@@ -73,6 +73,14 @@ test_request_target_forms :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(
 		t,
+		request_head_result(
+			"GET http://example.com:999999999999999999999999999999999999999999999999999999/ " +
+			"HTTP/1.1\r\nHost:\r\n\r\n",
+		),
+		Parse_Result.Ready,
+	)
+	testing.expect_value(
+		t,
 		request_line_result("CONNECT example.com:443 HTTP/1.1\r\n\r\n"),
 		Parse_Result.Ready,
 	)
@@ -113,7 +121,32 @@ test_request_target_forms :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(
 		t,
+		request_line_result("CONNECT [v1.a]:443 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Ready,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT [Vf.a-b!$&'()*+,;=.:]:443 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Ready,
+	)
+	testing.expect_value(
+		t,
 		request_line_result("CONNECT [:::]:443 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT [v.a]:443 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT [v1.]:443 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT [v1.a%20]:443 HTTP/1.1\r\n\r\n"),
 		Parse_Result.Invalid,
 	)
 	testing.expect_value(
@@ -124,6 +157,21 @@ test_request_target_forms :: proc(t: ^testing.T) {
 	testing.expect_value(
 		t,
 		request_line_result("CONNECT example.com:abc HTTP/1.1\r\n\r\n"),
+		Parse_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT example.com:65535 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Ready,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT example.com:65536 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT example.com:999999999999999999999 HTTP/1.1\r\n\r\n"),
 		Parse_Result.Invalid,
 	)
 	testing.expect_value(t, request_line_result("OPTIONS * HTTP/1.1\r\n\r\n"), Parse_Result.Ready)

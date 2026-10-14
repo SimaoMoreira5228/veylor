@@ -21,6 +21,7 @@ encode_static_route_response :: proc(
 	head: http1.Request_Head,
 	input: []u8,
 	output: []u8,
+	body_limit: u64,
 ) -> Static_Response_Event {
 	route, route_result := find_static_request_route(table, head, input)
 
@@ -65,6 +66,31 @@ encode_static_route_response :: proc(
 			return Static_Response_Event{result = .Invalid}
 		}
 	}
+
+	if head.has_content_length && head.content_length > body_limit {
+		error_reason: string = "Content Too Large"
+		error_head := response.encode_response_head(
+			method,
+			413,
+			transmute([]u8)error_reason,
+			[]response.Response_Header{},
+			.Fixed_Length,
+			0,
+			output,
+			.Close,
+		)
+
+		if error_head.result == .Buffer_Small {
+			return Static_Response_Event{result = .Buffer_Small}
+		}
+
+		if error_head.result != .Written {
+			return Static_Response_Event{result = .Invalid}
+		}
+
+		return Static_Response_Event{written = error_head.written, result = .Written}
+	}
+
 	connect_tunnel := false
 
 	if http1.bytes_equal(method, "CONNECT") {
@@ -86,6 +112,7 @@ encode_static_route_response :: proc(
 	if len(input) != head.length {
 		body_complete = false
 	}
+
 	policy := response.request_connection_policy(head, version, true, body_complete, false)
 	connection_header := response.response_connection_header(
 		method,
@@ -102,6 +129,7 @@ encode_static_route_response :: proc(
 	if route.response.status == 205 {
 		content_length = 0
 	}
+
 	head_event := response.encode_response_head(
 		method,
 		route.response.status,

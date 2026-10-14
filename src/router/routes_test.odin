@@ -3,6 +3,7 @@ package router
 
 import "core:testing"
 import http1 "veylor:http1"
+import body "veylor:http1/body"
 
 test_bytes :: proc(value: string) -> []u8 {
 	return transmute([]u8)value
@@ -182,6 +183,7 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 		Route_Table_Result.Added,
 	)
 	testing.expect_value(t, freeze_route_table(&table), Route_Table_Result.Frozen)
+	body_limit := body.DEFAULT_FIXED_BODY_LIMIT
 
 	origin_raw := "GET /items?mode=full HTTP/1.1\r\nHost: example.com\r\n\r\n"
 	origin_input := test_bytes(origin_raw)
@@ -197,7 +199,13 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 	testing.expect_value(t, result, Route_Table_Result.Found)
 	testing.expect_value(t, string(route.response.body), "ok")
 	output: [128]u8
-	response_event := encode_static_route_response(&table, origin_head, origin_input, output[:])
+	response_event := encode_static_route_response(
+		&table,
+		origin_head,
+		origin_input,
+		output[:],
+		body_limit,
+	)
 	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
 	testing.expect_value(t, response_event.keep_alive, true)
 	testing.expect_value(
@@ -221,7 +229,13 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 	route, result = find_static_request_route(&table, absolute_head, absolute_input)
 	testing.expect_value(t, result, Route_Table_Result.Found)
 	testing.expect_value(t, string(route.response.body), "ok")
-	response_event = encode_static_route_response(&table, absolute_head, absolute_input, output[:])
+	response_event = encode_static_route_response(
+		&table,
+		absolute_head,
+		absolute_input,
+		output[:],
+		body_limit,
+	)
 	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
 	testing.expect_value(t, response_event.keep_alive, true)
 
@@ -262,7 +276,13 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 		head_headers[:],
 	)
 	testing.expect_value(t, head_parse_result, http1.Parse_Result.Ready)
-	response_event = encode_static_route_response(&table, head_request, head_input, output[:])
+	response_event = encode_static_route_response(
+		&table,
+		head_request,
+		head_input,
+		output[:],
+		body_limit,
+	)
 	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
 	testing.expect_value(t, response_event.keep_alive, true)
 	testing.expect_value(
@@ -281,13 +301,74 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 		post_headers[:],
 	)
 	testing.expect_value(t, post_parse_result, http1.Parse_Result.Ready)
-	response_event = encode_static_route_response(&table, post_request, post_input, output[:])
+	response_event = encode_static_route_response(
+		&table,
+		post_request,
+		post_input,
+		output[:],
+		body_limit,
+	)
 	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
 	testing.expect_value(t, response_event.keep_alive, false)
 	testing.expect_value(
 		t,
 		string(output[:response_event.written]),
 		"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+	)
+
+	expect_raw :=
+		"POST /items HTTP/1.1\r\nHost: example.com\r\n" +
+		"Content-Length: 4\r\nExpect: 100-continue\r\n\r\n"
+	expect_input := test_bytes(expect_raw)
+	expect_headers: [3]http1.Header
+	expect_parser: http1.Parser
+	expect_request, expect_parse_result := http1.parse_request_head(
+		&expect_parser,
+		expect_input,
+		expect_headers[:],
+	)
+	testing.expect_value(t, expect_parse_result, http1.Parse_Result.Ready)
+	response_event = encode_static_route_response(
+		&table,
+		expect_request,
+		expect_input,
+		output[:],
+		4,
+	)
+	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
+	testing.expect_value(t, response_event.keep_alive, false)
+	testing.expect_value(
+		t,
+		string(output[:response_event.written]),
+		"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+	)
+
+	oversized_raw :=
+		"POST /items HTTP/1.1\r\nHost: example.com\r\n" +
+		"Content-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+	oversized_input := test_bytes(oversized_raw)
+	oversized_headers: [3]http1.Header
+	oversized_parser: http1.Parser
+	oversized_request, oversized_parse_result := http1.parse_request_head(
+		&oversized_parser,
+		oversized_input,
+		oversized_headers[:],
+	)
+	testing.expect_value(t, oversized_parse_result, http1.Parse_Result.Ready)
+	response_event = encode_static_route_response(
+		&table,
+		oversized_request,
+		oversized_input,
+		output[:],
+		4,
+	)
+	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
+	testing.expect_value(t, response_event.keep_alive, false)
+	testing.expect_value(
+		t,
+		string(output[:response_event.written]),
+		"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\n" +
+		"Content-Length: 0\r\n\r\n",
 	)
 
 	pipelined_raw :=
@@ -307,6 +388,7 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 		pipelined_request,
 		pipelined_input,
 		output[:],
+		body_limit,
 	)
 	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
 	testing.expect_value(t, response_event.keep_alive, false)

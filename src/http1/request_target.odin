@@ -232,9 +232,16 @@ valid_host_port :: proc(host_port: []u8, require_port: bool) -> bool {
 		if port_start >= len(host_port) {
 			return false
 		}
+		port := 0
 		for c in host_port[port_start:] {
 			if c < '0' || c > '9' {
 				return false
+			}
+			if require_port {
+				port = port * 10 + int(c - '0')
+				if port > 65535 {
+					return false
+				}
 			}
 		}
 	}

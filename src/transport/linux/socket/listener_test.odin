@@ -5,6 +5,7 @@ package socket
 import "core:sys/linux"
 import "core:testing"
 import http1 "veylor:http1"
+import http1_body "veylor:http1/body"
 import connection "veylor:http1/connection"
 import router "veylor:router"
 import "veylor:transport"
@@ -340,6 +341,7 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 		head_event.head,
 		request_input[:input_length],
 		response_bytes[:],
+		http1_body.DEFAULT_FIXED_BODY_LIMIT,
 	)
 	testing.expect_value(t, response_event.result, router.Static_Response_Result.Written)
 	testing.expect_value(t, response_event.keep_alive, true)
