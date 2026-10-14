@@ -9,11 +9,75 @@ import "veylor:transport"
 import socket "veylor:transport/linux/socket"
 
 @(test)
+test_accept_batch_drains_multiple_concurrent_loopback_clients :: proc(t: ^testing.T) {
+	loopback := [4]u8{127, 0, 0, 1}
+	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 16)
+	testing.expect_value(t, listener_result, socket.Result.Ready)
+	testing.expect_value(t, listener_error, i32(0))
+
+	if listener_result != .Ready {
+		return
+	}
+
+	client_fds: [8]linux.Fd
+	client_count := 0
+	for i in 0 ..< len(client_fds) {
+		flags: linux.Socket_FD_Flags = {.CLOEXEC}
+		fd, socket_error := linux.socket(.INET, .STREAM, flags, .TCP)
+		testing.expect_value(t, socket_error, linux.Errno.NONE)
+
+		if socket_error != .NONE {
+			break
+		}
+		destination := linux.Sock_Addr_In {
+			sin_family = .INET,
+			sin_port   = u16be(listener.local_address.port),
+			sin_addr   = loopback,
+		}
+		connect_error := linux.connect(fd, &destination)
+		testing.expect_value(t, connect_error, linux.Errno.NONE)
+
+		if connect_error != .NONE {
+			linux.close(fd)
+			break
+		}
+		client_fds[client_count] = fd
+		client_count += 1
+	}
+	testing.expect_value(t, client_count, len(client_fds))
+
+	if client_count != len(client_fds) {
+		for fd, i in client_fds[:client_count] {
+			linux.close(fd)
+		}
+		socket.close_listener(&listener)
+		return
+	}
+
+	accepted_storage: [9]socket.Accepted_Connection
+	batch := socket.accept_ready(listener, accepted_storage[:], len(client_fds) + 1)
+	testing.expect_value(t, batch.result, socket.Accept_Batch_Result.Drained)
+	testing.expect_value(t, batch.attempts, len(client_fds) + 1)
+	testing.expect_value(t, len(batch.connections), len(client_fds))
+
+	for connection, i in batch.connections {
+		testing.expect_value(t, connection.fd >= 0, true)
+		testing.expect_value(t, connection.peer.family, transport.Address_Family.IPv4)
+		socket.close_connection(&accepted_storage[i])
+	}
+	for fd in client_fds[:client_count] {
+		linux.close(fd)
+	}
+	socket.close_listener(&listener)
+}
+
+@(test)
 test_accept_turn_assigns_worker_scoped_connection_tokens :: proc(t: ^testing.T) {
 	loopback := [4]u8{127, 0, 0, 1}
 	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 8)
 	testing.expect_value(t, listener_result, socket.Result.Ready)
 	testing.expect_value(t, listener_error, i32(0))
+
 	if listener_result != .Ready {
 		return
 	}
@@ -21,6 +85,7 @@ test_accept_turn_assigns_worker_scoped_connection_tokens :: proc(t: ^testing.T) 
 	client_flags: linux.Socket_FD_Flags = {.CLOEXEC}
 	client, client_error := linux.socket(.INET, .STREAM, client_flags, .TCP)
 	testing.expect_value(t, client_error, linux.Errno.NONE)
+
 	if client_error != .NONE {
 		socket.close_listener(&listener)
 		return
@@ -32,6 +97,7 @@ test_accept_turn_assigns_worker_scoped_connection_tokens :: proc(t: ^testing.T) 
 	}
 	connect_error := linux.connect(client, &destination)
 	testing.expect_value(t, connect_error, linux.Errno.NONE)
+
 	if connect_error != .NONE {
 		linux.close(client)
 		socket.close_listener(&listener)
@@ -59,6 +125,7 @@ test_accept_turn_assigns_worker_scoped_connection_tokens :: proc(t: ^testing.T) 
 	)
 	testing.expect_value(t, turn.result, Accept_Turn_Result.Drained)
 	testing.expect_value(t, len(turn.connections), 1)
+
 	if len(turn.connections) != 1 {
 		linux.close(client)
 		socket.close_listener(&listener)
@@ -91,6 +158,7 @@ test_accept_turn_skips_listener_without_readiness_or_free_slots :: proc(t: ^test
 	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 8)
 	testing.expect_value(t, listener_result, socket.Result.Ready)
 	testing.expect_value(t, listener_error, i32(0))
+
 	if listener_result != .Ready {
 		return
 	}

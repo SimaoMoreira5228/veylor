@@ -12,6 +12,7 @@ import socket "veylor:transport/linux/socket"
 Worker_Turn :: struct {
 	stream_events:              []transport.Readiness_Event,
 	accepted:                   []Worker_Connection,
+	expired_timers:             []transport.Timer_Expiration,
 	byte_budget_per_connection: int,
 	poll_result:                epoll.Result,
 	accept_result:              Accept_Turn_Result,
@@ -91,30 +92,38 @@ run_worker_turn :: proc(
 	listener: socket.Listener,
 	listener_id: u64,
 	listener_registered: ^bool,
+	descriptor_limit_paused: ^bool,
 	table: ^connections.Connection_Table,
 	native_events: []linux.EPoll_Event,
 	readiness_events: []transport.Readiness_Event,
 	accepted_storage: []socket.Accepted_Connection,
 	connection_storage: []Worker_Connection,
+	timers: ^transport.Timer_Queue,
+	expired_timer_storage: []transport.Timer_Expiration,
 	event_budget: int,
 	byte_budget_per_connection: int,
 	accept_attempt_budget: int,
 	timeout_ms: i32,
 ) -> Worker_Turn {
 	if listener_registered == nil ||
+	   descriptor_limit_paused == nil ||
+	   timers == nil ||
 	   event_budget <= 0 ||
 	   byte_budget_per_connection <= 0 ||
 	   accept_attempt_budget <= 0 ||
 	   table.free_count < 0 ||
 	   table.free_count > len(table.slots) ||
-	   table.free_count > len(table.free_stack) {
+	   table.free_count > len(table.free_stack) ||
+	   timers.count < 0 ||
+	   timers.count > len(timers.storage) ||
+	   len(expired_timer_storage) == 0 {
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
 	capacity := min(event_budget, len(native_events), len(readiness_events))
 	if capacity == 0 {
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
-	if table.free_count == 0 && listener_registered^ {
+	if (table.free_count == 0 || descriptor_limit_paused^) && listener_registered^ {
 		result, error_code := epoll.unregister(poller, listener.fd)
 		if result != .Ready {
 			return Worker_Turn {
@@ -124,7 +133,7 @@ run_worker_turn :: proc(
 			}
 		}
 		listener_registered^ = false
-	} else if table.free_count > 0 && !listener_registered^ {
+	} else if table.free_count > 0 && !descriptor_limit_paused^ && !listener_registered^ {
 		result, error_code := epoll.register(
 			poller,
 			listener.fd,
@@ -140,7 +149,22 @@ run_worker_turn :: proc(
 		}
 		listener_registered^ = true
 	}
-	batch := epoll.wait(poller, native_events[:capacity], readiness_events[:capacity], timeout_ms)
+	now, clock_error := linux.clock_gettime(.MONOTONIC)
+	if clock_error != .NONE {
+		return Worker_Turn {
+			poll_result = .System_Error,
+			accept_result = .Error,
+			error_code = i32(clock_error),
+		}
+	}
+	now_ns := u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
+	wait_timeout_ms := transport.timer_wait_timeout_ms(timers, now_ns, timeout_ms)
+	batch := epoll.wait(
+		poller,
+		native_events[:capacity],
+		readiness_events[:capacity],
+		wait_timeout_ms,
+	)
 	turn := Worker_Turn {
 		byte_budget_per_connection = byte_budget_per_connection,
 		poll_result                = batch.result,
@@ -148,8 +172,26 @@ run_worker_turn :: proc(
 	}
 	if batch.result != .Ready {
 		turn.error_code = batch.error_code
+		if batch.result == .Timeout {
+			now, clock_error = linux.clock_gettime(.MONOTONIC)
+			if clock_error != .NONE {
+				turn.poll_result = .System_Error
+				turn.error_code = i32(clock_error)
+				return turn
+			}
+			now_ns = u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
+			turn.expired_timers = expire_worker_timers_at(timers, expired_timer_storage, now_ns)
+		}
 		return turn
 	}
+	now, clock_error = linux.clock_gettime(.MONOTONIC)
+	if clock_error != .NONE {
+		turn.poll_result = .System_Error
+		turn.error_code = i32(clock_error)
+		return turn
+	}
+	now_ns = u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
+	turn.expired_timers = expire_worker_timers_at(timers, expired_timer_storage, now_ns)
 
 	accepted_count := 0
 	stream_event_count := 0
@@ -174,12 +216,25 @@ run_worker_turn :: proc(
 			accepted_count += len(accept_turn.connections)
 			turn.accept_result = accept_turn.result
 			turn.error_code = accept_turn.error_code
+			if accept_turn.result == .Descriptor_Limit {
+				pause_result, pause_error := pause_listener_for_descriptor_limit(
+					poller,
+					listener,
+					listener_registered,
+					descriptor_limit_paused,
+				)
+				if pause_result != .Ready {
+					turn.poll_result = pause_result
+					turn.error_code = pause_error
+					return turn
+				}
+			}
 			continue
 		}
 		readiness_events[stream_event_count] = event
 		stream_event_count += 1
 	}
-	if table.free_count == 0 && listener_registered^ {
+	if (table.free_count == 0 || descriptor_limit_paused^) && listener_registered^ {
 		result, error_code := epoll.unregister(poller, listener.fd)
 		if result != .Ready {
 			turn.poll_result = .System_Error
@@ -191,4 +246,43 @@ run_worker_turn :: proc(
 	turn.stream_events = readiness_events[:stream_event_count]
 	turn.accepted = connection_storage[:accepted_count]
 	return turn
+}
+pause_listener_for_descriptor_limit :: proc(
+	poller: epoll.Epoll,
+	listener: socket.Listener,
+	listener_registered: ^bool,
+	descriptor_limit_paused: ^bool,
+) -> (
+	result: epoll.Result,
+	error_code: i32,
+) {
+	if listener_registered == nil || descriptor_limit_paused == nil {
+		return .Invalid, 0
+	}
+	if listener_registered^ {
+		result, error_code = epoll.unregister(poller, listener.fd)
+		if result != .Ready {
+			return
+		}
+		listener_registered^ = false
+	}
+	descriptor_limit_paused^ = true
+	return .Ready, 0
+}
+
+expire_worker_timers_at :: proc(
+	timers: ^transport.Timer_Queue,
+	expired_storage: []transport.Timer_Expiration,
+	now_ns: u64,
+) -> []transport.Timer_Expiration {
+	expired_count := 0
+	for expired_count < len(expired_storage) {
+		timer, result := transport.pop_expired_timer(timers, now_ns)
+		if result != .Expired {
+			break
+		}
+		expired_storage[expired_count] = timer
+		expired_count += 1
+	}
+	return expired_storage[:expired_count]
 }
