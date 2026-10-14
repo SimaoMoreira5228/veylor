@@ -16,6 +16,7 @@ Connection_Body_Result :: enum {
 	Trailer,
 	Need_More,
 	Would_Block,
+	Interrupted,
 	Complete,
 	Peer_Closed,
 	Cancelled,
@@ -60,9 +61,11 @@ begin_connection_body :: proc(
 		is_chunked         = head.is_chunked,
 		state              = .Reading,
 	}
+
 	if !head.is_chunked && !head.has_content_length {
 		driver.state = .Complete
 	}
+
 	if !head.is_chunked && head.has_content_length && head.content_length == 0 {
 		driver.state = .Complete
 	}
@@ -81,22 +84,35 @@ consume_body_completion :: proc(
 	if driver.state == .Complete {
 		return Connection_Body_Event{result = .Complete, body_complete = true}
 	}
+
 	if driver.state != .Reading {
 		return connection_body_event(driver)
 	}
-	if completion.connection_id != driver.connection_id ||
-	   completion.operation != transport.Transport_Operation.Read ||
-	   !valid_transport_result(completion.result) {
+
+	if completion.connection_id != driver.connection_id {
 		return fail_connection_body(driver, .Invalid)
 	}
+
+	if completion.operation != transport.Transport_Operation.Read {
+		return fail_connection_body(driver, .Invalid)
+	}
+
+	if !valid_transport_result(completion.result) {
+		return fail_connection_body(driver, .Invalid)
+	}
+
 	if driver.has_operation && completion.operation_id <= driver.operation_id {
 		return fail_connection_body(driver, .Invalid)
 	}
 	driver.operation_id = completion.operation_id
 	driver.has_operation = true
+
 	if completion.result.kind == .Progress {
-		if completion.result.transferred_bytes == 0 ||
-		   completion.result.transferred_bytes != len(input) {
+		if completion.result.transferred_bytes == 0 {
+			return fail_connection_body(driver, .Invalid)
+		}
+
+		if completion.result.transferred_bytes != len(input) {
 			return fail_connection_body(driver, .Invalid)
 		}
 	} else if len(input) != 0 {
@@ -106,6 +122,8 @@ consume_body_completion :: proc(
 	switch completion.result.kind {
 	case .Would_Block:
 		return Connection_Body_Event{result = .Would_Block}
+	case .Interrupted:
+		return Connection_Body_Event{result = .Interrupted}
 	case .End_Of_Stream:
 		return fail_connection_body(driver, .Invalid)
 	case .Cancelled:
@@ -143,9 +161,11 @@ consume_buffered_body :: proc(
 	if driver.state == .Complete {
 		return Connection_Body_Event{result = .Complete, body_complete = true}
 	}
+
 	if driver.state != .Reading {
 		return connection_body_event(driver)
 	}
+
 	if driver.is_chunked {
 		return consume_chunked_body(driver, input, spans, trailer_context, chunked_limits)
 	}
@@ -161,11 +181,13 @@ consume_fixed_body :: proc(
 	if len(input) > 0 && len(spans) == 0 {
 		return Connection_Body_Event{result = .Span_Capacity}
 	}
+
 	event := body.read_fixed_body(&driver.fixed, input, driver.content_length, body_limit)
 	switch event.result {
 	case .Data:
 		spans[0] = event.data
 		complete := driver.fixed.state == .Complete
+
 		if complete {
 			driver.state = .Complete
 		}
@@ -196,6 +218,7 @@ consume_chunked_body :: proc(
 	limits: body.Chunked_Limits,
 ) -> Connection_Body_Event {
 	event := body.decode_chunked_body(&driver.chunked, input, spans, trailer_context, limits)
+
 	switch event.result {
 	case .Data:
 		return Connection_Body_Event {

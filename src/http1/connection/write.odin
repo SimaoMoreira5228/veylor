@@ -14,6 +14,7 @@ Connection_Write_State :: enum {
 Connection_Write_Result :: enum {
 	Progress,
 	Would_Block,
+	Interrupted,
 	Complete,
 	Peer_Closed,
 	Cancelled,
@@ -41,6 +42,7 @@ begin_connection_write :: proc(connection_id: u64, bytes: []u8) -> Connection_Wr
 	cursor := response.begin_response_write(bytes)
 	state := Connection_Write_State.Pending
 	result := Connection_Write_Result.Progress
+
 	if cursor.state == .Complete {
 		state = .Complete
 		result = .Complete
@@ -67,11 +69,19 @@ consume_write_completion :: proc(
 	if driver.state != .Pending {
 		return connection_write_event(driver)
 	}
-	if completion.connection_id != driver.connection_id ||
-	   completion.operation != transport.Transport_Operation.Write ||
-	   !valid_transport_result(completion.result) {
+
+	if completion.connection_id != driver.connection_id {
 		return fail_connection_write(driver, .Invalid)
 	}
+
+	if completion.operation != transport.Transport_Operation.Write {
+		return fail_connection_write(driver, .Invalid)
+	}
+
+	if !valid_transport_result(completion.result) {
+		return fail_connection_write(driver, .Invalid)
+	}
+
 	if driver.has_operation && completion.operation_id <= driver.operation_id {
 		return fail_connection_write(driver, .Invalid)
 	}
@@ -81,6 +91,9 @@ consume_write_completion :: proc(
 	switch completion.result.kind {
 	case .Would_Block:
 		driver.result = .Would_Block
+		return connection_write_event(driver)
+	case .Interrupted:
+		driver.result = .Interrupted
 		return connection_write_event(driver)
 	case .End_Of_Stream:
 		return fail_connection_write(driver, .Invalid)
@@ -99,18 +112,25 @@ consume_write_completion :: proc(
 		return connection_write_event(driver)
 	case .Progress:
 		pending := connection_write_pending(driver)
-		if completion.result.transferred_bytes == 0 ||
-		   completion.result.transferred_bytes > len(pending) {
+
+		if completion.result.transferred_bytes == 0 {
 			return fail_connection_write(driver, .Invalid)
 		}
+
+		if completion.result.transferred_bytes > len(pending) {
+			return fail_connection_write(driver, .Invalid)
+		}
+
 		write_result := response.advance_response_write(
 			&driver.cursor,
 			completion.result.transferred_bytes,
 		)
+
 		if write_result == .Invalid {
 			return fail_connection_write(driver, .Invalid)
 		}
 		driver.result = .Progress
+
 		if write_result == .Complete {
 			driver.state = .Complete
 			driver.result = .Complete

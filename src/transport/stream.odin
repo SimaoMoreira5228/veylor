@@ -3,6 +3,7 @@ package transport
 IO_Result_Kind :: enum {
 	Progress,
 	Would_Block,
+	Interrupted,
 	End_Of_Stream,
 	Closed,
 	Cancelled,

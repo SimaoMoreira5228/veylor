@@ -15,6 +15,7 @@ Connection_Head_Result :: enum {
 	Need_More,
 	Ready,
 	Would_Block,
+	Interrupted,
 	Peer_Closed,
 	Cancelled,
 	Transport_Error,
@@ -81,6 +82,8 @@ consume_read_completion :: proc(
 	switch completion.result.kind {
 	case .Would_Block:
 		return Connection_Head_Event{result = .Would_Block}
+	case .Interrupted:
+		return Connection_Head_Event{result = .Interrupted}
 	case .End_Of_Stream:
 		if driver.input_length != 0 {
 			return fail_connection_head(driver, .Invalid)
