@@ -6,6 +6,7 @@ import http1 "veylor:http1"
 import body "veylor:http1/body"
 import connection "veylor:http1/connection"
 import connections "veylor:runtime/connections"
+import shutdown "veylor:runtime/shutdown"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
 import socket "veylor:transport/linux/socket"
@@ -58,12 +59,15 @@ read_connection_head_turn :: proc(
 			},
 		}
 	}
+
 	if driver.state != .Reading {
 		return Head_Read_Turn{head = connection.connection_head_event(driver)}
 	}
+
 	if byte_budget <= 0 || driver.input_length < 0 || driver.input_length > len(input) {
 		return Head_Read_Turn{head = connection.Connection_Head_Event{result = .Invalid}}
 	}
+
 	if driver.input_length == len(input) {
 		return Head_Read_Turn {
 			head = connection.reject_connection_head(driver, .Too_Large),
@@ -72,11 +76,13 @@ read_connection_head_turn :: proc(
 	}
 
 	budget, valid := socket.begin_stream_byte_budget(byte_budget)
+
 	if !valid {
 		return Head_Read_Turn{head = connection.Connection_Head_Event{result = .Invalid}}
 	}
 	read := socket.read_stream_budgeted(fd, input[driver.input_length:], &budget)
 	input_length := driver.input_length
+
 	if read.io.kind == .Progress {
 		input_length += read.io.transferred_bytes
 	}
@@ -87,6 +93,7 @@ read_connection_head_turn :: proc(
 		result        = read.io,
 	}
 	head := connection.consume_read_completion(driver, completion, input[:input_length], headers)
+
 	if input_length == len(input) && head.result == .Need_More {
 		head = connection.reject_connection_head(driver, .Too_Large)
 		return Head_Read_Turn {
@@ -126,6 +133,7 @@ read_connection_head_turn_with_deadline :: proc(
 			now_ns,
 			timeouts,
 		)
+
 		if schedule.result != .Scheduled {
 			return Head_Read_Turn {
 				head = connection.Connection_Head_Event{result = .Invalid},
@@ -135,13 +143,21 @@ read_connection_head_turn_with_deadline :: proc(
 	}
 
 	turn := read_connection_head_turn(connection_id, fd, driver, input, headers, byte_budget)
-	if turn.head.result == .Need_More ||
-	   turn.head.result == .Would_Block ||
-	   turn.head.result == .Interrupted {
+
+	if turn.head.result == .Need_More {
+		return turn
+	}
+
+	if turn.head.result == .Would_Block {
+		return turn
+	}
+
+	if turn.head.result == .Interrupted {
 		return turn
 	}
 
 	deadline_result := connections.cancel_connection_phase_deadline(table, timers, token)
+
 	if deadline_result != .Cancelled && deadline_result != .Not_Found {
 		turn.deadline_result = deadline_result
 		return turn
@@ -168,6 +184,7 @@ read_connection_body_turn_with_deadline :: proc(
 	if driver.state != .Reading {
 		return Body_Read_Turn{body = connection.connection_body_event(driver)}
 	}
+
 	if byte_budget <= 0 || len(input) == 0 {
 		return Body_Read_Turn {
 			body = connection.Connection_Body_Event{result = .Invalid},
@@ -175,6 +192,7 @@ read_connection_body_turn_with_deadline :: proc(
 		}
 	}
 	deadline_result := connections.Connection_Deadline_Schedule_Result.Not_Scheduled
+
 	if !driver.has_operation {
 		schedule := connections.schedule_connection_phase_deadline(
 			table,
@@ -184,6 +202,7 @@ read_connection_body_turn_with_deadline :: proc(
 			now_ns,
 			timeouts,
 		)
+
 		if schedule.result != .Scheduled {
 			return Body_Read_Turn {
 				body = connection.Connection_Body_Event{result = .Invalid},
@@ -194,6 +213,7 @@ read_connection_body_turn_with_deadline :: proc(
 	}
 
 	budget, valid := socket.begin_stream_byte_budget(byte_budget)
+
 	if !valid {
 		return Body_Read_Turn {
 			body = connection.Connection_Body_Event{result = .Invalid},
@@ -202,6 +222,7 @@ read_connection_body_turn_with_deadline :: proc(
 	}
 	read := socket.read_stream_budgeted(fd, input, &budget)
 	input_length := 0
+
 	if read.io.kind == .Progress {
 		input_length = read.io.transferred_bytes
 	}
@@ -225,13 +246,16 @@ read_connection_body_turn_with_deadline :: proc(
 		deadline_result  = deadline_result,
 	}
 	terminal := body_event.body_complete || driver.state == .Failed || driver.state == .Cancelled
+
 	if read.io.kind == .Progress {
 		cancel_result := connections.cancel_connection_phase_deadline(table, timers, token)
+
 		if cancel_result != .Cancelled {
 			turn.deadline_result = cancel_result
 			return turn
 		}
 		turn.deadline_result = .Cancelled
+
 		if terminal {
 			return turn
 		}
@@ -246,6 +270,7 @@ read_connection_body_turn_with_deadline :: proc(
 		turn.deadline_result = schedule.result
 		return turn
 	}
+
 	if terminal {
 		turn.deadline_result = connections.cancel_connection_phase_deadline(table, timers, token)
 	}
@@ -279,9 +304,11 @@ write_connection_turn_with_deadline :: proc(
 			deadline_result = idle.result,
 		}
 	}
+
 	if driver.state != .Pending {
 		return Write_Turn{write = connection.connection_write_event(driver)}
 	}
+
 	if byte_budget <= 0 {
 		return Write_Turn {
 			write = connection.Connection_Write_Event{result = .Invalid},
@@ -289,6 +316,7 @@ write_connection_turn_with_deadline :: proc(
 		}
 	}
 	deadline_result := connections.Connection_Deadline_Schedule_Result.Not_Scheduled
+
 	if !driver.has_operation {
 		schedule := connections.schedule_connection_phase_deadline(
 			table,
@@ -298,6 +326,7 @@ write_connection_turn_with_deadline :: proc(
 			now_ns,
 			timeouts,
 		)
+
 		if schedule.result != .Scheduled {
 			return Write_Turn {
 				write = connection.Connection_Write_Event{result = .Invalid},
@@ -308,6 +337,7 @@ write_connection_turn_with_deadline :: proc(
 	}
 
 	budget, valid := socket.begin_stream_byte_budget(byte_budget)
+
 	if !valid {
 		return Write_Turn {
 			write = connection.Connection_Write_Event{result = .Invalid},
@@ -330,13 +360,16 @@ write_connection_turn_with_deadline :: proc(
 		budget_exhausted = write.budget_exhausted,
 	}
 	terminal := driver.state != .Pending
+
 	if write.io.kind == .Progress {
 		cancel_result := connections.cancel_connection_phase_deadline(table, timers, token)
+
 		if cancel_result != .Cancelled {
 			turn.deadline_result = cancel_result
 			return turn
 		}
 		turn.deadline_result = .Cancelled
+
 		if terminal {
 			if driver.state == .Complete && keep_alive {
 				idle := connections.start_keep_alive_idle_deadline(
@@ -362,6 +395,7 @@ write_connection_turn_with_deadline :: proc(
 		turn.deadline_result = schedule.result
 		return turn
 	}
+
 	if terminal {
 		turn.deadline_result = connections.cancel_connection_phase_deadline(table, timers, token)
 	}
@@ -374,6 +408,7 @@ run_worker_turn :: proc(
 	listener_id: u64,
 	listener_registered: ^bool,
 	descriptor_limit_paused: ^bool,
+	shutdown_state: ^shutdown.State,
 	table: ^connections.Connection_Table,
 	native_events: []linux.EPoll_Event,
 	readiness_events: []transport.Readiness_Event,
@@ -386,26 +421,80 @@ run_worker_turn :: proc(
 	accept_attempt_budget: int,
 	timeout_ms: i32,
 ) -> Worker_Turn {
-	if listener_registered == nil ||
-	   descriptor_limit_paused == nil ||
-	   timers == nil ||
-	   event_budget <= 0 ||
-	   byte_budget_per_connection <= 0 ||
-	   accept_attempt_budget <= 0 ||
-	   table.free_count < 0 ||
-	   table.free_count > len(table.slots) ||
-	   table.free_count > len(table.free_stack) ||
-	   timers.count < 0 ||
-	   timers.count > len(timers.storage) ||
-	   len(expired_timer_storage) == 0 {
+	if listener_registered == nil {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if descriptor_limit_paused == nil {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if shutdown_state == nil {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if timers == nil {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if table == nil {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if event_budget <= 0 {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if byte_budget_per_connection <= 0 {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if accept_attempt_budget <= 0 {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if table.free_count < 0 {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if table.free_count > len(table.slots) {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if table.free_count > len(table.free_stack) {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if timers.count < 0 {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if timers.count > len(timers.storage) {
+		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
+	}
+
+	if len(expired_timer_storage) == 0 {
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
 	capacity := min(event_budget, len(native_events), len(readiness_events))
+
 	if capacity == 0 {
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
-	if (table.free_count == 0 || descriptor_limit_paused^) && listener_registered^ {
+	accepting := shutdown_state.phase == .Running
+	should_unregister_listener := !accepting
+
+	if table.free_count == 0 {
+		should_unregister_listener = true
+	}
+
+	if descriptor_limit_paused^ {
+		should_unregister_listener = true
+	}
+
+	if should_unregister_listener && listener_registered^ {
 		result, error_code := epoll.unregister(poller, listener.fd)
+
 		if result != .Ready {
 			return Worker_Turn {
 				poll_result = result,
@@ -414,13 +503,30 @@ run_worker_turn :: proc(
 			}
 		}
 		listener_registered^ = false
-	} else if table.free_count > 0 && !descriptor_limit_paused^ && !listener_registered^ {
+	}
+
+	should_register_listener := accepting
+
+	if table.free_count == 0 {
+		should_register_listener = false
+	}
+
+	if descriptor_limit_paused^ {
+		should_register_listener = false
+	}
+
+	if listener_registered^ {
+		should_register_listener = false
+	}
+
+	if should_register_listener {
 		result, error_code := epoll.register(
 			poller,
 			listener.fd,
 			listener_id,
 			epoll.Interest{readable = true},
 		)
+
 		if result != .Ready {
 			return Worker_Turn {
 				poll_result = result,
@@ -431,6 +537,7 @@ run_worker_turn :: proc(
 		listener_registered^ = true
 	}
 	now, clock_error := linux.clock_gettime(.MONOTONIC)
+
 	if clock_error != .NONE {
 		return Worker_Turn {
 			poll_result = .System_Error,
@@ -451,10 +558,13 @@ run_worker_turn :: proc(
 		poll_result                = batch.result,
 		accept_result              = .Not_Ready,
 	}
+
 	if batch.result != .Ready {
 		turn.error_code = batch.error_code
+
 		if batch.result == .Timeout {
 			now, clock_error = linux.clock_gettime(.MONOTONIC)
+
 			if clock_error != .NONE {
 				turn.poll_result = .System_Error
 				turn.error_code = i32(clock_error)
@@ -466,6 +576,7 @@ run_worker_turn :: proc(
 		return turn
 	}
 	now, clock_error = linux.clock_gettime(.MONOTONIC)
+
 	if clock_error != .NONE {
 		turn.poll_result = .System_Error
 		turn.error_code = i32(clock_error)
@@ -479,6 +590,7 @@ run_worker_turn :: proc(
 	listener_seen := false
 	for i := 0; i < len(batch.events); i += 1 {
 		event := batch.events[i]
+
 		if event.connection_id == listener_id {
 			if listener_seen {
 				turn.accept_result = .Invalid
@@ -494,9 +606,23 @@ run_worker_turn :: proc(
 				connection_storage[accepted_count:],
 				accept_attempt_budget,
 			)
-			accepted_count += len(accept_turn.connections)
 			turn.accept_result = accept_turn.result
 			turn.error_code = accept_turn.error_code
+
+			if len(accept_turn.connections) > 0 {
+				shutdown_result := shutdown.register_connections(
+					shutdown_state,
+					u64(len(accept_turn.connections)),
+				)
+
+				if shutdown_result != .Accepted {
+					discard_untracked_worker_connections(accept_turn.connections, table)
+					turn.accept_result = .Error
+					continue
+				}
+				accepted_count += len(accept_turn.connections)
+			}
+
 			if accept_turn.result == .Descriptor_Limit {
 				pause_result, pause_error := pause_listener_for_descriptor_limit(
 					poller,
@@ -504,6 +630,7 @@ run_worker_turn :: proc(
 					listener_registered,
 					descriptor_limit_paused,
 				)
+
 				if pause_result != .Ready {
 					turn.poll_result = pause_result
 					turn.error_code = pause_error
@@ -515,8 +642,20 @@ run_worker_turn :: proc(
 		readiness_events[stream_event_count] = event
 		stream_event_count += 1
 	}
-	if (table.free_count == 0 || descriptor_limit_paused^) && listener_registered^ {
+
+	listener_should_be_unregistered := shutdown_state.phase != .Running
+
+	if table.free_count == 0 {
+		listener_should_be_unregistered = true
+	}
+
+	if descriptor_limit_paused^ {
+		listener_should_be_unregistered = true
+	}
+
+	if listener_should_be_unregistered && listener_registered^ {
 		result, error_code := epoll.unregister(poller, listener.fd)
+
 		if result != .Ready {
 			turn.poll_result = .System_Error
 			turn.error_code = error_code
@@ -540,8 +679,10 @@ pause_listener_for_descriptor_limit :: proc(
 	if listener_registered == nil || descriptor_limit_paused == nil {
 		return .Invalid, 0
 	}
+
 	if listener_registered^ {
 		result, error_code = epoll.unregister(poller, listener.fd)
+
 		if result != .Ready {
 			return
 		}
@@ -559,6 +700,7 @@ expire_worker_timers_at :: proc(
 	expired_count := 0
 	for expired_count < len(expired_storage) {
 		timer, result := transport.pop_expired_timer(timers, now_ns)
+
 		if result != .Expired {
 			break
 		}

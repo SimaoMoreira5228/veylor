@@ -5,6 +5,7 @@ package linux_runtime
 import "core:sys/linux"
 import "core:testing"
 import connections "veylor:runtime/connections"
+import shutdown "veylor:runtime/shutdown"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
 import socket "veylor:transport/linux/socket"
@@ -14,6 +15,7 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	listener, listen_result, listen_error := socket.listen_ipv4([4]u8{127, 0, 0, 1}, 0, 4)
 	testing.expect_value(t, listen_result, socket.Result.Ready)
 	testing.expect_value(t, listen_error, i32(0))
+
 	if listen_result != .Ready {
 		return
 	}
@@ -21,6 +23,7 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	poller, poll_result, poll_error := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
 	testing.expect_value(t, poll_error, i32(0))
+
 	if poll_result != .Ready {
 		socket.close_listener(&listener)
 		return
@@ -53,12 +56,14 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	timer_storage: [1]transport.Timer_Expiration
 	timers := transport.init_timer_queue(timer_storage[:])
 	expired_timer_storage: [1]transport.Timer_Expiration
+	shutdown_state: shutdown.State
 	turn := run_worker_turn(
 		poller,
 		listener,
 		401,
 		&registered,
 		&paused,
+		&shutdown_state,
 		&table,
 		native_events[:],
 		readiness_events[:],
@@ -73,6 +78,66 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	)
 	testing.expect_value(t, turn.poll_result, epoll.Result.Timeout)
 	testing.expect_value(t, registered, true)
+	testing.expect_value(
+		t,
+		shutdown.register_connection(&shutdown_state),
+		shutdown.Result.Accepted,
+	)
+	clock, clock_error := linux.clock_gettime(.MONOTONIC)
+	testing.expect_value(t, clock_error, linux.Errno.NONE)
+	now_ns := u64(clock.time_sec) * 1_000_000_000 + u64(clock.time_nsec)
+	testing.expect_value(
+		t,
+		shutdown.request_shutdown(&shutdown_state, &timers, 1601, now_ns, 1_000_000_000_000),
+		shutdown.Result.Draining,
+	)
+	turn = run_worker_turn(
+		poller,
+		listener,
+		401,
+		&registered,
+		&paused,
+		&shutdown_state,
+		&table,
+		native_events[:],
+		readiness_events[:],
+		accepted_storage[:],
+		connection_storage[:],
+		&timers,
+		expired_timer_storage[:],
+		1,
+		1,
+		1,
+		0,
+	)
+	testing.expect_value(t, turn.poll_result, epoll.Result.Timeout)
+	testing.expect_value(t, registered, false)
+	testing.expect_value(
+		t,
+		shutdown.close_connection(&shutdown_state, &timers),
+		shutdown.Result.Completed,
+	)
+	turn = run_worker_turn(
+		poller,
+		listener,
+		401,
+		&registered,
+		&paused,
+		&shutdown_state,
+		&table,
+		native_events[:],
+		readiness_events[:],
+		accepted_storage[:],
+		connection_storage[:],
+		&timers,
+		expired_timer_storage[:],
+		1,
+		1,
+		1,
+		0,
+	)
+	testing.expect_value(t, turn.poll_result, epoll.Result.Timeout)
+	testing.expect_value(t, registered, false)
 	epoll.unregister(poller, listener.fd)
 	epoll.close(&poller)
 	socket.close_listener(&listener)
@@ -86,6 +151,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 8)
 	testing.expect_value(t, listener_result, socket.Result.Ready)
 	testing.expect_value(t, listener_error, i32(0))
+
 	if listener_result != .Ready {
 		return
 	}
@@ -93,6 +159,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	client_flags: linux.Socket_FD_Flags = {.CLOEXEC}
 	client, client_error := linux.socket(.INET, .STREAM, client_flags, .TCP)
 	testing.expect_value(t, client_error, linux.Errno.NONE)
+
 	if client_error != .NONE {
 		socket.close_listener(&listener)
 		return
@@ -104,6 +171,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	}
 	connect_error := linux.connect(client, &destination)
 	testing.expect_value(t, connect_error, linux.Errno.NONE)
+
 	if connect_error != .NONE {
 		linux.close(client)
 		socket.close_listener(&listener)
@@ -117,6 +185,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	poller, poller_result, poller_error := epoll.create()
 	testing.expect_value(t, poller_result, epoll.Result.Ready)
 	testing.expect_value(t, poller_error, i32(0))
+
 	if table_result != .Ready || poller_result != .Ready {
 		if poller_result == .Ready {
 			epoll.close(&poller)
@@ -129,6 +198,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	sockets: [2]linux.Fd
 	socket_error := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
 	testing.expect_value(t, socket_error, linux.Errno.NONE)
+
 	if socket_error != .NONE {
 		epoll.close(&poller)
 		linux.close(client)
@@ -140,6 +210,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	other_sockets: [2]linux.Fd
 	socket_error = linux.socketpair(.UNIX, .STREAM, .HOPOPT, &other_sockets)
 	testing.expect_value(t, socket_error, linux.Errno.NONE)
+
 	if socket_error != .NONE {
 		linux.close(sockets[0])
 		linux.close(sockets[1])
@@ -181,12 +252,14 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	)
 	listener_registered := false
 	descriptor_limit_paused := false
+	shutdown_state: shutdown.State
 	turn := run_worker_turn(
 		poller,
 		listener,
 		101,
 		&listener_registered,
 		&descriptor_limit_paused,
+		&shutdown_state,
 		&table,
 		native_events[:],
 		readiness_events[:],
@@ -204,10 +277,13 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	testing.expect_value(t, listener_registered, true)
 	testing.expect_value(t, len(turn.stream_events) <= 1, true)
 	testing.expect_value(t, len(turn.accepted), 1)
+	testing.expect_value(t, shutdown_state.active_connections, u64(1))
 	testing.expect_value(t, len(turn.expired_timers), 1)
+
 	if len(turn.expired_timers) == 1 {
 		testing.expect_value(t, turn.expired_timers[0].timer_id, u64(99))
 	}
+
 	if len(turn.accepted) == 1 {
 		testing.expect_value(t, turn.accepted[0].token.worker_id, u32(3))
 		resource_id, lookup_result := connections.lookup_connection(&table, turn.accepted[0].token)
@@ -230,6 +306,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 		101,
 		&listener_registered,
 		&descriptor_limit_paused,
+		&shutdown_state,
 		&table,
 		native_events[:],
 		readiness_events[:],
@@ -246,10 +323,12 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	testing.expect_value(t, listener_registered, false)
 	testing.expect_value(t, len(next_turn.stream_events), 1)
 	testing.expect_value(t, len(next_turn.expired_timers), 1)
+
 	if len(next_turn.expired_timers) == 1 {
 		testing.expect_value(t, next_turn.expired_timers[0].timer_id, u64(100))
 	}
 	first_stream_id := u64(0)
+
 	if len(next_turn.stream_events) == 1 {
 		first_stream_id = next_turn.stream_events[0].connection_id
 		testing.expect_value(t, first_stream_id == 202 || first_stream_id == 203, true)
@@ -264,6 +343,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 		101,
 		&listener_registered,
 		&descriptor_limit_paused,
+		&shutdown_state,
 		&table,
 		native_events[:],
 		readiness_events[:],
@@ -279,6 +359,7 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	testing.expect_value(t, resumed_turn.poll_result, epoll.Result.Ready)
 	testing.expect_value(t, listener_registered, true)
 	testing.expect_value(t, len(resumed_turn.stream_events), 1)
+
 	if len(next_turn.stream_events) == 1 && len(resumed_turn.stream_events) == 1 {
 		testing.expect_value(
 			t,
@@ -288,12 +369,11 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	}
 
 	if len(turn.accepted) == 1 {
-		accepted := socket.Accepted_Connection {
-			fd   = turn.accepted[0].fd,
-			peer = turn.accepted[0].peer,
-		}
-		socket.close_connection(&accepted)
-		connections.release_connection(&table, turn.accepted[0].token)
+		release := release_worker_connection(&turn.accepted[0], &table, &timers, &shutdown_state)
+		testing.expect_value(t, release.socket_result, socket.Result.Ready)
+		testing.expect_value(t, release.table_result, connections.Connection_Table_Result.Released)
+		testing.expect_value(t, release.shutdown_result, shutdown.Result.Connection_Closed)
+		testing.expect_value(t, shutdown_state.active_connections, u64(0))
 	}
 	linux.close(sockets[0])
 	linux.close(sockets[1])
@@ -302,4 +382,85 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	linux.close(client)
 	socket.close_listener(&listener)
 	epoll.close(&poller)
+}
+
+@(test)
+test_forced_shutdown_closes_owned_connections_and_completes :: proc(t: ^testing.T) {
+	sockets: [2][2]linux.Fd
+	for i := 0; i < len(sockets); i += 1 {
+		socket_error := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets[i])
+		testing.expect_value(t, socket_error, linux.Errno.NONE)
+
+		if socket_error != .NONE {
+			for opened in 0 ..< i {
+				linux.close(sockets[opened][0])
+				linux.close(sockets[opened][1])
+			}
+			return
+		}
+	}
+
+	slots: [2]connections.Connection_Slot
+	free_stack: [2]u32
+	table, table_result := connections.init_connection_table(12, 4, slots[:], free_stack[:])
+	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
+
+	if table_result != .Ready {
+		for pair in sockets {
+			linux.close(pair[0])
+			linux.close(pair[1])
+		}
+		return
+	}
+
+	worker_connections: [2]Worker_Connection
+	shutdown_state: shutdown.State
+	for i in 0 ..< len(worker_connections) {
+		token, allocate_result := connections.allocate_connection(&table, u64(sockets[i][0]))
+		testing.expect_value(t, allocate_result, connections.Connection_Table_Result.Ready)
+		worker_connections[i] = Worker_Connection {
+			token = token,
+			fd    = sockets[i][0],
+		}
+		testing.expect_value(
+			t,
+			shutdown.register_connection(&shutdown_state),
+			shutdown.Result.Accepted,
+		)
+	}
+
+	timer_storage: [4]transport.Timer_Expiration
+	timers := transport.init_timer_queue(timer_storage[:])
+	testing.expect_value(
+		t,
+		shutdown.request_shutdown(&shutdown_state, &timers, 1201, 50, 100),
+		shutdown.Result.Draining,
+	)
+	expiration, expiration_result := transport.pop_expired_timer(&timers, 150)
+	testing.expect_value(t, expiration_result, transport.Timer_Queue_Result.Expired)
+	testing.expect_value(
+		t,
+		shutdown.process_deadline(&shutdown_state, expiration),
+		shutdown.Result.Force_Connections,
+	)
+
+	closed_count, result := force_worker_connections(
+		worker_connections[:],
+		&table,
+		&timers,
+		&shutdown_state,
+	)
+	testing.expect_value(t, closed_count, 2)
+	testing.expect_value(t, result, shutdown.Result.Completed)
+	testing.expect_value(t, shutdown_state.phase, shutdown.Phase.Complete)
+	testing.expect_value(t, shutdown_state.active_connections, u64(0))
+	for i in 0 ..< len(worker_connections) {
+		testing.expect_value(t, worker_connections[i].fd, linux.Fd(-1))
+		_, lookup_result := connections.lookup_connection(&table, worker_connections[i].token)
+		testing.expect_value(t, lookup_result, connections.Connection_Table_Result.Stale)
+		buffer: [1]u8
+		peer_result := socket.read_stream(sockets[i][1], buffer[:])
+		testing.expect_value(t, peer_result.kind, transport.IO_Result_Kind.End_Of_Stream)
+		linux.close(sockets[i][1])
+	}
 }
