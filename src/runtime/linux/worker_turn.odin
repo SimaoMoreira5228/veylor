@@ -21,6 +21,7 @@ Worker_Turn :: struct {
 
 Head_Read_Turn :: struct {
 	head:             connection.Connection_Head_Event,
+	deadline_result:  connections.Connection_Deadline_Schedule_Result,
 	bytes_read:       int,
 	budget_exhausted: bool,
 	input_full:       bool,
@@ -85,6 +86,53 @@ read_connection_head_turn :: proc(
 		bytes_read = read.io.transferred_bytes,
 		budget_exhausted = read.budget_exhausted,
 	}
+}
+
+read_connection_head_turn_with_deadline :: proc(
+	connection_id: u64,
+	fd: linux.Fd,
+	driver: ^connection.Connection_Head_Driver,
+	input: []u8,
+	headers: []http1.Header,
+	byte_budget: int,
+	table: ^connections.Connection_Table,
+	token: connections.Connection_Token,
+	timers: ^transport.Timer_Queue,
+	timer_id: u64,
+	now_ns: u64,
+	timeouts: connections.Connection_Timeouts,
+) -> Head_Read_Turn {
+	if driver.state == .Reading && !driver.has_operation {
+		schedule := connections.schedule_connection_phase_deadline(
+			table,
+			timers,
+			token,
+			timer_id,
+			now_ns,
+			timeouts,
+		)
+		if schedule.result != .Scheduled {
+			return Head_Read_Turn {
+				head = connection.Connection_Head_Event{result = .Invalid},
+				deadline_result = schedule.result,
+			}
+		}
+	}
+
+	turn := read_connection_head_turn(connection_id, fd, driver, input, headers, byte_budget)
+	if turn.head.result == .Need_More ||
+	   turn.head.result == .Would_Block ||
+	   turn.head.result == .Interrupted {
+		return turn
+	}
+
+	deadline_result := connections.cancel_connection_phase_deadline(table, timers, token)
+	if deadline_result != .Cancelled && deadline_result != .Not_Found {
+		turn.deadline_result = deadline_result
+		return turn
+	}
+	turn.deadline_result = .Cancelled
+	return turn
 }
 
 run_worker_turn :: proc(

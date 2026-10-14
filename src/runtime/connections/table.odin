@@ -22,10 +22,24 @@ Connection_Phase :: enum {
 	Closing,
 }
 
+Connection_Deadline_Kind :: enum {
+	Request_Head,
+	Body_Progress,
+	Response_Write,
+	Keep_Alive_Idle,
+}
+
+Connection_Deadline :: struct {
+	token:    Connection_Token,
+	timer_id: u64,
+	kind:     Connection_Deadline_Kind,
+}
+
 Connection_Slot :: struct {
 	generation:        u64,
 	resource_id:       u64,
 	deadline_timer_id: u64,
+	deadline_kind:     Connection_Deadline_Kind,
 	state:             Connection_Slot_State,
 	phase:             Connection_Phase,
 	has_deadline:      bool,
@@ -59,6 +73,20 @@ Connection_Table_Result :: enum {
 MAX_CONNECTION_SLOT_COUNT :: u64(0x1_0000_0000)
 MAX_CONNECTION_GENERATION :: u64(0xffff_ffff_ffff_ffff)
 
+connection_token_is_for_worker :: proc(table: ^Connection_Table, token: Connection_Token) -> bool {
+	if token.worker_id != table.worker_id {
+		return false
+	}
+	return token.worker_generation == table.worker_generation
+}
+
+connection_slot_matches_token :: proc(slot: ^Connection_Slot, token: Connection_Token) -> bool {
+	if slot.state != .Occupied {
+		return false
+	}
+	return slot.generation == token.generation
+}
+
 init_connection_table :: proc(
 	worker_id: u32,
 	worker_generation: u64,
@@ -68,9 +96,15 @@ init_connection_table :: proc(
 	table: Connection_Table,
 	result: Connection_Table_Result,
 ) {
-	if worker_generation == 0 ||
-	   len(free_stack) < len(slots) ||
-	   u64(len(slots)) > MAX_CONNECTION_SLOT_COUNT {
+	if worker_generation == 0 {
+		return {}, .Invalid
+	}
+
+	if len(free_stack) < len(slots) {
+		return {}, .Invalid
+	}
+
+	if u64(len(slots)) > MAX_CONNECTION_SLOT_COUNT {
 		return {}, .Invalid
 	}
 	for i := 0; i < len(slots); i += 1 {
@@ -97,21 +131,30 @@ allocate_connection :: proc(
 	token: Connection_Token,
 	result: Connection_Table_Result,
 ) {
-	if table.free_count < 0 ||
-	   table.free_count > len(table.slots) ||
-	   table.free_count > len(table.free_stack) {
+	if table.free_count < 0 {
 		return {}, .Invalid
 	}
+
+	if table.free_count > len(table.slots) {
+		return {}, .Invalid
+	}
+
+	if table.free_count > len(table.free_stack) {
+		return {}, .Invalid
+	}
+
 	if table.free_count == 0 {
 		return {}, .Full
 	}
 
 	stack_index := table.free_count - 1
 	slot_index := table.free_stack[stack_index]
+
 	if u64(slot_index) >= u64(len(table.slots)) {
 		return {}, .Invalid
 	}
 	slot := &table.slots[int(slot_index)]
+
 	if slot.state != .Available || slot.generation == 0 {
 		return {}, .Invalid
 	}
@@ -136,14 +179,16 @@ lookup_connection :: proc(
 	resource_id: u64,
 	result: Connection_Table_Result,
 ) {
-	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+	if !connection_token_is_for_worker(table, token) {
 		return 0, .Stale
 	}
+
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return 0, .Invalid
 	}
-	slot := table.slots[int(token.slot)]
-	if slot.state != .Occupied || slot.generation != token.generation {
+	slot := &table.slots[int(token.slot)]
+
+	if !connection_slot_matches_token(slot, token) {
 		return 0, .Stale
 	}
 	return slot.resource_id, .Found
@@ -156,14 +201,16 @@ connection_phase :: proc(
 	phase: Connection_Phase,
 	result: Connection_Table_Result,
 ) {
-	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+	if !connection_token_is_for_worker(table, token) {
 		return {}, .Stale
 	}
+
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return {}, .Invalid
 	}
-	slot := table.slots[int(token.slot)]
-	if slot.state != .Occupied || slot.generation != token.generation {
+	slot := &table.slots[int(token.slot)]
+
+	if !connection_slot_matches_token(slot, token) {
 		return {}, .Stale
 	}
 	return slot.phase, .Found
@@ -173,27 +220,50 @@ bind_connection_deadline :: proc(
 	table: ^Connection_Table,
 	token: Connection_Token,
 	timer_id: u64,
+	kind: Connection_Deadline_Kind,
 ) -> Connection_Table_Result {
-	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+	if !connection_token_is_for_worker(table, token) {
 		return .Stale
 	}
+
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return .Invalid
 	}
 	slot := &table.slots[int(token.slot)]
-	if slot.state != .Occupied || slot.generation != token.generation {
+
+	if !connection_slot_matches_token(slot, token) {
 		return .Stale
 	}
+	expected_kind, has_deadline := connection_deadline_kind(slot.phase)
+
+	if !has_deadline {
+		return .Invalid_Transition
+	}
+
+	if expected_kind != kind {
+		return .Invalid_Transition
+	}
+
 	if slot.has_deadline {
 		return .Invalid_Transition
 	}
 	for i := 0; i < len(table.slots); i += 1 {
 		other := table.slots[i]
-		if other.state == .Occupied && other.has_deadline && other.deadline_timer_id == timer_id {
+
+		if other.state != .Occupied {
+			continue
+		}
+
+		if !other.has_deadline {
+			continue
+		}
+
+		if other.deadline_timer_id == timer_id {
 			return .Duplicate_Deadline
 		}
 	}
 	slot.deadline_timer_id = timer_id
+	slot.deadline_kind = kind
 	slot.has_deadline = true
 	return .Deadline_Set
 }
@@ -203,20 +273,28 @@ clear_connection_deadline :: proc(
 	token: Connection_Token,
 	timer_id: u64,
 ) -> Connection_Table_Result {
-	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+	if !connection_token_is_for_worker(table, token) {
 		return .Stale
 	}
+
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return .Invalid
 	}
 	slot := &table.slots[int(token.slot)]
-	if slot.state != .Occupied || slot.generation != token.generation {
+
+	if !connection_slot_matches_token(slot, token) {
 		return .Stale
 	}
-	if !slot.has_deadline || slot.deadline_timer_id != timer_id {
+
+	if !slot.has_deadline {
+		return .Not_Found
+	}
+
+	if slot.deadline_timer_id != timer_id {
 		return .Not_Found
 	}
 	slot.deadline_timer_id = 0
+	slot.deadline_kind = {}
 	slot.has_deadline = false
 	return .Deadline_Cleared
 }
@@ -225,23 +303,37 @@ expire_connection_deadline :: proc(
 	table: ^Connection_Table,
 	timer_id: u64,
 ) -> (
-	token: Connection_Token,
+	deadline: Connection_Deadline,
 	result: Connection_Table_Result,
 ) {
 	for i := 0; i < len(table.slots); i += 1 {
 		slot := &table.slots[i]
-		if slot.state != .Occupied || !slot.has_deadline || slot.deadline_timer_id != timer_id {
+
+		if slot.state != .Occupied {
 			continue
 		}
-		token = Connection_Token {
-			worker_id         = table.worker_id,
-			worker_generation = table.worker_generation,
-			slot              = u32(i),
-			generation        = slot.generation,
+
+		if !slot.has_deadline {
+			continue
+		}
+
+		if slot.deadline_timer_id != timer_id {
+			continue
+		}
+		deadline = Connection_Deadline {
+			token = Connection_Token {
+				worker_id = table.worker_id,
+				worker_generation = table.worker_generation,
+				slot = u32(i),
+				generation = slot.generation,
+			},
+			timer_id = timer_id,
+			kind = slot.deadline_kind,
 		}
 		slot.deadline_timer_id = 0
+		slot.deadline_kind = {}
 		slot.has_deadline = false
-		return token, .Deadline_Expired
+		return deadline, .Deadline_Expired
 	}
 	return {}, .Not_Found
 }
@@ -251,16 +343,31 @@ transition_connection :: proc(
 	token: Connection_Token,
 	next: Connection_Phase,
 ) -> Connection_Table_Result {
-	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+	if !connection_token_is_for_worker(table, token) {
 		return .Stale
 	}
+
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return .Invalid
 	}
 	slot := &table.slots[int(token.slot)]
-	if slot.state != .Occupied || slot.generation != token.generation {
+
+	if !connection_slot_matches_token(slot, token) {
 		return .Stale
 	}
+
+	if slot.has_deadline {
+		expected_kind, has_deadline := connection_deadline_kind(next)
+
+		if !has_deadline {
+			return .Invalid_Transition
+		}
+
+		if expected_kind != slot.deadline_kind {
+			return .Invalid_Transition
+		}
+	}
+
 	if !connection_phase_transition_allowed(slot.phase, next) {
 		return .Invalid_Transition
 	}
@@ -272,22 +379,36 @@ release_connection :: proc(
 	table: ^Connection_Table,
 	token: Connection_Token,
 ) -> Connection_Table_Result {
-	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+	if !connection_token_is_for_worker(table, token) {
 		return .Stale
 	}
-	if u64(token.slot) >= u64(len(table.slots)) ||
-	   table.free_count < 0 ||
-	   table.free_count >= len(table.free_stack) {
+
+	if u64(token.slot) >= u64(len(table.slots)) {
+		return .Invalid
+	}
+
+	if table.free_count < 0 {
+		return .Invalid
+	}
+
+	if table.free_count >= len(table.free_stack) {
 		return .Invalid
 	}
 	slot := &table.slots[int(token.slot)]
-	if slot.state != .Occupied || slot.generation != token.generation {
+
+	if !connection_slot_matches_token(slot, token) {
 		return .Stale
+	}
+
+	if slot.has_deadline {
+		return .Invalid_Transition
 	}
 	slot.resource_id = 0
 	slot.deadline_timer_id = 0
+	slot.deadline_kind = {}
 	slot.has_deadline = false
 	slot.phase = .Closing
+
 	if slot.generation == MAX_CONNECTION_GENERATION {
 		slot.state = .Retired
 		return .Retired
@@ -299,6 +420,27 @@ release_connection :: proc(
 	return .Released
 }
 
+connection_deadline_kind :: proc(
+	phase: Connection_Phase,
+) -> (
+	kind: Connection_Deadline_Kind,
+	valid: bool,
+) {
+	switch phase {
+	case .Reading_Request_Head:
+		return .Request_Head, true
+	case .Reading_Request_Body:
+		return .Body_Progress, true
+	case .Writing_Response:
+		return .Response_Write, true
+	case .Keep_Alive_Idle:
+		return .Keep_Alive_Idle, true
+	case .Awaiting_Handler, .Closing:
+		return {}, false
+	}
+	return {}, false
+}
+
 connection_phase_transition_allowed :: proc(
 	current: Connection_Phase,
 	next: Connection_Phase,
@@ -308,13 +450,21 @@ connection_phase_transition_allowed :: proc(
 	}
 	switch current {
 	case .Reading_Request_Head:
-		return(
-			next == .Reading_Request_Body ||
-			next == .Awaiting_Handler ||
-			next == .Writing_Response \
-		)
+
+		if next == .Reading_Request_Body {
+			return true
+		}
+
+		if next == .Awaiting_Handler {
+			return true
+		}
+		return next == .Writing_Response
 	case .Reading_Request_Body:
-		return next == .Awaiting_Handler || next == .Writing_Response
+
+		if next == .Awaiting_Handler {
+			return true
+		}
+		return next == .Writing_Response
 	case .Awaiting_Handler:
 		return next == .Writing_Response
 	case .Writing_Response:

@@ -13,9 +13,11 @@ test_connection_table_rejects_stale_tokens_after_slot_reuse :: proc(t: ^testing.
 	first: Connection_Token
 	first, result = allocate_connection(&table, 10)
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	second: Connection_Token
 	second, result = allocate_connection(&table, 20)
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	_, result = allocate_connection(&table, 30)
 	testing.expect_value(t, result, Connection_Table_Result.Full)
 
@@ -23,6 +25,7 @@ test_connection_table_rejects_stale_tokens_after_slot_reuse :: proc(t: ^testing.
 	resource_id, result = lookup_connection(&table, first)
 	testing.expect_value(t, result, Connection_Table_Result.Found)
 	testing.expect_value(t, resource_id, u64(10))
+
 	testing.expect_value(t, release_connection(&table, first), Connection_Table_Result.Released)
 	_, result = lookup_connection(&table, first)
 	testing.expect_value(t, result, Connection_Table_Result.Stale)
@@ -31,6 +34,7 @@ test_connection_table_rejects_stale_tokens_after_slot_reuse :: proc(t: ^testing.
 	reused: Connection_Token
 	reused, result = allocate_connection(&table, 30)
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	testing.expect_value(t, reused.slot, first.slot)
 	testing.expect_value(t, reused.generation, first.generation + 1)
 	_, result = lookup_connection(&table, first)
@@ -48,9 +52,11 @@ test_connection_table_retires_slots_before_generation_wrap :: proc(t: ^testing.T
 	free_stack: [1]u32
 	table, result := init_connection_table(3, 1, slots[:], free_stack[:])
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	first: Connection_Token
 	first, result = allocate_connection(&table, 42)
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	table.slots[int(first.slot)].generation = MAX_CONNECTION_GENERATION
 	first.generation = MAX_CONNECTION_GENERATION
 	testing.expect_value(t, release_connection(&table, first), Connection_Table_Result.Retired)
@@ -84,6 +90,7 @@ test_connection_table_rejects_tokens_from_other_worker_generations :: proc(t: ^t
 	other_table: Connection_Table
 	other_table, result = init_connection_table(5, 10, other_slots[:], other_free[:])
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	_, result = lookup_connection(&other_table, first_token)
 	testing.expect_value(t, result, Connection_Table_Result.Stale)
 	testing.expect_value(
@@ -97,6 +104,7 @@ test_connection_table_rejects_tokens_from_other_worker_generations :: proc(t: ^t
 	restarted_table: Connection_Table
 	restarted_table, result = init_connection_table(4, 11, restarted_slots[:], restarted_free[:])
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	_, result = lookup_connection(&restarted_table, first_token)
 	testing.expect_value(t, result, Connection_Table_Result.Stale)
 }
@@ -107,6 +115,7 @@ test_connection_table_tracks_valid_http_connection_phase_changes :: proc(t: ^tes
 	free_stack: [1]u32
 	table, result := init_connection_table(9, 2, slots[:], free_stack[:])
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
 	token: Connection_Token
 	token, result = allocate_connection(&table, 81)
 	testing.expect_value(t, result, Connection_Table_Result.Ready)
@@ -123,6 +132,7 @@ test_connection_table_tracks_valid_http_connection_phase_changes :: proc(t: ^tes
 
 	result = transition_connection(&table, token, .Reading_Request_Body)
 	testing.expect_value(t, result, Connection_Table_Result.Transitioned)
+
 	result = transition_connection(&table, token, .Awaiting_Handler)
 	testing.expect_value(t, result, Connection_Table_Result.Transitioned)
 	result = transition_connection(&table, token, .Writing_Response)
@@ -153,13 +163,18 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, first, 701),
+		bind_connection_deadline(&table, first, 701, .Request_Head),
 		Connection_Table_Result.Deadline_Set,
 	)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, second, 701),
+		bind_connection_deadline(&table, second, 701, .Request_Head),
 		Connection_Table_Result.Duplicate_Deadline,
+	)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, second, 702, .Body_Progress),
+		Connection_Table_Result.Invalid_Transition,
 	)
 	testing.expect_value(
 		t,
@@ -176,8 +191,70 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, first, 703),
+		transition_connection(&table, second, .Reading_Request_Body),
+		Connection_Table_Result.Transitioned,
+	)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, second, 705, .Body_Progress),
 		Connection_Table_Result.Deadline_Set,
+	)
+	testing.expect_value(
+		t,
+		transition_connection(&table, second, .Awaiting_Handler),
+		Connection_Table_Result.Invalid_Transition,
+	)
+	completed: Connection_Deadline
+	completed, result = expire_connection_deadline(&table, 705)
+	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
+	testing.expect_value(t, completed.token, second)
+	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Body_Progress)
+	testing.expect_value(
+		t,
+		transition_connection(&table, second, .Awaiting_Handler),
+		Connection_Table_Result.Transitioned,
+	)
+	testing.expect_value(
+		t,
+		transition_connection(&table, second, .Writing_Response),
+		Connection_Table_Result.Transitioned,
+	)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, second, 706, .Response_Write),
+		Connection_Table_Result.Deadline_Set,
+	)
+	completed, result = expire_connection_deadline(&table, 706)
+	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
+	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Response_Write)
+	testing.expect_value(
+		t,
+		transition_connection(&table, second, .Keep_Alive_Idle),
+		Connection_Table_Result.Transitioned,
+	)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, second, 707, .Keep_Alive_Idle),
+		Connection_Table_Result.Deadline_Set,
+	)
+	completed, result = expire_connection_deadline(&table, 707)
+	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
+	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Keep_Alive_Idle)
+
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, first, 703, .Request_Head),
+		Connection_Table_Result.Deadline_Set,
+	)
+	testing.expect_value(
+		t,
+		release_connection(&table, first),
+		Connection_Table_Result.Invalid_Transition,
+	)
+	testing.expect_value(
+		t,
+		clear_connection_deadline(&table, first, 703),
+		Connection_Table_Result.Deadline_Cleared,
 	)
 	testing.expect_value(t, release_connection(&table, first), Connection_Table_Result.Released)
 	_, result = expire_connection_deadline(&table, 703)
@@ -190,13 +267,14 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 	testing.expect_value(t, reused.generation, first.generation + 1)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, reused, 704),
+		bind_connection_deadline(&table, reused, 704, .Request_Head),
 		Connection_Table_Result.Deadline_Set,
 	)
-	completed: Connection_Token
 	completed, result = expire_connection_deadline(&table, 704)
 	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
-	testing.expect_value(t, completed, reused)
+	testing.expect_value(t, completed.token, reused)
+	testing.expect_value(t, completed.timer_id, u64(704))
+	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Request_Head)
 	testing.expect_value(t, release_connection(&table, second), Connection_Table_Result.Released)
 	testing.expect_value(t, release_connection(&table, reused), Connection_Table_Result.Released)
 }
