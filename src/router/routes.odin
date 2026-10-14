@@ -10,7 +10,7 @@ Static_Response :: struct {
 	body:    []u8,
 }
 
-// NOTE: Route keys and response slices are borrowed until the table is discarded.
+// NOTE: Route keys and response slices must remain alive and unchanged until the table is discarded.
 Static_Route :: struct {
 	method:   []u8,
 	path:     []u8,
@@ -237,7 +237,13 @@ find_static_request_route :: proc(
 	if path_result != .Found {
 		return {}, path_result
 	}
-	return find_static_route(table, method, path)
+	candidate, route_result := find_static_route(table, method, path)
+
+	if route_result != .Not_Found || !http1.bytes_equal(method, "HEAD") {
+		return candidate, route_result
+	}
+	get_method: string = "GET"
+	return find_static_route(table, transmute([]u8)get_method, path)
 }
 
 request_path :: proc(
@@ -365,7 +371,70 @@ compare_route_keys :: proc(method_a, path_a, method_b, path_b: []u8) -> int {
 	if method_comparison != 0 {
 		return method_comparison
 	}
-	return compare_bytes(path_a, path_b)
+	return compare_encoded_paths(path_a, path_b)
+}
+
+Route_Path_Token :: struct {
+	value:   u8,
+	encoded: bool,
+}
+
+compare_encoded_paths :: proc(left, right: []u8) -> int {
+	left_index := 0
+	right_index := 0
+
+	for left_index < len(left) && right_index < len(right) {
+		left_token, next_left_index := route_path_token(left, left_index)
+		right_token, next_right_index := route_path_token(right, right_index)
+		left_index = next_left_index
+		right_index = next_right_index
+
+		if left_token.encoded != right_token.encoded {
+			if left_token.encoded {
+				return 1
+			}
+			return -1
+		}
+
+		if left_token.value < right_token.value {
+			return -1
+		}
+
+		if left_token.value > right_token.value {
+			return 1
+		}
+	}
+
+	if left_index < len(left) {
+		return 1
+	}
+
+	if right_index < len(right) {
+		return -1
+	}
+	return 0
+}
+
+route_path_token :: proc(path: []u8, index: int) -> (token: Route_Path_Token, next_index: int) {
+	if path[index] != '%' {
+		return Route_Path_Token{value = path[index]}, index + 1
+	}
+	value := route_hex_value(path[index + 1]) * 16 + route_hex_value(path[index + 2])
+	return Route_Path_Token {
+		value = value,
+		encoded = !http1.is_uri_unreserved(value),
+	}, index + 3
+}
+
+route_hex_value :: proc(c: u8) -> u8 {
+	if c >= '0' && c <= '9' {
+		return c - '0'
+	}
+
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 10
+	}
+	return c - 'A' + 10
 }
 
 compare_bytes :: proc(left, right: []u8) -> int {

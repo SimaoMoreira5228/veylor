@@ -85,6 +85,88 @@ test_static_routes_reject_duplicate_keys_when_frozen :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_static_routes_normalize_unreserved_escapes_and_preserve_encoded_slashes :: proc(
+	t: ^testing.T,
+) {
+	routes: [3]Static_Route
+	table := init_route_table(routes[:])
+	testing.expect_value(
+		t,
+		register_static_route(
+			&table,
+			test_bytes("GET"),
+			test_bytes("/~user"),
+			Static_Response {
+				status = 200,
+				body   = test_bytes("unreserved"),
+			},
+		),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(
+		t,
+		register_static_route(
+			&table,
+			test_bytes("GET"),
+			test_bytes("/a%2Fb"),
+			Static_Response {
+				status = 200,
+				body   = test_bytes("encoded slash"),
+			},
+		),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(
+		t,
+		register_static_route(
+			&table,
+			test_bytes("GET"),
+			test_bytes("/a/b"),
+			Static_Response {
+				status = 200,
+				body   = test_bytes("path separator"),
+			},
+		),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(t, freeze_route_table(&table), Route_Table_Result.Frozen)
+
+	route, result := find_static_route(&table, test_bytes("GET"), test_bytes("/%7euser"))
+	testing.expect_value(t, result, Route_Table_Result.Found)
+	testing.expect_value(t, string(route.response.body), "unreserved")
+
+	route, result = find_static_route(&table, test_bytes("GET"), test_bytes("/a%2fb"))
+	testing.expect_value(t, result, Route_Table_Result.Found)
+	testing.expect_value(t, string(route.response.body), "encoded slash")
+
+	route, result = find_static_route(&table, test_bytes("GET"), test_bytes("/a/b"))
+	testing.expect_value(t, result, Route_Table_Result.Found)
+	testing.expect_value(t, string(route.response.body), "path separator")
+
+	duplicate_routes: [2]Static_Route
+	duplicate_table := init_route_table(duplicate_routes[:])
+	response := Static_Response {
+		status = 204,
+	}
+	testing.expect_value(
+		t,
+		register_static_route(&duplicate_table, test_bytes("GET"), test_bytes("/~user"), response),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(
+		t,
+		register_static_route(
+			&duplicate_table,
+			test_bytes("GET"),
+			test_bytes("/%7Euser"),
+			response,
+		),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(t, freeze_route_table(&duplicate_table), Route_Table_Result.Duplicate)
+}
+
+@(test)
 test_static_route_storage_and_path_inputs_are_bounded :: proc(t: ^testing.T) {
 	routes: [1]Static_Route
 	table := init_route_table(routes[:])
@@ -150,12 +232,17 @@ test_static_route_index_matches_large_tables :: proc(t: ^testing.T) {
 
 @(test)
 test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^testing.T) {
-	routes: [5]Static_Route
+	routes: [7]Static_Route
 	table := init_route_table(routes[:])
 	static_response := Static_Response {
 		status = 200,
 		reason = test_bytes("OK"),
 		body   = test_bytes("ok"),
+	}
+	head_response := Static_Response {
+		status = 200,
+		reason = test_bytes("OK"),
+		body   = test_bytes("head"),
 	}
 	testing.expect_value(
 		t,
@@ -174,12 +261,17 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 	)
 	testing.expect_value(
 		t,
-		register_static_route(&table, test_bytes("HEAD"), test_bytes("/items"), static_response),
+		register_static_route(&table, test_bytes("POST"), test_bytes("/items"), static_response),
 		Route_Table_Result.Added,
 	)
 	testing.expect_value(
 		t,
-		register_static_route(&table, test_bytes("POST"), test_bytes("/items"), static_response),
+		register_static_route(&table, test_bytes("GET"), test_bytes("/explicit"), static_response),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(
+		t,
+		register_static_route(&table, test_bytes("HEAD"), test_bytes("/explicit"), head_response),
 		Route_Table_Result.Added,
 	)
 	testing.expect_value(t, freeze_route_table(&table), Route_Table_Result.Frozen)
@@ -289,6 +381,30 @@ test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^test
 		t,
 		string(output[:response_event.written]),
 		"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n",
+	)
+
+	explicit_head_raw := "HEAD /explicit HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	explicit_head_input := test_bytes(explicit_head_raw)
+	explicit_head_headers: [1]http1.Header
+	explicit_head_parser: http1.Parser
+	explicit_head_request, explicit_head_parse_result := http1.parse_request_head(
+		&explicit_head_parser,
+		explicit_head_input,
+		explicit_head_headers[:],
+	)
+	testing.expect_value(t, explicit_head_parse_result, http1.Parse_Result.Ready)
+	response_event = encode_static_route_response(
+		&table,
+		explicit_head_request,
+		explicit_head_input,
+		output[:],
+		body_limit,
+	)
+	testing.expect_value(t, response_event.result, Static_Response_Result.Written)
+	testing.expect_value(
+		t,
+		string(output[:response_event.written]),
+		"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
 	)
 
 	post_raw := "POST /items HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\n"
