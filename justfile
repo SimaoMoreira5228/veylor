@@ -21,8 +21,9 @@ test:
 check-linux:
     odin check src/transport/linux -vet -no-entry-point -collection:veylor=src
     odin check src/transport/linux/socket -vet -no-entry-point -collection:veylor=src
+    odin check src/runtime/linux -vet -no-entry-point -collection:veylor=src
 
 test-linux:
-    odin test src/transport/linux/socket -all-packages -collection:veylor=src
+    odin test src/runtime/linux -all-packages -collection:veylor=src
 
 integration-linux: check-linux test-linux
