@@ -10,7 +10,9 @@ import epoll "veylor:transport/linux"
 import socket "veylor:transport/linux/socket"
 
 @(test)
-test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T) {
+test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots :: proc(
+	t: ^testing.T,
+) {
 	loopback := [4]u8{127, 0, 0, 1}
 	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 8)
 	testing.expect_value(t, listener_result, socket.Result.Ready)
@@ -66,6 +68,24 @@ test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T)
 	}
 	_, poller_error = epoll.register(poller, sockets[0], 202, epoll.Interest{readable = true})
 	testing.expect_value(t, poller_error, i32(0))
+	other_sockets: [2]linux.Fd
+	socket_error = linux.socketpair(.UNIX, .STREAM, .HOPOPT, &other_sockets)
+	testing.expect_value(t, socket_error, linux.Errno.NONE)
+	if socket_error != .NONE {
+		linux.close(sockets[0])
+		linux.close(sockets[1])
+		epoll.close(&poller)
+		linux.close(client)
+		socket.close_listener(&listener)
+		return
+	}
+	_, poller_error = epoll.register(
+		poller,
+		other_sockets[0],
+		203,
+		epoll.Interest{readable = true},
+	)
+	testing.expect_value(t, poller_error, i32(0))
 
 	native_events: [1]linux.EPoll_Event
 	readiness_events: [1]transport.Readiness_Event
@@ -83,10 +103,12 @@ test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T)
 		accepted_storage[:],
 		connection_storage[:],
 		1,
+		4096,
 		2,
 		100,
 	)
 	testing.expect_value(t, turn.poll_result, epoll.Result.Ready)
+	testing.expect_value(t, turn.byte_budget_per_connection, 4096)
 	testing.expect_value(t, listener_registered, true)
 	testing.expect_value(t, len(turn.stream_events) <= 1, true)
 	testing.expect_value(t, len(turn.accepted), 1)
@@ -104,6 +126,8 @@ test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T)
 	message := "ready"
 	_, socket_error = linux.write(sockets[1], transmute([]u8)message)
 	testing.expect_value(t, socket_error, linux.Errno.NONE)
+	_, socket_error = linux.write(other_sockets[1], transmute([]u8)message)
+	testing.expect_value(t, socket_error, linux.Errno.NONE)
 	next_turn := run_worker_turn(
 		poller,
 		listener,
@@ -115,14 +139,17 @@ test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T)
 		accepted_storage[:],
 		connection_storage[:],
 		1,
+		4096,
 		2,
 		100,
 	)
 	testing.expect_value(t, next_turn.poll_result, epoll.Result.Ready)
 	testing.expect_value(t, listener_registered, false)
 	testing.expect_value(t, len(next_turn.stream_events), 1)
+	first_stream_id := u64(0)
 	if len(next_turn.stream_events) == 1 {
-		testing.expect_value(t, next_turn.stream_events[0].connection_id, u64(202))
+		first_stream_id = next_turn.stream_events[0].connection_id
+		testing.expect_value(t, first_stream_id == 202 || first_stream_id == 203, true)
 		testing.expect_value(t, next_turn.stream_events[0].readable, true)
 	}
 	table_result = connections.release_connection(&table, dummy_token)
@@ -139,12 +166,20 @@ test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T)
 		accepted_storage[:],
 		connection_storage[:],
 		1,
+		4096,
 		2,
 		0,
 	)
 	testing.expect_value(t, resumed_turn.poll_result, epoll.Result.Ready)
 	testing.expect_value(t, listener_registered, true)
 	testing.expect_value(t, len(resumed_turn.stream_events), 1)
+	if len(next_turn.stream_events) == 1 && len(resumed_turn.stream_events) == 1 {
+		testing.expect_value(
+			t,
+			first_stream_id != resumed_turn.stream_events[0].connection_id,
+			true,
+		)
+	}
 
 	if len(turn.accepted) == 1 {
 		accepted := socket.Accepted_Connection {
@@ -156,6 +191,8 @@ test_worker_turn_bounds_events_and_assigns_accepted_slots :: proc(t: ^testing.T)
 	}
 	linux.close(sockets[0])
 	linux.close(sockets[1])
+	linux.close(other_sockets[0])
+	linux.close(other_sockets[1])
 	linux.close(client)
 	socket.close_listener(&listener)
 	epoll.close(&poller)

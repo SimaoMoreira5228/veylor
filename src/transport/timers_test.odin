@@ -46,6 +46,7 @@ test_timer_queue_rejects_duplicate_and_capacity_overflow :: proc(t: ^testing.T) 
 		timer_id    = 1,
 		deadline_ns = 10,
 	}
+
 	testing.expect_value(t, schedule_timer(&queue, timer), Timer_Queue_Result.Scheduled)
 	testing.expect_value(t, schedule_timer(&queue, timer), Timer_Queue_Result.Duplicate)
 	testing.expect_value(
@@ -53,6 +54,7 @@ test_timer_queue_rejects_duplicate_and_capacity_overflow :: proc(t: ^testing.T) 
 		schedule_timer(&queue, Timer_Expiration{timer_id = 2, deadline_ns = 20}),
 		Timer_Queue_Result.Full,
 	)
+
 	testing.expect_value(t, queue.count, 1)
 }
 
@@ -91,4 +93,26 @@ test_timer_queue_cancels_root_and_interior_entries :: proc(t: ^testing.T) {
 	timer, result = pop_expired_timer(&queue, 40)
 	testing.expect_value(t, result, Timer_Queue_Result.Expired)
 	testing.expect_value(t, timer.timer_id, u64(4))
+}
+
+@(test)
+test_timer_wait_timeout_rounds_up_and_respects_worker_cap :: proc(t: ^testing.T) {
+	storage: [2]Timer_Expiration
+	queue := init_timer_queue(storage[:])
+	testing.expect_value(t, timer_wait_timeout_ms(&queue, 100, 50), i32(50))
+
+	schedule_timer(&queue, Timer_Expiration{timer_id = 1, deadline_ns = 1_000_002})
+
+	testing.expect_value(t, timer_wait_timeout_ms(&queue, 1, 50), i32(2))
+	testing.expect_value(t, timer_wait_timeout_ms(&queue, 1, 1), i32(1))
+	testing.expect_value(t, timer_wait_timeout_ms(&queue, 1, -1), i32(2))
+	testing.expect_value(t, timer_wait_timeout_ms(&queue, 1_000_002, -1), i32(0))
+}
+
+@(test)
+test_timer_wait_timeout_saturates_at_epoll_integer_limit :: proc(t: ^testing.T) {
+	storage: [1]Timer_Expiration
+	queue := init_timer_queue(storage[:])
+	schedule_timer(&queue, Timer_Expiration{timer_id = 1, deadline_ns = 0xffff_ffff_ffff_ffff})
+	testing.expect_value(t, timer_wait_timeout_ms(&queue, 0, -1), i32(0x7fff_ffff))
 }

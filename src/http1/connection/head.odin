@@ -60,23 +60,31 @@ consume_read_completion :: proc(
 			result = .Ready,
 		}
 	}
+
 	if driver.state != .Reading {
 		return connection_head_event(driver)
 	}
-	if completion.connection_id != driver.connection_id ||
-	   completion.operation != transport.Transport_Operation.Read {
-		return fail_connection_head(driver, .Invalid)
+
+	if completion.connection_id != driver.connection_id {
+		return reject_connection_head(driver, .Invalid)
 	}
+
+	if completion.operation != transport.Transport_Operation.Read {
+		return reject_connection_head(driver, .Invalid)
+	}
+
 	if driver.has_operation && completion.operation_id <= driver.operation_id {
-		return fail_connection_head(driver, .Invalid)
+		return reject_connection_head(driver, .Invalid)
 	}
 	driver.operation_id = completion.operation_id
 	driver.has_operation = true
+
 	if completion.result.kind != .Progress && len(input) != driver.input_length {
-		return fail_connection_head(driver, .Invalid)
+		return reject_connection_head(driver, .Invalid)
 	}
+
 	if !valid_transport_result(completion.result) {
-		return fail_connection_head(driver, .Invalid)
+		return reject_connection_head(driver, .Invalid)
 	}
 
 	switch completion.result.kind {
@@ -85,8 +93,9 @@ consume_read_completion :: proc(
 	case .Interrupted:
 		return Connection_Head_Event{result = .Interrupted}
 	case .End_Of_Stream:
+
 		if driver.input_length != 0 {
-			return fail_connection_head(driver, .Invalid)
+			return reject_connection_head(driver, .Invalid)
 		}
 		driver.state = .Closed
 		driver.result = .Peer_Closed
@@ -101,20 +110,29 @@ consume_read_completion :: proc(
 		driver.error_code = completion.result.error_code
 		return connection_head_event(driver)
 	case .Closed:
-		return fail_connection_head(driver, .Invalid)
+		return reject_connection_head(driver, .Invalid)
 	case .Progress:
-		if completion.result.transferred_bytes == 0 ||
-		   len(input) < driver.input_length ||
-		   len(input) - driver.input_length != completion.result.transferred_bytes {
-			return fail_connection_head(driver, .Invalid)
+
+		if completion.result.transferred_bytes == 0 {
+			return reject_connection_head(driver, .Invalid)
+		}
+
+		if len(input) < driver.input_length {
+			return reject_connection_head(driver, .Invalid)
+		}
+
+		if len(input) - driver.input_length != completion.result.transferred_bytes {
+			return reject_connection_head(driver, .Invalid)
 		}
 	}
 
 	head, parse_result := http1.parse_request_head(&driver.parser, input, headers, limits)
 	driver.input_length = len(input)
+
 	if parse_result == .Need_More {
 		return Connection_Head_Event{result = .Need_More}
 	}
+
 	if parse_result == .Ready {
 		driver.state = .Ready
 		driver.result = .Ready
@@ -152,7 +170,7 @@ connection_head_event :: proc(driver: ^Connection_Head_Driver) -> Connection_Hea
 	return Connection_Head_Event{result = driver.result, error_code = driver.error_code}
 }
 
-fail_connection_head :: proc(
+reject_connection_head :: proc(
 	driver: ^Connection_Head_Driver,
 	result: Connection_Head_Result,
 ) -> Connection_Head_Event {
