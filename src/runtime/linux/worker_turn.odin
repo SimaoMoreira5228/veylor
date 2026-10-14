@@ -3,6 +3,7 @@ package linux_runtime
 
 import "core:sys/linux"
 import http1 "veylor:http1"
+import body "veylor:http1/body"
 import connection "veylor:http1/connection"
 import connections "veylor:runtime/connections"
 import "veylor:transport"
@@ -25,6 +26,20 @@ Head_Read_Turn :: struct {
 	bytes_read:       int,
 	budget_exhausted: bool,
 	input_full:       bool,
+}
+
+Body_Read_Turn :: struct {
+	body:             connection.Connection_Body_Event,
+	deadline_result:  connections.Connection_Deadline_Schedule_Result,
+	bytes_read:       int,
+	budget_exhausted: bool,
+}
+
+Write_Turn :: struct {
+	write:            connection.Connection_Write_Event,
+	deadline_result:  connections.Connection_Deadline_Schedule_Result,
+	bytes_written:    int,
+	budget_exhausted: bool,
 }
 
 read_connection_head_turn :: proc(
@@ -132,6 +147,224 @@ read_connection_head_turn_with_deadline :: proc(
 		return turn
 	}
 	turn.deadline_result = .Cancelled
+	return turn
+}
+
+read_connection_body_turn_with_deadline :: proc(
+	connection_id: u64,
+	fd: linux.Fd,
+	driver: ^connection.Connection_Body_Driver,
+	input: []u8,
+	spans: []http1.Span,
+	trailer_context: body.Chunked_Trailer_Context,
+	byte_budget: int,
+	table: ^connections.Connection_Table,
+	token: connections.Connection_Token,
+	timers: ^transport.Timer_Queue,
+	timer_id: u64,
+	now_ns: u64,
+	timeouts: connections.Connection_Timeouts,
+) -> Body_Read_Turn {
+	if driver.state != .Reading {
+		return Body_Read_Turn{body = connection.connection_body_event(driver)}
+	}
+	if byte_budget <= 0 || len(input) == 0 {
+		return Body_Read_Turn {
+			body = connection.Connection_Body_Event{result = .Invalid},
+			deadline_result = .Invalid,
+		}
+	}
+	deadline_result := connections.Connection_Deadline_Schedule_Result.Not_Scheduled
+	if !driver.has_operation {
+		schedule := connections.schedule_connection_phase_deadline(
+			table,
+			timers,
+			token,
+			timer_id,
+			now_ns,
+			timeouts,
+		)
+		if schedule.result != .Scheduled {
+			return Body_Read_Turn {
+				body = connection.Connection_Body_Event{result = .Invalid},
+				deadline_result = schedule.result,
+			}
+		}
+		deadline_result = schedule.result
+	}
+
+	budget, valid := socket.begin_stream_byte_budget(byte_budget)
+	if !valid {
+		return Body_Read_Turn {
+			body = connection.Connection_Body_Event{result = .Invalid},
+			deadline_result = .Invalid,
+		}
+	}
+	read := socket.read_stream_budgeted(fd, input, &budget)
+	input_length := 0
+	if read.io.kind == .Progress {
+		input_length = read.io.transferred_bytes
+	}
+	completion := transport.IO_Completion {
+		connection_id = connection_id,
+		operation_id  = driver.operation_id + 1,
+		operation     = .Read,
+		result        = read.io,
+	}
+	body_event := connection.consume_body_completion(
+		driver,
+		completion,
+		input[:input_length],
+		spans,
+		trailer_context,
+	)
+	turn := Body_Read_Turn {
+		body             = body_event,
+		bytes_read       = read.io.transferred_bytes,
+		budget_exhausted = read.budget_exhausted,
+		deadline_result  = deadline_result,
+	}
+	terminal := body_event.body_complete || driver.state == .Failed || driver.state == .Cancelled
+	if read.io.kind == .Progress {
+		cancel_result := connections.cancel_connection_phase_deadline(table, timers, token)
+		if cancel_result != .Cancelled {
+			turn.deadline_result = cancel_result
+			return turn
+		}
+		turn.deadline_result = .Cancelled
+		if terminal {
+			return turn
+		}
+		schedule := connections.schedule_connection_phase_deadline(
+			table,
+			timers,
+			token,
+			timer_id,
+			now_ns,
+			timeouts,
+		)
+		turn.deadline_result = schedule.result
+		return turn
+	}
+	if terminal {
+		turn.deadline_result = connections.cancel_connection_phase_deadline(table, timers, token)
+	}
+	return turn
+}
+
+write_connection_turn_with_deadline :: proc(
+	connection_id: u64,
+	fd: linux.Fd,
+	driver: ^connection.Connection_Write_Driver,
+	byte_budget: int,
+	keep_alive: bool,
+	table: ^connections.Connection_Table,
+	token: connections.Connection_Token,
+	timers: ^transport.Timer_Queue,
+	timer_id: u64,
+	now_ns: u64,
+	timeouts: connections.Connection_Timeouts,
+) -> Write_Turn {
+	if driver.state == .Complete && keep_alive {
+		idle := connections.start_keep_alive_idle_deadline(
+			table,
+			timers,
+			token,
+			timer_id,
+			now_ns,
+			timeouts,
+		)
+		return Write_Turn {
+			write = connection.connection_write_event(driver),
+			deadline_result = idle.result,
+		}
+	}
+	if driver.state != .Pending {
+		return Write_Turn{write = connection.connection_write_event(driver)}
+	}
+	if byte_budget <= 0 {
+		return Write_Turn {
+			write = connection.Connection_Write_Event{result = .Invalid},
+			deadline_result = .Invalid,
+		}
+	}
+	deadline_result := connections.Connection_Deadline_Schedule_Result.Not_Scheduled
+	if !driver.has_operation {
+		schedule := connections.schedule_connection_phase_deadline(
+			table,
+			timers,
+			token,
+			timer_id,
+			now_ns,
+			timeouts,
+		)
+		if schedule.result != .Scheduled {
+			return Write_Turn {
+				write = connection.Connection_Write_Event{result = .Invalid},
+				deadline_result = schedule.result,
+			}
+		}
+		deadline_result = schedule.result
+	}
+
+	budget, valid := socket.begin_stream_byte_budget(byte_budget)
+	if !valid {
+		return Write_Turn {
+			write = connection.Connection_Write_Event{result = .Invalid},
+			deadline_result = .Invalid,
+		}
+	}
+	pending := connection.connection_write_pending(driver)
+	write := socket.write_stream_budgeted(fd, pending, &budget)
+	completion := transport.IO_Completion {
+		connection_id = connection_id,
+		operation_id  = driver.operation_id + 1,
+		operation     = .Write,
+		result        = write.io,
+	}
+	write_event := connection.consume_write_completion(driver, completion)
+	turn := Write_Turn {
+		write            = write_event,
+		deadline_result  = deadline_result,
+		bytes_written    = write.io.transferred_bytes,
+		budget_exhausted = write.budget_exhausted,
+	}
+	terminal := driver.state != .Pending
+	if write.io.kind == .Progress {
+		cancel_result := connections.cancel_connection_phase_deadline(table, timers, token)
+		if cancel_result != .Cancelled {
+			turn.deadline_result = cancel_result
+			return turn
+		}
+		turn.deadline_result = .Cancelled
+		if terminal {
+			if driver.state == .Complete && keep_alive {
+				idle := connections.start_keep_alive_idle_deadline(
+					table,
+					timers,
+					token,
+					timer_id,
+					now_ns,
+					timeouts,
+				)
+				turn.deadline_result = idle.result
+			}
+			return turn
+		}
+		schedule := connections.schedule_connection_phase_deadline(
+			table,
+			timers,
+			token,
+			timer_id,
+			now_ns,
+			timeouts,
+		)
+		turn.deadline_result = schedule.result
+		return turn
+	}
+	if terminal {
+		turn.deadline_result = connections.cancel_connection_phase_deadline(table, timers, token)
+	}
 	return turn
 }
 
