@@ -23,10 +23,12 @@ Connection_Phase :: enum {
 }
 
 Connection_Slot :: struct {
-	generation:  u64,
-	resource_id: u64,
-	state:       Connection_Slot_State,
-	phase:       Connection_Phase,
+	generation:        u64,
+	resource_id:       u64,
+	deadline_timer_id: u64,
+	state:             Connection_Slot_State,
+	phase:             Connection_Phase,
+	has_deadline:      bool,
 }
 
 Connection_Table :: struct {
@@ -46,6 +48,11 @@ Connection_Table_Result :: enum {
 	Stale,
 	Transitioned,
 	Invalid_Transition,
+	Deadline_Set,
+	Deadline_Cleared,
+	Deadline_Expired,
+	Duplicate_Deadline,
+	Not_Found,
 	Invalid,
 }
 
@@ -162,6 +169,83 @@ connection_phase :: proc(
 	return slot.phase, .Found
 }
 
+bind_connection_deadline :: proc(
+	table: ^Connection_Table,
+	token: Connection_Token,
+	timer_id: u64,
+) -> Connection_Table_Result {
+	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+		return .Stale
+	}
+	if u64(token.slot) >= u64(len(table.slots)) {
+		return .Invalid
+	}
+	slot := &table.slots[int(token.slot)]
+	if slot.state != .Occupied || slot.generation != token.generation {
+		return .Stale
+	}
+	if slot.has_deadline {
+		return .Invalid_Transition
+	}
+	for i := 0; i < len(table.slots); i += 1 {
+		other := table.slots[i]
+		if other.state == .Occupied && other.has_deadline && other.deadline_timer_id == timer_id {
+			return .Duplicate_Deadline
+		}
+	}
+	slot.deadline_timer_id = timer_id
+	slot.has_deadline = true
+	return .Deadline_Set
+}
+
+clear_connection_deadline :: proc(
+	table: ^Connection_Table,
+	token: Connection_Token,
+	timer_id: u64,
+) -> Connection_Table_Result {
+	if token.worker_id != table.worker_id || token.worker_generation != table.worker_generation {
+		return .Stale
+	}
+	if u64(token.slot) >= u64(len(table.slots)) {
+		return .Invalid
+	}
+	slot := &table.slots[int(token.slot)]
+	if slot.state != .Occupied || slot.generation != token.generation {
+		return .Stale
+	}
+	if !slot.has_deadline || slot.deadline_timer_id != timer_id {
+		return .Not_Found
+	}
+	slot.deadline_timer_id = 0
+	slot.has_deadline = false
+	return .Deadline_Cleared
+}
+
+expire_connection_deadline :: proc(
+	table: ^Connection_Table,
+	timer_id: u64,
+) -> (
+	token: Connection_Token,
+	result: Connection_Table_Result,
+) {
+	for i := 0; i < len(table.slots); i += 1 {
+		slot := &table.slots[i]
+		if slot.state != .Occupied || !slot.has_deadline || slot.deadline_timer_id != timer_id {
+			continue
+		}
+		token = Connection_Token {
+			worker_id         = table.worker_id,
+			worker_generation = table.worker_generation,
+			slot              = u32(i),
+			generation        = slot.generation,
+		}
+		slot.deadline_timer_id = 0
+		slot.has_deadline = false
+		return token, .Deadline_Expired
+	}
+	return {}, .Not_Found
+}
+
 transition_connection :: proc(
 	table: ^Connection_Table,
 	token: Connection_Token,
@@ -201,6 +285,8 @@ release_connection :: proc(
 		return .Stale
 	}
 	slot.resource_id = 0
+	slot.deadline_timer_id = 0
+	slot.has_deadline = false
 	slot.phase = .Closing
 	if slot.generation == MAX_CONNECTION_GENERATION {
 		slot.state = .Retired

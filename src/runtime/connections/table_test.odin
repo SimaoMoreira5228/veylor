@@ -137,3 +137,66 @@ test_connection_table_tracks_valid_http_connection_phase_changes :: proc(t: ^tes
 	testing.expect_value(t, result, Connection_Table_Result.Invalid_Transition)
 	testing.expect_value(t, release_connection(&table, token), Connection_Table_Result.Released)
 }
+
+@(test)
+test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: ^testing.T) {
+	slots: [2]Connection_Slot
+	free_stack: [2]u32
+	table, result := init_connection_table(11, 3, slots[:], free_stack[:])
+	testing.expect_value(t, result, Connection_Table_Result.Ready)
+	first: Connection_Token
+	first, result = allocate_connection(&table, 101)
+	testing.expect_value(t, result, Connection_Table_Result.Ready)
+	second: Connection_Token
+	second, result = allocate_connection(&table, 102)
+	testing.expect_value(t, result, Connection_Table_Result.Ready)
+
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, first, 701),
+		Connection_Table_Result.Deadline_Set,
+	)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, second, 701),
+		Connection_Table_Result.Duplicate_Deadline,
+	)
+	testing.expect_value(
+		t,
+		clear_connection_deadline(&table, first, 702),
+		Connection_Table_Result.Not_Found,
+	)
+	testing.expect_value(
+		t,
+		clear_connection_deadline(&table, first, 701),
+		Connection_Table_Result.Deadline_Cleared,
+	)
+	_, result = expire_connection_deadline(&table, 701)
+	testing.expect_value(t, result, Connection_Table_Result.Not_Found)
+
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, first, 703),
+		Connection_Table_Result.Deadline_Set,
+	)
+	testing.expect_value(t, release_connection(&table, first), Connection_Table_Result.Released)
+	_, result = expire_connection_deadline(&table, 703)
+	testing.expect_value(t, result, Connection_Table_Result.Not_Found)
+
+	reused: Connection_Token
+	reused, result = allocate_connection(&table, 103)
+	testing.expect_value(t, result, Connection_Table_Result.Ready)
+	testing.expect_value(t, reused.slot, first.slot)
+	testing.expect_value(t, reused.generation, first.generation + 1)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, reused, 704),
+		Connection_Table_Result.Deadline_Set,
+	)
+	completed: Connection_Token
+	completed, result = expire_connection_deadline(&table, 704)
+	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
+	testing.expect_value(t, completed, reused)
+	testing.expect_value(t, release_connection(&table, second), Connection_Table_Result.Released)
+	testing.expect_value(t, release_connection(&table, reused), Connection_Table_Result.Released)
+}
