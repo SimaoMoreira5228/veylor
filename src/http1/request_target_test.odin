@@ -174,6 +174,11 @@ test_request_target_forms :: proc(t: ^testing.T) {
 		request_line_result("CONNECT example.com:999999999999999999999 HTTP/1.1\r\n\r\n"),
 		Parse_Result.Invalid,
 	)
+	testing.expect_value(
+		t,
+		request_line_result("CONNECT example.com:9223372036854776251 HTTP/1.1\r\n\r\n"),
+		Parse_Result.Invalid,
+	)
 	testing.expect_value(t, request_line_result("OPTIONS * HTTP/1.1\r\n\r\n"), Parse_Result.Ready)
 	testing.expect_value(t, request_line_result("GET * HTTP/1.1\r\n\r\n"), Parse_Result.Invalid)
 	testing.expect_value(

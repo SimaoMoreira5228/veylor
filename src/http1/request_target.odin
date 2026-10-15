@@ -92,6 +92,7 @@ absolute_form_authority :: proc(target: []u8) -> (authority: Span, valid: bool) 
 	if target[colon + 2] != '/' {
 		return {}, false
 	}
+
 	authority_start := colon + 3
 	authority_end := authority_start
 	for authority_end < len(target) &&
@@ -111,6 +112,7 @@ absolute_form_authority :: proc(target: []u8) -> (authority: Span, valid: bool) 
 	if !valid_absolute_suffix(target[authority_end:]) {
 		return {}, false
 	}
+
 	host_start := authority_start
 	for i := authority_start; i < authority_end; i += 1 {
 		if target[i] == '@' {
@@ -125,6 +127,7 @@ valid_target_authority :: proc(authority: []u8, require_port: bool) -> bool {
 	if len(authority) == 0 {
 		return false
 	}
+
 	host_start := 0
 
 	if !require_port {
@@ -167,6 +170,7 @@ valid_host_port :: proc(host_port: []u8, require_port: bool) -> bool {
 	if len(host_port) == 0 {
 		return false
 	}
+
 	port_start := -1
 	host_end := len(host_port)
 
@@ -232,16 +236,19 @@ valid_host_port :: proc(host_port: []u8, require_port: bool) -> bool {
 		if port_start >= len(host_port) {
 			return false
 		}
+
 		port := 0
 		for c in host_port[port_start:] {
 			if c < '0' || c > '9' {
 				return false
 			}
 			if require_port {
-				port = port * 10 + int(c - '0')
-				if port > 65535 {
+				digit := int(c - '0')
+
+				if port > (65535 - digit) / 10 {
 					return false
 				}
+				port = port * 10 + digit
 			}
 		}
 	}
@@ -261,11 +268,13 @@ valid_ip_literal :: proc(literal: []u8) -> bool {
 		if dot <= 1 || dot == len(literal) - 1 {
 			return false
 		}
+
 		for c in literal[1:dot] {
 			if !is_hex(c) {
 				return false
 			}
 		}
+
 		for c in literal[dot + 1:] {
 			if !is_uri_unreserved(c) && !is_uri_sub_delim(c) && c != ':' {
 				return false
@@ -273,6 +282,7 @@ valid_ip_literal :: proc(literal: []u8) -> bool {
 		}
 		return true
 	}
+
 	double_colon := -1
 	for i := 0; i < len(literal) - 1; i += 1 {
 		if literal[i] == ':' && literal[i + 1] == ':' {
@@ -304,6 +314,7 @@ ipv6_group_count :: proc(part: []u8, allow_ipv4_tail: bool) -> (count: int, vali
 	if len(part) == 0 {
 		return 0, true
 	}
+
 	start := 0
 	for i := 0; i < len(part); i += 1 {
 		if part[i] != ':' {
@@ -356,6 +367,7 @@ ipv6_segment_count :: proc(segment: []u8, allow_ipv4: bool) -> (count: int, vali
 	if len(segment) > 4 {
 		return 0, false
 	}
+
 	for c in segment {
 		if !is_hex(c) {
 			return 0, false

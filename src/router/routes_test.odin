@@ -21,7 +21,8 @@ write_test_route_path :: proc(path: []u8, value: int) {
 @(test)
 test_static_routes_freeze_and_match_method_path_and_queryless_path :: proc(t: ^testing.T) {
 	routes: [3]Static_Route
-	table := init_route_table(routes[:])
+	index_slots: [6]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
 	response := Static_Response {
 		status = 200,
 		reason = test_bytes("OK"),
@@ -64,7 +65,8 @@ test_static_routes_freeze_and_match_method_path_and_queryless_path :: proc(t: ^t
 @(test)
 test_static_routes_reject_duplicate_keys_when_frozen :: proc(t: ^testing.T) {
 	routes: [2]Static_Route
-	table := init_route_table(routes[:])
+	index_slots: [4]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
 	response := Static_Response {
 		status = 204,
 	}
@@ -89,7 +91,8 @@ test_static_routes_normalize_unreserved_escapes_and_preserve_encoded_slashes :: 
 	t: ^testing.T,
 ) {
 	routes: [3]Static_Route
-	table := init_route_table(routes[:])
+	index_slots: [6]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
 	testing.expect_value(
 		t,
 		register_static_route(
@@ -144,7 +147,8 @@ test_static_routes_normalize_unreserved_escapes_and_preserve_encoded_slashes :: 
 	testing.expect_value(t, string(route.response.body), "path separator")
 
 	duplicate_routes: [2]Static_Route
-	duplicate_table := init_route_table(duplicate_routes[:])
+	duplicate_index_slots: [4]Route_Index_Slot
+	duplicate_table := init_route_table(duplicate_routes[:], duplicate_index_slots[:])
 	response := Static_Response {
 		status = 204,
 	}
@@ -169,7 +173,8 @@ test_static_routes_normalize_unreserved_escapes_and_preserve_encoded_slashes :: 
 @(test)
 test_static_route_storage_and_path_inputs_are_bounded :: proc(t: ^testing.T) {
 	routes: [1]Static_Route
-	table := init_route_table(routes[:])
+	index_slots: [2]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
 	response := Static_Response {
 		status = 200,
 	}
@@ -196,9 +201,43 @@ test_static_route_storage_and_path_inputs_are_bounded :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_route_table_requires_index_slots_only_for_exact_routes :: proc(t: ^testing.T) {
+	exact_routes: [1]Static_Route
+	no_index_slots: []Route_Index_Slot
+	exact_table := init_route_table(exact_routes[:], no_index_slots)
+	response := Static_Response {
+		status = 204,
+	}
+	testing.expect_value(
+		t,
+		register_static_route(&exact_table, test_bytes("GET"), test_bytes("/items"), response),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(t, freeze_route_table(&exact_table), Route_Table_Result.Index_Capacity)
+	testing.expect_value(t, exact_table.state, Route_Table_State.Registering)
+
+	exact_index_slots: [2]Route_Index_Slot
+	exact_table.index_slots = exact_index_slots[:]
+	testing.expect_value(t, freeze_route_table(&exact_table), Route_Table_Result.Frozen)
+	_, result := find_static_route(&exact_table, test_bytes("GET"), test_bytes("/items"))
+	testing.expect_value(t, result, Route_Table_Result.Found)
+
+	dynamic_routes: [1]Static_Route
+	dynamic_table := init_route_table(dynamic_routes[:], no_index_slots)
+	testing.expect_value(
+		t,
+		register_static_route(&dynamic_table, test_bytes("GET"), test_bytes("/:item"), response),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(t, freeze_route_table(&dynamic_table), Route_Table_Result.Frozen)
+}
+
+@(test)
 test_static_route_index_matches_large_tables :: proc(t: ^testing.T) {
 	route_storage := make([]Static_Route, 10_000)
 	defer delete(route_storage)
+	index_slots := make([]Route_Index_Slot, 32_768)
+	defer delete(index_slots)
 	path_storage: [10_000][6]u8
 	method := test_bytes("GET")
 	static_response := Static_Response {
@@ -207,7 +246,7 @@ test_static_route_index_matches_large_tables :: proc(t: ^testing.T) {
 	}
 	route_counts := [?]int{8, 100, 10_000}
 	for route_count in route_counts {
-		table := init_route_table(route_storage[:route_count])
+		table := init_route_table(route_storage[:route_count], index_slots[:])
 		for i := 0; i < route_count; i += 1 {
 			value := route_count - i - 1
 			write_test_route_path(path_storage[value][:], value)
@@ -231,9 +270,66 @@ test_static_route_index_matches_large_tables :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_route_hash_collision_falls_back_to_bounded_binary_search :: proc(t: ^testing.T) {
+	routes: [10]Static_Route
+	index_slots: [32]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
+	path_storage: [10][6]u8
+	method := test_bytes("GET")
+	response := Static_Response {
+		status = 204,
+	}
+	candidate_paths: [32][10][6]u8
+	candidate_counts: [32]int
+	for value := 0; value < 10_000; value += 1 {
+		candidate: [6]u8
+		write_test_route_path(candidate[:], value)
+		bucket := route_hash(method, candidate[:], len(index_slots))
+
+		if candidate_counts[bucket] == len(candidate_paths[bucket]) {
+			continue
+		}
+		copy(candidate_paths[bucket][candidate_counts[bucket]][:], candidate[:])
+		candidate_counts[bucket] += 1
+	}
+	target_bucket := -1
+	for bucket_count, bucket_index in candidate_counts {
+		if bucket_count == len(path_storage) {
+			target_bucket = bucket_index
+			break
+		}
+	}
+	testing.expect_value(t, target_bucket >= 0, true)
+
+	for i := 0; i < len(path_storage); i += 1 {
+		copy(path_storage[i][:], candidate_paths[target_bucket][i][:])
+		result := register_static_route(&table, method, path_storage[i][:], response)
+		testing.expect_value(t, result, Route_Table_Result.Added)
+	}
+	testing.expect_value(t, freeze_route_table(&table), Route_Table_Result.Frozen)
+
+	last_route := table.routes[table.exact_count - 1]
+	last_path := last_route.path
+	slot_index := route_hash(method, last_path, len(index_slots))
+	probes := 0
+	for index_slots[slot_index] != u32(last_route.route_id) {
+		probes += 1
+		slot_index += 1
+
+		if slot_index == len(index_slots) {
+			slot_index = 0
+		}
+	}
+	testing.expect_value(t, probes > MAX_ROUTE_HASH_PROBES, true)
+	_, result := find_static_route(&table, method, last_path)
+	testing.expect_value(t, result, Route_Table_Result.Found)
+}
+
+@(test)
 test_static_request_routes_use_parsed_origin_and_absolute_paths :: proc(t: ^testing.T) {
 	routes: [7]Static_Route
-	table := init_route_table(routes[:])
+	index_slots: [14]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
 	static_response := Static_Response {
 		status = 200,
 		reason = test_bytes("OK"),

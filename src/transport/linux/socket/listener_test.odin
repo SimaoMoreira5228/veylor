@@ -310,7 +310,8 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 	)
 
 	route_storage: [1]router.Static_Route
-	route_table := router.init_route_table(route_storage[:])
+	route_index_slots: [2]router.Route_Index_Slot
+	route_table := router.init_route_table(route_storage[:], route_index_slots[:])
 	method := "GET"
 	health_path := "/health"
 	reason := "OK"
