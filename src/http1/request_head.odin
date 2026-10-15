@@ -29,7 +29,8 @@ Parse_Result :: enum {
 	Need_More,
 	Ready,
 	Invalid,
-	Too_Large,
+	Request_Line_Too_Large,
+	Header_Section_Too_Large,
 	Header_Capacity,
 	Expectation_Failed,
 	Buffer_Changed,
@@ -150,24 +151,25 @@ parse_request_head :: proc(
 
 		if parser.state == .Request_Line {
 			if line_end - parser.line_start > limits.request_line_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Request_Line_Too_Large)
 			}
 
 			if line_end == parser.line_start {
 				empty_line_bytes := line_next - parser.line_start
 
 				if limits.request_line_bytes < 0 {
-					return fail(parser, .Too_Large)
+					return fail(parser, .Request_Line_Too_Large)
 				}
 
 				if parser.leading_empty_bytes > limits.request_line_bytes {
-					return fail(parser, .Too_Large)
+					return fail(parser, .Request_Line_Too_Large)
 				}
+
 				remaining_request_line_bytes :=
 					limits.request_line_bytes - parser.leading_empty_bytes
 
 				if empty_line_bytes > remaining_request_line_bytes {
-					return fail(parser, .Too_Large)
+					return fail(parser, .Request_Line_Too_Large)
 				}
 				parser.leading_empty_bytes += empty_line_bytes
 			} else {
@@ -178,6 +180,7 @@ parse_request_head :: proc(
 				if !valid {
 					return fail(parser, .Invalid)
 				}
+
 				method.offset += parser.line_start
 				target.offset += parser.line_start
 				version.offset += parser.line_start
@@ -195,7 +198,7 @@ parse_request_head :: proc(
 			}
 		} else {
 			if line_next - parser.header_start > limits.header_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
 
 			if line_end == parser.line_start {
@@ -212,7 +215,7 @@ parse_request_head :: proc(
 			}
 
 			if parser.header_count >= limits.header_count {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
 
 			if parser.header_count >= len(headers) {
@@ -223,6 +226,7 @@ parse_request_head :: proc(
 			if !valid {
 				return fail(parser, .Invalid)
 			}
+
 			field_value_start := header.name.offset + header.name.length + 1
 
 			if field_value_start > line_end {
@@ -231,12 +235,13 @@ parse_request_head :: proc(
 			field_value_bytes := line_end - field_value_start
 
 			if header.name.length > limits.field_name_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
 
 			if field_value_bytes > limits.field_value_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
+
 			name := input[header.name.offset:header.name.offset + header.name.length]
 			value := input[header.value.offset:header.value.offset + header.value.length]
 
@@ -292,6 +297,7 @@ parse_request_head :: proc(
 				if parser.transfer_encoding_seen {
 					return fail(parser, .Invalid)
 				}
+
 				version := input[parser.version.offset:parser.version.offset +
 				parser.version.length]
 
@@ -344,12 +350,12 @@ parse_request_head :: proc(
 		}
 
 		if request_line_bytes > limits.request_line_bytes {
-			return fail(parser, .Too_Large)
+			return fail(parser, .Request_Line_Too_Large)
 		}
 	}
 
 	if parser.state == .Headers && len(input) - parser.header_start > limits.header_bytes {
-		return fail(parser, .Too_Large)
+		return fail(parser, .Header_Section_Too_Large)
 	}
 
 	if parser.state == .Headers {
@@ -358,26 +364,28 @@ parse_request_head :: proc(
 		if line_end > parser.line_start && input[line_end - 1] == '\r' {
 			line_end -= 1
 		}
+
 		line_length := line_end - parser.line_start
 
 		if limits.field_name_bytes < 0 || limits.field_value_bytes < 0 {
-			return fail(parser, .Too_Large)
+			return fail(parser, .Header_Section_Too_Large)
 		}
 
 		if parser.header_value_start_offset == 0 {
 			if line_length > limits.field_name_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
 		} else {
 			field_name_bytes := parser.header_value_start_offset - 1
 
 			if field_name_bytes > limits.field_name_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
+
 			field_value_bytes := line_length - parser.header_value_start_offset
 
 			if field_value_bytes > limits.field_value_bytes {
-				return fail(parser, .Too_Large)
+				return fail(parser, .Header_Section_Too_Large)
 			}
 		}
 	}
@@ -397,6 +405,7 @@ ascii_case_insensitive_bytes_equal :: proc(left, right: []u8) -> bool {
 	if len(left) != len(right) {
 		return false
 	}
+
 	for left_byte, i in left {
 		lowered_left := left_byte
 		lowered_right := right[i]
@@ -464,6 +473,7 @@ parse_request_line :: proc(
 	if first_space <= 0 || second_space <= first_space + 1 || second_space == len(line) - 1 {
 		return {}, {}, {}, {}, {}, false
 	}
+
 	for c in line[:first_space] {
 		if !is_token(c) {
 			return {}, {}, {}, {}, {}, false
@@ -510,6 +520,7 @@ parse_header :: proc(input: []u8, start, end: int) -> (header: Header, valid: bo
 	if colon <= start {
 		return {}, false
 	}
+
 	for c in input[start:colon] {
 		if !is_token(c) {
 			return {}, false
@@ -524,6 +535,7 @@ parse_header :: proc(input: []u8, start, end: int) -> (header: Header, valid: bo
 	for value_end > value_start && is_ows(input[value_end - 1]) {
 		value_end -= 1
 	}
+
 	for c in input[value_start:value_end] {
 		if (c < 0x20 && c != '\t') || c == 0x7f {
 			return {}, false
@@ -567,6 +579,7 @@ bytes_equal :: proc(bytes: []u8, expected: string) -> bool {
 	if len(bytes) != len(expected) {
 		return false
 	}
+
 	for c, i in bytes {
 		if c != expected[i] {
 			return false

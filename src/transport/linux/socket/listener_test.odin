@@ -21,6 +21,8 @@ is_terminal_head_result :: proc(result: connection.Connection_Head_Result) -> bo
 	case .Ready,
 	     .Invalid,
 	     .Too_Large,
+	     .Request_Line_Too_Large,
+	     .Header_Section_Too_Large,
 	     .Header_Capacity,
 	     .Expectation_Failed,
 	     .Buffer_Changed,
@@ -128,6 +130,7 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 	if result != .Ready {
 		return
 	}
+
 	testing.expect_value(t, listener.local_address.port > 0, true)
 
 	poller, poller_result, poller_error := epoll.create()
@@ -205,6 +208,7 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 		close_listener(&listener)
 		return
 	}
+
 	accepted_stream := accepted[0]
 	testing.expect_value(t, accepted_stream.peer.family, transport.Address_Family.IPv4)
 	testing.expect_value(t, string(accepted_stream.peer.address[:4]), string(loopback[:]))
@@ -290,6 +294,7 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 			batch = epoll.wait(poller, native_events[:], ready_events[:], 100)
 		}
 	}
+
 	testing.expect_value(t, head_event.result, connection.Connection_Head_Result.Ready)
 
 	if head_event.result != .Ready {
@@ -386,6 +391,7 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 			batch = epoll.wait(poller, native_events[:], ready_events[:], 100)
 		}
 	}
+
 	testing.expect_value(t, write_event.result, connection.Connection_Write_Result.Complete)
 	epoll.unregister(poller, accepted_stream.fd)
 
@@ -423,6 +429,7 @@ test_nonblocking_ipv4_listener_accepts_and_registers_stream :: proc(t: ^testing.
 			break
 		}
 	}
+
 	testing.expect_value(t, received_length, response_length)
 	testing.expect_value(
 		t,

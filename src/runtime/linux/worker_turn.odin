@@ -16,6 +16,7 @@ Worker_Turn :: struct {
 	accepted:                   []Worker_Connection,
 	expired_timers:             []transport.Timer_Expiration,
 	byte_budget_per_connection: int,
+	now_ns:                     u64,
 	poll_result:                epoll.Result,
 	accept_result:              Accept_Turn_Result,
 	error_code:                 i32,
@@ -476,6 +477,7 @@ run_worker_turn :: proc(
 	if len(expired_timer_storage) == 0 {
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
+
 	capacity := min(event_budget, len(native_events), len(readiness_events))
 
 	if capacity == 0 {
@@ -536,6 +538,7 @@ run_worker_turn :: proc(
 		}
 		listener_registered^ = true
 	}
+
 	now, clock_error := linux.clock_gettime(.MONOTONIC)
 
 	if clock_error != .NONE {
@@ -555,6 +558,7 @@ run_worker_turn :: proc(
 	)
 	turn := Worker_Turn {
 		byte_budget_per_connection = byte_budget_per_connection,
+		now_ns                     = now_ns,
 		poll_result                = batch.result,
 		accept_result              = .Not_Ready,
 	}
@@ -571,6 +575,7 @@ run_worker_turn :: proc(
 				return turn
 			}
 			now_ns = u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
+			turn.now_ns = now_ns
 			turn.expired_timers = expire_worker_timers_at(timers, expired_timer_storage, now_ns)
 		}
 		return turn
@@ -583,6 +588,7 @@ run_worker_turn :: proc(
 		return turn
 	}
 	now_ns = u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
+	turn.now_ns = now_ns
 	turn.expired_timers = expire_worker_timers_at(timers, expired_timer_storage, now_ns)
 
 	accepted_count := 0

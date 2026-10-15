@@ -21,6 +21,8 @@ Connection_Head_Result :: enum {
 	Transport_Error,
 	Invalid,
 	Too_Large,
+	Request_Line_Too_Large,
+	Header_Section_Too_Large,
 	Header_Capacity,
 	Expectation_Failed,
 	Buffer_Changed,
@@ -93,10 +95,10 @@ consume_read_completion :: proc(
 	case .Interrupted:
 		return Connection_Head_Event{result = .Interrupted}
 	case .End_Of_Stream:
-
 		if driver.input_length != 0 {
 			return reject_connection_head(driver, .Invalid)
 		}
+
 		driver.state = .Closed
 		driver.result = .Peer_Closed
 		return connection_head_event(driver)
@@ -112,7 +114,6 @@ consume_read_completion :: proc(
 	case .Closed:
 		return reject_connection_head(driver, .Invalid)
 	case .Progress:
-
 		if completion.result.transferred_bytes == 0 {
 			return reject_connection_head(driver, .Invalid)
 		}
@@ -147,8 +148,10 @@ connection_head_parse_result :: proc(result: http1.Parse_Result) -> Connection_H
 	switch result {
 	case .Invalid:
 		return .Invalid
-	case .Too_Large:
-		return .Too_Large
+	case .Request_Line_Too_Large:
+		return .Request_Line_Too_Large
+	case .Header_Section_Too_Large:
+		return .Header_Section_Too_Large
 	case .Header_Capacity:
 		return .Header_Capacity
 	case .Expectation_Failed:

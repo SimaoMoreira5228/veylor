@@ -140,3 +140,61 @@ test_connection_head_driver_rejects_wrong_or_inconsistent_completions :: proc(t:
 	event = consume_read_completion(&driver, blocked_with_id, input[:0], headers[:])
 	testing.expect_value(t, event.result, Connection_Head_Result.Invalid)
 }
+
+@(test)
+test_connection_head_preserves_request_and_header_limit_results :: proc(t: ^testing.T) {
+	request_line := "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	request_line_input := transmute([]u8)request_line
+	request_line_headers: [2]http1.Header
+	request_line_driver := begin_connection_head(42)
+	request_line_completion := transport.IO_Completion {
+		connection_id = 42,
+		operation_id = 1,
+		operation = .Read,
+		result = transport.IO_Result {
+			kind = .Progress,
+			transferred_bytes = len(request_line_input),
+		},
+	}
+	request_line_limits := http1.DEFAULT_LIMITS
+	request_line_limits.request_line_bytes = len("GET / HTTP/1.1") - 1
+	request_line_event := consume_read_completion(
+		&request_line_driver,
+		request_line_completion,
+		request_line_input,
+		request_line_headers[:],
+		request_line_limits,
+	)
+	testing.expect_value(
+		t,
+		request_line_event.result,
+		Connection_Head_Result.Request_Line_Too_Large,
+	)
+
+	header_input := transmute([]u8)request_line
+	header_storage: [2]http1.Header
+	header_driver := begin_connection_head(43)
+	header_completion := transport.IO_Completion {
+		connection_id = 43,
+		operation_id = 1,
+		operation = .Read,
+		result = transport.IO_Result {
+			kind = .Progress,
+			transferred_bytes = len(header_input),
+		},
+	}
+	header_limits := http1.DEFAULT_LIMITS
+	header_limits.header_bytes = 1
+	header_event := consume_read_completion(
+		&header_driver,
+		header_completion,
+		header_input,
+		header_storage[:],
+		header_limits,
+	)
+	testing.expect_value(
+		t,
+		header_event.result,
+		Connection_Head_Result.Header_Section_Too_Large,
+	)
+}

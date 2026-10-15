@@ -168,7 +168,7 @@ test_request_head_bounds_leading_empty_lines_by_request_line_limit :: proc(t: ^t
 	invalid_headers: [2]Header
 	invalid_parser: Parser
 	_, result = parse_request_head(&invalid_parser, invalid_input, invalid_headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Request_Line_Too_Large)
 }
 
 @(test)
@@ -191,7 +191,7 @@ test_request_head_rejects_partial_fields_over_field_limits :: proc(t: ^testing.T
 	name_limits := DEFAULT_LIMITS
 	name_limits.field_name_bytes = len("Long")
 	_, result := parse_request_head(&name_parser, name_input, name_headers[:], name_limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 
 	value_raw := "GET / HTTP/1.1\r\nHost: example.com\r\nX: value-too-long"
 	value_input := transmute([]u8)value_raw
@@ -200,7 +200,7 @@ test_request_head_rejects_partial_fields_over_field_limits :: proc(t: ^testing.T
 	value_limits := DEFAULT_LIMITS
 	value_limits.field_value_bytes = len("value")
 	_, result = parse_request_head(&value_parser, value_input, value_headers[:], value_limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 
 	name_split_raw := "GET / HTTP/1.1\r\nHost: example.com\r\nLonger"
 	name_split_input: [128]u8
@@ -225,7 +225,7 @@ test_request_head_rejects_partial_fields_over_field_limits :: proc(t: ^testing.T
 		name_split_headers[:],
 		name_split_limits,
 	)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 
 	value_split_raw := "GET / HTTP/1.1\r\nHost: example.com\r\nX: abcdefghijkl"
 	value_split_input: [128]u8
@@ -250,7 +250,7 @@ test_request_head_rejects_partial_fields_over_field_limits :: proc(t: ^testing.T
 		value_split_headers[:],
 		value_split_limits,
 	)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 }
 
 @(test)
@@ -496,7 +496,7 @@ test_request_head_enforces_header_count_at_exact_boundary :: proc(t: ^testing.T)
 	reset(&parser)
 	limits.header_count = 1
 	_, result = parse_request_head(&parser, input, headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 }
 
 @(test)
@@ -513,7 +513,7 @@ test_request_head_enforces_header_byte_limit :: proc(t: ^testing.T) {
 	reset(&parser)
 	limits.header_bytes = 10
 	_, result = parse_request_head(&parser, input, headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 }
 
 @(test)
@@ -531,13 +531,13 @@ test_request_head_enforces_field_name_and_value_limits :: proc(t: ^testing.T) {
 	reset(&parser)
 	limits.field_name_bytes -= 1
 	_, result = parse_request_head(&parser, input, headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 
 	reset(&parser)
 	limits.field_name_bytes = len("X-Test")
 	limits.field_value_bytes -= 1
 	_, result = parse_request_head(&parser, input, headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 
 	padded_raw := "GET / HTTP/1.1\r\nHost: a\r\nX-Test:  y \r\n\r\n"
 	padded_input := transmute([]u8)padded_raw
@@ -545,7 +545,7 @@ test_request_head_enforces_field_name_and_value_limits :: proc(t: ^testing.T) {
 	limits.field_name_bytes = len("X-Test")
 	limits.field_value_bytes = 3
 	_, result = parse_request_head(&parser, padded_input, headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Header_Section_Too_Large)
 }
 
 @(test)
@@ -634,5 +634,5 @@ test_request_line_limit_accepts_a_split_trailing_cr :: proc(t: ^testing.T) {
 	reset(&parser)
 	limits.request_line_bytes -= 1
 	_, result = parse_request_head(&parser, input, headers[:], limits)
-	testing.expect_value(t, result, Parse_Result.Too_Large)
+	testing.expect_value(t, result, Parse_Result.Request_Line_Too_Large)
 }
