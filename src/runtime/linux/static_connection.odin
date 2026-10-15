@@ -23,6 +23,7 @@ Static_Connection_Result :: enum {
 	Keep_Alive,
 	Closed,
 	Response_Buffer_Small,
+	Capacity_Limit,
 	Transport_Error,
 	Invalid,
 }
@@ -169,6 +170,10 @@ static_connection_turn :: proc(
 		turn := Static_Connection_Turn {
 			bytes_read = read_turn.bytes_read,
 		}
+		if read_turn.deadline_result == .Full {
+			state.phase = .Failed
+			return Static_Connection_Turn{result = .Capacity_Limit}
+		}
 
 		if read_turn.head.result == .Need_More ||
 		   read_turn.head.result == .Would_Block ||
@@ -241,6 +246,10 @@ static_connection_turn :: proc(
 		)
 		turn := Static_Connection_Turn {
 			bytes_written = write_turn.bytes_written,
+		}
+		if write_turn.deadline_result == .Full {
+			state.phase = .Failed
+			return Static_Connection_Turn{result = .Capacity_Limit}
 		}
 
 		if write_turn.write.result == .Complete {

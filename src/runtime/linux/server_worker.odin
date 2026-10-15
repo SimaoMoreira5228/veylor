@@ -198,6 +198,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		)
 
 		if connection_turn.result == .Closed ||
+		   connection_turn.result == .Capacity_Limit ||
 		   connection_turn.result == .Transport_Error ||
 		   connection_turn.result == .Response_Buffer_Small ||
 		   connection_turn.result == .Invalid {

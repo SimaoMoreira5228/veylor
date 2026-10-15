@@ -72,6 +72,112 @@ test_accept_batch_drains_multiple_concurrent_loopback_clients :: proc(t: ^testin
 }
 
 @(test)
+test_accept_turn_resumes_after_caller_storage_fills :: proc(t: ^testing.T) {
+	loopback := [4]u8{127, 0, 0, 1}
+	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 8)
+	testing.expect_value(t, listener_result, socket.Result.Ready)
+	testing.expect_value(t, listener_error, i32(0))
+
+	if listener_result != .Ready {
+		return
+	}
+
+	client_fds: [2]linux.Fd
+	for &fd in client_fds {
+		fd = -1
+	}
+	client_count := 0
+	for &fd in client_fds {
+		client_fd, socket_error := linux.socket(.INET, .STREAM, {.CLOEXEC}, .TCP)
+		if socket_error != .NONE {
+			break
+		}
+		destination := linux.Sock_Addr_In {
+			sin_family = .INET,
+			sin_port   = u16be(listener.local_address.port),
+			sin_addr   = loopback,
+		}
+		if linux.connect(client_fd, &destination) != .NONE {
+			linux.close(client_fd)
+			break
+		}
+		fd = client_fd
+		client_count += 1
+	}
+	testing.expect_value(t, client_count, len(client_fds))
+
+	if client_count != len(client_fds) {
+		for fd in client_fds {
+			if fd >= 0 {
+				linux.close(fd)
+			}
+		}
+		socket.close_listener(&listener)
+		return
+	}
+
+	slots: [2]connections.Connection_Slot
+	free_stack: [2]u32
+	table, table_result := connections.init_connection_table(4, 1, slots[:], free_stack[:])
+	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
+	accepted_storage: [1]socket.Accepted_Connection
+	worker_storage: [1]Worker_Connection
+	readiness := transport.Readiness_Event {
+		connection_id = 51,
+		readable      = true,
+	}
+	first_turn := accept_listener_readiness(
+		listener,
+		51,
+		readiness,
+		&table,
+		accepted_storage[:],
+		worker_storage[:],
+		4,
+	)
+	testing.expect_value(t, first_turn.result, Accept_Turn_Result.Caller_Capacity)
+	testing.expect_value(t, len(first_turn.connections), 1)
+	testing.expect_value(t, table.free_count, 1)
+
+	if len(first_turn.connections) == 1 {
+		socket.close_connection(&accepted_storage[0])
+		connections.release_connection(&table, first_turn.connections[0].token)
+	}
+	second_turn := accept_listener_readiness(
+		listener,
+		51,
+		readiness,
+		&table,
+		accepted_storage[:],
+		worker_storage[:],
+		4,
+	)
+	testing.expect_value(t, second_turn.result, Accept_Turn_Result.Caller_Capacity)
+	testing.expect_value(t, len(second_turn.connections), 1)
+
+	if len(second_turn.connections) == 1 {
+		socket.close_connection(&accepted_storage[0])
+		connections.release_connection(&table, second_turn.connections[0].token)
+	}
+	third_turn := accept_listener_readiness(
+		listener,
+		51,
+		readiness,
+		&table,
+		accepted_storage[:],
+		worker_storage[:],
+		4,
+	)
+	testing.expect_value(t, third_turn.result, Accept_Turn_Result.Drained)
+	testing.expect_value(t, len(third_turn.connections), 0)
+	testing.expect_value(t, table.free_count, len(table.slots))
+	for fd in client_fds {
+		linux.close(fd)
+	}
+	socket.close_listener(&listener)
+}
+
+@(test)
 test_accept_turn_assigns_worker_scoped_connection_tokens :: proc(t: ^testing.T) {
 	loopback := [4]u8{127, 0, 0, 1}
 	listener, listener_result, listener_error := socket.listen_ipv4(loopback, 0, 8)

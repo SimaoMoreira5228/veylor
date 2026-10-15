@@ -45,6 +45,7 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	testing.expect_value(t, paused, true)
 
 	paused = false
+
 	slots: [1]connections.Connection_Slot
 	free_stack: [1]u32
 	table, table_result := connections.init_connection_table(7, 8, slots[:], free_stack[:])
@@ -78,6 +79,7 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	)
 	testing.expect_value(t, turn.poll_result, epoll.Result.Timeout)
 	testing.expect_value(t, registered, true)
+
 	testing.expect_value(
 		t,
 		shutdown.register_connection(&shutdown_state),
@@ -91,6 +93,7 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 		shutdown.request_shutdown(&shutdown_state, &timers, 1601, now_ns, 1_000_000_000_000),
 		shutdown.Result.Draining,
 	)
+
 	turn = run_worker_turn(
 		poller,
 		listener,
@@ -117,6 +120,7 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 		shutdown.close_connection(&shutdown_state, &timers),
 		shutdown.Result.Completed,
 	)
+
 	turn = run_worker_turn(
 		poller,
 		listener,
@@ -139,6 +143,153 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	testing.expect_value(t, turn.poll_result, epoll.Result.Timeout)
 	testing.expect_value(t, registered, false)
 	epoll.unregister(poller, listener.fd)
+	epoll.close(&poller)
+	socket.close_listener(&listener)
+}
+
+@(test)
+test_full_connection_table_keeps_new_clients_in_backlog_until_a_slot_frees :: proc(t: ^testing.T) {
+	loopback := [4]u8{127, 0, 0, 1}
+	listener, listen_result, listen_error := socket.listen_ipv4(loopback, 0, 4)
+	testing.expect_value(t, listen_result, socket.Result.Ready)
+	testing.expect_value(t, listen_error, i32(0))
+	if listen_result != .Ready {
+		return
+	}
+	poller, poll_result, poll_error := epoll.create()
+	testing.expect_value(t, poll_result, epoll.Result.Ready)
+	testing.expect_value(t, poll_error, i32(0))
+	if poll_result != .Ready {
+		socket.close_listener(&listener)
+		return
+	}
+
+	client_fds: [2]linux.Fd
+	for &fd in client_fds {
+		fd = -1
+	}
+	client_count := 0
+	for &fd in client_fds {
+		client_fd, socket_error := linux.socket(.INET, .STREAM, {.CLOEXEC}, .TCP)
+		if socket_error != .NONE {
+			break
+		}
+		destination := linux.Sock_Addr_In {
+			sin_family = .INET,
+			sin_port   = u16be(listener.local_address.port),
+			sin_addr   = loopback,
+		}
+		if linux.connect(client_fd, &destination) != .NONE {
+			linux.close(client_fd)
+			break
+		}
+		fd = client_fd
+		client_count += 1
+	}
+	testing.expect_value(t, client_count, len(client_fds))
+	if client_count != len(client_fds) {
+		for fd in client_fds {
+			if fd >= 0 {
+				linux.close(fd)
+			}
+		}
+		epoll.close(&poller)
+		socket.close_listener(&listener)
+		return
+	}
+
+	slots: [1]connections.Connection_Slot
+	free_stack: [1]u32
+	table, table_result := connections.init_connection_table(8, 1, slots[:], free_stack[:])
+	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
+	shutdown_state: shutdown.State
+	timer_storage: [1]transport.Timer_Expiration
+	timers := transport.init_timer_queue(timer_storage[:])
+	native_events: [1]linux.EPoll_Event
+	readiness_events: [1]transport.Readiness_Event
+	accepted_storage: [1]socket.Accepted_Connection
+	connection_storage: [1]Worker_Connection
+	expired_timer_storage: [1]transport.Timer_Expiration
+	listener_registered := false
+	descriptor_limit_paused := false
+	first_turn := run_worker_turn(
+		poller,
+		listener,
+		77,
+		&listener_registered,
+		&descriptor_limit_paused,
+		&shutdown_state,
+		&table,
+		native_events[:],
+		readiness_events[:],
+		accepted_storage[:],
+		connection_storage[:],
+		&timers,
+		expired_timer_storage[:],
+		1,
+		64,
+		4,
+		100,
+	)
+	testing.expect_value(t, first_turn.accept_result, Accept_Turn_Result.Table_Full)
+	testing.expect_value(t, len(first_turn.accepted), 1)
+	testing.expect_value(t, listener_registered, false)
+	testing.expect_value(t, table.free_count, 0)
+
+	first_release := release_worker_connection(
+		&first_turn.accepted[0],
+		&table,
+		&timers,
+		&shutdown_state,
+	)
+	testing.expect_value(t, first_release.socket_result, socket.Result.Ready)
+	testing.expect_value(
+		t,
+		first_release.table_result,
+		connections.Connection_Table_Result.Released,
+	)
+	testing.expect_value(t, table.free_count, 1)
+
+	second_turn := run_worker_turn(
+		poller,
+		listener,
+		77,
+		&listener_registered,
+		&descriptor_limit_paused,
+		&shutdown_state,
+		&table,
+		native_events[:],
+		readiness_events[:],
+		accepted_storage[:],
+		connection_storage[:],
+		&timers,
+		expired_timer_storage[:],
+		1,
+		64,
+		4,
+		100,
+	)
+	testing.expect_value(t, second_turn.accept_result, Accept_Turn_Result.Table_Full)
+	testing.expect_value(t, len(second_turn.accepted), 1)
+	testing.expect_value(t, listener_registered, false)
+	testing.expect_value(t, table.free_count, 0)
+
+	second_release := release_worker_connection(
+		&second_turn.accepted[0],
+		&table,
+		&timers,
+		&shutdown_state,
+	)
+	testing.expect_value(t, second_release.socket_result, socket.Result.Ready)
+	testing.expect_value(
+		t,
+		second_release.table_result,
+		connections.Connection_Table_Result.Released,
+	)
+	testing.expect_value(t, shutdown_state.active_connections, u64(0))
+	for fd in client_fds {
+		linux.close(fd)
+	}
 	epoll.close(&poller)
 	socket.close_listener(&listener)
 }
