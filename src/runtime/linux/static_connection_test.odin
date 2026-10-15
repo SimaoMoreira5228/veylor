@@ -21,10 +21,11 @@ Static_Connection_Test_Context :: struct {
 	timeouts: connections.Connection_Timeouts,
 }
 
-drive_static_connection_to_keep_alive :: proc(
+drive_static_connection_until_response_terminal :: proc(
 	ctx: ^Static_Connection_Test_Context,
 	native_events: []linux.EPoll_Event,
 	readiness_events: []transport.Readiness_Event,
+	body_limit: u64,
 ) -> Static_Connection_Turn {
 	for attempt in 0 ..< 8 {
 		batch := epoll.wait(ctx.poller, native_events, readiness_events, 100)
@@ -38,7 +39,7 @@ drive_static_connection_to_keep_alive :: proc(
 				ctx.state,
 				readiness,
 				ctx.routes,
-				1024,
+				body_limit,
 				128,
 				ctx.table,
 				ctx.timers,
@@ -80,7 +81,9 @@ drive_static_worker_to_keep_alive :: proc(worker: ^Static_Worker) -> Static_Work
 }
 
 @(test)
-test_static_connection_routes_two_sequential_requests_on_one_socket :: proc(t: ^testing.T) {
+test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: proc(
+	t: ^testing.T,
+) {
 	sockets: [2]linux.Fd
 	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
 	testing.expect_value(t, socket_result, linux.Errno.NONE)
@@ -98,8 +101,8 @@ test_static_connection_routes_two_sequential_requests_on_one_socket :: proc(t: ^
 		return
 	}
 
-	route_storage: [1]router.Static_Route
-	route_index_storage: [2]router.Route_Index_Slot
+	route_storage: [2]router.Static_Route
+	route_index_storage: [4]router.Route_Index_Slot
 	routes := router.init_route_table(route_storage[:], route_index_storage[:])
 	method := "GET"
 	path := "/health"
@@ -114,6 +117,15 @@ test_static_connection_routes_two_sequential_requests_on_one_socket :: proc(t: ^
 		&routes,
 		transmute([]u8)method,
 		transmute([]u8)path,
+		route_response,
+	)
+	testing.expect_value(t, register_result, router.Route_Table_Result.Added)
+	upload_method := "POST"
+	upload_path := "/upload"
+	register_result = router.register_static_route(
+		&routes,
+		transmute([]u8)upload_method,
+		transmute([]u8)upload_path,
 		route_response,
 	)
 	testing.expect_value(t, register_result, router.Route_Table_Result.Added)
@@ -174,7 +186,12 @@ test_static_connection_routes_two_sequential_requests_on_one_socket :: proc(t: ^
 	written, write_error := linux.write(sockets[1], transmute([]u8)request)
 	testing.expect_value(t, write_error, linux.Errno.NONE)
 	testing.expect_value(t, written, len(request))
-	turn := drive_static_connection_to_keep_alive(&ctx, native_events[:], readiness_events[:])
+	turn := drive_static_connection_until_response_terminal(
+		&ctx,
+		native_events[:],
+		readiness_events[:],
+		1024,
+	)
 	testing.expect_value(t, turn.result, Static_Connection_Result.Keep_Alive)
 	testing.expect_value(t, state.phase, Static_Connection_Phase.Keep_Alive_Idle)
 
@@ -190,7 +207,12 @@ test_static_connection_routes_two_sequential_requests_on_one_socket :: proc(t: ^
 	written, write_error = linux.write(sockets[1], transmute([]u8)request)
 	testing.expect_value(t, write_error, linux.Errno.NONE)
 	testing.expect_value(t, written, len(request))
-	turn = drive_static_connection_to_keep_alive(&ctx, native_events[:], readiness_events[:])
+	turn = drive_static_connection_until_response_terminal(
+		&ctx,
+		native_events[:],
+		readiness_events[:],
+		1024,
+	)
 	testing.expect_value(t, turn.result, Static_Connection_Result.Keep_Alive)
 
 	second_response: [256]u8
@@ -201,14 +223,45 @@ test_static_connection_routes_two_sequential_requests_on_one_socket :: proc(t: ^
 		string(second_response[:second_length]),
 		"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
 	)
+	oversized_request :=
+		"POST /upload HTTP/1.1\r\nHost: example.test\r\n" +
+		"Content-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+	written, write_error = linux.write(sockets[1], transmute([]u8)oversized_request)
+	testing.expect_value(t, write_error, linux.Errno.NONE)
+	testing.expect_value(t, written, len(oversized_request))
+	turn = drive_static_connection_until_response_terminal(
+		&ctx,
+		native_events[:],
+		readiness_events[:],
+		4,
+	)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Closed)
+	testing.expect_value(t, state.phase, Static_Connection_Phase.Closed)
+	testing.expect_value(t, state.keep_alive, false)
+	testing.expect_value(t, state.head_driver.input_length, len(oversized_request))
+	third_response: [256]u8
+	third_length, third_error := linux.read(sockets[1], third_response[:])
+	testing.expect_value(t, third_error, linux.Errno.NONE)
+	expected_response :=
+		"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\n" +
+		"Content-Length: 0\r\n\r\n"
+	testing.expect_value(
+		t,
+		string(third_response[:third_length]),
+		expected_response,
+	)
 
 	epoll.unregister(poller, sockets[0])
-	epoll.close(&poller)
-	linux.close(sockets[1])
 	release := release_worker_connection(&state.worker, &table, &timers, &shutdown_state)
 	testing.expect_value(t, release.table_result, connections.Connection_Table_Result.Released)
 	testing.expect_value(t, release.socket_result, socket.Result.Ready)
 	testing.expect_value(t, release.shutdown_result, shutdown.Result.Connection_Closed)
+	testing.expect_value(t, timers.count, 0)
+	response_length, response_error := linux.read(sockets[1], third_response[:])
+	testing.expect_value(t, response_error, linux.Errno.NONE)
+	testing.expect_value(t, response_length, 0)
+	epoll.close(&poller)
+	linux.close(sockets[1])
 }
 
 @(test)

@@ -258,3 +258,122 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	transport.cancel_timer(&timers, 99)
 	linux.close(sockets[1])
 }
+
+@(test)
+test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t: ^testing.T) {
+	sockets: [2]linux.Fd
+	socket_error := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
+	testing.expect_value(t, socket_error, linux.Errno.NONE)
+	if socket_error != .NONE {
+		return
+	}
+	poller, poller_result, poller_error := epoll.create()
+	testing.expect_value(t, poller_result, epoll.Result.Ready)
+	testing.expect_value(t, poller_error, i32(0))
+	if poller_result != .Ready {
+		linux.close(sockets[0])
+		linux.close(sockets[1])
+		return
+	}
+
+	route_storage: [1]router.Static_Route
+	route_index_storage: [2]router.Route_Index_Slot
+	routes := router.init_route_table(route_storage[:], route_index_storage[:])
+	body: [96]u8
+	for &byte in body {
+		byte = 'x'
+	}
+	method := "GET"
+	path := "/large"
+	reason := "OK"
+	route_result := router.register_static_route(
+		&routes,
+		transmute([]u8)method,
+		transmute([]u8)path,
+		router.Static_Response {
+			status = 200,
+			reason = transmute([]u8)reason,
+			body   = body[:],
+		},
+	)
+	testing.expect_value(t, route_result, router.Route_Table_Result.Added)
+	testing.expect_value(t, router.freeze_route_table(&routes), router.Route_Table_Result.Frozen)
+
+	slots: [1]connections.Connection_Slot
+	free_stack: [1]u32
+	table, table_result := connections.init_connection_table(4, 1, slots[:], free_stack[:])
+	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
+	token, allocation_result := connections.allocate_connection(&table, u64(sockets[0]))
+	testing.expect_value(t, allocation_result, connections.Connection_Table_Result.Ready)
+	shutdown_state: shutdown.State
+	testing.expect_value(
+		t,
+		shutdown.register_connection(&shutdown_state),
+		shutdown.Result.Accepted,
+	)
+
+	timer_storage: [1]transport.Timer_Expiration
+	timers := transport.init_timer_queue(timer_storage[:])
+	request_input: [128]u8
+	request_headers: [4]http1.Header
+	response_buffer: [96]u8
+	state, state_result := init_static_connection(
+		Worker_Connection {
+			token = token,
+			fd    = sockets[0],
+		},
+		request_input[:],
+		request_headers[:],
+		response_buffer[:],
+	)
+	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
+	_, register_error := register_static_connection(poller, &state)
+	testing.expect_value(t, register_error, i32(0))
+
+	request := "GET /large HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	written, write_error := linux.write(sockets[1], transmute([]u8)request)
+	testing.expect_value(t, write_error, linux.Errno.NONE)
+	testing.expect_value(t, written, len(request))
+	native_events: [1]linux.EPoll_Event
+	readiness_events: [1]transport.Readiness_Event
+	batch := epoll.wait(poller, native_events[:], readiness_events[:], 100)
+	testing.expect_value(t, batch.result, epoll.Result.Ready)
+	testing.expect_value(t, len(batch.events), 1)
+
+	timeouts := connections.Connection_Timeouts {
+		request_head_ns = 100,
+	}
+	if batch.result == .Ready && len(batch.events) == 1 {
+		turn := static_connection_turn(
+			poller,
+			&state,
+			batch.events[0],
+			&routes,
+			1024,
+			64,
+			&table,
+			&timers,
+			timeouts,
+			1,
+		)
+		testing.expect_value(t, turn.result, Static_Connection_Result.Response_Buffer_Small)
+		testing.expect_value(t, state.phase, Static_Connection_Phase.Failed)
+	}
+
+	worker := Static_Worker {
+		poller         = poller,
+		shutdown_state = &shutdown_state,
+		table          = &table,
+		timers         = &timers,
+	}
+	close_result := close_static_worker_connection(&worker, &state)
+	testing.expect_value(t, close_result, Static_Worker_Result.Ready)
+	testing.expect_value(t, state.active, false)
+	testing.expect_value(t, shutdown_state.active_connections, u64(0))
+	response: [128]u8
+	response_length, read_error := linux.read(sockets[1], response[:])
+	testing.expect_value(t, read_error, linux.Errno.NONE)
+	testing.expect_value(t, response_length, 0)
+	epoll.close(&poller)
+	linux.close(sockets[1])
+}

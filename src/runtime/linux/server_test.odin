@@ -334,6 +334,34 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 }
 
 @(test)
+test_managed_server_repeats_start_stop_join_and_destroy :: proc(t: ^testing.T) {
+	for cycle in 0 ..< 32 {
+		instance: Managed_Server_Test_Instance
+		initialized := init_managed_server_test_instance(
+			&instance,
+			u32(cycle + 20),
+			"/cycle",
+			"cycle",
+			0,
+		)
+		testing.expect_value(t, initialized, true)
+		if !initialized {
+			cleanup_managed_server_test_instance(&instance)
+			return
+		}
+
+		stop_result := request_managed_server_stop(&instance.server)
+		testing.expect_value(t, stop_result, Managed_Server_Result.Stop_Requested)
+		join_result := join_managed_server(&instance.server)
+		testing.expect_value(t, join_result, Managed_Server_Result.Joined)
+		testing.expect_value(t, instance.server.worker_result, Static_Worker_Result.Ready)
+		destroy_result := destroy_managed_server(&instance.server)
+		testing.expect_value(t, destroy_result, Managed_Server_Result.Destroyed)
+		testing.expect_value(t, instance.server.phase, Managed_Server_Phase.Destroyed)
+	}
+}
+
+@(test)
 test_managed_server_instances_keep_state_and_shutdown_independent :: proc(t: ^testing.T) {
 	first: Managed_Server_Test_Instance
 	second: Managed_Server_Test_Instance
