@@ -55,8 +55,7 @@ request_shutdown :: proc(
 	}
 
 	if grace_ns == 0 {
-		state.phase = .Forcing
-		return .Force_Connections
+		return force_shutdown(state, timers)
 	}
 
 	if timers == nil {
@@ -83,6 +82,42 @@ request_shutdown :: proc(
 		return .Invalid
 	}
 	return .Invalid
+}
+
+force_shutdown :: proc(state: ^State, timers: ^transport.Timer_Queue) -> Result {
+	if state == nil || state.phase == .Destroyed {
+		return .Invalid
+	}
+
+	if state.active_connections == 0 {
+		if state.has_deadline {
+			if timers == nil {
+				return .Invalid
+			}
+			cancel_result := cancel_deadline(timers, state.timer_id)
+
+			if cancel_result != .Cancelled && cancel_result != .Not_Found {
+				return .Invalid
+			}
+			state.has_deadline = false
+		}
+		state.phase = .Complete
+		return .Completed
+	}
+	if state.has_deadline {
+		if timers == nil {
+			return .Invalid
+		}
+		cancel_result := cancel_deadline(timers, state.timer_id)
+
+		if cancel_result != .Cancelled && cancel_result != .Not_Found {
+			return .Invalid
+		}
+		state.has_deadline = false
+	}
+
+	state.phase = .Forcing
+	return .Force_Connections
 }
 
 register_connection :: proc(state: ^State) -> Result {
@@ -127,6 +162,7 @@ close_connection :: proc(state: ^State, timers: ^transport.Timer_Queue) -> Resul
 			return .Invalid
 		}
 	}
+
 	state.active_connections -= 1
 
 	if state.active_connections != 0 {
@@ -169,6 +205,7 @@ process_deadline :: proc(state: ^State, timer: transport.Timer_Expiration) -> Re
 	if timer.deadline_ns != state.deadline_ns {
 		return .Stale_Expiration
 	}
+
 	state.has_deadline = false
 	state.phase = .Forcing
 	return .Force_Connections
@@ -194,6 +231,7 @@ destroy :: proc(state: ^State) -> Result {
 	if state.has_deadline {
 		return .Busy
 	}
+
 	state.phase = .Destroyed
 	return .Destroyed
 }

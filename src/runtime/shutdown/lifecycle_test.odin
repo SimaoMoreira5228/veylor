@@ -12,11 +12,13 @@ test_shutdown_stops_admission_drains_until_deadline_then_completes :: proc(t: ^t
 
 	timer_storage: [1]transport.Timer_Expiration
 	timers := transport.init_timer_queue(timer_storage[:])
+
 	testing.expect_value(t, request_shutdown(&state, &timers, 71, 100, 50), Result.Draining)
 	testing.expect_value(t, state.phase, Phase.Draining)
 	testing.expect_value(t, state.active_connections, u64(2))
 	testing.expect_value(t, timer_storage[0].deadline_ns, u64(150))
 	testing.expect_value(t, register_connection(&state), Result.Not_Accepting)
+
 	testing.expect_value(
 		t,
 		process_deadline(&state, transport.Timer_Expiration{timer_id = 71, deadline_ns = 149}),
@@ -86,5 +88,30 @@ test_zero_grace_shutdown_forces_connections_immediately :: proc(t: ^testing.T) {
 	testing.expect_value(t, state.phase, Phase.Forcing)
 	close_result := close_connection(&state, nil)
 	testing.expect_value(t, close_result, Result.Completed)
+	testing.expect_value(t, destroy(&state), Result.Destroyed)
+}
+
+@(test)
+test_force_shutdown_completes_without_connections :: proc(t: ^testing.T) {
+	state: State
+	testing.expect_value(t, force_shutdown(&state, nil), Result.Completed)
+	testing.expect_value(t, state.phase, Phase.Complete)
+	testing.expect_value(t, state.active_connections, u64(0))
+	testing.expect_value(t, destroy(&state), Result.Destroyed)
+}
+
+@(test)
+test_force_shutdown_cancels_drain_deadline_before_forcing_connections :: proc(t: ^testing.T) {
+	state: State
+	testing.expect_value(t, register_connection(&state), Result.Accepted)
+	timer_storage: [1]transport.Timer_Expiration
+	timers := transport.init_timer_queue(timer_storage[:])
+	testing.expect_value(t, request_shutdown(&state, &timers, 101, 500, 100), Result.Draining)
+	testing.expect_value(t, timers.count, 1)
+	testing.expect_value(t, force_shutdown(&state, &timers), Result.Force_Connections)
+	testing.expect_value(t, state.phase, Phase.Forcing)
+	testing.expect_value(t, state.has_deadline, false)
+	testing.expect_value(t, timers.count, 0)
+	testing.expect_value(t, close_connection(&state, &timers), Result.Completed)
 	testing.expect_value(t, destroy(&state), Result.Destroyed)
 }

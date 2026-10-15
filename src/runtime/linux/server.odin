@@ -72,10 +72,7 @@ init_managed_server :: proc(
 	   worker.timeouts.keep_alive_idle_ns == 0 {
 		return .Invalid
 	}
-	required_timers := len(worker.table.slots)
-	if shutdown_grace_ns > 0 {
-		required_timers += 1
-	}
+	required_timers := len(worker.table.slots) + 2
 	if len(worker.timers.storage) < required_timers {
 		return .Capacity
 	}
@@ -210,7 +207,8 @@ destroy_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result
 	}
 	if server.phase == .Joined {
 		if server.worker.shutdown_state.phase != .Complete ||
-		   server.worker.shutdown_state.active_connections != 0 {
+		   server.worker.shutdown_state.active_connections != 0 ||
+		   server.worker.timers.count != 0 {
 			return .Busy
 		}
 	}
@@ -271,11 +269,22 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 	for {
 		if sync.atomic_load_explicit(&server.stop_requested, .Acquire) &&
 		   server.worker.shutdown_state.phase == .Running {
+			if !cancel_static_worker_listener_retry(server.worker) {
+				server.worker_result = .Error
+				shutdown.force_shutdown(
+					server.worker.shutdown_state,
+					server.worker.timers,
+				)
+				continue
+			}
 			now, clock_error := linux.clock_gettime(.MONOTONIC)
 
 			if clock_error != .NONE {
 				server.worker_result = .Error
-				server.worker.shutdown_state.phase = .Forcing
+				shutdown.force_shutdown(
+					server.worker.shutdown_state,
+					server.worker.timers,
+				)
 				continue
 			}
 			now_ns := u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
@@ -291,7 +300,10 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 			   shutdown_result != .Force_Connections &&
 			   shutdown_result != .Completed {
 				server.worker_result = .Error
-				server.worker.shutdown_state.phase = .Forcing
+				shutdown.force_shutdown(
+					server.worker.shutdown_state,
+					server.worker.timers,
+				)
 			}
 		}
 		if server.worker.shutdown_state.phase == .Complete {
@@ -301,7 +313,10 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 
 		if turn.result == .Error || turn.result == .Invalid {
 			server.worker_result = .Error
-			server.worker.shutdown_state.phase = .Forcing
+			shutdown.force_shutdown(
+				server.worker.shutdown_state,
+				server.worker.timers,
+			)
 		}
 	}
 }

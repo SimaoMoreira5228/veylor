@@ -11,6 +11,8 @@ import epoll "veylor:transport/linux"
 import socket "veylor:transport/linux/socket"
 
 STATIC_WORKER_CONTROL_EVENT_ID :: u64(0xffff_ffff_ffff_ffff)
+STATIC_LISTENER_RETRY_TIMER_ID :: u64(0xffff_ffff_ffff_fffd)
+STATIC_LISTENER_RETRY_DELAY_NS :: u64(100_000_000)
 
 Static_Connection_Buffers :: struct {
 	request_input: []u8,
@@ -19,29 +21,30 @@ Static_Connection_Buffers :: struct {
 }
 
 Static_Worker :: struct {
-	poller:                  epoll.Epoll,
-	listener:                socket.Listener,
-	listener_registered:     bool,
-	descriptor_limit_paused: bool,
-	control_fd:              linux.Fd,
-	control_registered:      bool,
-	shutdown_state:          ^shutdown.State,
-	table:                   ^connections.Connection_Table,
-	routes:                  ^router.Route_Table,
-	connection_states:       []Static_Connection,
-	connection_buffers:      []Static_Connection_Buffers,
-	native_events:           []linux.EPoll_Event,
-	readiness_events:        []transport.Readiness_Event,
-	accepted_storage:        []socket.Accepted_Connection,
-	accepted_connections:    []Worker_Connection,
-	timers:                  ^transport.Timer_Queue,
-	expired_timer_storage:   []transport.Timer_Expiration,
-	event_budget:            int,
-	byte_budget:             int,
-	accept_attempt_budget:   int,
-	timeout_ms:              i32,
-	body_limit:              u64,
-	timeouts:                connections.Connection_Timeouts,
+	poller:                     epoll.Epoll,
+	listener:                   socket.Listener,
+	listener_registered:        bool,
+	descriptor_limit_paused:    bool,
+	descriptor_retry_scheduled: bool,
+	control_fd:                 linux.Fd,
+	control_registered:         bool,
+	shutdown_state:             ^shutdown.State,
+	table:                      ^connections.Connection_Table,
+	routes:                     ^router.Route_Table,
+	connection_states:          []Static_Connection,
+	connection_buffers:         []Static_Connection_Buffers,
+	native_events:              []linux.EPoll_Event,
+	readiness_events:           []transport.Readiness_Event,
+	accepted_storage:           []socket.Accepted_Connection,
+	accepted_connections:       []Worker_Connection,
+	timers:                     ^transport.Timer_Queue,
+	expired_timer_storage:      []transport.Timer_Expiration,
+	event_budget:               int,
+	byte_budget:                int,
+	accept_attempt_budget:      int,
+	timeout_ms:                 i32,
+	body_limit:                 u64,
+	timeouts:                   connections.Connection_Timeouts,
 }
 
 Static_Worker_Result :: enum {
@@ -66,6 +69,9 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	if worker.shutdown_state.phase == .Forcing {
 		turn := Static_Worker_Turn {
 			result = .Ready,
+		}
+		if !cancel_static_worker_listener_retry(worker) {
+			turn.result = .Error
 		}
 
 		if worker.listener_registered {
@@ -108,6 +114,11 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	   turn.accept_result == .Error ||
 	   turn.accept_result == .Invalid {
 		result.result = .Error
+	}
+	if turn.accept_result == .Descriptor_Limit {
+		if !schedule_static_worker_listener_retry(worker, turn.now_ns) {
+			result.result = .Error
+		}
 	}
 	process_static_worker_expirations(worker, turn.expired_timers, &result)
 
@@ -200,12 +211,24 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	}
 
 	if worker.shutdown_state.phase == .Forcing {
+		if !cancel_static_worker_listener_retry(worker) {
+			result.result = .Error
+		}
 		force_static_worker_connections(worker, &result)
 	}
 	return result
 }
 
 force_static_worker_connections :: proc(worker: ^Static_Worker, turn: ^Static_Worker_Turn) {
+	shutdown_result := shutdown.force_shutdown(worker.shutdown_state, worker.timers)
+
+	if shutdown_result == .Completed {
+		return
+	}
+	if shutdown_result != .Force_Connections {
+		turn.result = .Error
+		return
+	}
 	for i := 0; i < len(worker.connection_states); i += 1 {
 		state := &worker.connection_states[i]
 
@@ -274,6 +297,11 @@ process_static_worker_expirations :: proc(
 	turn: ^Static_Worker_Turn,
 ) {
 	for timer in expired {
+		if timer.timer_id == STATIC_LISTENER_RETRY_TIMER_ID {
+			worker.descriptor_retry_scheduled = false
+			worker.descriptor_limit_paused = false
+			continue
+		}
 		if worker.shutdown_state.has_deadline && timer.timer_id == worker.shutdown_state.timer_id {
 			if shutdown.process_deadline(worker.shutdown_state, timer) == .Force_Connections {
 				worker.shutdown_state.phase = .Forcing
@@ -302,6 +330,33 @@ process_static_worker_expirations :: proc(
 		}
 		turn.closed_count += 1
 	}
+}
+
+schedule_static_worker_listener_retry :: proc(worker: ^Static_Worker, now_ns: u64) -> bool {
+	if worker.descriptor_retry_scheduled {
+		return true
+	}
+	if STATIC_LISTENER_RETRY_DELAY_NS > 0xffff_ffff_ffff_ffff - now_ns {
+		return false
+	}
+	timer := transport.Timer_Expiration {
+		timer_id    = STATIC_LISTENER_RETRY_TIMER_ID,
+		deadline_ns = now_ns + STATIC_LISTENER_RETRY_DELAY_NS,
+	}
+	if transport.schedule_timer(worker.timers, timer) != .Scheduled {
+		return false
+	}
+	worker.descriptor_retry_scheduled = true
+	return true
+}
+
+cancel_static_worker_listener_retry :: proc(worker: ^Static_Worker) -> bool {
+	if !worker.descriptor_retry_scheduled {
+		return true
+	}
+	timer_result := transport.cancel_timer(worker.timers, STATIC_LISTENER_RETRY_TIMER_ID)
+	worker.descriptor_retry_scheduled = false
+	return timer_result == .Cancelled || timer_result == .Not_Found
 }
 
 close_static_worker_connection :: proc(
