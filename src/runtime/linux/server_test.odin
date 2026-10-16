@@ -358,6 +358,20 @@ test_managed_server_repeats_start_stop_join_and_destroy :: proc(t: ^testing.T) {
 		destroy_result := destroy_managed_server(&instance.server)
 		testing.expect_value(t, destroy_result, Managed_Server_Result.Destroyed)
 		testing.expect_value(t, instance.server.phase, Managed_Server_Phase.Destroyed)
+		testing.expect_value(
+			t,
+			instance.server.worker_pool.phase,
+			workers.Worker_Pool_Phase.Destroyed,
+		)
+		testing.expect_value(
+			t,
+			instance.server.worker.shutdown_state.phase,
+			shutdown.Phase.Destroyed,
+		)
+		testing.expect_value(t, instance.server.control_fd, linux.Fd(-1))
+		testing.expect_value(t, instance.worker.control_fd, linux.Fd(-1))
+		testing.expect_value(t, instance.worker.poller.fd, linux.Fd(-1))
+		testing.expect_value(t, instance.worker.listener.fd, linux.Fd(-1))
 	}
 }
 

@@ -36,13 +36,14 @@ Managed_Server_Result :: enum {
 }
 
 Managed_Server :: struct {
-	worker:            ^Static_Worker,
-	worker_pool:       workers.Worker_Pool,
-	phase:             Managed_Server_Phase,
-	control_fd:        linux.Fd,
-	stop_requested:    bool,
-	shutdown_grace_ns: u64,
-	worker_result:     Static_Worker_Result,
+	worker:               ^Static_Worker,
+	worker_pool:          workers.Worker_Pool,
+	phase:                Managed_Server_Phase,
+	control_fd:           linux.Fd,
+	stop_requested:       bool,
+	force_stop_requested: bool,
+	shutdown_grace_ns:    u64,
+	worker_result:        Static_Worker_Result,
 }
 
 init_managed_server :: proc(
@@ -123,6 +124,7 @@ start_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result {
 	server.worker.control_fd = control_fd
 	server.worker.control_registered = true
 	sync.atomic_store_explicit(&server.stop_requested, false, .Relaxed)
+	sync.atomic_store_explicit(&server.force_stop_requested, false, .Relaxed)
 	server.worker_result = .Ready
 	pool_result := workers.start_worker_pool(
 		&server.worker_pool,
@@ -158,6 +160,27 @@ request_managed_server_stop :: proc(server: ^Managed_Server) -> Managed_Server_R
 	server.phase = .Stop_Requested
 
 	if !write_result {
+		return .System_Error
+	}
+	return .Stop_Requested
+}
+
+request_managed_server_force_stop :: proc(server: ^Managed_Server) -> Managed_Server_Result {
+	if server == nil {
+		return .Invalid
+	}
+	if server.phase == .Running {
+		sync.atomic_store_explicit(&server.force_stop_requested, true, .Release)
+		return request_managed_server_stop(server)
+	}
+	if server.phase != .Stop_Requested {
+		return .Invalid
+	}
+	if sync.atomic_load_explicit(&server.force_stop_requested, .Acquire) {
+		return .Already_Stopping
+	}
+	sync.atomic_store_explicit(&server.force_stop_requested, true, .Release)
+	if !signal_managed_server_worker(server.control_fd) {
 		return .System_Error
 	}
 	return .Stop_Requested
@@ -267,24 +290,31 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 		return
 	}
 	for {
+		force_requested := sync.atomic_load_explicit(&server.force_stop_requested, .Acquire)
+		if force_requested && server.worker.shutdown_state.phase != .Complete {
+			if !cancel_static_worker_listener_retry(server.worker) {
+				server.worker_result = .Error
+			}
+			force_result := shutdown.force_shutdown(
+				server.worker.shutdown_state,
+				server.worker.timers,
+			)
+			if force_result != .Force_Connections && force_result != .Completed {
+				server.worker_result = .Error
+			}
+		}
 		if sync.atomic_load_explicit(&server.stop_requested, .Acquire) &&
 		   server.worker.shutdown_state.phase == .Running {
 			if !cancel_static_worker_listener_retry(server.worker) {
 				server.worker_result = .Error
-				shutdown.force_shutdown(
-					server.worker.shutdown_state,
-					server.worker.timers,
-				)
+				shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
 				continue
 			}
 			now, clock_error := linux.clock_gettime(.MONOTONIC)
 
 			if clock_error != .NONE {
 				server.worker_result = .Error
-				shutdown.force_shutdown(
-					server.worker.shutdown_state,
-					server.worker.timers,
-				)
+				shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
 				continue
 			}
 			now_ns := u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
@@ -300,10 +330,7 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 			   shutdown_result != .Force_Connections &&
 			   shutdown_result != .Completed {
 				server.worker_result = .Error
-				shutdown.force_shutdown(
-					server.worker.shutdown_state,
-					server.worker.timers,
-				)
+				shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
 			}
 		}
 		if server.worker.shutdown_state.phase == .Complete {
@@ -313,10 +340,7 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 
 		if turn.result == .Error || turn.result == .Invalid {
 			server.worker_result = .Error
-			shutdown.force_shutdown(
-				server.worker.shutdown_state,
-				server.worker.timers,
-			)
+			shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
 		}
 	}
 }
