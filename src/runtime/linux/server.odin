@@ -290,47 +290,57 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 		return
 	}
 	for {
-		force_requested := sync.atomic_load_explicit(&server.force_stop_requested, .Acquire)
-		if force_requested && server.worker.shutdown_state.phase != .Complete {
-			if !cancel_static_worker_listener_retry(server.worker) {
-				server.worker_result = .Error
+		if sync.atomic_load_explicit(&server.stop_requested, .Acquire) {
+			force_requested := sync.atomic_load_explicit(&server.force_stop_requested, .Acquire)
+			if force_requested && server.worker.shutdown_state.phase != .Complete {
+				if !cancel_static_worker_listener_retry(server.worker) {
+					server.worker_result = .Error
+				}
+				force_result := shutdown.force_shutdown(
+					server.worker.shutdown_state,
+					server.worker.timers,
+				)
+				if force_result != .Force_Connections && force_result != .Completed {
+					server.worker_result = .Error
+				}
 			}
-			force_result := shutdown.force_shutdown(
-				server.worker.shutdown_state,
-				server.worker.timers,
-			)
-			if force_result != .Force_Connections && force_result != .Completed {
-				server.worker_result = .Error
-			}
-		}
-		if sync.atomic_load_explicit(&server.stop_requested, .Acquire) &&
-		   server.worker.shutdown_state.phase == .Running {
-			if !cancel_static_worker_listener_retry(server.worker) {
-				server.worker_result = .Error
-				shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
-				continue
-			}
-			now, clock_error := linux.clock_gettime(.MONOTONIC)
+			if !force_requested && server.worker.shutdown_state.phase == .Running {
+				if !cancel_static_worker_listener_retry(server.worker) {
+					server.worker_result = .Error
+					shutdown.force_shutdown(
+						server.worker.shutdown_state,
+						server.worker.timers,
+					)
+					continue
+				}
+				now, clock_error := linux.clock_gettime(.MONOTONIC)
 
-			if clock_error != .NONE {
-				server.worker_result = .Error
-				shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
-				continue
-			}
-			now_ns := u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
-			shutdown_result := shutdown.request_shutdown(
-				server.worker.shutdown_state,
-				server.worker.timers,
-				MANAGED_SERVER_SHUTDOWN_TIMER_ID,
-				now_ns,
-				server.shutdown_grace_ns,
-			)
+				if clock_error != .NONE {
+					server.worker_result = .Error
+					shutdown.force_shutdown(
+						server.worker.shutdown_state,
+						server.worker.timers,
+					)
+					continue
+				}
+				now_ns := u64(now.time_sec) * 1_000_000_000 + u64(now.time_nsec)
+				shutdown_result := shutdown.request_shutdown(
+					server.worker.shutdown_state,
+					server.worker.timers,
+					MANAGED_SERVER_SHUTDOWN_TIMER_ID,
+					now_ns,
+					server.shutdown_grace_ns,
+				)
 
-			if shutdown_result != .Draining &&
-			   shutdown_result != .Force_Connections &&
-			   shutdown_result != .Completed {
-				server.worker_result = .Error
-				shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
+				if shutdown_result != .Draining &&
+				   shutdown_result != .Force_Connections &&
+				   shutdown_result != .Completed {
+					server.worker_result = .Error
+					shutdown.force_shutdown(
+						server.worker.shutdown_state,
+						server.worker.timers,
+					)
+				}
 			}
 		}
 		if server.worker.shutdown_state.phase == .Complete {
@@ -340,7 +350,10 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 
 		if turn.result == .Error || turn.result == .Invalid {
 			server.worker_result = .Error
-			shutdown.force_shutdown(server.worker.shutdown_state, server.worker.timers)
+			shutdown.force_shutdown(
+				server.worker.shutdown_state,
+				server.worker.timers,
+			)
 		}
 	}
 }
