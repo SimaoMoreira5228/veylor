@@ -29,9 +29,7 @@ static_workspace_allocation_client :: proc(t: ^testing.T) {
 
 	for _ in 0 ..< 64 {
 		state := Static_Connection {
-			token = connections.Connection_Token {
-				slot = 0,
-			},
+			token = connections.Connection_Token{slot = 0},
 			workspace_pool = &pool,
 			workspace_slot = -1,
 		}
@@ -51,14 +49,17 @@ static_workspace_allocation_verifier :: proc(t: ^testing.T, tracker: ^mem.Tracki
 
 @(test)
 test_warm_workspace_acquire_and_release_allocates_no_heap_memory :: proc(t: ^testing.T) {
-	testing.expect_leaks(t, static_workspace_allocation_client, static_workspace_allocation_verifier)
+	testing.expect_leaks(
+		t,
+		static_workspace_allocation_client,
+		static_workspace_allocation_verifier,
+	)
 }
 
 @(test)
 test_idle_connection_control_metadata_stays_within_256_bytes :: proc(t: ^testing.T) {
-	idle_metadata_bytes := size_of(Static_Connection) +
-		size_of(connections.Connection_Slot) +
-		size_of(u32)
+	idle_metadata_bytes :=
+		size_of(Static_Connection) + size_of(connections.Connection_Slot) + size_of(u32)
 	testing.expect_value(t, idle_metadata_bytes <= 256, true)
 }
 
@@ -78,16 +79,12 @@ test_static_workspace_pool_reuses_bounded_caller_storage :: proc(t: ^testing.T) 
 	testing.expect_value(t, initialized, true)
 
 	first := Static_Connection {
-		token = connections.Connection_Token {
-			slot = 0,
-		},
+		token = connections.Connection_Token{slot = 0},
 		workspace_pool = &pool,
 		workspace_slot = -1,
 	}
 	second := Static_Connection {
-		token = connections.Connection_Token {
-			slot = 1,
-		},
+		token = connections.Connection_Token{slot = 1},
 		workspace_pool = &pool,
 		workspace_slot = -1,
 	}
@@ -133,6 +130,7 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 	if socket_error != .NONE {
 		return
 	}
+
 	poller, poller_result, poller_error := epoll.create()
 	testing.expect_value(t, poller_result, epoll.Result.Ready)
 	testing.expect_value(t, poller_error, i32(0))
@@ -166,10 +164,7 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 		t,
 		transport.schedule_timer(
 			&timers,
-			transport.Timer_Expiration {
-				timer_id    = 99,
-				deadline_ns = 1_000,
-			},
+			transport.Timer_Expiration{timer_id = 99, deadline_ns = 1_000},
 		),
 		transport.Timer_Queue_Result.Scheduled,
 	)
@@ -189,14 +184,12 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 		workspace_free_stack[:],
 	)
 	testing.expect_value(t, pool_ready, true)
+
 	timeouts := connections.Connection_Timeouts {
 		request_head_ns = 100,
 	}
 	state, state_result := init_static_connection(
-		Worker_Connection {
-			token = token,
-			fd    = sockets[0],
-		},
+		Worker_Connection{token = token, fd = sockets[0]},
 		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
@@ -247,6 +240,12 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 	}
 	close_result := close_static_worker_connection(&worker, &state)
 	testing.expect_value(t, close_result, Static_Worker_Result.Ready)
+	testing.expect_value(t, worker.metrics.closed_connections, u64(1))
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Deadline_Capacity)],
+		u64(1),
+	)
 	testing.expect_value(t, state.active, false)
 	testing.expect_value(t, shutdown_state.active_connections, u64(0))
 	testing.expect_value(t, shutdown_state.phase, shutdown.Phase.Running)
@@ -313,9 +312,7 @@ test_full_workspace_pool_closes_request_without_response :: proc(t: ^testing.T) 
 	)
 	testing.expect_value(t, pool_ready, true)
 	held_request := Static_Connection {
-		token = connections.Connection_Token {
-			slot = 1,
-		},
+		token = connections.Connection_Token{slot = 1},
 		workspace_pool = &workspace_pool,
 		workspace_slot = -1,
 	}
@@ -323,10 +320,7 @@ test_full_workspace_pool_closes_request_without_response :: proc(t: ^testing.T) 
 	testing.expect_value(t, acquired, true)
 
 	state, state_result := init_static_connection(
-		Worker_Connection {
-			token = token,
-			fd    = sockets[0],
-		},
+		Worker_Connection{token = token, fd = sockets[0]},
 		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
@@ -352,7 +346,7 @@ test_full_workspace_pool_closes_request_without_response :: proc(t: ^testing.T) 
 			128,
 			&table,
 			&timers,
-			connections.Connection_Timeouts {},
+			connections.Connection_Timeouts{},
 			100,
 		)
 		testing.expect_value(t, turn.result, Static_Connection_Result.Capacity_Limit)
@@ -363,13 +357,18 @@ test_full_workspace_pool_closes_request_without_response :: proc(t: ^testing.T) 
 	testing.expect_value(t, workspace_pool.exhaustion_count, u64(1))
 
 	worker := Static_Worker {
-		poller = poller,
+		poller         = poller,
 		shutdown_state = &shutdown_state,
-		table = &table,
-		timers = &timers,
+		table          = &table,
+		timers         = &timers,
 	}
 	close_result := close_static_worker_connection(&worker, &state)
 	testing.expect_value(t, close_result, Static_Worker_Result.Ready)
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Workspace_Exhausted)],
+		u64(1),
+	)
 	testing.expect_value(t, release_static_workspace(&held_request), true)
 	testing.expect_value(t, workspace_pool.free_count, 1)
 	testing.expect_value(t, workspace_pool.active_count, 0)
@@ -423,10 +422,7 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 		t,
 		transport.schedule_timer(
 			&timers,
-			transport.Timer_Expiration {
-				timer_id    = 99,
-				deadline_ns = 1_000,
-			},
+			transport.Timer_Expiration{timer_id = 99, deadline_ns = 1_000},
 		),
 		transport.Timer_Queue_Result.Scheduled,
 	)
@@ -456,10 +452,7 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	workspace, acquired := acquire_static_workspace(&state)
 	testing.expect_value(t, acquired, true)
 	copy(response_buffer[:len(message)], transmute([]u8)message)
-	state.write_driver = connection.begin_connection_write(
-		1,
-		workspace.response[:len(message)],
-	)
+	state.write_driver = connection.begin_connection_write(1, workspace.response[:len(message)])
 	state.phase = .Writing_Response
 	state.response_length = len(message)
 	state.active = true
@@ -488,9 +481,7 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 			64,
 			&table,
 			&timers,
-			connections.Connection_Timeouts {
-				response_write_ns = 100,
-			},
+			connections.Connection_Timeouts{response_write_ns = 100},
 			1,
 		)
 		testing.expect_value(t, turn.result, Static_Connection_Result.Capacity_Limit)
@@ -514,6 +505,11 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	}
 	close_result := close_static_worker_connection(&worker, &state)
 	testing.expect_value(t, close_result, Static_Worker_Result.Ready)
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Deadline_Capacity)],
+		u64(1),
+	)
 	testing.expect_value(t, state.active, false)
 	testing.expect_value(t, shutdown_state.active_connections, u64(0))
 	epoll.close(&poller)
@@ -552,11 +548,7 @@ test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t:
 		&routes,
 		transmute([]u8)method,
 		transmute([]u8)path,
-		router.Static_Response {
-			status = 200,
-			reason = transmute([]u8)reason,
-			body   = body[:],
-		},
+		router.Static_Response{status = 200, reason = transmute([]u8)reason, body = body[:]},
 	)
 	testing.expect_value(t, route_result, router.Route_Table_Result.Added)
 	testing.expect_value(t, router.freeze_route_table(&routes), router.Route_Table_Result.Frozen)
@@ -592,10 +584,7 @@ test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t:
 	)
 	testing.expect_value(t, pool_ready, true)
 	state, state_result := init_static_connection(
-		Worker_Connection {
-			token = token,
-			fd    = sockets[0],
-		},
+		Worker_Connection{token = token, fd = sockets[0]},
 		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
@@ -640,6 +629,11 @@ test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t:
 	}
 	close_result := close_static_worker_connection(&worker, &state)
 	testing.expect_value(t, close_result, Static_Worker_Result.Ready)
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Response_Buffer_Limit)],
+		u64(1),
+	)
 	testing.expect_value(t, state.active, false)
 	testing.expect_value(t, shutdown_state.active_connections, u64(0))
 	response: [128]u8

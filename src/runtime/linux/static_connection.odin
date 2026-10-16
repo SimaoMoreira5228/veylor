@@ -29,6 +29,23 @@ Static_Connection_Result :: enum {
 	Invalid,
 }
 
+Static_Connection_Close_Reason :: enum u8 {
+	Unknown,
+	Normal,
+	Peer_Closed,
+	Request_Rejected,
+	Route_Not_Found,
+	Workspace_Exhausted,
+	Deadline_Capacity,
+	Response_Buffer_Limit,
+	Transport_Error,
+	Timed_Out,
+	Shutdown_Forced,
+	Initialization_Failed,
+	Internal_Error,
+	Count,
+}
+
 Static_Connection_Workspace :: struct {
 	head_driver:   connection.Connection_Head_Driver,
 	request_input: []u8,
@@ -59,6 +76,8 @@ Static_Connection :: struct {
 	keep_alive:      bool,
 	active:          bool,
 	registered:      bool,
+	idle_counted:    bool,
+	close_reason:    Static_Connection_Close_Reason,
 }
 
 Static_Connection_Turn :: struct {
@@ -153,19 +172,23 @@ static_connection_turn :: proc(
 	if state.fd < 0 ||
 	   readiness.connection_id != static_connection_event_id(state.token) ||
 	   byte_budget <= 0 {
+		state.close_reason = .Internal_Error
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	resource_id, lookup_result := connections.lookup_connection(table, state.token)
 
 	if lookup_result != .Found || resource_id != u64(state.fd) {
+		state.close_reason = .Internal_Error
 		state.phase = .Failed
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	if readiness.error {
+		state.close_reason = .Transport_Error
 		state.phase = .Failed
 		return Static_Connection_Turn{result = .Transport_Error}
 	}
 	if readiness.peer_closed && !readiness.readable && state.phase != .Writing_Response {
+		state.close_reason = .Peer_Closed
 		state.phase = .Closed
 		return Static_Connection_Turn{result = .Closed}
 	}
@@ -177,6 +200,7 @@ static_connection_turn :: proc(
 		resume_result := connections.resume_keep_alive_request(table, timers, state.token)
 
 		if resume_result != .Ready {
+			state.close_reason = .Internal_Error
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Invalid}
 		}
@@ -190,6 +214,7 @@ static_connection_turn :: proc(
 		workspace, acquired := acquire_static_workspace(state)
 
 		if !acquired {
+			state.close_reason = .Workspace_Exhausted
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Capacity_Limit}
 		}
@@ -212,8 +237,12 @@ static_connection_turn :: proc(
 			bytes_read = read_turn.bytes_read,
 		}
 		if read_turn.deadline_result == .Full {
+			state.close_reason = .Deadline_Capacity
 			state.phase = .Failed
-			return Static_Connection_Turn{result = .Capacity_Limit}
+			return Static_Connection_Turn {
+				bytes_read = read_turn.bytes_read,
+				result = .Capacity_Limit,
+			}
 		}
 
 		if read_turn.head.result == .Need_More ||
@@ -228,11 +257,13 @@ static_connection_turn :: proc(
 						state.token,
 					)
 					if cancel_result != .Cancelled && cancel_result != .Not_Found {
+						state.close_reason = .Internal_Error
 						state.phase = .Failed
 						return Static_Connection_Turn{result = .Invalid}
 					}
 				}
 				if !release_static_workspace(state) {
+					state.close_reason = .Internal_Error
 					state.phase = .Failed
 					return Static_Connection_Turn{result = .Invalid}
 				}
@@ -246,17 +277,23 @@ static_connection_turn :: proc(
 				workspace.response,
 				read_turn.head.result,
 			)
+			write_error_response.bytes_read = turn.bytes_read
 
 			if write_error_response.result != .Response_Progress {
+				state.close_reason = static_connection_close_reason(write_error_response.result)
 				state.phase = .Failed
 				return write_error_response
 			}
-			return register_static_response_write(poller, state, table)
+			write_turn := register_static_response_write(poller, state, table)
+			write_turn.bytes_read += turn.bytes_read
+			return write_turn
 		}
 		if connections.transition_connection(table, state.token, .Writing_Response) !=
 		   .Transitioned {
+			state.close_reason = .Internal_Error
 			state.phase = .Failed
-			return Static_Connection_Turn{result = .Invalid}
+			turn.result = .Invalid
+			return turn
 		}
 		state.phase = .Writing_Response
 
@@ -269,6 +306,7 @@ static_connection_turn :: proc(
 		)
 
 		if response_event.result == .Route_Not_Found {
+			state.close_reason = .Route_Not_Found
 			error_response := encode_static_error_response(
 				workspace.response,
 				404,
@@ -276,22 +314,33 @@ static_connection_turn :: proc(
 			)
 
 			if error_response.result != .Written {
+				state.close_reason = .Response_Buffer_Limit
 				state.phase = .Failed
-				return Static_Connection_Turn{result = .Response_Buffer_Small}
+				turn.result = .Response_Buffer_Small
+				return turn
 			}
 			state.response_length = error_response.written
 			state.keep_alive = false
 		} else if response_event.result == .Buffer_Small {
+			state.close_reason = .Response_Buffer_Limit
 			state.phase = .Failed
-			return Static_Connection_Turn{result = .Response_Buffer_Small}
+			turn.result = .Response_Buffer_Small
+			return turn
 		} else if response_event.result != .Written {
+			state.close_reason = .Internal_Error
 			state.phase = .Failed
-			return Static_Connection_Turn{result = .Invalid}
+			turn.result = .Invalid
+			return turn
 		} else {
 			state.response_length = response_event.written
 			state.keep_alive = response_event.keep_alive
+			if !response_event.keep_alive {
+				state.close_reason = .Normal
+			}
 		}
-		return register_static_response_write(poller, state, table)
+		write_turn := register_static_response_write(poller, state, table)
+		write_turn.bytes_read += turn.bytes_read
+		return write_turn
 	}
 
 	if state.phase == .Writing_Response {
@@ -315,6 +364,7 @@ static_connection_turn :: proc(
 			bytes_written = write_turn.bytes_written,
 		}
 		if write_turn.deadline_result == .Full {
+			state.close_reason = .Deadline_Capacity
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Capacity_Limit}
 		}
@@ -329,6 +379,7 @@ static_connection_turn :: proc(
 				)
 
 				if epoll_result != .Ready {
+					state.close_reason = .Transport_Error
 					state.phase = .Failed
 					return Static_Connection_Turn {
 						result = .Transport_Error,
@@ -337,6 +388,7 @@ static_connection_turn :: proc(
 				}
 				state.phase = .Keep_Alive_Idle
 				if !release_static_workspace(state) {
+					state.close_reason = .Internal_Error
 					state.phase = .Failed
 					return Static_Connection_Turn{result = .Invalid}
 				}
@@ -344,6 +396,9 @@ static_connection_turn :: proc(
 				return turn
 			}
 			state.phase = .Closed
+			if state.close_reason == .Unknown {
+				state.close_reason = .Normal
+			}
 			turn.result = .Closed
 			return turn
 		}
@@ -354,6 +409,7 @@ static_connection_turn :: proc(
 			turn.result = .Response_Progress
 			return turn
 		}
+		state.close_reason = .Transport_Error
 		state.phase = .Failed
 		turn.result = .Transport_Error
 		turn.error_code = write_turn.write.error_code
@@ -507,6 +563,7 @@ static_error_response_for_head :: proc(
 ) -> Static_Connection_Turn {
 	status: u16 = 400
 	reason := "Bad Request"
+	state.close_reason = .Request_Rejected
 
 	switch result {
 	case .Request_Line_Too_Large:
@@ -522,18 +579,27 @@ static_error_response_for_head :: proc(
 	case .Need_More,
 	     .Ready,
 	     .Would_Block,
-	     .Interrupted,
-	     .Peer_Closed,
-	     .Cancelled,
-	     .Transport_Error:
+	     .Interrupted:
+		state.close_reason = .Internal_Error
+		return Static_Connection_Turn{result = .Invalid}
+	case .Peer_Closed:
+		state.close_reason = .Peer_Closed
+		return Static_Connection_Turn{result = .Invalid}
+	case .Cancelled:
+		state.close_reason = .Shutdown_Forced
+		return Static_Connection_Turn{result = .Invalid}
+	case .Transport_Error:
+		state.close_reason = .Transport_Error
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	error_response := encode_static_error_response(output, status, reason)
 
 	if error_response.result == .Buffer_Small {
+		state.close_reason = .Response_Buffer_Limit
 		return Static_Connection_Turn{result = .Response_Buffer_Small}
 	}
 	if error_response.result != .Written {
+		state.close_reason = .Internal_Error
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	state.response_length = error_response.written

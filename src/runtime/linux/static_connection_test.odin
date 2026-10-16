@@ -91,6 +91,7 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 	if socket_result != .NONE {
 		return
 	}
+
 	poller, poll_result, poll_error := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
 	testing.expect_value(t, poll_error, i32(0))
@@ -142,6 +143,7 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
 	token, allocation_result := connections.allocate_connection(&table, u64(sockets[0]))
 	testing.expect_value(t, allocation_result, connections.Connection_Table_Result.Ready)
+
 	timer_storage: [2]transport.Timer_Expiration
 	timers := transport.init_timer_queue(timer_storage[:])
 	shutdown_state: shutdown.State
@@ -169,10 +171,7 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 		workspace_free_stack[:],
 	)
 	testing.expect_value(t, pool_ready, true)
-	state, state_result := init_static_connection(
-		worker,
-		&workspace_pool,
-	)
+	state, state_result := init_static_connection(worker, &workspace_pool)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	static_register_result, register_error := register_static_connection(poller, &state)
 	testing.expect_value(t, static_register_result, epoll.Result.Ready)
@@ -261,13 +260,8 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 	third_length, third_error := linux.read(sockets[1], third_response[:])
 	testing.expect_value(t, third_error, linux.Errno.NONE)
 	expected_response :=
-		"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\n" +
-		"Content-Length: 0\r\n\r\n"
-	testing.expect_value(
-		t,
-		string(third_response[:third_length]),
-		expected_response,
-	)
+		"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\n" + "Content-Length: 0\r\n\r\n"
+	testing.expect_value(t, string(third_response[:third_length]), expected_response)
 
 	worker_for_close := Static_Worker {
 		poller         = poller,
@@ -296,6 +290,7 @@ test_static_worker_forces_shutdown_during_a_backpressured_response_write :: proc
 	if socket_error != .NONE {
 		return
 	}
+
 	send_buffer_size := i32(4096)
 	setsockopt_error := linux.setsockopt(sockets[0], .SOCKET, .SNDBUF, &send_buffer_size)
 	testing.expect_value(t, setsockopt_error, linux.Errno.NONE)
@@ -310,6 +305,7 @@ test_static_worker_forces_shutdown_during_a_backpressured_response_write :: proc
 		linux.close(sockets[1])
 		return
 	}
+
 	poller, poll_result, poll_error := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
 	testing.expect_value(t, poll_error, i32(0))
@@ -383,10 +379,7 @@ test_static_worker_forces_shutdown_during_a_backpressured_response_write :: proc
 		workspace_free_stack[:],
 	)
 	testing.expect_value(t, pool_ready, true)
-	state, state_result := init_static_connection(
-		worker_connection,
-		&workspace_pool,
-	)
+	state, state_result := init_static_connection(worker_connection, &workspace_pool)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	connection_register_result, register_error := register_static_connection(poller, &state)
 	testing.expect_value(t, connection_register_result, epoll.Result.Ready)
@@ -535,6 +528,7 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 	if listen_result != .Ready {
 		return
 	}
+
 	poller, poll_result, poll_error := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
 	testing.expect_value(t, poll_error, i32(0))
@@ -654,6 +648,11 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 	testing.expect_value(t, turn.result, Static_Worker_Result.Ready)
 	testing.expect_value(t, turn.accepted_count, 1)
 	testing.expect_value(t, worker.workspace_pool.free_count, 1)
+	testing.expect_value(t, worker.metrics.accepted_connections, u64(1))
+	testing.expect_value(t, worker.metrics.active_connections, u64(1))
+	testing.expect_value(t, worker.metrics.idle_connections, u64(0))
+	testing.expect_value(t, worker.metrics.workspace_active, 0)
+	testing.expect_value(t, worker.metrics.workspace_capacity, 1)
 
 	request := "GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n"
 	written, write_error := linux.write(client, transmute([]u8)request)
@@ -664,6 +663,11 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 	testing.expect_value(t, turn.accepted_count, 0)
 	testing.expect_value(t, turn.closed_count, 0)
 	testing.expect_value(t, worker.workspace_pool.free_count, 1)
+	testing.expect_value(t, worker.metrics.bytes_read, u64(len(request)))
+	testing.expect_value(t, worker.metrics.bytes_written > 0, true)
+	testing.expect_value(t, worker.metrics.active_connections, u64(1))
+	testing.expect_value(t, worker.metrics.idle_connections, u64(1))
+	testing.expect_value(t, worker.metrics.timer_count, 1)
 
 	first_response: [256]u8
 	first_length, read_error := linux.read(client, first_response[:])
@@ -673,6 +677,7 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 		string(first_response[:first_length]),
 		"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
 	)
+
 	written, write_error = linux.write(client, transmute([]u8)request)
 	testing.expect_value(t, write_error, linux.Errno.NONE)
 	testing.expect_value(t, written, len(request))
@@ -680,6 +685,8 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 	testing.expect_value(t, turn.result, Static_Worker_Result.Ready)
 	testing.expect_value(t, turn.accepted_count, 0)
 	testing.expect_value(t, worker.workspace_pool.free_count, 1)
+	testing.expect_value(t, worker.metrics.bytes_read, u64(2 * len(request)))
+	testing.expect_value(t, worker.metrics.idle_connections, u64(1))
 
 	second_response: [256]u8
 	second_length, second_read_error := linux.read(client, second_response[:])
@@ -703,6 +710,17 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 		}
 	}
 	testing.expect_value(t, connection_states[0].active, false)
+	testing.expect_value(t, worker.metrics.active_connections, u64(0))
+	testing.expect_value(t, worker.metrics.idle_connections, u64(0))
+	testing.expect_value(t, worker.metrics.workspace_active, 0)
+	testing.expect_value(t, worker.metrics.timer_count, 0)
+	read_total := 2 * len(request) + len(malformed_request)
+	testing.expect_value(t, worker.metrics.bytes_read, u64(read_total))
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Request_Rejected)],
+		u64(1),
+	)
 	bad_response: [256]u8
 	bad_response_length, bad_read_error := linux.read(client, bad_response[:])
 	testing.expect_value(t, bad_read_error, linux.Errno.NONE)

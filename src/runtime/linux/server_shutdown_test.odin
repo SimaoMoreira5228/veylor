@@ -13,6 +13,91 @@ import epoll "veylor:transport/linux"
 import socket "veylor:transport/linux/socket"
 
 @(test)
+test_request_head_timeout_records_a_close_reason :: proc(t: ^testing.T) {
+	sockets: [2]linux.Fd
+	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
+	testing.expect_value(t, socket_result, linux.Errno.NONE)
+	if socket_result != .NONE {
+		return
+	}
+
+	slots: [1]connections.Connection_Slot
+	free_stack: [1]u32
+	table, table_result := connections.init_connection_table(21, 1, slots[:], free_stack[:])
+	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
+	token, allocation_result := connections.allocate_connection(&table, u64(sockets[0]))
+	testing.expect_value(t, allocation_result, connections.Connection_Table_Result.Ready)
+
+	shutdown_state: shutdown.State
+	testing.expect_value(t, shutdown.register_connection(&shutdown_state), shutdown.Result.Accepted)
+	timer_storage: [1]transport.Timer_Expiration
+	timers := transport.init_timer_queue(timer_storage[:])
+
+	request_input: [128]u8
+	headers: [4]http1.Header
+	response: [128]u8
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
+		request_input = request_input[:],
+		headers       = headers[:],
+		response      = response[:],
+	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
+	state, state_result := init_static_connection(
+		Worker_Connection {
+			token = token,
+			fd    = sockets[0],
+		},
+		&workspace_pool,
+	)
+	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
+	states := [?]Static_Connection{state}
+
+	timeouts := connections.Connection_Timeouts {
+		request_head_ns = 100,
+	}
+	timer_id := static_connection_event_id(token)
+	schedule := connections.schedule_connection_phase_deadline(
+		&table,
+		&timers,
+		token,
+		timer_id,
+		1_000,
+		timeouts,
+	)
+	testing.expect_value(t, schedule.result, connections.Connection_Deadline_Schedule_Result.Scheduled)
+	timer, timer_result := transport.pop_expired_timer(&timers, schedule.timer.deadline_ns)
+	testing.expect_value(t, timer_result, transport.Timer_Queue_Result.Expired)
+	expired := [?]transport.Timer_Expiration{timer}
+	worker := Static_Worker {
+		shutdown_state    = &shutdown_state,
+		table             = &table,
+		workspace_pool    = &workspace_pool,
+		timers            = &timers,
+		connection_states = states[:],
+	}
+	turn := Static_Worker_Turn{}
+	process_static_worker_expirations(&worker, expired[:], &turn)
+
+	testing.expect_value(t, turn.closed_count, 1)
+	testing.expect_value(t, worker.metrics.closed_connections, u64(1))
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Timed_Out)],
+		u64(1),
+	)
+	testing.expect_value(t, states[0].active, false)
+	testing.expect_value(t, table.free_count, 1)
+	testing.expect_value(t, shutdown_state.active_connections, u64(0))
+	linux.close(sockets[1])
+}
+
+@(test)
 test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testing.T) {
 	sockets: [2]linux.Fd
 	socket_error := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
@@ -301,7 +386,7 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 		router.Static_Response {
 			status = 200,
 			reason = transmute([]u8)reason,
-			body   = transmute([]u8)body,
+			body = transmute([]u8)body,
 		},
 	)
 	testing.expect_value(t, route_result, router.Route_Table_Result.Added)
@@ -424,6 +509,11 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 	worker_turn := run_static_worker_turn(&worker)
 	testing.expect_value(t, worker_turn.result, Static_Worker_Result.Not_Ready)
 	testing.expect_value(t, worker_turn.closed_count, 1)
+	testing.expect_value(
+		t,
+		worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Shutdown_Forced)],
+		u64(1),
+	)
 	testing.expect_value(t, connection_states[0].active, false)
 	testing.expect_value(t, table.free_count, 1)
 	testing.expect_value(t, timers.count, 0)

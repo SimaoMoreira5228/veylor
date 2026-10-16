@@ -32,6 +32,7 @@ Static_Worker :: struct {
 	accepted_connections:       []Worker_Connection,
 	timers:                     ^transport.Timer_Queue,
 	expired_timer_storage:      []transport.Timer_Expiration,
+	metrics:                    Static_Worker_Metrics,
 	event_budget:               int,
 	byte_budget:                int,
 	accept_attempt_budget:      int,
@@ -45,6 +46,19 @@ Static_Worker_Result :: enum {
 	Not_Ready,
 	Error,
 	Invalid,
+}
+
+Static_Worker_Metrics :: struct {
+	accepted_connections: u64,
+	active_connections:   u64,
+	idle_connections:     u64,
+	closed_connections:   u64,
+	close_reasons:        [int(Static_Connection_Close_Reason.Count)]u64,
+	bytes_read:           u64,
+	bytes_written:        u64,
+	timer_count:          int,
+	workspace_active:     int,
+	workspace_capacity:   int,
 }
 
 Static_Worker_Turn :: struct {
@@ -61,6 +75,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	if !valid_static_worker(worker) {
 		return Static_Worker_Turn{result = .Invalid}
 	}
+	refresh_static_worker_gauges(worker)
 	if worker.shutdown_state.phase == .Forcing {
 		turn := Static_Worker_Turn {
 			result = .Ready,
@@ -79,6 +94,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			worker.listener_registered = false
 		}
 		force_static_worker_connections(worker, &turn)
+		refresh_static_worker_gauges(worker)
 		return turn
 	}
 	turn := run_worker_turn(
@@ -119,6 +135,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 
 	for &accepted in turn.accepted {
 		result.accepted_count += 1
+		worker.metrics.accepted_connections += 1
 		slot_index := int(accepted.token.slot)
 		state, init_result := init_static_connection(
 			accepted,
@@ -126,12 +143,15 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		)
 
 		if init_result != .Need_More {
-			release_worker_connection(
+			release := release_worker_connection(
 				&accepted,
 				worker.table,
 				worker.timers,
 				worker.shutdown_state,
 			)
+			if release.table_result == .Released || release.table_result == .Retired {
+				record_static_worker_close(worker, .Initialization_Failed)
+			}
 			result.result = .Error
 			continue
 		}
@@ -143,6 +163,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 
 		if register_result != .Ready {
 			result.result = .Error
+			worker.connection_states[slot_index].close_reason = .Transport_Error
 			close_static_worker_connection(worker, &worker.connection_states[slot_index])
 		}
 	}
@@ -188,11 +209,17 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			worker.timeouts,
 			turn.now_ns,
 		)
+		if !sync_static_worker_idle_count(worker, state) {
+			state.close_reason = .Internal_Error
+			connection_turn.result = .Invalid
+		}
 		if connection_turn.bytes_read > 0 {
 			result.bytes_read += u64(connection_turn.bytes_read)
+			worker.metrics.bytes_read += u64(connection_turn.bytes_read)
 		}
 		if connection_turn.bytes_written > 0 {
 			result.bytes_written += u64(connection_turn.bytes_written)
+			worker.metrics.bytes_written += u64(connection_turn.bytes_written)
 		}
 
 		if connection_turn.result == .Closed ||
@@ -200,6 +227,9 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		   connection_turn.result == .Transport_Error ||
 		   connection_turn.result == .Response_Buffer_Small ||
 		   connection_turn.result == .Invalid {
+			if state.close_reason == .Unknown {
+				state.close_reason = static_connection_close_reason(connection_turn.result)
+			}
 			close_result := close_static_worker_connection(worker, state)
 
 			if close_result == .Error {
@@ -215,6 +245,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		}
 		force_static_worker_connections(worker, &result)
 	}
+	refresh_static_worker_gauges(worker)
 	return result
 }
 
@@ -234,6 +265,7 @@ force_static_worker_connections :: proc(worker: ^Static_Worker, turn: ^Static_Wo
 		if !state.active {
 			continue
 		}
+		state.close_reason = .Shutdown_Forced
 		if close_static_worker_connection(worker, state) == .Error {
 			turn.result = .Error
 		}
@@ -326,6 +358,7 @@ process_static_worker_expirations :: proc(
 			turn.result = .Invalid
 			continue
 		}
+		state.close_reason = .Timed_Out
 		if close_static_worker_connection(worker, state) == .Error {
 			turn.result = .Error
 		}
@@ -368,6 +401,14 @@ close_static_worker_connection :: proc(
 		return .Invalid
 	}
 	result := Static_Worker_Result.Ready
+	if state.idle_counted {
+		if worker.metrics.idle_connections == 0 {
+			result = .Error
+		} else {
+			worker.metrics.idle_connections -= 1
+		}
+		state.idle_counted = false
+	}
 
 	if state.registered {
 		unregister_result, _ := epoll.unregister(worker.poller, state.fd)
@@ -393,6 +434,7 @@ close_static_worker_connection :: proc(
 	if release.table_result != .Released && release.table_result != .Retired {
 		return .Error
 	}
+	record_static_worker_close(worker, state.close_reason)
 	if release.socket_result != .Ready {
 		result = .Error
 	}
@@ -401,6 +443,69 @@ close_static_worker_connection :: proc(
 	}
 	state^ = Static_Connection{}
 	return result
+}
+
+record_static_worker_close :: proc(
+	worker: ^Static_Worker,
+	reason: Static_Connection_Close_Reason,
+) {
+	if worker == nil {
+		return
+	}
+	index := int(reason)
+	if index < 0 || index >= len(worker.metrics.close_reasons) {
+		index = int(Static_Connection_Close_Reason.Unknown)
+	}
+	worker.metrics.closed_connections += 1
+	worker.metrics.close_reasons[index] += 1
+}
+
+static_connection_close_reason :: proc(
+	result: Static_Connection_Result,
+) -> Static_Connection_Close_Reason {
+	switch result {
+	case .Closed:
+		return .Normal
+	case .Capacity_Limit:
+		return .Deadline_Capacity
+	case .Response_Buffer_Small:
+		return .Response_Buffer_Limit
+	case .Transport_Error:
+		return .Transport_Error
+	case .Invalid:
+		return .Internal_Error
+	case .Need_More, .Response_Progress, .Keep_Alive:
+		return .Unknown
+	}
+	return .Unknown
+}
+
+sync_static_worker_idle_count :: proc(worker: ^Static_Worker, state: ^Static_Connection) -> bool {
+	is_idle := state.phase == .Keep_Alive_Idle
+	if is_idle == state.idle_counted {
+		return true
+	}
+	if is_idle {
+		worker.metrics.idle_connections += 1
+		state.idle_counted = true
+		return true
+	}
+	if worker.metrics.idle_connections == 0 {
+		return false
+	}
+	worker.metrics.idle_connections -= 1
+	state.idle_counted = false
+	return true
+}
+
+refresh_static_worker_gauges :: proc(worker: ^Static_Worker) {
+	if worker == nil {
+		return
+	}
+	worker.metrics.active_connections = worker.shutdown_state.active_connections
+	worker.metrics.timer_count = worker.timers.count
+	worker.metrics.workspace_active = worker.workspace_pool.active_count
+	worker.metrics.workspace_capacity = len(worker.workspace_pool.storage)
 }
 
 static_worker_poll_result :: proc(result: epoll.Result) -> Static_Worker_Result {

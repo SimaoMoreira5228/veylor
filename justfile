@@ -30,3 +30,6 @@ test-linux:
     odin test src/runtime/linux -all-packages -collection:veylor=src -out:build/test-runtime-linux
 
 integration-linux: check-linux test-linux
+
+build-native-static:
+	odin build examples/native_static -collection:veylor=src -o:speed -out:build/veylor-static
