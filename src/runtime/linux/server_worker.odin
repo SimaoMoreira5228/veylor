@@ -55,11 +55,13 @@ Static_Worker_Result :: enum {
 }
 
 Static_Worker_Turn :: struct {
-	worker:          Worker_Turn,
-	accepted_count:  int,
-	processed_count: int,
-	closed_count:    int,
-	result:          Static_Worker_Result,
+	worker:               Worker_Turn,
+	accepted_count:       int,
+	processed_count:      int,
+	closed_count:         int,
+	bytes_read:           u64,
+	bytes_written:        u64,
+	result:               Static_Worker_Result,
 }
 
 run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
@@ -125,12 +127,10 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	for &accepted in turn.accepted {
 		result.accepted_count += 1
 		slot_index := int(accepted.token.slot)
-		buffers := worker.connection_buffers[slot_index]
+		buffers := &worker.connection_buffers[slot_index]
 		state, init_result := init_static_connection(
 			accepted,
-			buffers.request_input,
-			buffers.headers,
-			buffers.response,
+			buffers,
 		)
 
 		if init_result != .Need_More {
@@ -179,7 +179,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		if !state.active {
 			continue
 		}
-		if state.event_id != readiness.connection_id {
+		if static_connection_event_id(state.token) != readiness.connection_id {
 			result.result = .Invalid
 			continue
 		}
@@ -196,6 +196,12 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			worker.timeouts,
 			turn.now_ns,
 		)
+		if connection_turn.bytes_read > 0 {
+			result.bytes_read += u64(connection_turn.bytes_read)
+		}
+		if connection_turn.bytes_written > 0 {
+			result.bytes_written += u64(connection_turn.bytes_written)
+		}
 
 		if connection_turn.result == .Closed ||
 		   connection_turn.result == .Capacity_Limit ||
@@ -322,7 +328,7 @@ process_static_worker_expirations :: proc(
 		}
 		state := &worker.connection_states[slot_index]
 
-		if !state.active || state.worker.token.generation != deadline.token.generation {
+		if !state.active || state.token.generation != deadline.token.generation {
 			turn.result = .Invalid
 			continue
 		}
@@ -370,7 +376,7 @@ close_static_worker_connection :: proc(
 	result := Static_Worker_Result.Ready
 
 	if state.registered {
-		unregister_result, _ := epoll.unregister(worker.poller, state.worker.fd)
+		unregister_result, _ := epoll.unregister(worker.poller, state.fd)
 
 		if unregister_result != .Ready {
 			result = .Error
@@ -378,7 +384,10 @@ close_static_worker_connection :: proc(
 		state.registered = false
 	}
 	release := release_worker_connection(
-		&state.worker,
+		&Worker_Connection {
+			token = state.token,
+			fd    = state.fd,
+		},
 		worker.table,
 		worker.timers,
 		worker.shutdown_state,

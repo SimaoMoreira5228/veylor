@@ -109,25 +109,25 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	accepted_connections: [4]Worker_Connection
 	expired_timers: [5]transport.Timer_Expiration
 	worker := Static_Worker {
-		poller                = poller,
-		listener              = listener,
-		shutdown_state        = &shutdown_state,
-		table                 = &table,
-		routes                = &routes,
-		connection_states     = connection_states[:],
-		connection_buffers    = connection_buffers[:],
-		native_events         = native_events[:],
-		readiness_events      = readiness_events[:],
-		accepted_storage      = accepted_storage[:],
-		accepted_connections  = accepted_connections[:],
-		timers                = &timers,
-		expired_timer_storage = expired_timers[:],
-		event_budget          = 1,
-		byte_budget           = 64,
-		accept_attempt_budget = 4,
-		timeout_ms            = 0,
-		body_limit            = 1024,
-		timeouts              = connections.Connection_Timeouts {
+		poller                 = poller,
+		listener               = listener,
+		shutdown_state         = &shutdown_state,
+		table                  = &table,
+		routes                 = &routes,
+		connection_states      = connection_states[:],
+		connection_buffers     = connection_buffers[:],
+		native_events          = native_events[:],
+		readiness_events       = readiness_events[:],
+		accepted_storage       = accepted_storage[:],
+		accepted_connections   = accepted_connections[:],
+		timers                 = &timers,
+		expired_timer_storage  = expired_timers[:],
+		event_budget           = 1,
+		byte_budget            = 64,
+		accept_attempt_budget  = 4,
+		timeout_ms             = 0,
+		body_limit             = 1024,
+		timeouts               = connections.Connection_Timeouts {
 			request_head_ns    = 60_000_000_000,
 			response_write_ns  = 60_000_000_000,
 			keep_alive_idle_ns = 60_000_000_000,
@@ -184,11 +184,17 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 		testing.expect_value(t, hot_written, hot_request_length)
 	}
 
+	warm_read_bytes := 0
 	for turn_index := 0; turn_index < 1024; turn_index += 1 {
 		turn := run_static_worker_turn(&worker)
 		testing.expect_value(t, turn.result, Static_Worker_Result.Ready)
 		testing.expect_value(t, turn.processed_count, 1)
+		testing.expect_value(t, turn.bytes_read > 0, true)
+		testing.expect_value(t, turn.bytes_read <= u64(worker.byte_budget), true)
+		testing.expect_value(t, turn.bytes_written, u64(0))
+		warm_read_bytes += int(turn.bytes_read)
 	}
+	testing.expect_value(t, warm_read_bytes > 0, true)
 	hot_prefix_count := 0
 	for state in connection_states {
 		if !state.active ||
@@ -196,7 +202,7 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 		   state.head_driver.input_length <= 0 {
 			continue
 		}
-		if http1.bytes_equal(state.request_input[:len(hot_prefix)], hot_prefix) {
+		if http1.bytes_equal(state.buffers.request_input[:len(hot_prefix)], hot_prefix) {
 			hot_prefix_count += 1
 			testing.expect_value(t, state.head_driver.input_length < hot_request_length, true)
 		}
@@ -208,6 +214,7 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	testing.expect_value(t, cold_written, len(cold_request))
 
 	cold_served := false
+	cold_response := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
 	for turn_index := 0; turn_index < 16; turn_index += 1 {
 		turn := run_static_worker_turn(&worker)
 
@@ -221,6 +228,7 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 			}
 		}
 		if cold_served {
+			testing.expect_value(t, turn.bytes_written, u64(len(cold_response)))
 			break
 		}
 	}
@@ -233,7 +241,7 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 		   state.head_driver.input_length <= 0 {
 			continue
 		}
-		if http1.bytes_equal(state.request_input[:len(hot_prefix)], hot_prefix) {
+		if http1.bytes_equal(state.buffers.request_input[:len(hot_prefix)], hot_prefix) {
 			hot_prefix_count += 1
 			testing.expect_value(t, state.head_driver.input_length < hot_request_length, true)
 		}
@@ -246,11 +254,7 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	response: [256]u8
 	response_length, read_error := linux.read(cold_client, response[:])
 	testing.expect_value(t, read_error, linux.Errno.NONE)
-	testing.expect_value(
-		t,
-		string(response[:response_length]),
-		"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-	)
+	testing.expect_value(t, string(response[:response_length]), cold_response)
 
 	for client in hot_clients {
 		linux.close(client)

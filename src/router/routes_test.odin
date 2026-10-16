@@ -1,12 +1,59 @@
 #+test
 package router
 
+import "core:mem"
 import "core:testing"
 import http1 "veylor:http1"
 import body "veylor:http1/body"
 
 test_bytes :: proc(value: string) -> []u8 {
 	return transmute([]u8)value
+}
+
+static_route_allocation_client :: proc(t: ^testing.T) {
+	routes: [1]Static_Route
+	index_slots: [2]Route_Index_Slot
+	table := init_route_table(routes[:], index_slots[:])
+	response := Static_Response {
+		status = 200,
+		reason = test_bytes("OK"),
+		body   = test_bytes("health"),
+	}
+	testing.expect_value(
+		t,
+		register_static_route(&table, test_bytes("GET"), test_bytes("/health"), response),
+		Route_Table_Result.Added,
+	)
+	testing.expect_value(t, freeze_route_table(&table), Route_Table_Result.Frozen)
+
+	raw := "GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	input := test_bytes(raw)
+	for _ in 0 ..< 64 {
+		parser: http1.Parser
+		headers: [4]http1.Header
+		head, parse_result := http1.parse_request_head(&parser, input, headers[:])
+		testing.expect_value(t, parse_result, http1.Parse_Result.Ready)
+		output: [128]u8
+		event := encode_static_route_response(
+			&table,
+			head,
+			input,
+			output[:],
+			body.DEFAULT_FIXED_BODY_LIMIT,
+		)
+		testing.expect_value(t, event.result, Static_Response_Result.Written)
+		testing.expect_value(t, event.written > 0, true)
+	}
+}
+
+static_route_allocation_verifier :: proc(t: ^testing.T, tracker: ^mem.Tracking_Allocator) {
+	testing.expect_value(t, tracker.total_allocation_count, i64(0))
+	testing.expect_value(t, len(tracker.allocation_map), 0)
+}
+
+@(test)
+test_warm_exact_static_route_path_allocates_no_heap_memory :: proc(t: ^testing.T) {
+	testing.expect_leaks(t, static_route_allocation_client, static_route_allocation_verifier)
 }
 
 write_test_route_path :: proc(path: []u8, value: int) {
@@ -244,6 +291,7 @@ test_static_route_index_matches_large_tables :: proc(t: ^testing.T) {
 		status = 200,
 		body   = test_bytes("ok"),
 	}
+
 	route_counts := [?]int{8, 100, 10_000}
 	for route_count in route_counts {
 		table := init_route_table(route_storage[:route_count], index_slots[:])
@@ -292,6 +340,7 @@ test_route_hash_collision_falls_back_to_bounded_binary_search :: proc(t: ^testin
 		copy(candidate_paths[bucket][candidate_counts[bucket]][:], candidate[:])
 		candidate_counts[bucket] += 1
 	}
+
 	target_bucket := -1
 	for bucket_count, bucket_index in candidate_counts {
 		if bucket_count == len(path_storage) {

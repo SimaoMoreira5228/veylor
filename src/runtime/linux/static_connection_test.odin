@@ -157,11 +157,14 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_output: [256]u8
+	buffers := Static_Connection_Buffers {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_output[:],
+	}
 	state, state_result := init_static_connection(
 		worker,
-		request_input[:],
-		request_headers[:],
-		response_output[:],
+		&buffers,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	static_register_result, register_error := register_static_connection(poller, &state)
@@ -252,7 +255,16 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 	)
 
 	epoll.unregister(poller, sockets[0])
-	release := release_worker_connection(&state.worker, &table, &timers, &shutdown_state)
+	worker_connection := Worker_Connection {
+		token = state.token,
+		fd    = state.fd,
+	}
+	release := release_worker_connection(
+		&worker_connection,
+		&table,
+		&timers,
+		&shutdown_state,
+	)
 	testing.expect_value(t, release.table_result, connections.Connection_Table_Result.Released)
 	testing.expect_value(t, release.socket_result, socket.Result.Ready)
 	testing.expect_value(t, release.shutdown_result, shutdown.Result.Connection_Closed)
@@ -348,11 +360,14 @@ test_static_worker_forces_shutdown_during_a_backpressured_response_write :: proc
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_storage: [131_328]u8
+	buffers := Static_Connection_Buffers {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_storage[:],
+	}
 	state, state_result := init_static_connection(
 		worker_connection,
-		request_input[:],
-		request_headers[:],
-		response_storage[:],
+		&buffers,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	connection_register_result, register_error := register_static_connection(poller, &state)

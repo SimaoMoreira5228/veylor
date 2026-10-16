@@ -1,7 +1,7 @@
 #+build linux
 package linux_runtime
 
-import http1 "veylor:http1"
+import "core:sys/linux"
 import connection "veylor:http1/connection"
 import response "veylor:http1/response"
 import router "veylor:router"
@@ -29,13 +29,11 @@ Static_Connection_Result :: enum {
 }
 
 Static_Connection :: struct {
-	worker:          Worker_Connection,
-	event_id:        u64,
+	token:           connections.Connection_Token,
+	fd:              linux.Fd,
 	head_driver:     connection.Connection_Head_Driver,
 	write_driver:    connection.Connection_Write_Driver,
-	request_input:   []u8,
-	headers:         []http1.Header,
-	response:        []u8,
+	buffers:         ^Static_Connection_Buffers,
 	phase:           Static_Connection_Phase,
 	response_length: int,
 	keep_alive:      bool,
@@ -52,29 +50,25 @@ Static_Connection_Turn :: struct {
 
 init_static_connection :: proc(
 	worker: Worker_Connection,
-	request_input: []u8,
-	headers: []http1.Header,
-	response_storage: []u8,
+	buffers: ^Static_Connection_Buffers,
 ) -> (
 	state: Static_Connection,
 	result: Static_Connection_Result,
 ) {
-	if worker.fd < 0 ||
-	   len(request_input) == 0 ||
-	   len(headers) == 0 ||
-	   len(response_storage) == 0 {
+	if worker.fd < 0 || buffers == nil ||
+	   len(buffers.request_input) == 0 ||
+	   len(buffers.headers) == 0 ||
+	   len(buffers.response) == 0 {
 		return {}, .Invalid
 	}
 	connection_id := static_connection_event_id(worker.token)
 	state = Static_Connection {
-		worker        = worker,
-		event_id      = connection_id,
-		head_driver   = connection.begin_connection_head(connection_id),
-		request_input = request_input,
-		headers       = headers,
-		response      = response_storage,
-		phase         = .Reading_Request_Head,
-		active        = true,
+		token       = worker.token,
+		fd          = worker.fd,
+		head_driver = connection.begin_connection_head(connection_id),
+		buffers     = buffers,
+		phase       = .Reading_Request_Head,
+		active      = true,
 	}
 	return state, .Need_More
 }
@@ -86,13 +80,13 @@ register_static_connection :: proc(
 	result: epoll.Result,
 	error_code: i32,
 ) {
-	if state == nil || state.worker.fd < 0 || state.phase != .Reading_Request_Head {
+	if state == nil || state.fd < 0 || state.phase != .Reading_Request_Head {
 		return .Invalid, 0
 	}
 	result, error_code = epoll.register(
 		poller,
-		state.worker.fd,
-		state.event_id,
+		state.fd,
+		static_connection_event_id(state.token),
 		epoll.Interest{readable = true},
 	)
 
@@ -114,15 +108,17 @@ static_connection_turn :: proc(
 	timeouts: connections.Connection_Timeouts,
 	now_ns: u64,
 ) -> Static_Connection_Turn {
-	if state == nil || routes == nil || table == nil || timers == nil {
+	if state == nil || state.buffers == nil || routes == nil || table == nil || timers == nil {
 		return Static_Connection_Turn{result = .Invalid}
 	}
-	if state.worker.fd < 0 || readiness.connection_id != state.event_id || byte_budget <= 0 {
+	if state.fd < 0 ||
+	   readiness.connection_id != static_connection_event_id(state.token) ||
+	   byte_budget <= 0 {
 		return Static_Connection_Turn{result = .Invalid}
 	}
-	resource_id, lookup_result := connections.lookup_connection(table, state.worker.token)
+	resource_id, lookup_result := connections.lookup_connection(table, state.token)
 
-	if lookup_result != .Found || resource_id != u64(state.worker.fd) {
+	if lookup_result != .Found || resource_id != u64(state.fd) {
 		state.phase = .Failed
 		return Static_Connection_Turn{result = .Invalid}
 	}
@@ -139,13 +135,13 @@ static_connection_turn :: proc(
 		if !readiness.readable {
 			return Static_Connection_Turn{result = .Keep_Alive}
 		}
-		resume_result := connections.resume_keep_alive_request(table, timers, state.worker.token)
+		resume_result := connections.resume_keep_alive_request(table, timers, state.token)
 
 		if resume_result != .Ready {
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Invalid}
 		}
-		state.head_driver = connection.begin_connection_head(state.event_id)
+		state.head_driver = connection.begin_connection_head(static_connection_event_id(state.token))
 		state.phase = .Reading_Request_Head
 	}
 
@@ -154,16 +150,16 @@ static_connection_turn :: proc(
 			return Static_Connection_Turn{result = .Need_More}
 		}
 		read_turn := read_connection_head_turn_with_deadline(
-			state.event_id,
-			state.worker.fd,
+			static_connection_event_id(state.token),
+			state.fd,
 			&state.head_driver,
-			state.request_input,
-			state.headers,
+			state.buffers.request_input,
+			state.buffers.headers,
 			byte_budget,
 			table,
-			state.worker.token,
+			state.token,
 			timers,
-			state.event_id,
+			static_connection_event_id(state.token),
 			now_ns,
 			timeouts,
 		)
@@ -190,7 +186,7 @@ static_connection_turn :: proc(
 			}
 			return register_static_response_write(poller, state, table)
 		}
-		if connections.transition_connection(table, state.worker.token, .Writing_Response) !=
+		if connections.transition_connection(table, state.token, .Writing_Response) !=
 		   .Transitioned {
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Invalid}
@@ -200,13 +196,17 @@ static_connection_turn :: proc(
 		response_event := router.encode_static_route_response(
 			routes,
 			read_turn.head.head,
-			state.request_input[:state.head_driver.input_length],
-			state.response,
+			state.buffers.request_input[:state.head_driver.input_length],
+			state.buffers.response,
 			body_limit,
 		)
 
 		if response_event.result == .Route_Not_Found {
-			error_response := encode_static_error_response(state.response, 404, "Not Found")
+			error_response := encode_static_error_response(
+				state.buffers.response,
+				404,
+				"Not Found",
+			)
 
 			if error_response.result != .Written {
 				state.phase = .Failed
@@ -232,15 +232,15 @@ static_connection_turn :: proc(
 			return Static_Connection_Turn{result = .Response_Progress}
 		}
 		write_turn := write_connection_turn_with_deadline(
-			state.event_id,
-			state.worker.fd,
+			static_connection_event_id(state.token),
+			state.fd,
 			&state.write_driver,
 			byte_budget,
 			state.keep_alive,
 			table,
-			state.worker.token,
+			state.token,
 			timers,
-			state.event_id,
+			static_connection_event_id(state.token),
 			now_ns,
 			timeouts,
 		)
@@ -256,8 +256,8 @@ static_connection_turn :: proc(
 			if state.keep_alive {
 				epoll_result, error_code := epoll.modify(
 					poller,
-					state.worker.fd,
-					state.event_id,
+					state.fd,
+					static_connection_event_id(state.token),
 					epoll.Interest{readable = true},
 				)
 
@@ -300,15 +300,15 @@ register_static_response_write :: proc(
 	table: ^connections.Connection_Table,
 ) -> Static_Connection_Turn {
 	state.write_driver = connection.begin_connection_write(
-		state.event_id,
-		state.response[:state.response_length],
+		static_connection_event_id(state.token),
+		state.buffers.response[:state.response_length],
 	)
 	if state.write_driver.state != .Pending {
 		state.phase = .Failed
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	if state.phase != .Writing_Response {
-		if connections.transition_connection(table, state.worker.token, .Writing_Response) !=
+		if connections.transition_connection(table, state.token, .Writing_Response) !=
 		   .Transitioned {
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Invalid}
@@ -316,8 +316,8 @@ register_static_response_write :: proc(
 	}
 	result, error_code := epoll.modify(
 		poller,
-		state.worker.fd,
-		state.event_id,
+		state.fd,
+		static_connection_event_id(state.token),
 		epoll.Interest{writable = true},
 	)
 
@@ -360,7 +360,7 @@ static_error_response_for_head :: proc(
 	     .Transport_Error:
 		return Static_Connection_Turn{result = .Invalid}
 	}
-	error_response := encode_static_error_response(state.response, status, reason)
+	error_response := encode_static_error_response(state.buffers.response, status, reason)
 
 	if error_response.result == .Buffer_Small {
 		return Static_Connection_Turn{result = .Response_Buffer_Small}

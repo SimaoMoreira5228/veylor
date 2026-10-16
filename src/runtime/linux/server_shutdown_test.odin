@@ -96,11 +96,14 @@ test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testin
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_storage: [131_328]u8
+	buffers := Static_Connection_Buffers {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_storage[:],
+	}
 	state, state_result := init_static_connection(
 		worker_connection,
-		request_input[:],
-		request_headers[:],
-		response_storage[:],
+		&buffers,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	connection_register_result, register_error := register_static_connection(poller, &state)
@@ -324,11 +327,14 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [256]u8
+	buffers := Static_Connection_Buffers {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_buffer[:],
+	}
 	state, state_result := init_static_connection(
 		worker_connection,
-		request_input[:],
-		request_headers[:],
-		response_buffer[:],
+		&buffers,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)

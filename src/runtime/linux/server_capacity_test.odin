@@ -64,6 +64,11 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [128]u8
+	buffers := Static_Connection_Buffers {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_buffer[:],
+	}
 	timeouts := connections.Connection_Timeouts {
 		request_head_ns = 100,
 	}
@@ -72,9 +77,7 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 			token = token,
 			fd    = sockets[0],
 		},
-		request_input[:],
-		request_headers[:],
-		response_buffer[:],
+		&buffers,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)
@@ -189,14 +192,14 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	message := "response body"
 	response_buffer: [128]u8
 	copy(response_buffer[:len(message)], transmute([]u8)message)
+	buffers := Static_Connection_Buffers {
+		response = response_buffer[:],
+	}
 	state := Static_Connection {
-		worker = Worker_Connection {
-			token = token,
-			fd    = sockets[0],
-		},
-		event_id        = 1,
+		token           = token,
+		fd              = sockets[0],
 		write_driver    = connection.begin_connection_write(1, response_buffer[:len(message)]),
-		response        = response_buffer[:],
+		buffers         = &buffers,
 		phase           = .Writing_Response,
 		response_length = len(message),
 		active          = true,
@@ -205,7 +208,7 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	_, register_error := epoll.register(
 		poller,
 		sockets[0],
-		state.event_id,
+		static_connection_event_id(state.token),
 		epoll.Interest{writable = true},
 	)
 	testing.expect_value(t, register_error, i32(0))
@@ -317,14 +320,17 @@ test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t:
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [96]u8
+	buffers := Static_Connection_Buffers {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_buffer[:],
+	}
 	state, state_result := init_static_connection(
 		Worker_Connection {
 			token = token,
 			fd    = sockets[0],
 		},
-		request_input[:],
-		request_headers[:],
-		response_buffer[:],
+		&buffers,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)
