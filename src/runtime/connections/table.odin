@@ -7,13 +7,13 @@ Connection_Token :: struct {
 	generation:        u64,
 }
 
-Connection_Slot_State :: enum {
+Connection_Slot_State :: enum u8 {
 	Available,
 	Occupied,
 	Retired,
 }
 
-Connection_Phase :: enum {
+Connection_Phase :: enum u8 {
 	Reading_Request_Head,
 	Reading_Request_Body,
 	Awaiting_Handler,
@@ -22,7 +22,7 @@ Connection_Phase :: enum {
 	Closing,
 }
 
-Connection_Deadline_Kind :: enum {
+Connection_Deadline_Kind :: enum u8 {
 	Request_Head,
 	Body_Progress,
 	Response_Write,
@@ -107,6 +107,7 @@ init_connection_table :: proc(
 	if u64(len(slots)) > MAX_CONNECTION_SLOT_COUNT {
 		return {}, .Invalid
 	}
+
 	for i := 0; i < len(slots); i += 1 {
 		slots[i] = Connection_Slot {
 			generation = 1,
@@ -153,6 +154,7 @@ allocate_connection :: proc(
 	if u64(slot_index) >= u64(len(table.slots)) {
 		return {}, .Invalid
 	}
+
 	slot := &table.slots[int(slot_index)]
 
 	if slot.state != .Available || slot.generation == 0 {
@@ -186,6 +188,7 @@ lookup_connection :: proc(
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return 0, .Invalid
 	}
+
 	slot := &table.slots[int(token.slot)]
 
 	if !connection_slot_matches_token(slot, token) {
@@ -208,6 +211,7 @@ connection_phase :: proc(
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return {}, .Invalid
 	}
+
 	slot := &table.slots[int(token.slot)]
 
 	if !connection_slot_matches_token(slot, token) {
@@ -247,6 +251,7 @@ bind_connection_deadline :: proc(
 	if slot.has_deadline {
 		return .Invalid_Transition
 	}
+
 	for i := 0; i < len(table.slots); i += 1 {
 		other := table.slots[i]
 
@@ -262,6 +267,7 @@ bind_connection_deadline :: proc(
 			return .Duplicate_Deadline
 		}
 	}
+
 	slot.deadline_timer_id = timer_id
 	slot.deadline_kind = kind
 	slot.has_deadline = true
@@ -293,6 +299,7 @@ clear_connection_deadline :: proc(
 	if slot.deadline_timer_id != timer_id {
 		return .Not_Found
 	}
+
 	slot.deadline_timer_id = 0
 	slot.deadline_kind = {}
 	slot.has_deadline = false
@@ -320,6 +327,7 @@ expire_connection_deadline :: proc(
 		if slot.deadline_timer_id != timer_id {
 			continue
 		}
+
 		deadline = Connection_Deadline {
 			token = Connection_Token {
 				worker_id = table.worker_id,
@@ -330,6 +338,7 @@ expire_connection_deadline :: proc(
 			timer_id = timer_id,
 			kind = slot.deadline_kind,
 		}
+
 		slot.deadline_timer_id = 0
 		slot.deadline_kind = {}
 		slot.has_deadline = false
@@ -350,6 +359,7 @@ transition_connection :: proc(
 	if u64(token.slot) >= u64(len(table.slots)) {
 		return .Invalid
 	}
+
 	slot := &table.slots[int(token.slot)]
 
 	if !connection_slot_matches_token(slot, token) {
@@ -371,6 +381,7 @@ transition_connection :: proc(
 	if !connection_phase_transition_allowed(slot.phase, next) {
 		return .Invalid_Transition
 	}
+
 	slot.phase = next
 	return .Transitioned
 }
@@ -403,6 +414,7 @@ release_connection :: proc(
 	if slot.has_deadline {
 		return .Invalid_Transition
 	}
+
 	slot.resource_id = 0
 	slot.deadline_timer_id = 0
 	slot.deadline_kind = {}
@@ -450,7 +462,6 @@ connection_phase_transition_allowed :: proc(
 	}
 	switch current {
 	case .Reading_Request_Head:
-
 		if next == .Reading_Request_Body {
 			return true
 		}
@@ -460,7 +471,6 @@ connection_phase_transition_allowed :: proc(
 		}
 		return next == .Writing_Response
 	case .Reading_Request_Body:
-
 		if next == .Awaiting_Handler {
 			return true
 		}

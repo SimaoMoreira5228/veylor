@@ -24,10 +24,12 @@ Managed_Server_Test_Instance :: struct {
 	timers:               transport.Timer_Queue,
 	timer_storage:        [3]transport.Timer_Expiration,
 	connection_states:    [1]Static_Connection,
+	workspace_storage:   [1]Static_Connection_Workspace,
+	workspace_free_stack: [1]u32,
+	workspace_pool:      Static_Workspace_Pool,
 	request_input:        [128]u8,
 	request_headers:      [4]http1.Header,
 	response_buffer:      [256]u8,
-	connection_buffers:   [1]Static_Connection_Buffers,
 	native_events:        [2]linux.EPoll_Event,
 	readiness_events:     [2]transport.Readiness_Event,
 	accepted_storage:     [1]socket.Accepted_Connection,
@@ -97,11 +99,21 @@ init_managed_server_test_instance :: proc(
 		return false
 	}
 	instance.timers = transport.init_timer_queue(instance.timer_storage[:])
-	instance.connection_buffers[0] = Static_Connection_Buffers {
+	instance.workspace_storage[0] = Static_Connection_Workspace {
 		request_input = instance.request_input[:],
 		headers       = instance.request_headers[:],
 		response      = instance.response_buffer[:],
 	}
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		instance.workspace_storage[:],
+		instance.workspace_free_stack[:],
+	)
+	if !pool_ready {
+		epoll.close(&poller)
+		socket.close_listener(&listener)
+		return false
+	}
+	instance.workspace_pool = workspace_pool
 	instance.worker = Static_Worker {
 		poller = poller,
 		listener = listener,
@@ -109,7 +121,7 @@ init_managed_server_test_instance :: proc(
 		table = &instance.table,
 		routes = &instance.routes,
 		connection_states = instance.connection_states[:],
-		connection_buffers = instance.connection_buffers[:],
+		workspace_pool = &instance.workspace_pool,
 		native_events = instance.native_events[:],
 		readiness_events = instance.readiness_events[:],
 		accepted_storage = instance.accepted_storage[:],
@@ -221,12 +233,18 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [256]u8
-	connection_buffers: [1]Static_Connection_Buffers
-	connection_buffers[0] = Static_Connection_Buffers {
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
 		request_input = request_input[:],
 		headers       = request_headers[:],
 		response      = response_buffer[:],
 	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	native_events: [2]linux.EPoll_Event
 	readiness_events: [2]transport.Readiness_Event
 	accepted_storage: [1]socket.Accepted_Connection
@@ -239,7 +257,7 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 		table = &table,
 		routes = &routes,
 		connection_states = connection_states[:],
-		connection_buffers = connection_buffers[:],
+		workspace_pool = &workspace_pool,
 		native_events = native_events[:],
 		readiness_events = readiness_events[:],
 		accepted_storage = accepted_storage[:],

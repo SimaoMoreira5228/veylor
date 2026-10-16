@@ -30,6 +30,7 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 		socket.close_listener(&listener)
 		return
 	}
+
 	hot_clients: [3]linux.Fd
 	for &client in hot_clients {
 		client = -1
@@ -95,41 +96,47 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	request_inputs: [4][32 * 1024]u8
 	request_headers: [4][4]http1.Header
 	response_buffers: [4][256]u8
-	connection_buffers: [4]Static_Connection_Buffers
-	for i := 0; i < len(connection_buffers); i += 1 {
-		connection_buffers[i] = Static_Connection_Buffers {
+	workspace_storage: [4]Static_Connection_Workspace
+	for i := 0; i < len(workspace_storage); i += 1 {
+		workspace_storage[i] = Static_Connection_Workspace {
 			request_input = request_inputs[i][:],
 			headers       = request_headers[i][:],
 			response      = response_buffers[i][:],
 		}
 	}
+	workspace_free_stack: [4]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	native_events: [1]linux.EPoll_Event
 	readiness_events: [1]transport.Readiness_Event
 	accepted_storage: [4]socket.Accepted_Connection
 	accepted_connections: [4]Worker_Connection
 	expired_timers: [5]transport.Timer_Expiration
 	worker := Static_Worker {
-		poller                 = poller,
-		listener               = listener,
-		shutdown_state         = &shutdown_state,
-		table                  = &table,
-		routes                 = &routes,
-		connection_states      = connection_states[:],
-		connection_buffers     = connection_buffers[:],
-		native_events          = native_events[:],
-		readiness_events       = readiness_events[:],
-		accepted_storage       = accepted_storage[:],
-		accepted_connections   = accepted_connections[:],
-		timers                 = &timers,
-		expired_timer_storage  = expired_timers[:],
-		event_budget           = 1,
-		byte_budget            = 64,
-		accept_attempt_budget  = 4,
-		timeout_ms             = 0,
-		body_limit             = 1024,
-		timeouts               = connections.Connection_Timeouts {
-			request_head_ns    = 60_000_000_000,
-			response_write_ns  = 60_000_000_000,
+		poller = poller,
+		listener = listener,
+		shutdown_state = &shutdown_state,
+		table = &table,
+		routes = &routes,
+		connection_states = connection_states[:],
+		workspace_pool = &workspace_pool,
+		native_events = native_events[:],
+		readiness_events = readiness_events[:],
+		accepted_storage = accepted_storage[:],
+		accepted_connections = accepted_connections[:],
+		timers = &timers,
+		expired_timer_storage = expired_timers[:],
+		event_budget = 1,
+		byte_budget = 64,
+		accept_attempt_budget = 4,
+		timeout_ms = 0,
+		body_limit = 1024,
+		timeouts = connections.Connection_Timeouts {
+			request_head_ns = 60_000_000_000,
+			response_write_ns = 60_000_000_000,
 			keep_alive_idle_ns = 60_000_000_000,
 		},
 	}
@@ -199,12 +206,21 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	for state in connection_states {
 		if !state.active ||
 		   state.phase != .Reading_Request_Head ||
-		   state.head_driver.input_length <= 0 {
+		   state.workspace_slot < 0 ||
+		   state.workspace_pool.storage[state.workspace_slot].head_driver.input_length <= 0 {
 			continue
 		}
-		if http1.bytes_equal(state.buffers.request_input[:len(hot_prefix)], hot_prefix) {
+		if http1.bytes_equal(
+			state.workspace_pool.storage[state.workspace_slot].request_input[:len(hot_prefix)],
+			hot_prefix,
+		) {
 			hot_prefix_count += 1
-			testing.expect_value(t, state.head_driver.input_length < hot_request_length, true)
+			testing.expect_value(
+				t,
+				state.workspace_pool.storage[state.workspace_slot].head_driver.input_length <
+				hot_request_length,
+				true,
+			)
 		}
 	}
 	testing.expect_value(t, hot_prefix_count, len(hot_clients))
@@ -238,12 +254,21 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	for state in connection_states {
 		if !state.active ||
 		   state.phase != .Reading_Request_Head ||
-		   state.head_driver.input_length <= 0 {
+		   state.workspace_slot < 0 ||
+		   state.workspace_pool.storage[state.workspace_slot].head_driver.input_length <= 0 {
 			continue
 		}
-		if http1.bytes_equal(state.buffers.request_input[:len(hot_prefix)], hot_prefix) {
+		if http1.bytes_equal(
+			state.workspace_pool.storage[state.workspace_slot].request_input[:len(hot_prefix)],
+			hot_prefix,
+		) {
 			hot_prefix_count += 1
-			testing.expect_value(t, state.head_driver.input_length < hot_request_length, true)
+			testing.expect_value(
+				t,
+				state.workspace_pool.storage[state.workspace_slot].head_driver.input_length <
+				hot_request_length,
+				true,
+			)
 		}
 	}
 	testing.expect_value(t, hot_prefix_count, len(hot_clients))

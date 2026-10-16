@@ -2,7 +2,6 @@
 package linux_runtime
 
 import "core:sys/linux"
-import http1 "veylor:http1"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
 import shutdown "veylor:runtime/shutdown"
@@ -13,12 +12,6 @@ import socket "veylor:transport/linux/socket"
 STATIC_WORKER_CONTROL_EVENT_ID :: u64(0xffff_ffff_ffff_ffff)
 STATIC_LISTENER_RETRY_TIMER_ID :: u64(0xffff_ffff_ffff_fffd)
 STATIC_LISTENER_RETRY_DELAY_NS :: u64(100_000_000)
-
-Static_Connection_Buffers :: struct {
-	request_input: []u8,
-	headers:       []http1.Header,
-	response:      []u8,
-}
 
 Static_Worker :: struct {
 	poller:                     epoll.Epoll,
@@ -32,7 +25,7 @@ Static_Worker :: struct {
 	table:                      ^connections.Connection_Table,
 	routes:                     ^router.Route_Table,
 	connection_states:          []Static_Connection,
-	connection_buffers:         []Static_Connection_Buffers,
+	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
 	readiness_events:           []transport.Readiness_Event,
 	accepted_storage:           []socket.Accepted_Connection,
@@ -127,10 +120,9 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	for &accepted in turn.accepted {
 		result.accepted_count += 1
 		slot_index := int(accepted.token.slot)
-		buffers := &worker.connection_buffers[slot_index]
 		state, init_result := init_static_connection(
 			accepted,
-			buffers,
+			worker.workspace_pool,
 		)
 
 		if init_result != .Need_More {
@@ -264,8 +256,10 @@ valid_static_worker :: proc(worker: ^Static_Worker) -> bool {
 		return false
 	}
 	if worker.table.free_count > len(worker.table.slots) ||
-	   len(worker.connection_states) < len(worker.table.slots) ||
-	   len(worker.connection_buffers) < len(worker.table.slots) {
+	   len(worker.connection_states) < len(worker.table.slots) {
+		return false
+	}
+	if !valid_static_workspace_pool(worker.workspace_pool) {
 		return false
 	}
 	if worker.event_budget <= 0 || worker.byte_budget <= 0 || worker.accept_attempt_budget <= 0 {
@@ -382,6 +376,9 @@ close_static_worker_connection :: proc(
 			result = .Error
 		}
 		state.registered = false
+	}
+	if !release_static_workspace(state) {
+		result = .Error
 	}
 	release := release_worker_connection(
 		&Worker_Connection {

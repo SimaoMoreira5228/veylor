@@ -96,14 +96,21 @@ test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testin
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_storage: [131_328]u8
-	buffers := Static_Connection_Buffers {
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
 		request_input = request_input[:],
 		headers       = request_headers[:],
 		response      = response_storage[:],
 	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	state, state_result := init_static_connection(
 		worker_connection,
-		&buffers,
+		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	connection_register_result, register_error := register_static_connection(poller, &state)
@@ -194,12 +201,6 @@ test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testin
 
 	connection_states: [1]Static_Connection
 	connection_states[0] = state
-	connection_buffers: [1]Static_Connection_Buffers
-	connection_buffers[0] = Static_Connection_Buffers {
-		request_input = request_input[:],
-		headers       = request_headers[:],
-		response      = response_storage[:],
-	}
 	worker_native_events: [1]linux.EPoll_Event
 	worker_readiness_events: [1]transport.Readiness_Event
 	accepted_storage: [1]socket.Accepted_Connection
@@ -212,7 +213,7 @@ test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testin
 		table                 = &table,
 		routes                = &routes,
 		connection_states     = connection_states[:],
-		connection_buffers    = connection_buffers[:],
+		workspace_pool        = &workspace_pool,
 		native_events         = worker_native_events[:],
 		readiness_events      = worker_readiness_events[:],
 		accepted_storage      = accepted_storage[:],
@@ -327,14 +328,21 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [256]u8
-	buffers := Static_Connection_Buffers {
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
 		request_input = request_input[:],
 		headers       = request_headers[:],
 		response      = response_buffer[:],
 	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	state, state_result := init_static_connection(
 		worker_connection,
-		&buffers,
+		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)
@@ -371,7 +379,11 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 		)
 		testing.expect_value(t, read_turn.result, Static_Connection_Result.Need_More)
 		testing.expect_value(t, read_turn.bytes_read, len(partial_request))
-		testing.expect_value(t, state.head_driver.input_length, len(partial_request))
+		testing.expect_value(
+			t,
+			state.workspace_pool.storage[state.workspace_slot].head_driver.input_length,
+			len(partial_request),
+		)
 	}
 	testing.expect_value(t, timers.count, 1)
 	testing.expect_value(
@@ -382,13 +394,6 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 
 	connection_states := [?]Static_Connection {
 		state,
-	}
-	connection_buffers := [?]Static_Connection_Buffers {
-		{
-			request_input = request_input[:],
-			headers       = request_headers[:],
-			response      = response_buffer[:],
-		},
 	}
 	worker_native_events: [1]linux.EPoll_Event
 	worker_readiness_events: [1]transport.Readiness_Event
@@ -402,7 +407,7 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 		table                 = &table,
 		routes                = &routes,
 		connection_states     = connection_states[:],
-		connection_buffers    = connection_buffers[:],
+		workspace_pool        = &workspace_pool,
 		native_events         = worker_native_events[:],
 		readiness_events      = worker_readiness_events[:],
 		accepted_storage      = accepted_storage[:],

@@ -2,6 +2,7 @@
 package linux_runtime
 
 import "core:sys/linux"
+import http1 "veylor:http1"
 import connection "veylor:http1/connection"
 import response "veylor:http1/response"
 import router "veylor:router"
@@ -28,12 +29,31 @@ Static_Connection_Result :: enum {
 	Invalid,
 }
 
+Static_Connection_Workspace :: struct {
+	head_driver:   connection.Connection_Head_Driver,
+	request_input: []u8,
+	headers:       []http1.Header,
+	response:      []u8,
+}
+
+Static_Workspace_Pool :: struct {
+	storage:             []Static_Connection_Workspace,
+	free_stack:          []u32,
+	free_count:          int,
+	active_count:        int,
+	high_water_mark:     int,
+	acquisition_count:   u64,
+	release_count:       u64,
+	exhaustion_count:    u64,
+	initialized:         bool,
+}
+
 Static_Connection :: struct {
 	token:           connections.Connection_Token,
 	fd:              linux.Fd,
-	head_driver:     connection.Connection_Head_Driver,
+	workspace_pool:  ^Static_Workspace_Pool,
+	workspace_slot:  int,
 	write_driver:    connection.Connection_Write_Driver,
-	buffers:         ^Static_Connection_Buffers,
 	phase:           Static_Connection_Phase,
 	response_length: int,
 	keep_alive:      bool,
@@ -48,27 +68,46 @@ Static_Connection_Turn :: struct {
 	error_code:    i32,
 }
 
+init_static_workspace_pool :: proc(
+	storage: []Static_Connection_Workspace,
+	free_stack: []u32,
+) -> (pool: Static_Workspace_Pool, result: bool) {
+	if len(storage) == 0 || len(free_stack) < len(storage) {
+		return {}, false
+	}
+	for i := 0; i < len(storage); i += 1 {
+		if len(storage[i].request_input) == 0 ||
+		   len(storage[i].headers) == 0 ||
+		   len(storage[i].response) == 0 {
+			return {}, false
+		}
+		free_stack[i] = u32(len(storage) - i - 1)
+	}
+	return Static_Workspace_Pool {
+		storage     = storage,
+		free_stack  = free_stack,
+		free_count  = len(storage),
+		initialized = true,
+	}, true
+}
+
 init_static_connection :: proc(
 	worker: Worker_Connection,
-	buffers: ^Static_Connection_Buffers,
+	workspace_pool: ^Static_Workspace_Pool,
 ) -> (
 	state: Static_Connection,
 	result: Static_Connection_Result,
 ) {
-	if worker.fd < 0 || buffers == nil ||
-	   len(buffers.request_input) == 0 ||
-	   len(buffers.headers) == 0 ||
-	   len(buffers.response) == 0 {
+	if worker.fd < 0 || !valid_static_workspace_pool(workspace_pool) {
 		return {}, .Invalid
 	}
-	connection_id := static_connection_event_id(worker.token)
 	state = Static_Connection {
-		token       = worker.token,
-		fd          = worker.fd,
-		head_driver = connection.begin_connection_head(connection_id),
-		buffers     = buffers,
-		phase       = .Reading_Request_Head,
-		active      = true,
+		token          = worker.token,
+		fd             = worker.fd,
+		workspace_pool = workspace_pool,
+		workspace_slot = -1,
+		phase          = .Reading_Request_Head,
+		active         = true,
 	}
 	return state, .Need_More
 }
@@ -108,7 +147,7 @@ static_connection_turn :: proc(
 	timeouts: connections.Connection_Timeouts,
 	now_ns: u64,
 ) -> Static_Connection_Turn {
-	if state == nil || state.buffers == nil || routes == nil || table == nil || timers == nil {
+	if state == nil || routes == nil || table == nil || timers == nil {
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	if state.fd < 0 ||
@@ -141,7 +180,6 @@ static_connection_turn :: proc(
 			state.phase = .Failed
 			return Static_Connection_Turn{result = .Invalid}
 		}
-		state.head_driver = connection.begin_connection_head(static_connection_event_id(state.token))
 		state.phase = .Reading_Request_Head
 	}
 
@@ -149,12 +187,18 @@ static_connection_turn :: proc(
 		if !readiness.readable && !readiness.peer_closed {
 			return Static_Connection_Turn{result = .Need_More}
 		}
+		workspace, acquired := acquire_static_workspace(state)
+
+		if !acquired {
+			state.phase = .Failed
+			return Static_Connection_Turn{result = .Capacity_Limit}
+		}
 		read_turn := read_connection_head_turn_with_deadline(
 			static_connection_event_id(state.token),
 			state.fd,
-			&state.head_driver,
-			state.buffers.request_input,
-			state.buffers.headers,
+			&workspace.head_driver,
+			workspace.request_input,
+			workspace.headers,
 			byte_budget,
 			table,
 			state.token,
@@ -163,6 +207,7 @@ static_connection_turn :: proc(
 			now_ns,
 			timeouts,
 		)
+		input_length := workspace.head_driver.input_length
 		turn := Static_Connection_Turn {
 			bytes_read = read_turn.bytes_read,
 		}
@@ -174,11 +219,33 @@ static_connection_turn :: proc(
 		if read_turn.head.result == .Need_More ||
 		   read_turn.head.result == .Would_Block ||
 		   read_turn.head.result == .Interrupted {
+			if input_length == 0 {
+				if read_turn.head.result == .Would_Block ||
+				   read_turn.head.result == .Interrupted {
+					cancel_result := connections.cancel_connection_phase_deadline(
+						table,
+						timers,
+						state.token,
+					)
+					if cancel_result != .Cancelled && cancel_result != .Not_Found {
+						state.phase = .Failed
+						return Static_Connection_Turn{result = .Invalid}
+					}
+				}
+				if !release_static_workspace(state) {
+					state.phase = .Failed
+					return Static_Connection_Turn{result = .Invalid}
+				}
+			}
 			turn.result = .Need_More
 			return turn
 		}
 		if read_turn.head.result != .Ready {
-			write_error_response := static_error_response_for_head(state, read_turn.head.result)
+			write_error_response := static_error_response_for_head(
+				state,
+				workspace.response,
+				read_turn.head.result,
+			)
 
 			if write_error_response.result != .Response_Progress {
 				state.phase = .Failed
@@ -196,14 +263,14 @@ static_connection_turn :: proc(
 		response_event := router.encode_static_route_response(
 			routes,
 			read_turn.head.head,
-			state.buffers.request_input[:state.head_driver.input_length],
-			state.buffers.response,
+			workspace.request_input[:input_length],
+			workspace.response,
 			body_limit,
 		)
 
 		if response_event.result == .Route_Not_Found {
 			error_response := encode_static_error_response(
-				state.buffers.response,
+				workspace.response,
 				404,
 				"Not Found",
 			)
@@ -269,6 +336,10 @@ static_connection_turn :: proc(
 					}
 				}
 				state.phase = .Keep_Alive_Idle
+				if !release_static_workspace(state) {
+					state.phase = .Failed
+					return Static_Connection_Turn{result = .Invalid}
+				}
 				turn.result = .Keep_Alive
 				return turn
 			}
@@ -294,14 +365,110 @@ static_connection_turn :: proc(
 	return Static_Connection_Turn{result = .Invalid}
 }
 
+acquire_static_workspace :: proc(
+	state: ^Static_Connection,
+) -> (workspace: ^Static_Connection_Workspace, acquired: bool) {
+	if state == nil || !valid_static_workspace_pool(state.workspace_pool) {
+		return nil, false
+	}
+	pool := state.workspace_pool
+
+	if state.workspace_slot >= 0 {
+		if state.workspace_slot >= len(pool.storage) {
+			return nil, false
+		}
+		return &pool.storage[state.workspace_slot], true
+	}
+	if state.workspace_slot != -1 {
+		return nil, false
+	}
+	if pool.free_count == 0 {
+		pool.exhaustion_count += 1
+		return nil, false
+	}
+	stack_index := pool.free_count - 1
+	slot := pool.free_stack[stack_index]
+	if u64(slot) >= u64(len(pool.storage)) {
+		return nil, false
+	}
+	pool.free_count = stack_index
+	pool.active_count += 1
+	pool.acquisition_count += 1
+	pool.high_water_mark = max(pool.high_water_mark, pool.active_count)
+	state.workspace_slot = int(slot)
+	workspace = &pool.storage[int(slot)]
+	workspace.head_driver = connection.begin_connection_head(
+		static_connection_event_id(state.token),
+	)
+	return workspace, true
+}
+
+release_static_workspace :: proc(state: ^Static_Connection) -> bool {
+	if state == nil {
+		return false
+	}
+	if state.workspace_slot == -1 {
+		return true
+	}
+	if !valid_static_workspace_pool(state.workspace_pool) {
+		return false
+	}
+	pool := state.workspace_pool
+	if state.workspace_slot < 0 || state.workspace_slot >= len(pool.storage) {
+		return false
+	}
+	if pool.free_count >= len(pool.storage) {
+		return false
+	}
+	if pool.active_count <= 0 {
+		return false
+	}
+	slot := state.workspace_slot
+	reset_static_workspace_head(&pool.storage[slot])
+	pool.free_stack[pool.free_count] = u32(slot)
+	pool.free_count += 1
+	pool.active_count -= 1
+	pool.release_count += 1
+	state.workspace_slot = -1
+	state.write_driver = {}
+	return true
+}
+
+reset_static_workspace_head :: proc(workspace: ^Static_Connection_Workspace) {
+	workspace.head_driver.parser.input_base = nil
+	workspace.head_driver.parser.header_base = nil
+}
+
+valid_static_workspace_pool :: proc(pool: ^Static_Workspace_Pool) -> bool {
+	if pool == nil || !pool.initialized || len(pool.storage) == 0 {
+		return false
+	}
+	if len(pool.free_stack) < len(pool.storage) ||
+	   pool.free_count < 0 ||
+	   pool.free_count > len(pool.storage) ||
+	   pool.active_count < 0 ||
+	   pool.active_count > len(pool.storage) ||
+	   pool.free_count + pool.active_count != len(pool.storage) ||
+	   pool.high_water_mark < pool.active_count ||
+	   pool.high_water_mark > len(pool.storage) {
+		return false
+	}
+	return true
+}
+
 register_static_response_write :: proc(
 	poller: epoll.Epoll,
 	state: ^Static_Connection,
 	table: ^connections.Connection_Table,
 ) -> Static_Connection_Turn {
+	if state == nil || !valid_static_workspace_pool(state.workspace_pool) ||
+	   state.workspace_slot < 0 || state.workspace_slot >= len(state.workspace_pool.storage) {
+		return Static_Connection_Turn{result = .Invalid}
+	}
+	workspace := &state.workspace_pool.storage[state.workspace_slot]
 	state.write_driver = connection.begin_connection_write(
 		static_connection_event_id(state.token),
-		state.buffers.response[:state.response_length],
+		workspace.response[:state.response_length],
 	)
 	if state.write_driver.state != .Pending {
 		state.phase = .Failed
@@ -335,6 +502,7 @@ static_connection_event_id :: proc(token: connections.Connection_Token) -> u64 {
 
 static_error_response_for_head :: proc(
 	state: ^Static_Connection,
+	output: []u8,
 	result: connection.Connection_Head_Result,
 ) -> Static_Connection_Turn {
 	status: u16 = 400
@@ -360,7 +528,7 @@ static_error_response_for_head :: proc(
 	     .Transport_Error:
 		return Static_Connection_Turn{result = .Invalid}
 	}
-	error_response := encode_static_error_response(state.buffers.response, status, reason)
+	error_response := encode_static_error_response(output, status, reason)
 
 	if error_response.result == .Buffer_Small {
 		return Static_Connection_Turn{result = .Response_Buffer_Small}

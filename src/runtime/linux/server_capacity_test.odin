@@ -2,6 +2,7 @@
 #+test
 package linux_runtime
 
+import "core:mem"
 import "core:sys/linux"
 import "core:testing"
 import http1 "veylor:http1"
@@ -11,6 +12,118 @@ import connections "veylor:runtime/connections"
 import shutdown "veylor:runtime/shutdown"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
+
+static_workspace_allocation_client :: proc(t: ^testing.T) {
+	request_input: [128]u8
+	headers: [4]http1.Header
+	response: [128]u8
+	storage: [1]Static_Connection_Workspace
+	storage[0] = Static_Connection_Workspace {
+		request_input = request_input[:],
+		headers       = headers[:],
+		response      = response[:],
+	}
+	free_stack: [1]u32
+	pool, initialized := init_static_workspace_pool(storage[:], free_stack[:])
+	testing.expect_value(t, initialized, true)
+
+	for _ in 0 ..< 64 {
+		state := Static_Connection {
+			token = connections.Connection_Token {
+				slot = 0,
+			},
+			workspace_pool = &pool,
+			workspace_slot = -1,
+		}
+		workspace, acquired := acquire_static_workspace(&state)
+		testing.expect_value(t, acquired, true)
+		if acquired {
+			workspace.head_driver.input_length = 17
+		}
+		testing.expect_value(t, release_static_workspace(&state), true)
+	}
+}
+
+static_workspace_allocation_verifier :: proc(t: ^testing.T, tracker: ^mem.Tracking_Allocator) {
+	testing.expect_value(t, tracker.total_allocation_count, i64(0))
+	testing.expect_value(t, len(tracker.allocation_map), 0)
+}
+
+@(test)
+test_warm_workspace_acquire_and_release_allocates_no_heap_memory :: proc(t: ^testing.T) {
+	testing.expect_leaks(t, static_workspace_allocation_client, static_workspace_allocation_verifier)
+}
+
+@(test)
+test_idle_connection_control_metadata_stays_within_256_bytes :: proc(t: ^testing.T) {
+	idle_metadata_bytes := size_of(Static_Connection) +
+		size_of(connections.Connection_Slot) +
+		size_of(u32)
+	testing.expect_value(t, idle_metadata_bytes <= 256, true)
+}
+
+@(test)
+test_static_workspace_pool_reuses_bounded_caller_storage :: proc(t: ^testing.T) {
+	request_input: [1]u8
+	headers: [1]http1.Header
+	response: [1]u8
+	storage: [1]Static_Connection_Workspace
+	storage[0] = Static_Connection_Workspace {
+		request_input = request_input[:],
+		headers       = headers[:],
+		response      = response[:],
+	}
+	free_stack: [1]u32
+	pool, initialized := init_static_workspace_pool(storage[:], free_stack[:])
+	testing.expect_value(t, initialized, true)
+
+	first := Static_Connection {
+		token = connections.Connection_Token {
+			slot = 0,
+		},
+		workspace_pool = &pool,
+		workspace_slot = -1,
+	}
+	second := Static_Connection {
+		token = connections.Connection_Token {
+			slot = 1,
+		},
+		workspace_pool = &pool,
+		workspace_slot = -1,
+	}
+	workspace, acquired := acquire_static_workspace(&first)
+	testing.expect_value(t, acquired, true)
+	testing.expect_value(t, first.workspace_slot, 0)
+	testing.expect_value(t, pool.free_count, 0)
+	testing.expect_value(t, pool.active_count, 1)
+	testing.expect_value(t, pool.high_water_mark, 1)
+	testing.expect_value(t, pool.acquisition_count, u64(1))
+	if acquired {
+		workspace.head_driver.input_length = 17
+	}
+
+	_, acquired = acquire_static_workspace(&second)
+	testing.expect_value(t, acquired, false)
+	testing.expect_value(t, second.workspace_slot, -1)
+	testing.expect_value(t, pool.free_count, 0)
+	testing.expect_value(t, pool.exhaustion_count, u64(1))
+	testing.expect_value(t, release_static_workspace(&first), true)
+	testing.expect_value(t, pool.free_count, 1)
+	testing.expect_value(t, pool.active_count, 0)
+	testing.expect_value(t, pool.release_count, u64(1))
+
+	workspace, acquired = acquire_static_workspace(&second)
+	testing.expect_value(t, acquired, true)
+	testing.expect_value(t, second.workspace_slot, 0)
+	testing.expect_value(t, pool.acquisition_count, u64(2))
+	if acquired {
+		testing.expect_value(t, workspace.head_driver.input_length, 0)
+	}
+	testing.expect_value(t, release_static_workspace(&second), true)
+	testing.expect_value(t, pool.free_count, 1)
+	testing.expect_value(t, pool.active_count, 0)
+	testing.expect_value(t, pool.release_count, u64(2))
+}
 
 @(test)
 test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testing.T) {
@@ -64,11 +177,18 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [128]u8
-	buffers := Static_Connection_Buffers {
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
 		request_input = request_input[:],
 		headers       = request_headers[:],
 		response      = response_buffer[:],
 	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	timeouts := connections.Connection_Timeouts {
 		request_head_ns = 100,
 	}
@@ -77,7 +197,7 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 			token = token,
 			fd    = sockets[0],
 		},
-		&buffers,
+		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)
@@ -136,6 +256,128 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 }
 
 @(test)
+test_full_workspace_pool_closes_request_without_response :: proc(t: ^testing.T) {
+	sockets: [2]linux.Fd
+	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
+	testing.expect_value(t, socket_result, linux.Errno.NONE)
+	if socket_result != .NONE {
+		return
+	}
+	poller, poller_result, _ := epoll.create()
+	testing.expect_value(t, poller_result, epoll.Result.Ready)
+	if poller_result != .Ready {
+		linux.close(sockets[0])
+		linux.close(sockets[1])
+		return
+	}
+
+	route_storage: [1]router.Static_Route
+	route_index_storage: [2]router.Route_Index_Slot
+	routes := router.init_route_table(route_storage[:], route_index_storage[:])
+	testing.expect_value(t, router.freeze_route_table(&routes), router.Route_Table_Result.Frozen)
+
+	connection_slots: [1]connections.Connection_Slot
+	connection_free_stack: [1]u32
+	table, table_result := connections.init_connection_table(
+		17,
+		1,
+		connection_slots[:],
+		connection_free_stack[:],
+	)
+	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
+	token, allocation_result := connections.allocate_connection(&table, u64(sockets[0]))
+	testing.expect_value(t, allocation_result, connections.Connection_Table_Result.Ready)
+
+	shutdown_state: shutdown.State
+	testing.expect_value(
+		t,
+		shutdown.register_connection(&shutdown_state),
+		shutdown.Result.Accepted,
+	)
+	timer_storage: [2]transport.Timer_Expiration
+	timers := transport.init_timer_queue(timer_storage[:])
+
+	request_input: [128]u8
+	request_headers: [4]http1.Header
+	response_buffer: [128]u8
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_buffer[:],
+	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
+	held_request := Static_Connection {
+		token = connections.Connection_Token {
+			slot = 1,
+		},
+		workspace_pool = &workspace_pool,
+		workspace_slot = -1,
+	}
+	_, acquired := acquire_static_workspace(&held_request)
+	testing.expect_value(t, acquired, true)
+
+	state, state_result := init_static_connection(
+		Worker_Connection {
+			token = token,
+			fd    = sockets[0],
+		},
+		&workspace_pool,
+	)
+	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
+	_, register_error := register_static_connection(poller, &state)
+	testing.expect_value(t, register_error, i32(0))
+
+	request := "GET /health HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	written, write_error := linux.write(sockets[1], transmute([]u8)request)
+	testing.expect_value(t, write_error, linux.Errno.NONE)
+	testing.expect_value(t, written, len(request))
+
+	native_events: [1]linux.EPoll_Event
+	readiness_events: [1]transport.Readiness_Event
+	batch := epoll.wait(poller, native_events[:], readiness_events[:], 100)
+	testing.expect_value(t, batch.result, epoll.Result.Ready)
+	if batch.result == .Ready && len(batch.events) == 1 {
+		turn := static_connection_turn(
+			poller,
+			&state,
+			batch.events[0],
+			&routes,
+			1024,
+			128,
+			&table,
+			&timers,
+			connections.Connection_Timeouts {},
+			100,
+		)
+		testing.expect_value(t, turn.result, Static_Connection_Result.Capacity_Limit)
+	}
+	testing.expect_value(t, state.workspace_slot, -1)
+	testing.expect_value(t, workspace_pool.free_count, 0)
+	testing.expect_value(t, workspace_pool.active_count, 1)
+	testing.expect_value(t, workspace_pool.exhaustion_count, u64(1))
+
+	worker := Static_Worker {
+		poller = poller,
+		shutdown_state = &shutdown_state,
+		table = &table,
+		timers = &timers,
+	}
+	close_result := close_static_worker_connection(&worker, &state)
+	testing.expect_value(t, close_result, Static_Worker_Result.Ready)
+	testing.expect_value(t, release_static_workspace(&held_request), true)
+	testing.expect_value(t, workspace_pool.free_count, 1)
+	testing.expect_value(t, workspace_pool.active_count, 0)
+	epoll.close(&poller)
+	linux.close(sockets[1])
+}
+
+@(test)
 test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) {
 	sockets: [2]linux.Fd
 	socket_error := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
@@ -190,21 +432,38 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	)
 
 	message := "response body"
+	request_input: [1]u8
+	request_headers: [1]http1.Header
 	response_buffer: [128]u8
-	copy(response_buffer[:len(message)], transmute([]u8)message)
-	buffers := Static_Connection_Buffers {
-		response = response_buffer[:],
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
+		request_input = request_input[:],
+		headers       = request_headers[:],
+		response      = response_buffer[:],
 	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	state := Static_Connection {
-		token           = token,
-		fd              = sockets[0],
-		write_driver    = connection.begin_connection_write(1, response_buffer[:len(message)]),
-		buffers         = &buffers,
-		phase           = .Writing_Response,
-		response_length = len(message),
-		active          = true,
-		registered      = true,
+		token          = token,
+		fd             = sockets[0],
+		workspace_pool = &workspace_pool,
+		workspace_slot = -1,
 	}
+	workspace, acquired := acquire_static_workspace(&state)
+	testing.expect_value(t, acquired, true)
+	copy(response_buffer[:len(message)], transmute([]u8)message)
+	state.write_driver = connection.begin_connection_write(
+		1,
+		workspace.response[:len(message)],
+	)
+	state.phase = .Writing_Response
+	state.response_length = len(message)
+	state.active = true
+	state.registered = true
 	_, register_error := epoll.register(
 		poller,
 		sockets[0],
@@ -320,17 +579,24 @@ test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t:
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [96]u8
-	buffers := Static_Connection_Buffers {
+	workspace_storage: [1]Static_Connection_Workspace
+	workspace_storage[0] = Static_Connection_Workspace {
 		request_input = request_input[:],
 		headers       = request_headers[:],
 		response      = response_buffer[:],
 	}
+	workspace_free_stack: [1]u32
+	workspace_pool, pool_ready := init_static_workspace_pool(
+		workspace_storage[:],
+		workspace_free_stack[:],
+	)
+	testing.expect_value(t, pool_ready, true)
 	state, state_result := init_static_connection(
 		Worker_Connection {
 			token = token,
 			fd    = sockets[0],
 		},
-		&buffers,
+		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)

@@ -77,15 +77,6 @@ init_managed_server :: proc(
 	if len(worker.timers.storage) < required_timers {
 		return .Capacity
 	}
-	for i := 0; i < len(worker.table.slots); i += 1 {
-		buffers := worker.connection_buffers[i]
-
-		if len(buffers.request_input) == 0 ||
-		   len(buffers.headers) == 0 ||
-		   len(buffers.response) == 0 {
-			return .Invalid
-		}
-	}
 	if len(worker_storage) == 0 {
 		return .Capacity
 	}
