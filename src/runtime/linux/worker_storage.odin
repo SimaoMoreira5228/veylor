@@ -66,6 +66,7 @@ init_static_worker_storage :: proc(
 	worker_generation: u64,
 	routes: ^router.Route_Table,
 	file_root: ^Static_File_Root,
+	native_routes: ^router.Native_Table = nil,
 ) -> Static_Worker_Storage_Result {
 	if storage == nil {
 		return {error = .Invalid}
@@ -113,7 +114,9 @@ init_static_worker_storage :: proc(
 		return {error = .Timer_Queue_Failed}
 	}
 
-	for workspace_index := 0; workspace_index < STATIC_WORKER_WORKSPACE_CAPACITY; workspace_index += 1 {
+	for workspace_index := 0;
+	    workspace_index < STATIC_WORKER_WORKSPACE_CAPACITY;
+	    workspace_index += 1 {
 		storage.workspace_storage[workspace_index] = Static_Connection_Workspace {
 			request_input = storage.request_input_storage[workspace_index][:],
 			headers       = storage.header_storage[workspace_index][:],
@@ -138,6 +141,7 @@ init_static_worker_storage :: proc(
 		table = &storage.connection_table,
 		routes = routes,
 		file_root = file_root,
+		native_routes = native_routes,
 		connection_states = storage.connection_states[:],
 		workspace_pool = &storage.workspace_pool,
 		native_events = storage.native_events[:],

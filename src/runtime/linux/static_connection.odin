@@ -70,6 +70,7 @@ Static_Connection :: struct {
 	fd:              linux.Fd,
 	workspace_pool:  ^Static_Workspace_Pool,
 	file_root:       ^Static_File_Root,
+	native_routes:   ^router.Native_Table,
 	workspace_slot:  int,
 	write_driver:    connection.Connection_Write_Driver,
 	file:            Static_File,
@@ -123,6 +124,7 @@ init_static_connection :: proc(
 	worker: Worker_Connection,
 	workspace_pool: ^Static_Workspace_Pool,
 	file_root: ^Static_File_Root = nil,
+	native_routes: ^router.Native_Table = nil,
 ) -> (
 	state: Static_Connection,
 	result: Static_Connection_Result,
@@ -137,6 +139,7 @@ init_static_connection :: proc(
 		fd = worker.fd,
 		workspace_pool = workspace_pool,
 		file_root = file_root,
+		native_routes = native_routes,
 		workspace_slot = -1,
 		file = Static_File{fd = -1},
 		phase = .Reading_Request_Head,
@@ -314,6 +317,36 @@ static_connection_turn :: proc(
 			return turn
 		}
 		state.phase = .Writing_Response
+
+		if state.native_routes != nil {
+			native_event := dispatch_native_route_response(
+				state.native_routes,
+				read_turn.head.head,
+				workspace.request_input[:input_length],
+				workspace.response,
+				body_limit,
+			)
+			if native_event.result == .Responded {
+				state.response_length = native_event.written
+				state.keep_alive = native_event.keep_alive
+				if !native_event.keep_alive {
+					state.close_reason = .Normal
+				}
+				write_turn := register_static_response_write(poller, state, table)
+				write_turn.bytes_read += turn.bytes_read
+				return write_turn
+			}
+			if native_event.result == .Buffer_Small {
+				state.close_reason = .Response_Buffer_Limit
+				state.phase = .Failed
+				return Static_Connection_Turn{result = .Response_Buffer_Small}
+			}
+			if native_event.result == .Invalid {
+				state.close_reason = .Internal_Error
+				state.phase = .Failed
+				return Static_Connection_Turn{result = .Invalid}
+			}
+		}
 
 		response_event := router.encode_static_route_response(
 			routes,

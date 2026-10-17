@@ -26,6 +26,7 @@ Static_Worker :: struct {
 	table:                      ^connections.Connection_Table,
 	routes:                     ^router.Route_Table,
 	file_root:                  ^Static_File_Root,
+	native_routes:              ^router.Native_Table,
 	connection_states:          []Static_Connection,
 	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
@@ -142,6 +143,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			accepted,
 			worker.workspace_pool,
 			worker.file_root,
+			worker.native_routes,
 		)
 
 		if init_result != .Need_More {

@@ -3,6 +3,7 @@ package abi
 
 import odin_runtime "base:runtime"
 import "core:mem"
+import "core:sync"
 import response "veylor:http1/response"
 import router "veylor:router"
 import server_runtime "veylor:runtime/linux"
@@ -21,17 +22,19 @@ Vyl_Server_State :: enum {
 }
 
 Vyl_Server :: struct {
-	config:              Vyl_Config,
-	state:               Vyl_Server_State,
-	route_storage:       [VYL_MAX_ROUTES]router.Static_Route,
-	route_index_storage: [VYL_ROUTE_INDEX_CAPACITY]router.Route_Index_Slot,
-	routes:              router.Route_Table,
-	route_bytes:         [VYL_ROUTE_BYTES_CAPACITY]u8,
-	route_bytes_used:    int,
-	worker_storage:      []server_runtime.Static_Worker_Storage,
-	server_workers:      [VYL_MAX_WORKERS]^server_runtime.Static_Worker,
-	worker_threads:      [VYL_MAX_WORKERS]workers.Worker_Thread,
-	managed_server:      server_runtime.Managed_Server,
+	config:               Vyl_Config,
+	state:                Vyl_Server_State,
+	route_storage:        [VYL_MAX_ROUTES]router.Static_Route,
+	route_index_storage:  [VYL_ROUTE_INDEX_CAPACITY]router.Route_Index_Slot,
+	routes:               router.Route_Table,
+	route_bytes:          [VYL_ROUTE_BYTES_CAPACITY]u8,
+	route_bytes_used:     int,
+	native_route_storage: [VYL_MAX_ROUTES]router.Native_Route,
+	native_routes:        router.Native_Table,
+	worker_storage:       []server_runtime.Static_Worker_Storage,
+	server_workers:       [VYL_MAX_WORKERS]^server_runtime.Static_Worker,
+	worker_threads:       [VYL_MAX_WORKERS]workers.Worker_Thread,
+	managed_server:       server_runtime.Managed_Server,
 }
 
 @(export)
@@ -75,6 +78,7 @@ vyl_server_create :: proc "c" (config: ^Vyl_Config, out_server: ^^Vyl_Server) ->
 	server.worker_storage = worker_storage_ptr[:int(config.worker_count)]
 	server.config = config^
 	server.routes = router.init_route_table(server.route_storage[:], server.route_index_storage[:])
+	server.native_routes = router.init_native_table(server.native_route_storage[:])
 	server.state = .Configuring
 
 	out_server^ = server
@@ -115,6 +119,10 @@ vyl_server_route_static :: proc "c" (
 	if !response.valid_response_value(reason_bytes) {
 		return i32(Vyl_Result.Invalid_Argument)
 	}
+	_, native_conflict := router.find_native_route(&server.native_routes, method_bytes, path_bytes)
+	if native_conflict == .Found {
+		return i32(Vyl_Result.Duplicate_Route)
+	}
 
 	bytes_needed := int(method.length + path.length + reason.length + body.length)
 	if server.route_bytes_used > len(server.route_bytes) - bytes_needed {
@@ -138,6 +146,67 @@ vyl_server_route_static :: proc "c" (
 			return i32(Vyl_Result.Duplicate_Route)
 		}
 		if register_result == .Full || register_result == .Index_Capacity {
+			return i32(Vyl_Result.Capacity)
+		}
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	return i32(Vyl_Result.Ok)
+}
+
+@(export)
+vyl_server_route_native :: proc "c" (
+	server: ^Vyl_Server,
+	method: Vyl_Bytes,
+	path: Vyl_Bytes,
+	handler: Vyl_Native_Handler,
+	user_data: rawptr,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if server == nil || !valid_configuring_server(server) {
+		return i32(Vyl_Result.Bad_State)
+	}
+	if !valid_input_bytes(method, VYL_MAX_METHOD_BYTES, false) ||
+	   !valid_input_bytes(path, VYL_MAX_PATH_BYTES, false) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if handler == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	method_bytes := method.data[:int(method.length)]
+	path_bytes := path.data[:int(path.length)]
+
+	bytes_needed := int(method.length + path.length)
+	if server.route_bytes_used > len(server.route_bytes) - bytes_needed {
+		return i32(Vyl_Result.Capacity)
+	}
+	for i := 0; i < server.routes.count; i += 1 {
+		static_route := server.routes.routes[i]
+		if router.compare_bytes(static_route.method, method_bytes) == 0 &&
+		   router.compare_bytes(static_route.path, path_bytes) == 0 {
+			return i32(Vyl_Result.Duplicate_Route)
+		}
+	}
+
+	previous_bytes_used := server.route_bytes_used
+	owned_method := retain_route_bytes(server, method_bytes)
+	owned_path := retain_route_bytes(server, path_bytes)
+
+	register_result := router.register_native_route(
+		&server.native_routes,
+		owned_method,
+		owned_path,
+		router.Native_Handler(handler),
+		user_data,
+	)
+	if register_result != .Added {
+		server.route_bytes_used = previous_bytes_used
+		if register_result == .Duplicate {
+			return i32(Vyl_Result.Duplicate_Route)
+		}
+		if register_result == .Full {
 			return i32(Vyl_Result.Capacity)
 		}
 		return i32(Vyl_Result.Invalid_Argument)
@@ -200,6 +269,7 @@ vyl_server_listen :: proc "c" (
 			1,
 			&server.routes,
 			nil,
+			&server.native_routes,
 		)
 		if worker_result.error != .None {
 			system_error^ = worker_result.system_error
@@ -287,6 +357,14 @@ vyl_server_join :: proc "c" (server: ^Vyl_Server) -> i32 {
 	}
 	if server.state != .Stop_Requested {
 		return i32(Vyl_Result.Bad_State)
+	}
+
+	caller := sync.current_thread_id()
+	for i := 0; i < int(server.config.worker_count); i += 1 {
+		worker_thread := server.worker_threads[i].thread
+		if worker_thread != nil && worker_thread.id == caller {
+			return i32(Vyl_Result.Busy)
+		}
 	}
 
 	join_result := server_runtime.join_managed_server(&server.managed_server)

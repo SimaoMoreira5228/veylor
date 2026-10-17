@@ -34,3 +34,20 @@ Vyl_Bytes :: struct {
 	data:   [^]u8,
 	length: u32,
 }
+
+Vyl_Native_Request :: struct {
+	method: Vyl_Bytes,
+	path:   Vyl_Bytes,
+}
+
+Vyl_Native_Response :: struct {
+	status: i32,
+	reason: Vyl_Bytes,
+	body:   Vyl_Bytes,
+}
+
+Vyl_Native_Handler :: #type proc "c" (
+	user_data: rawptr,
+	request: ^Vyl_Native_Request,
+	response: ^Vyl_Native_Response,
+) -> i32

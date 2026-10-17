@@ -37,10 +37,29 @@ typedef struct {
   uint32_t length;
 } vyl_bytes;
 
+typedef struct {
+  vyl_bytes method;
+  vyl_bytes path;
+} vyl_native_request;
+
+typedef struct {
+  int32_t status;
+  vyl_bytes reason;
+  vyl_bytes body;
+} vyl_native_response;
+
+typedef int32_t (*vyl_native_handler)(void *user_data,
+                                      const vyl_native_request *request,
+                                      vyl_native_response *response);
+
 int32_t vyl_server_create(const vyl_config *config, vyl_server **out_server);
 int32_t vyl_server_route_static(vyl_server *server, vyl_bytes method,
                                 vyl_bytes path, int32_t status,
                                 vyl_bytes reason, vyl_bytes body);
+ 
+int32_t vyl_server_route_native(vyl_server *server, vyl_bytes method,
+                                vyl_bytes path, vyl_native_handler handler,
+                                void *user_data);
 int32_t vyl_server_listen(vyl_server *server, const uint8_t address[4],
                           uint16_t port, uint16_t *bound_port,
                           int32_t *system_error);
