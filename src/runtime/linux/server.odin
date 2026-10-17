@@ -59,6 +59,7 @@ init_managed_server :: proc(
 	if server.phase != .Unstarted {
 		return .Invalid
 	}
+
 	listener_fd := linux.Fd(-1)
 	for i := 0; i < len(server_workers); i += 1 {
 		worker := server_workers[i]
@@ -79,6 +80,9 @@ init_managed_server :: proc(
 		if worker.timeouts.request_head_ns == 0 ||
 		   worker.timeouts.response_write_ns == 0 ||
 		   worker.timeouts.keep_alive_idle_ns == 0 {
+			return .Invalid
+		}
+		if worker.timeout_ms == 0 {
 			return .Invalid
 		}
 		required_timers := len(worker.table.slots) + 2
@@ -116,10 +120,12 @@ init_managed_server :: proc(
 			}
 		}
 	}
+
 	for worker in server_workers {
 		worker.control_fd = -1
 		worker.managed_result = .Ready
 	}
+
 	server^ = Managed_Server {
 		server_workers    = server_workers,
 		worker_pool       = workers.init_worker_pool(worker_storage),
@@ -155,6 +161,7 @@ start_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result {
 		worker.control_registered = true
 		worker.managed_result = .Ready
 	}
+
 	sync.atomic_store_explicit(&server.stop_requested, false, .Relaxed)
 	sync.atomic_store_explicit(&server.force_stop_requested, false, .Relaxed)
 	pool_result := workers.start_worker_pool(
@@ -221,6 +228,7 @@ join_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result {
 		return .Worker_Error
 	}
 	server.phase = .Joined
+
 	for worker in server.server_workers {
 		if worker.managed_result != .Ready {
 			return .Worker_Error
@@ -262,8 +270,8 @@ destroy_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result
 		}
 		if server.phase == .Joined &&
 		   (worker.shutdown_state.phase != .Complete ||
-		    worker.shutdown_state.active_connections != 0 ||
-		    worker.timers.count != 0) {
+				   worker.shutdown_state.active_connections != 0 ||
+				   worker.timers.count != 0) {
 			return .Busy
 		}
 	}
@@ -278,11 +286,13 @@ destroy_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result
 			return .Worker_Error
 		}
 	}
+
 	pool_result := workers.destroy_worker_pool(&server.worker_pool)
 
 	if pool_result != .Destroyed {
 		return .Worker_Error
 	}
+
 	result := Managed_Server_Result.Destroyed
 	for worker in server.server_workers {
 		if worker.control_registered {
@@ -331,10 +341,7 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 				if !cancel_static_worker_listener_retry(worker) {
 					worker.managed_result = .Error
 				}
-				force_result := shutdown.force_shutdown(
-					worker.shutdown_state,
-					worker.timers,
-				)
+				force_result := shutdown.force_shutdown(worker.shutdown_state, worker.timers)
 				if force_result != .Force_Connections && force_result != .Completed {
 					worker.managed_result = .Error
 				}
@@ -366,9 +373,11 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 				}
 			}
 		}
+
 		if worker.shutdown_state.phase == .Complete {
 			return
 		}
+
 		turn := run_static_worker_turn(worker)
 
 		if turn.result == .Error || turn.result == .Invalid {

@@ -54,12 +54,14 @@ init_managed_server_test_instance :: proc(
 	if listener_result != .Ready {
 		return false
 	}
+
 	if !init_managed_server_test_worker(instance, worker_id, path, body, listener) {
 		socket.close_listener(&listener)
 		instance.worker.listener.fd = -1
 		return false
 	}
 	instance.server_workers[0] = &instance.worker
+
 	server_result := init_managed_server(
 		&instance.server,
 		instance.server_workers[:],
@@ -94,6 +96,7 @@ init_managed_server_test_worker :: proc(
 	   workspace_capacity > len(instance.workspace_storage) {
 		return false
 	}
+
 	instance.worker.poller.fd = -1
 	instance.worker.listener.fd = listener.fd
 	instance.worker.listener.local_address = listener.local_address
@@ -103,6 +106,7 @@ init_managed_server_test_worker :: proc(
 	if poller_result != .Ready {
 		return false
 	}
+
 	instance.routes = router.init_route_table(
 		instance.route_storage[:],
 		instance.route_index_storage[:],
@@ -125,6 +129,7 @@ init_managed_server_test_worker :: proc(
 		epoll.close(&poller)
 		return false
 	}
+
 	table_result: connections.Connection_Table_Result
 	instance.table, table_result = connections.init_connection_table(
 		worker_id,
@@ -204,6 +209,31 @@ cleanup_managed_server_test_instance :: proc(instance: ^Managed_Server_Test_Inst
 }
 
 @(test)
+test_managed_server_rejects_zero_poll_timeout :: proc(t: ^testing.T) {
+	instance: Managed_Server_Test_Instance
+	loopback := [4]u8{127, 0, 0, 1}
+	listener, listen_result, _ := socket.listen_ipv4(loopback, 0, 4)
+	testing.expect_value(t, listen_result, socket.Result.Ready)
+	if listen_result != .Ready {
+		return
+	}
+
+	worker_ready := init_managed_server_test_worker(&instance, 41, "/ready", "ready", listener, 0)
+	testing.expect_value(t, worker_ready, true)
+	if !worker_ready {
+		cleanup_managed_server_test_instance(&instance)
+		return
+	}
+
+	server_workers := [?]^Static_Worker{&instance.worker}
+	worker_storage: [1]workers.Worker_Thread
+	server: Managed_Server
+	init_result := init_managed_server(&server, server_workers[:], worker_storage[:], 0)
+	testing.expect_value(t, init_result, Managed_Server_Result.Invalid)
+	cleanup_managed_server_test_instance(&instance)
+}
+
+@(test)
 test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T) {
 	loopback := [4]u8{127, 0, 0, 1}
 	listener, listen_result, listen_error := socket.listen_ipv4(loopback, 0, 4)
@@ -213,6 +243,7 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 	if listen_result != .Ready {
 		return
 	}
+
 	poller, poll_result, poll_error := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
 	testing.expect_value(t, poll_error, i32(0))
