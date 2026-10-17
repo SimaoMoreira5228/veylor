@@ -6,6 +6,7 @@ check:
     odin check src/runtime/connections -vet -no-entry-point -collection:veylor=src
     odin check src/runtime/shutdown -vet -no-entry-point -collection:veylor=src
     odin check src/runtime/workers -vet -no-entry-point -collection:veylor=src
+    odin check src/runtime/host -vet -no-entry-point -collection:veylor=src
     odin check src/router -vet -no-entry-point -collection:veylor=src
     odin check src/http1 -vet -no-entry-point -collection:veylor=src
     odin check src/http1/body -vet -no-entry-point -collection:veylor=src
@@ -22,6 +23,7 @@ test:
     odin test src/runtime/connections -all-packages -collection:veylor=src -out:build/test-runtime-connections
     odin test src/runtime/shutdown -all-packages -collection:veylor=src -out:build/test-runtime-shutdown
     odin test src/runtime/workers -all-packages -collection:veylor=src -out:build/test-runtime-workers
+    odin test src/runtime/host -all-packages -collection:veylor=src -out:build/test-runtime-host
     odin test src/router -all-packages -collection:veylor=src -out:build/test-router
 
 check-linux:

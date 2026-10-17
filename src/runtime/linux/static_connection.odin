@@ -6,6 +6,7 @@ import http1 "veylor:http1"
 import connection "veylor:http1/connection"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
+import host "veylor:runtime/host"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
 
@@ -13,6 +14,7 @@ Static_Connection_Phase :: enum {
 	Reading_Request_Head,
 	Writing_Response,
 	Writing_File_Body,
+	Awaiting_Host,
 	Keep_Alive_Idle,
 	Closed,
 	Failed,
@@ -40,6 +42,7 @@ Static_Connection_Close_Reason :: enum u8 {
 	Response_Buffer_Limit,
 	Transport_Error,
 	Timed_Out,
+	Host_Queue_Full,
 	Shutdown_Forced,
 	Initialization_Failed,
 	Internal_Error,
@@ -70,6 +73,7 @@ Static_Connection :: struct {
 	fd:              linux.Fd,
 	workspace_pool:  ^Static_Workspace_Pool,
 	file_root:       ^Static_File_Root,
+	host_queue:      ^host.Host_Queue,
 	native_routes:   ^router.Native_Table,
 	workspace_slot:  int,
 	write_driver:    connection.Connection_Write_Driver,
@@ -125,6 +129,7 @@ init_static_connection :: proc(
 	workspace_pool: ^Static_Workspace_Pool,
 	file_root: ^Static_File_Root = nil,
 	native_routes: ^router.Native_Table = nil,
+	host_queue: ^host.Host_Queue = nil,
 ) -> (
 	state: Static_Connection,
 	result: Static_Connection_Result,
@@ -140,6 +145,7 @@ init_static_connection :: proc(
 		workspace_pool = workspace_pool,
 		file_root = file_root,
 		native_routes = native_routes,
+		host_queue = host_queue,
 		workspace_slot = -1,
 		file = Static_File{fd = -1},
 		phase = .Reading_Request_Head,
@@ -208,6 +214,10 @@ static_connection_turn :: proc(
 		state.close_reason = .Peer_Closed
 		state.phase = .Closed
 		return Static_Connection_Turn{result = .Closed}
+	}
+
+	if state.phase == .Awaiting_Host {
+		return Static_Connection_Turn{result = .Need_More}
 	}
 
 	if state.phase == .Keep_Alive_Idle {
@@ -309,15 +319,6 @@ static_connection_turn :: proc(
 			write_turn.bytes_read += turn.bytes_read
 			return write_turn
 		}
-		if connections.transition_connection(table, state.token, .Writing_Response) !=
-		   .Transitioned {
-			state.close_reason = .Internal_Error
-			state.phase = .Failed
-			turn.result = .Invalid
-			return turn
-		}
-		state.phase = .Writing_Response
-
 		if state.native_routes != nil {
 			native_event := dispatch_native_route_response(
 				state.native_routes,
@@ -355,6 +356,30 @@ static_connection_turn :: proc(
 			workspace.response,
 			body_limit,
 		)
+
+		if response_event.result == .Managed {
+			managed_turn := park_static_connection_for_host(
+				poller,
+				state,
+				read_turn.head.head,
+				routes,
+				workspace,
+				input_length,
+				turn.bytes_read,
+				table,
+				timers,
+			)
+			return managed_turn
+		}
+
+		if connections.transition_connection(table, state.token, .Writing_Response) !=
+		   .Transitioned {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			turn.result = .Invalid
+			return turn
+		}
+		state.phase = .Writing_Response
 
 		file_response_ready := false
 		if response_event.result == .Route_Not_Found && state.file_root != nil {
@@ -647,6 +672,68 @@ valid_static_workspace_pool :: proc(pool: ^Static_Workspace_Pool) -> bool {
 		return false
 	}
 	return true
+}
+
+park_static_connection_for_host :: proc(
+	poller: epoll.Epoll,
+	state: ^Static_Connection,
+	head: http1.Request_Head,
+	routes: ^router.Route_Table,
+	workspace: ^Static_Connection_Workspace,
+	input_length: int,
+	bytes_read: int,
+	table: ^connections.Connection_Table,
+	timers: ^transport.Timer_Queue,
+) -> Static_Connection_Turn {
+	if state.host_queue == nil {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	input := workspace.request_input[:input_length]
+	method := input[head.method.offset:head.method.offset + head.method.length]
+	target := input[head.target.offset:head.target.offset + head.target.length]
+	path, _, path_result := router.request_path(head.target_form, method, target)
+	if path_result != .Found {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	managed_route, managed_result := router.find_static_request_route(routes, head, input)
+	if managed_result != .Found || managed_route.kind != .Managed {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	enqueue_result := host.enqueue_request(
+		state.host_queue,
+		state.token,
+		managed_route.route_id,
+		method,
+		path,
+	)
+	if enqueue_result == .Full {
+		state.close_reason = .Host_Queue_Full
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Capacity_Limit}
+	}
+	if enqueue_result != .Enqueued {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	if connections.transition_connection(table, state.token, .Awaiting_Handler) != .Transitioned {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	if !release_static_workspace(state) {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	state.phase = .Awaiting_Host
+	return Static_Connection_Turn{bytes_read = bytes_read, result = .Need_More}
 }
 
 register_static_response_write :: proc(

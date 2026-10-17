@@ -7,6 +7,7 @@ Static_Response_Result :: enum {
 	Written,
 	Route_Not_Found,
 	Buffer_Small,
+	Managed,
 	Invalid,
 }
 
@@ -31,6 +32,10 @@ encode_static_route_response :: proc(
 
 	if route_result != .Found {
 		return Static_Response_Event{result = .Invalid}
+	}
+
+	if route.kind == .Managed {
+		return Static_Response_Event{result = .Managed}
 	}
 
 	if head.length < 0 {

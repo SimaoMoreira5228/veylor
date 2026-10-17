@@ -60,6 +60,8 @@ int32_t vyl_server_route_static(vyl_server *server, vyl_bytes method,
 int32_t vyl_server_route_native(vyl_server *server, vyl_bytes method,
                                 vyl_bytes path, vyl_native_handler handler,
                                 void *user_data);
+int32_t vyl_server_route_managed(vyl_server *server, vyl_bytes method,
+                                 vyl_bytes path);
 int32_t vyl_server_listen(vyl_server *server, const uint8_t address[4],
                           uint16_t port, uint16_t *bound_port,
                           int32_t *system_error);

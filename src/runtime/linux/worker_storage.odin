@@ -5,6 +5,7 @@ import "core:sys/linux"
 import http1 "veylor:http1"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
+import host "veylor:runtime/host"
 import shutdown "veylor:runtime/shutdown"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
@@ -51,6 +52,8 @@ Static_Worker_Storage :: struct {
 	request_input_storage: [STATIC_WORKER_WORKSPACE_CAPACITY][STATIC_WORKER_REQUEST_INPUT_CAPACITY]u8,
 	header_storage:        [STATIC_WORKER_WORKSPACE_CAPACITY][STATIC_WORKER_HEADER_CAPACITY]http1.Header,
 	response_storage:      [STATIC_WORKER_WORKSPACE_CAPACITY][STATIC_WORKER_RESPONSE_CAPACITY]u8,
+	host_event_storage:    [host.HOST_QUEUE_DEPTH]host.Host_Event,
+	host_queue:            host.Host_Queue,
 	native_events:         [STATIC_WORKER_EVENT_CAPACITY]linux.EPoll_Event,
 	readiness_events:      [STATIC_WORKER_EVENT_CAPACITY]transport.Readiness_Event,
 	accepted_storage:      [STATIC_WORKER_ACCEPT_CAPACITY]socket.Accepted_Connection,
@@ -105,6 +108,7 @@ init_static_worker_storage :: proc(
 	}
 	storage.connection_table = table
 
+	storage.host_queue = host.init_host_queue(storage.host_event_storage[:])
 	storage.timers = transport.init_timer_queue(
 		storage.timer_storage[:],
 		storage.timer_index_storage[:],
@@ -142,6 +146,7 @@ init_static_worker_storage :: proc(
 		routes = routes,
 		file_root = file_root,
 		native_routes = native_routes,
+		host_queue = &storage.host_queue,
 		connection_states = storage.connection_states[:],
 		workspace_pool = &storage.workspace_pool,
 		native_events = storage.native_events[:],

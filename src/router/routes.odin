@@ -10,6 +10,11 @@ Static_Response :: struct {
 	body:    []u8,
 }
 
+Route_Kind :: enum {
+	Static,
+	Managed,
+}
+
 // NOTE: Route keys, response slices, and index storage must remain alive and unchanged until discard.
 Static_Route :: struct {
 	method:                []u8,
@@ -17,6 +22,7 @@ Static_Route :: struct {
 	response:              Static_Response,
 	route_id:              u64,
 	dynamic_segment_count: int,
+	kind:                  Route_Kind,
 }
 
 MAX_ROUTE_HASH_PROBES :: 8
@@ -119,6 +125,57 @@ register_static_route :: proc(
 		path                  = path,
 		response              = static_response,
 		dynamic_segment_count = dynamic_segments,
+		kind                  = .Static,
+	}
+
+	table.count += 1
+	return .Added
+}
+
+register_managed_route :: proc(
+	table: ^Route_Table,
+	method: []u8,
+	path: []u8,
+) -> Route_Table_Result {
+	if table == nil {
+		return .Invalid
+	}
+
+	if table.state == .Frozen {
+		return .Frozen
+	}
+
+	if table.state != .Registering {
+		return .Invalid
+	}
+
+	if !valid_route_method(method) {
+		return .Invalid
+	}
+
+	dynamic_segments, pattern_valid := inspect_route_pattern(path)
+
+	if !pattern_valid {
+		return .Invalid
+	}
+
+	if table.count < 0 {
+		return .Invalid
+	}
+
+	if table.count > len(table.routes) {
+		return .Invalid
+	}
+
+	if table.count == len(table.routes) {
+		return .Full
+	}
+
+	table.routes[table.count] = Static_Route {
+		method                = method,
+		path                  = path,
+		dynamic_segment_count = dynamic_segments,
+		kind                  = .Managed,
 	}
 
 	table.count += 1

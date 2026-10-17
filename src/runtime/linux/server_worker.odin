@@ -4,6 +4,7 @@ package linux_runtime
 import "core:sys/linux"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
+import host "veylor:runtime/host"
 import shutdown "veylor:runtime/shutdown"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
@@ -27,6 +28,7 @@ Static_Worker :: struct {
 	routes:                     ^router.Route_Table,
 	file_root:                  ^Static_File_Root,
 	native_routes:              ^router.Native_Table,
+	host_queue:                 ^host.Host_Queue,
 	connection_states:          []Static_Connection,
 	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
@@ -144,6 +146,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			worker.workspace_pool,
 			worker.file_root,
 			worker.native_routes,
+			worker.host_queue,
 		)
 
 		if init_result != .Need_More {

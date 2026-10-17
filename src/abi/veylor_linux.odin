@@ -216,6 +216,58 @@ vyl_server_route_native :: proc "c" (
 }
 
 @(export)
+vyl_server_route_managed :: proc "c" (
+	server: ^Vyl_Server,
+	method: Vyl_Bytes,
+	path: Vyl_Bytes,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if server == nil || !valid_configuring_server(server) {
+		return i32(Vyl_Result.Bad_State)
+	}
+	if !valid_input_bytes(method, VYL_MAX_METHOD_BYTES, false) ||
+	   !valid_input_bytes(path, VYL_MAX_PATH_BYTES, false) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	method_bytes := method.data[:int(method.length)]
+	path_bytes := path.data[:int(path.length)]
+	_, native_conflict := router.find_native_route(&server.native_routes, method_bytes, path_bytes)
+	if native_conflict == .Found {
+		return i32(Vyl_Result.Duplicate_Route)
+	}
+	for i := 0; i < server.routes.count; i += 1 {
+		static_route := server.routes.routes[i]
+		if router.compare_bytes(static_route.method, method_bytes) == 0 &&
+		   router.compare_bytes(static_route.path, path_bytes) == 0 {
+			return i32(Vyl_Result.Duplicate_Route)
+		}
+	}
+
+	bytes_needed := int(method.length + path.length)
+	if server.route_bytes_used > len(server.route_bytes) - bytes_needed {
+		return i32(Vyl_Result.Capacity)
+	}
+	previous_bytes_used := server.route_bytes_used
+	owned_method := retain_route_bytes(server, method_bytes)
+	owned_path := retain_route_bytes(server, path_bytes)
+	register_result := router.register_managed_route(&server.routes, owned_method, owned_path)
+	if register_result != .Added {
+		server.route_bytes_used = previous_bytes_used
+		if register_result == .Duplicate {
+			return i32(Vyl_Result.Duplicate_Route)
+		}
+		if register_result == .Full {
+			return i32(Vyl_Result.Capacity)
+		}
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	return i32(Vyl_Result.Ok)
+}
+
+@(export)
 vyl_server_listen :: proc "c" (
 	server: ^Vyl_Server,
 	address: [^]u8,

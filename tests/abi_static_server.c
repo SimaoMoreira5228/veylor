@@ -287,10 +287,39 @@ int main(void) {
     return 1;
   }
 
+  uint8_t managed_method[] = "GET";
+  uint8_t managed_path[] = "/managed";
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){managed_method, sizeof(managed_method) - 1},
+      (vyl_bytes){managed_path, sizeof(managed_path) - 1});
+  if (!expect_result("managed route", result, VYL_OK)) {
+    return 1;
+  }
+
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){managed_method, sizeof(managed_method) - 1},
+      (vyl_bytes){managed_path, sizeof(managed_path) - 1});
+  if (!expect_result("duplicate managed route", result, VYL_DUPLICATE_ROUTE)) {
+    return 1;
+  }
+
+  uint8_t clash_method[] = "GET";
+  uint8_t clash_path[] = "/health";
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){clash_method, sizeof(clash_method) - 1},
+      (vyl_bytes){clash_path, sizeof(clash_path) - 1});
+  if (!expect_result("managed over static", result, VYL_DUPLICATE_ROUTE)) {
+    return 1;
+  }
+
   memset(echo_method, 'X', sizeof(echo_method) - 1);
   memset(echo_path, 'X', sizeof(echo_path) - 1);
   memset(guard_method, 'X', sizeof(guard_method) - 1);
   memset(guard_path, 'X', sizeof(guard_path) - 1);
+  memset(managed_method, 'X', sizeof(managed_method) - 1);
+  memset(managed_path, 'X', sizeof(managed_path) - 1);
+  memset(clash_method, 'X', sizeof(clash_method) - 1);
+  memset(clash_path, 'X', sizeof(clash_path) - 1);
 
   const uint8_t loopback[4] = {127, 0, 0, 1};
   uint16_t bound_port = 0;
