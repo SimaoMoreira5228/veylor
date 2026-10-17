@@ -43,7 +43,7 @@ listen_ipv4 :: proc(
 	address: [4]u8,
 	port: u16,
 	backlog: i32,
-	reuse_address := true,
+	reuse_port := false,
 ) -> (
 	listener: Listener,
 	result: Result,
@@ -52,6 +52,7 @@ listen_ipv4 :: proc(
 	if backlog <= 0 {
 		return {}, .Invalid, 0
 	}
+
 	socket_flags: linux.Socket_FD_Flags = {.NONBLOCK, .CLOEXEC}
 	fd, socket_error := linux.socket(.INET, .STREAM, socket_flags, .TCP)
 
@@ -59,13 +60,19 @@ listen_ipv4 :: proc(
 		return {}, .Error, i32(socket_error)
 	}
 
-	if reuse_address {
-		reuse_value := i32(1)
-		option_error := linux.setsockopt(fd, .SOCKET, .REUSEADDR, &reuse_value)
+	reuse_address := i32(1)
+	address_option_error := linux.setsockopt(fd, .SOCKET, .REUSEADDR, &reuse_address)
+	if address_option_error != .NONE {
+		linux.close(fd)
+		return {}, .Error, i32(address_option_error)
+	}
 
-		if option_error != .NONE {
+	if reuse_port {
+		reuse_port_value := i32(1)
+		port_option_error := linux.setsockopt(fd, .SOCKET, .REUSEPORT, &reuse_port_value)
+		if port_option_error != .NONE {
 			linux.close(fd)
-			return {}, .Error, i32(option_error)
+			return {}, .Error, i32(port_option_error)
 		}
 	}
 
@@ -74,6 +81,7 @@ listen_ipv4 :: proc(
 		sin_port   = u16be(port),
 		sin_addr   = address,
 	}
+
 	bind_error := linux.bind(fd, &local)
 
 	if bind_error != .NONE {
@@ -95,6 +103,7 @@ listen_ipv4 :: proc(
 		linux.close(fd)
 		return {}, .Error, i32(name_error)
 	}
+
 	return Listener{fd = fd, local_address = Peer_Address(bound.ipv4)}, .Ready, 0
 }
 
@@ -108,6 +117,7 @@ accept_one :: proc(
 	if listener.fd < 0 {
 		return {}, .Invalid, 0
 	}
+
 	peer: linux.Sock_Addr_In
 	socket_flags: linux.Socket_FD_Flags = {.NONBLOCK, .CLOEXEC}
 	fd, accept_error := linux.accept(listener.fd, &peer, socket_flags)
@@ -120,6 +130,7 @@ accept_one :: proc(
 	if result == .Would_Block || result == .Interrupted {
 		return {}, result, 0
 	}
+
 	return {}, result, i32(accept_error)
 }
 
@@ -139,6 +150,7 @@ accept_error_result :: proc(err: linux.Errno) -> Result {
 	if err == .EMFILE || err == .ENFILE {
 		return .Descriptor_Limit
 	}
+
 	return .Error
 }
 
@@ -160,18 +172,22 @@ accept_ready :: proc(
 	for attempts < max_attempts && accepted_count < len(storage) {
 		connection, result, error_code := accept_one(listener)
 		attempts += 1
+
 		switch result {
 		case .Ready:
 			storage[accepted_count] = connection
 			accepted_count += 1
+
 		case .Would_Block:
 			return Accept_Batch {
 				connections = storage[:accepted_count],
 				attempts = attempts,
 				result = .Drained,
 			}
+
 		case .Interrupted:
 			continue
+
 		case .Descriptor_Limit:
 			return Accept_Batch {
 				connections = storage[:accepted_count],
@@ -179,12 +195,14 @@ accept_ready :: proc(
 				result = .Descriptor_Limit,
 				error_code = error_code,
 			}
+
 		case .Invalid:
 			return Accept_Batch {
 				connections = storage[:accepted_count],
 				attempts = attempts,
 				result = .Invalid,
 			}
+
 		case .Error:
 			return Accept_Batch {
 				connections = storage[:accepted_count],
@@ -194,6 +212,7 @@ accept_ready :: proc(
 			}
 		}
 	}
+
 	result := Accept_Batch_Result.Budget_Exhausted
 
 	if accepted_count == len(storage) {
@@ -210,11 +229,13 @@ close_listener :: proc(listener: ^Listener) -> (result: Result, error_code: i32)
 	if listener.fd < 0 {
 		return .Invalid, 0
 	}
+
 	err := linux.close(listener.fd)
 
 	if err != .NONE {
 		return .Error, i32(err)
 	}
+
 	listener.fd = -1
 	return .Ready, 0
 }
@@ -223,11 +244,13 @@ close_connection :: proc(connection: ^Accepted_Connection) -> (result: Result, e
 	if connection.fd < 0 {
 		return .Invalid, 0
 	}
+
 	err := linux.close(connection.fd)
 
 	if err != .NONE {
 		return .Error, i32(err)
 	}
+
 	connection.fd = -1
 	return .Ready, 0
 }
@@ -238,5 +261,6 @@ Peer_Address :: proc(addr: linux.Sock_Addr_In) -> transport.Peer_Address {
 	address[1] = addr.sin_addr[1]
 	address[2] = addr.sin_addr[2]
 	address[3] = addr.sin_addr[3]
+
 	return transport.Peer_Address{family = .IPv4, address = address, port = u16(addr.sin_port)}
 }

@@ -13,6 +13,7 @@ check:
 
 format:
 	odinfmt src -w
+	odinfmt examples -w
 
 test:
     odin test src/http1/connection -all-packages -collection:veylor=src -out:build/test-http1-connection

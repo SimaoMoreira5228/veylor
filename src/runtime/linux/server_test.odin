@@ -18,24 +18,25 @@ Managed_Server_Test_Instance :: struct {
 	route_storage:        [1]router.Static_Route,
 	route_index_storage:  [2]router.Route_Index_Slot,
 	table:                connections.Connection_Table,
-	connection_slots:     [1]connections.Connection_Slot,
-	free_stack:           [1]u32,
+	connection_slots:     [32]connections.Connection_Slot,
+	free_stack:           [32]u32,
 	shutdown_state:       shutdown.State,
 	timers:               transport.Timer_Queue,
-	timer_storage:        [3]transport.Timer_Expiration,
-	connection_states:    [1]Static_Connection,
-	workspace_storage:   [1]Static_Connection_Workspace,
-	workspace_free_stack: [1]u32,
-	workspace_pool:      Static_Workspace_Pool,
-	request_input:        [128]u8,
-	request_headers:      [4]http1.Header,
-	response_buffer:      [256]u8,
+	timer_storage:        [34]transport.Timer_Expiration,
+	connection_states:    [32]Static_Connection,
+	workspace_storage:    [32]Static_Connection_Workspace,
+	workspace_free_stack: [32]u32,
+	workspace_pool:       Static_Workspace_Pool,
+	request_input:        [32][128]u8,
+	request_headers:      [32][4]http1.Header,
+	response_buffer:      [32][256]u8,
 	native_events:        [2]linux.EPoll_Event,
 	readiness_events:     [2]transport.Readiness_Event,
 	accepted_storage:     [1]socket.Accepted_Connection,
 	accepted_connections: [1]Worker_Connection,
-	expired_timers:       [2]transport.Timer_Expiration,
+	expired_timers:       [34]transport.Timer_Expiration,
 	worker:               Static_Worker,
+	server_workers:       [1]^Static_Worker,
 	worker_storage:       [1]workers.Worker_Thread,
 	server:               Managed_Server,
 	initialized:          bool,
@@ -47,19 +48,59 @@ init_managed_server_test_instance :: proc(
 	path, body: string,
 	shutdown_grace_ns: u64,
 ) -> bool {
-	instance.worker.poller.fd = -1
-	instance.worker.listener.fd = -1
-	instance.worker.control_fd = -1
 	loopback := [4]u8{127, 0, 0, 1}
 	listener, listener_result, _ := socket.listen_ipv4(loopback, 0, 4)
 
 	if listener_result != .Ready {
 		return false
 	}
+	if !init_managed_server_test_worker(instance, worker_id, path, body, listener) {
+		socket.close_listener(&listener)
+		instance.worker.listener.fd = -1
+		return false
+	}
+	instance.server_workers[0] = &instance.worker
+	server_result := init_managed_server(
+		&instance.server,
+		instance.server_workers[:],
+		instance.worker_storage[:],
+		shutdown_grace_ns,
+	)
+	if server_result != .Initialized {
+		epoll.close(&instance.worker.poller)
+		socket.close_listener(&instance.worker.listener)
+		instance.worker.listener.fd = -1
+		return false
+	}
+	instance.initialized = true
+	if start_managed_server(&instance.server) != .Started {
+		return false
+	}
+	return true
+}
+
+init_managed_server_test_worker :: proc(
+	instance: ^Managed_Server_Test_Instance,
+	worker_id: u32,
+	path, body: string,
+	listener: socket.Listener,
+	timeout_ms: i32 = -1,
+	connection_capacity: int = 32,
+	workspace_capacity: int = 32,
+) -> bool {
+	if connection_capacity <= 0 ||
+	   connection_capacity > len(instance.connection_slots) ||
+	   workspace_capacity <= 0 ||
+	   workspace_capacity > len(instance.workspace_storage) {
+		return false
+	}
+	instance.worker.poller.fd = -1
+	instance.worker.listener.fd = listener.fd
+	instance.worker.listener.local_address = listener.local_address
+	instance.worker.control_fd = -1
 	poller, poller_result, _ := epoll.create()
 
 	if poller_result != .Ready {
-		socket.close_listener(&listener)
 		return false
 	}
 	instance.routes = router.init_route_table(
@@ -82,41 +123,40 @@ init_managed_server_test_instance :: proc(
 
 	if route_result != .Added || router.freeze_route_table(&instance.routes) != .Frozen {
 		epoll.close(&poller)
-		socket.close_listener(&listener)
 		return false
 	}
 	table_result: connections.Connection_Table_Result
 	instance.table, table_result = connections.init_connection_table(
 		worker_id,
 		1,
-		instance.connection_slots[:],
-		instance.free_stack[:],
+		instance.connection_slots[:connection_capacity],
+		instance.free_stack[:connection_capacity],
 	)
 
 	if table_result != .Ready {
 		epoll.close(&poller)
-		socket.close_listener(&listener)
 		return false
 	}
 	instance.timers = transport.init_timer_queue(instance.timer_storage[:])
-	instance.workspace_storage[0] = Static_Connection_Workspace {
-		request_input = instance.request_input[:],
-		headers       = instance.request_headers[:],
-		response      = instance.response_buffer[:],
+	for i := 0; i < len(instance.workspace_storage); i += 1 {
+		instance.workspace_storage[i] = Static_Connection_Workspace {
+			request_input = instance.request_input[i][:],
+			headers       = instance.request_headers[i][:],
+			response      = instance.response_buffer[i][:],
+		}
 	}
 	workspace_pool, pool_ready := init_static_workspace_pool(
-		instance.workspace_storage[:],
-		instance.workspace_free_stack[:],
+		instance.workspace_storage[:workspace_capacity],
+		instance.workspace_free_stack[:workspace_capacity],
 	)
 	if !pool_ready {
 		epoll.close(&poller)
-		socket.close_listener(&listener)
 		return false
 	}
 	instance.workspace_pool = workspace_pool
 	instance.worker = Static_Worker {
 		poller = poller,
-		listener = listener,
+		listener = socket.Listener{fd = listener.fd, local_address = listener.local_address},
 		shutdown_state = &instance.shutdown_state,
 		table = &instance.table,
 		routes = &instance.routes,
@@ -131,27 +171,13 @@ init_managed_server_test_instance :: proc(
 		event_budget = 2,
 		byte_budget = 128,
 		accept_attempt_budget = 1,
-		timeout_ms = -1,
+		timeout_ms = timeout_ms,
 		body_limit = 1024,
 		timeouts = connections.Connection_Timeouts {
 			request_head_ns = 1_000_000_000,
 			response_write_ns = 1_000_000_000,
 			keep_alive_idle_ns = 1_000_000_000,
 		},
-	}
-	server_result := init_managed_server(
-		&instance.server,
-		&instance.worker,
-		instance.worker_storage[:],
-		shutdown_grace_ns,
-	)
-
-	if server_result != .Initialized {
-		return false
-	}
-	instance.initialized = true
-	if start_managed_server(&instance.server) != .Started {
-		return false
 	}
 	return true
 }
@@ -276,16 +302,18 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 		},
 	}
 	worker_storage: [1]workers.Worker_Thread
+	server_workers: [1]^Static_Worker
+	server_workers[0] = &worker
 	server: Managed_Server
 	testing.expect_value(
 		t,
-		init_managed_server(&server, &worker, worker_storage[:], 0),
+		init_managed_server(&server, server_workers[:], worker_storage[:], 0),
 		Managed_Server_Result.Initialized,
 	)
 	testing.expect_value(t, start_managed_server(&server), Managed_Server_Result.Started)
 	testing.expect_value(
 		t,
-		init_managed_server(&server, &worker, worker_storage[:], 0),
+		init_managed_server(&server, server_workers[:], worker_storage[:], 0),
 		Managed_Server_Result.Invalid,
 	)
 	testing.expect_value(t, server.phase, Managed_Server_Phase.Running)
@@ -339,7 +367,7 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 		Managed_Server_Result.Already_Stopping,
 	)
 	testing.expect_value(t, join_managed_server(&server), Managed_Server_Result.Joined)
-	testing.expect_value(t, server.worker_result, Static_Worker_Result.Ready)
+	testing.expect_value(t, worker.managed_result, Static_Worker_Result.Ready)
 	testing.expect_value(t, shutdown_state.phase, shutdown.Phase.Complete)
 	testing.expect_value(t, shutdown_state.active_connections, u64(0))
 
@@ -372,7 +400,7 @@ test_managed_server_repeats_start_stop_join_and_destroy :: proc(t: ^testing.T) {
 		testing.expect_value(t, stop_result, Managed_Server_Result.Stop_Requested)
 		join_result := join_managed_server(&instance.server)
 		testing.expect_value(t, join_result, Managed_Server_Result.Joined)
-		testing.expect_value(t, instance.server.worker_result, Static_Worker_Result.Ready)
+		testing.expect_value(t, instance.worker.managed_result, Static_Worker_Result.Ready)
 		destroy_result := destroy_managed_server(&instance.server)
 		testing.expect_value(t, destroy_result, Managed_Server_Result.Destroyed)
 		testing.expect_value(t, instance.server.phase, Managed_Server_Phase.Destroyed)
@@ -381,12 +409,8 @@ test_managed_server_repeats_start_stop_join_and_destroy :: proc(t: ^testing.T) {
 			instance.server.worker_pool.phase,
 			workers.Worker_Pool_Phase.Destroyed,
 		)
-		testing.expect_value(
-			t,
-			instance.server.worker.shutdown_state.phase,
-			shutdown.Phase.Destroyed,
-		)
-		testing.expect_value(t, instance.server.control_fd, linux.Fd(-1))
+		testing.expect_value(t, instance.worker.shutdown_state.phase, shutdown.Phase.Destroyed)
+		testing.expect_value(t, instance.worker.control_fd, linux.Fd(-1))
 		testing.expect_value(t, instance.worker.control_fd, linux.Fd(-1))
 		testing.expect_value(t, instance.worker.poller.fd, linux.Fd(-1))
 		testing.expect_value(t, instance.worker.listener.fd, linux.Fd(-1))

@@ -28,6 +28,7 @@ test_managed_server_force_stop_cancels_a_live_keep_alive_connection :: proc(t: ^
 		testing.expect_value(t, client >= 0, true)
 		return
 	}
+
 	request := "GET /cancel HTTP/1.1\r\nHost: cancel.example\r\n\r\n"
 	written, write_error := linux.write(client, transmute([]u8)request)
 	testing.expect_value(t, write_error, linux.Errno.NONE)
@@ -52,10 +53,11 @@ test_managed_server_force_stop_cancels_a_live_keep_alive_connection :: proc(t: ^
 	)
 	join_result := join_managed_server(&instance.server)
 	testing.expect_value(t, join_result, Managed_Server_Result.Joined)
-	testing.expect_value(t, instance.server.worker_result, Static_Worker_Result.Ready)
+	testing.expect_value(t, instance.worker.managed_result, Static_Worker_Result.Ready)
 	testing.expect_value(t, instance.worker.shutdown_state.phase, shutdown.Phase.Complete)
 	testing.expect_value(t, instance.worker.shutdown_state.active_connections, u64(0))
 	testing.expect_value(t, instance.worker.timers.count, 0)
+
 	close_length, close_error := linux.read(client, response[:])
 	testing.expect_value(t, close_error, linux.Errno.NONE)
 	testing.expect_value(t, close_length, 0)
@@ -87,7 +89,7 @@ test_managed_server_force_stop_from_running_completes :: proc(t: ^testing.T) {
 	testing.expect_value(t, force_result, Managed_Server_Result.Stop_Requested)
 	join_result := join_managed_server(&instance.server)
 	testing.expect_value(t, join_result, Managed_Server_Result.Joined)
-	testing.expect_value(t, instance.server.worker_result, Static_Worker_Result.Ready)
+	testing.expect_value(t, instance.worker.managed_result, Static_Worker_Result.Ready)
 	testing.expect_value(t, instance.worker.shutdown_state.phase, shutdown.Phase.Complete)
 	testing.expect_value(t, instance.worker.shutdown_state.active_connections, u64(0))
 	testing.expect_value(t, instance.worker.timers.count, 0)

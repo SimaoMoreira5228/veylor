@@ -21,6 +21,7 @@ Static_Worker :: struct {
 	descriptor_retry_scheduled: bool,
 	control_fd:                 linux.Fd,
 	control_registered:         bool,
+	managed_result:             Static_Worker_Result,
 	shutdown_state:             ^shutdown.State,
 	table:                      ^connections.Connection_Table,
 	routes:                     ^router.Route_Table,
@@ -62,13 +63,13 @@ Static_Worker_Metrics :: struct {
 }
 
 Static_Worker_Turn :: struct {
-	worker:               Worker_Turn,
-	accepted_count:       int,
-	processed_count:      int,
-	closed_count:         int,
-	bytes_read:           u64,
-	bytes_written:        u64,
-	result:               Static_Worker_Result,
+	worker:          Worker_Turn,
+	accepted_count:  int,
+	processed_count: int,
+	closed_count:    int,
+	bytes_read:      u64,
+	bytes_written:   u64,
+	result:          Static_Worker_Result,
 }
 
 run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
@@ -89,7 +90,6 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 
 			if unregister_result != .Ready {
 				turn.result = .Error
-				return turn
 			}
 			worker.listener_registered = false
 		}
@@ -137,10 +137,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		result.accepted_count += 1
 		worker.metrics.accepted_connections += 1
 		slot_index := int(accepted.token.slot)
-		state, init_result := init_static_connection(
-			accepted,
-			worker.workspace_pool,
-		)
+		state, init_result := init_static_connection(accepted, worker.workspace_pool)
 
 		if init_result != .Need_More {
 			release := release_worker_connection(
@@ -422,10 +419,7 @@ close_static_worker_connection :: proc(
 		result = .Error
 	}
 	release := release_worker_connection(
-		&Worker_Connection {
-			token = state.token,
-			fd    = state.fd,
-		},
+		&Worker_Connection{token = state.token, fd = state.fd},
 		worker.table,
 		worker.timers,
 		worker.shutdown_state,
