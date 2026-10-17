@@ -13,6 +13,7 @@ import epoll "veylor:transport/linux"
 Static_Connection_Phase :: enum {
 	Reading_Request_Head,
 	Writing_Response,
+	Writing_File_Body,
 	Keep_Alive_Idle,
 	Closed,
 	Failed,
@@ -54,23 +55,28 @@ Static_Connection_Workspace :: struct {
 }
 
 Static_Workspace_Pool :: struct {
-	storage:             []Static_Connection_Workspace,
-	free_stack:          []u32,
-	free_count:          int,
-	active_count:        int,
-	high_water_mark:     int,
-	acquisition_count:   u64,
-	release_count:       u64,
-	exhaustion_count:    u64,
-	initialized:         bool,
+	storage:           []Static_Connection_Workspace,
+	free_stack:        []u32,
+	free_count:        int,
+	active_count:      int,
+	high_water_mark:   int,
+	acquisition_count: u64,
+	release_count:     u64,
+	exhaustion_count:  u64,
+	initialized:       bool,
 }
 
 Static_Connection :: struct {
 	token:           connections.Connection_Token,
 	fd:              linux.Fd,
 	workspace_pool:  ^Static_Workspace_Pool,
+	file_root:       ^Static_File_Root,
 	workspace_slot:  int,
 	write_driver:    connection.Connection_Write_Driver,
+	file:            Static_File,
+	file_offset:     i64,
+	file_remaining:  u64,
+	has_file:        bool,
 	phase:           Static_Connection_Phase,
 	response_length: int,
 	keep_alive:      bool,
@@ -90,7 +96,10 @@ Static_Connection_Turn :: struct {
 init_static_workspace_pool :: proc(
 	storage: []Static_Connection_Workspace,
 	free_stack: []u32,
-) -> (pool: Static_Workspace_Pool, result: bool) {
+) -> (
+	pool: Static_Workspace_Pool,
+	result: bool,
+) {
 	if len(storage) == 0 || len(free_stack) < len(storage) {
 		return {}, false
 	}
@@ -103,30 +112,36 @@ init_static_workspace_pool :: proc(
 		free_stack[i] = u32(len(storage) - i - 1)
 	}
 	return Static_Workspace_Pool {
-		storage     = storage,
-		free_stack  = free_stack,
-		free_count  = len(storage),
-		initialized = true,
-	}, true
+			storage = storage,
+			free_stack = free_stack,
+			free_count = len(storage),
+			initialized = true,
+		},
+		true
 }
 
 init_static_connection :: proc(
 	worker: Worker_Connection,
 	workspace_pool: ^Static_Workspace_Pool,
+	file_root: ^Static_File_Root = nil,
 ) -> (
 	state: Static_Connection,
 	result: Static_Connection_Result,
 ) {
-	if worker.fd < 0 || !valid_static_workspace_pool(workspace_pool) {
+	if worker.fd < 0 ||
+	   !valid_static_workspace_pool(workspace_pool) ||
+	   (file_root != nil && !valid_static_file_root(file_root)) {
 		return {}, .Invalid
 	}
 	state = Static_Connection {
-		token          = worker.token,
-		fd             = worker.fd,
+		token = worker.token,
+		fd = worker.fd,
 		workspace_pool = workspace_pool,
+		file_root = file_root,
 		workspace_slot = -1,
-		phase          = .Reading_Request_Head,
-		active         = true,
+		file = Static_File{fd = -1},
+		phase = .Reading_Request_Head,
+		active = true,
 	}
 	return state, .Need_More
 }
@@ -249,8 +264,7 @@ static_connection_turn :: proc(
 		   read_turn.head.result == .Would_Block ||
 		   read_turn.head.result == .Interrupted {
 			if input_length == 0 {
-				if read_turn.head.result == .Would_Block ||
-				   read_turn.head.result == .Interrupted {
+				if read_turn.head.result == .Would_Block || read_turn.head.result == .Interrupted {
 					cancel_result := connections.cancel_connection_phase_deadline(
 						table,
 						timers,
@@ -269,6 +283,12 @@ static_connection_turn :: proc(
 				}
 			}
 			turn.result = .Need_More
+			return turn
+		}
+		if read_turn.head.result == .Peer_Closed {
+			state.close_reason = .Peer_Closed
+			state.phase = .Closed
+			turn.result = .Closed
 			return turn
 		}
 		if read_turn.head.result != .Ready {
@@ -305,13 +325,80 @@ static_connection_turn :: proc(
 			body_limit,
 		)
 
+		file_response_ready := false
+		if response_event.result == .Route_Not_Found && state.file_root != nil {
+			file_event := encode_static_file_response(
+				state.file_root,
+				read_turn.head.head,
+				workspace.request_input[:input_length],
+				workspace.response,
+				body_limit,
+			)
+			switch file_event.result {
+			case .Encoded:
+				state.response_length = file_event.response_length
+				state.keep_alive = file_event.keep_alive
+				state.file = file_event.file
+				state.has_file = file_event.stream_body
+				if file_event.stream_body {
+					state.file_offset = 0
+					state.file_remaining = file_event.file.size
+				}
+				if !file_event.keep_alive {
+					state.close_reason = .Normal
+				}
+				file_response_ready = true
+
+			case .Body_Too_Large:
+				file_error := encode_static_file_failure_response(
+					state,
+					workspace.response,
+					413,
+					"Content Too Large",
+					.Request_Rejected,
+				)
+				file_error.bytes_read = turn.bytes_read
+				if file_error.result != .Response_Progress {
+					return file_error
+				}
+				file_response_ready = true
+
+			case .System_Error:
+				file_error := encode_static_file_failure_response(
+					state,
+					workspace.response,
+					500,
+					"Internal Server Error",
+					.Internal_Error,
+				)
+				file_error.bytes_read = turn.bytes_read
+				if file_error.result != .Response_Progress {
+					return file_error
+				}
+				file_response_ready = true
+
+			case .Buffer_Small:
+				state.close_reason = .Response_Buffer_Limit
+				state.phase = .Failed
+				return Static_Connection_Turn{result = .Response_Buffer_Small}
+
+			case .Invalid:
+				state.close_reason = .Internal_Error
+				state.phase = .Failed
+				return Static_Connection_Turn{result = .Invalid}
+
+			case .Not_Mounted, .Not_Found:
+			}
+		}
+		if file_response_ready {
+			write_turn := register_static_response_write(poller, state, table)
+			write_turn.bytes_read += turn.bytes_read
+			return write_turn
+		}
+
 		if response_event.result == .Route_Not_Found {
 			state.close_reason = .Route_Not_Found
-			error_response := encode_static_error_response(
-				workspace.response,
-				404,
-				"Not Found",
-			)
+			error_response := encode_static_error_response(workspace.response, 404, "Not Found")
 
 			if error_response.result != .Written {
 				state.close_reason = .Response_Buffer_Limit
@@ -352,7 +439,7 @@ static_connection_turn :: proc(
 			state.fd,
 			&state.write_driver,
 			byte_budget,
-			state.keep_alive,
+			state.keep_alive && !state.has_file,
 			table,
 			state.token,
 			timers,
@@ -370,6 +457,11 @@ static_connection_turn :: proc(
 		}
 
 		if write_turn.write.result == .Complete {
+			if state.has_file {
+				file_turn := begin_static_file_body(state, table, timers, timeouts, now_ns)
+				file_turn.bytes_written = write_turn.bytes_written
+				return file_turn
+			}
 			if state.keep_alive {
 				epoll_result, error_code := epoll.modify(
 					poller,
@@ -415,6 +507,18 @@ static_connection_turn :: proc(
 		turn.error_code = write_turn.write.error_code
 		return turn
 	}
+	if state.phase == .Writing_File_Body {
+		return static_file_body_turn(
+			poller,
+			state,
+			readiness,
+			byte_budget,
+			table,
+			timers,
+			timeouts,
+			now_ns,
+		)
+	}
 	if state.phase == .Closed {
 		return Static_Connection_Turn{result = .Closed}
 	}
@@ -423,7 +527,10 @@ static_connection_turn :: proc(
 
 acquire_static_workspace :: proc(
 	state: ^Static_Connection,
-) -> (workspace: ^Static_Connection_Workspace, acquired: bool) {
+) -> (
+	workspace: ^Static_Connection_Workspace,
+	acquired: bool,
+) {
 	if state == nil || !valid_static_workspace_pool(state.workspace_pool) {
 		return nil, false
 	}
@@ -517,8 +624,10 @@ register_static_response_write :: proc(
 	state: ^Static_Connection,
 	table: ^connections.Connection_Table,
 ) -> Static_Connection_Turn {
-	if state == nil || !valid_static_workspace_pool(state.workspace_pool) ||
-	   state.workspace_slot < 0 || state.workspace_slot >= len(state.workspace_pool.storage) {
+	if state == nil ||
+	   !valid_static_workspace_pool(state.workspace_pool) ||
+	   state.workspace_slot < 0 ||
+	   state.workspace_slot >= len(state.workspace_pool.storage) {
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	workspace := &state.workspace_pool.storage[state.workspace_slot]
@@ -576,10 +685,7 @@ static_error_response_for_head :: proc(
 		status = 417
 		reason = "Expectation Failed"
 	case .Invalid, .Buffer_Changed:
-	case .Need_More,
-	     .Ready,
-	     .Would_Block,
-	     .Interrupted:
+	case .Need_More, .Ready, .Would_Block, .Interrupted:
 		state.close_reason = .Internal_Error
 		return Static_Connection_Turn{result = .Invalid}
 	case .Peer_Closed:
@@ -600,6 +706,30 @@ static_error_response_for_head :: proc(
 	}
 	if error_response.result != .Written {
 		state.close_reason = .Internal_Error
+		return Static_Connection_Turn{result = .Invalid}
+	}
+	state.response_length = error_response.written
+	state.keep_alive = false
+	return Static_Connection_Turn{result = .Response_Progress}
+}
+
+encode_static_file_failure_response :: proc(
+	state: ^Static_Connection,
+	output: []u8,
+	status: u16,
+	reason: string,
+	close_reason: Static_Connection_Close_Reason,
+) -> Static_Connection_Turn {
+	state.close_reason = close_reason
+	error_response := encode_static_error_response(output, status, reason)
+	if error_response.result == .Buffer_Small {
+		state.close_reason = .Response_Buffer_Limit
+		state.phase = .Failed
+		return Static_Connection_Turn{result = .Response_Buffer_Small}
+	}
+	if error_response.result != .Written {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	state.response_length = error_response.written

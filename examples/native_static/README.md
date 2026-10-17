@@ -12,11 +12,15 @@ Run it for 120 seconds on port 8080 with four workers:
 ./build/veylor-static 120 8080 4
 ```
 
-It serves `GET /health` on loopback. The arguments set run time, port, and worker count, in that order.
-All are optional; the worker count defaults to one and accepts values from one to four. With multiple
-workers, each gets a separate `SO_REUSEPORT` listener on the same port and keeps its own connection
-state and buffers. On exit it prints aggregate counters and the accepted-connection count for each
-worker. The server drains active connections for up to five seconds before it stops.
+It serves `GET /health` and `GET`/`HEAD /assets/<path>` on loopback. File paths are opened beneath
+`examples/native_static/public`, with symlinks and traversal rejected. Small files use the caller-owned
+response buffer; larger bodies stream with `sendfile`.
+Run it from the repository root so that directory resolves. The arguments set run time, port, and worker
+count, in that order. All are optional; the worker count defaults to one and accepts values from one to
+four. With multiple workers, each gets a separate `SO_REUSEPORT` listener on the same port and keeps its
+own connection state and buffers. On exit it prints aggregate counters, per-worker accept and close
+counts, workspace peaks, and nonzero close reasons. The server drains active connections for up to five
+seconds before it stops.
 
 ## Limits in this sample
 
@@ -32,6 +36,7 @@ body-consuming handler or host event queue yet, so this table covers only the st
 | Header fields | 100 | The worker returns 431 and closes the connection. |
 | Header field name/value | 256 B / 8 KiB | The parser returns 431 when either per-field limit is exceeded. |
 | Response output | 1 KiB per workspace | The worker closes before writing a partial response. |
+| Static file body | Files that fit the 1 KiB response buffer are copied there; larger files use 64 KiB `sendfile` turns. | `HEAD` sends headers and the file length only. |
 | Declared request body | 16 MiB | A larger `Content-Length` on a matched static route gets 413 before body reads. |
 | Events per worker turn | 128 | Remaining level-triggered events stay ready for a later turn. |
 | Read/write bytes per connection turn | 64 KiB | The worker resumes the connection on a later turn. |

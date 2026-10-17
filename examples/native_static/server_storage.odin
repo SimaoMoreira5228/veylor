@@ -43,6 +43,8 @@ Static_Server_Storage :: struct {
 	accepted_storage:      [MAX_STATIC_WORKERS][ACCEPT_BATCH_CAPACITY]socket.Accepted_Connection,
 	accepted_connections:  [MAX_STATIC_WORKERS][ACCEPT_BATCH_CAPACITY]runtime.Worker_Connection,
 	expired_timer_storage: [MAX_STATIC_WORKERS][CONNECTIONS_PER_WORKER + 2]transport.Timer_Expiration,
+	static_file_root_fd:   linux.Fd,
+	static_file_root:      runtime.Static_File_Root,
 	server_worker_storage: [MAX_STATIC_WORKERS]runtime.Static_Worker,
 	server_workers:        [MAX_STATIC_WORKERS]^runtime.Static_Worker,
 	worker_threads:        [MAX_STATIC_WORKERS]workers.Worker_Thread,
@@ -57,10 +59,34 @@ initialize_static_server_storage :: proc(
 	if storage == nil || worker_count <= 0 || worker_count > MAX_STATIC_WORKERS {
 		return false
 	}
+
 	for i := 0; i < MAX_STATIC_WORKERS; i += 1 {
 		storage.server_worker_storage[i].poller.fd = -1
 		storage.server_worker_storage[i].listener.fd = -1
 	}
+	storage.static_file_root_fd = -1
+
+	file_root_fd, file_root_error := linux.open(
+		"examples/native_static/public",
+		{.CLOEXEC, .DIRECTORY},
+	)
+	if file_root_error != .NONE {
+		fmt.eprintln("static file root open failed:", file_root_error)
+		return false
+	}
+
+	file_mount_prefix := "/assets/"
+	if !runtime.init_static_file_root(
+		&storage.static_file_root,
+		file_root_fd,
+		transmute([]u8)file_mount_prefix,
+	) {
+		fmt.eprintln("static file root setup failed")
+		linux.close(file_root_fd)
+		return false
+	}
+	storage.static_file_root_fd = file_root_fd
+
 	storage.routes = router.init_route_table(
 		storage.route_storage[:],
 		storage.route_index_storage[:],
@@ -74,6 +100,7 @@ initialize_static_server_storage :: proc(
 		reason = transmute([]u8)reason,
 		body   = transmute([]u8)response_body,
 	}
+
 	register_result := router.register_static_route(
 		&storage.routes,
 		transmute([]u8)method,
@@ -82,13 +109,16 @@ initialize_static_server_storage :: proc(
 	)
 	if register_result != .Added || router.freeze_route_table(&storage.routes) != .Frozen {
 		fmt.eprintln("route setup failed:", register_result)
+		close_unmanaged_static_server_storage(storage)
 		return false
 	}
+
 	for i := 0; i < worker_count; i += 1 {
 		listen_port := port
 		if i > 0 {
 			listen_port = storage.server_worker_storage[0].listener.local_address.port
 		}
+
 		listener, listen_result, listen_error := socket.listen_ipv4(
 			address,
 			listen_port,
@@ -100,6 +130,7 @@ initialize_static_server_storage :: proc(
 			close_unmanaged_static_server_storage(storage)
 			return false
 		}
+
 		if !initialize_static_worker_storage(storage, listener, i) {
 			close_unmanaged_static_server_storage(storage)
 			return false
@@ -115,11 +146,13 @@ initialize_static_worker_storage :: proc(
 ) -> bool {
 	storage.server_worker_storage[worker_index].poller.fd = -1
 	storage.server_worker_storage[worker_index].listener = listener
+
 	poller, poll_result, poll_error := epoll.create()
 	if poll_result != .Ready {
 		fmt.eprintln("epoll create failed:", poll_result, poll_error)
 		return false
 	}
+
 	table, table_result := connections.init_connection_table(
 		u32(worker_index + 1),
 		1,
@@ -132,9 +165,11 @@ initialize_static_worker_storage :: proc(
 		return false
 	}
 	storage.connection_tables[worker_index] = table
+
 	storage.timers[worker_index] = transport.init_timer_queue(
 		storage.timer_storage[worker_index][:],
 	)
+
 	for workspace_index := 0; workspace_index < WORKSPACES_PER_WORKER; workspace_index += 1 {
 		storage.workspace_storage[worker_index][workspace_index] =
 			runtime.Static_Connection_Workspace {
@@ -143,6 +178,7 @@ initialize_static_worker_storage :: proc(
 				response      = storage.response_storage[worker_index][workspace_index][:],
 			}
 	}
+
 	workspace_pool, pool_ready := runtime.init_static_workspace_pool(
 		storage.workspace_storage[worker_index][:],
 		storage.workspace_free_stacks[worker_index][:],
@@ -153,28 +189,30 @@ initialize_static_worker_storage :: proc(
 		return false
 	}
 	storage.workspace_pools[worker_index] = workspace_pool
+
 	worker := runtime.Static_Worker {
-		poller                = poller,
-		listener              = listener,
-		shutdown_state        = &storage.shutdown_states[worker_index],
-		table                 = &storage.connection_tables[worker_index],
-		routes                = &storage.routes,
-		connection_states     = storage.connection_states[worker_index][:],
-		workspace_pool        = &storage.workspace_pools[worker_index],
-		native_events         = storage.native_events[worker_index][:],
-		readiness_events      = storage.readiness_events[worker_index][:],
-		accepted_storage      = storage.accepted_storage[worker_index][:],
-		accepted_connections  = storage.accepted_connections[worker_index][:],
-		timers                = &storage.timers[worker_index],
+		poller = poller,
+		listener = listener,
+		shutdown_state = &storage.shutdown_states[worker_index],
+		table = &storage.connection_tables[worker_index],
+		routes = &storage.routes,
+		file_root = &storage.static_file_root,
+		connection_states = storage.connection_states[worker_index][:],
+		workspace_pool = &storage.workspace_pools[worker_index],
+		native_events = storage.native_events[worker_index][:],
+		readiness_events = storage.readiness_events[worker_index][:],
+		accepted_storage = storage.accepted_storage[worker_index][:],
+		accepted_connections = storage.accepted_connections[worker_index][:],
+		timers = &storage.timers[worker_index],
 		expired_timer_storage = storage.expired_timer_storage[worker_index][:],
-		event_budget          = WORKER_EVENT_CAPACITY,
-		byte_budget           = 64 * 1024,
+		event_budget = WORKER_EVENT_CAPACITY,
+		byte_budget = 64 * 1024,
 		accept_attempt_budget = ACCEPT_BATCH_CAPACITY,
-		timeout_ms            = 100,
-		body_limit            = 16 * 1024 * 1024,
-		timeouts              = connections.Connection_Timeouts {
-			request_head_ns    = 10_000_000_000,
-			response_write_ns  = 10_000_000_000,
+		timeout_ms = 100,
+		body_limit = 16 * 1024 * 1024,
+		timeouts = connections.Connection_Timeouts {
+			request_head_ns = 10_000_000_000,
+			response_write_ns = 10_000_000_000,
 			keep_alive_idle_ns = 5_000_000_000,
 		},
 	}
@@ -192,5 +230,10 @@ close_unmanaged_static_server_storage :: proc(storage: ^Static_Server_Storage) {
 		if worker.listener.fd >= 0 {
 			socket.close_listener(&worker.listener)
 		}
+	}
+
+	if storage.static_file_root_fd >= 0 {
+		linux.close(storage.static_file_root_fd)
+		storage.static_file_root_fd = -1
 	}
 }

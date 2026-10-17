@@ -25,6 +25,7 @@ Static_Worker :: struct {
 	shutdown_state:             ^shutdown.State,
 	table:                      ^connections.Connection_Table,
 	routes:                     ^router.Route_Table,
+	file_root:                  ^Static_File_Root,
 	connection_states:          []Static_Connection,
 	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
@@ -137,7 +138,11 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		result.accepted_count += 1
 		worker.metrics.accepted_connections += 1
 		slot_index := int(accepted.token.slot)
-		state, init_result := init_static_connection(accepted, worker.workspace_pool)
+		state, init_result := init_static_connection(
+			accepted,
+			worker.workspace_pool,
+			worker.file_root,
+		)
 
 		if init_result != .Need_More {
 			release := release_worker_connection(
@@ -153,6 +158,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			continue
 		}
 		worker.connection_states[slot_index] = state
+
 		register_result, _ := register_static_connection(
 			worker.poller,
 			&worker.connection_states[slot_index],
@@ -174,6 +180,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			}
 			continue
 		}
+
 		if readiness.connection_id == 0 {
 			result.result = .Invalid
 			continue
@@ -281,6 +288,9 @@ valid_static_worker :: proc(worker: ^Static_Worker) -> bool {
 	if worker.routes.state != .Frozen {
 		return false
 	}
+	if worker.file_root != nil && !valid_static_file_root(worker.file_root) {
+		return false
+	}
 	if worker.poller.fd < 0 || worker.listener.fd < 0 || worker.table.free_count < 0 {
 		return false
 	}
@@ -332,17 +342,20 @@ process_static_worker_expirations :: proc(
 			worker.descriptor_limit_paused = false
 			continue
 		}
+
 		if worker.shutdown_state.has_deadline && timer.timer_id == worker.shutdown_state.timer_id {
 			if shutdown.process_deadline(worker.shutdown_state, timer) == .Force_Connections {
 				worker.shutdown_state.phase = .Forcing
 			}
 			continue
 		}
+
 		deadline, result := connections.expire_connection_deadline(worker.table, timer.timer_id)
 
 		if result != .Deadline_Expired {
 			continue
 		}
+
 		slot_index := int(deadline.token.slot)
 
 		if slot_index >= len(worker.connection_states) {
@@ -355,6 +368,7 @@ process_static_worker_expirations :: proc(
 			turn.result = .Invalid
 			continue
 		}
+
 		state.close_reason = .Timed_Out
 		if close_static_worker_connection(worker, state) == .Error {
 			turn.result = .Error
@@ -397,6 +411,7 @@ close_static_worker_connection :: proc(
 	if worker == nil || state == nil || !state.active {
 		return .Invalid
 	}
+
 	result := Static_Worker_Result.Ready
 	if state.idle_counted {
 		if worker.metrics.idle_connections == 0 {
@@ -415,9 +430,18 @@ close_static_worker_connection :: proc(
 		}
 		state.registered = false
 	}
+
 	if !release_static_workspace(state) {
 		result = .Error
 	}
+
+	if state.has_file {
+		if !close_static_file(&state.file) {
+			result = .Error
+		}
+		state.has_file = false
+	}
+
 	release := release_worker_connection(
 		&Worker_Connection{token = state.token, fd = state.fd},
 		worker.table,
@@ -428,10 +452,12 @@ close_static_worker_connection :: proc(
 	if release.table_result != .Released && release.table_result != .Retired {
 		return .Error
 	}
+
 	record_static_worker_close(worker, state.close_reason)
 	if release.socket_result != .Ready {
 		result = .Error
 	}
+
 	if release.shutdown_result != .Connection_Closed && release.shutdown_result != .Completed {
 		result = .Error
 	}
