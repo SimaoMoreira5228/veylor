@@ -23,6 +23,7 @@ Managed_Server_Test_Instance :: struct {
 	shutdown_state:       shutdown.State,
 	timers:               transport.Timer_Queue,
 	timer_storage:        [34]transport.Timer_Expiration,
+	timer_index_storage:  [34 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32,
 	connection_states:    [32]Static_Connection,
 	workspace_storage:    [32]Static_Connection_Workspace,
 	workspace_free_stack: [32]u32,
@@ -142,7 +143,10 @@ init_managed_server_test_worker :: proc(
 		epoll.close(&poller)
 		return false
 	}
-	instance.timers = transport.init_timer_queue(instance.timer_storage[:])
+	instance.timers = transport.init_timer_queue(
+		instance.timer_storage[:],
+		instance.timer_index_storage[:],
+	)
 	for i := 0; i < len(instance.workspace_storage); i += 1 {
 		instance.workspace_storage[i] = Static_Connection_Workspace {
 			request_input = instance.request_input[i][:],
@@ -285,7 +289,8 @@ test_managed_server_starts_serves_stops_joins_and_destroys :: proc(t: ^testing.T
 	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
 	shutdown_state: shutdown.State
 	timer_storage: [3]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [3 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	connection_states: [1]Static_Connection
 	request_input: [128]u8
 	request_headers: [4]http1.Header

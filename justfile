@@ -1,3 +1,5 @@
+ABI_CFLAGS := "-std=c11 -Wall -Wextra -Werror"
+
 default: test
 
 check:
@@ -34,3 +36,8 @@ integration-linux: check-linux test-linux
 
 build-native-static:
 	odin build examples/native_static -collection:veylor=src -o:speed -out:build/veylor-static
+
+integration-abi-linux:
+	odin build src/abi -build-mode:shared -collection:veylor=src -o:speed -out:build/libveylor.so
+	clang {{ABI_CFLAGS}} -Iinclude tests/abi_static_server.c -Lbuild -lveylor -o build/test-abi-static-server
+	LD_LIBRARY_PATH=build build/test-abi-static-server

@@ -11,7 +11,8 @@ test_shutdown_stops_admission_drains_until_deadline_then_completes :: proc(t: ^t
 	testing.expect_value(t, register_connection(&state), Result.Accepted)
 
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 
 	testing.expect_value(t, request_shutdown(&state, &timers, 71, 100, 50), Result.Draining)
 	testing.expect_value(t, state.phase, Phase.Draining)
@@ -41,7 +42,8 @@ test_shutdown_completes_early_and_cancels_deadline :: proc(t: ^testing.T) {
 	state: State
 	testing.expect_value(t, register_connection(&state), Result.Accepted)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	testing.expect_value(t, request_shutdown(&state, &timers, 81, 200, 75), Result.Draining)
 	testing.expect_value(t, close_connection(&state, &timers), Result.Completed)
 	testing.expect_value(t, timers.count, 0)
@@ -55,7 +57,8 @@ test_shutdown_does_not_change_state_when_deadline_cannot_be_scheduled :: proc(t:
 	state: State
 	testing.expect_value(t, register_connection(&state), Result.Accepted)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	testing.expect_value(
 		t,
 		transport.schedule_timer(
@@ -105,7 +108,8 @@ test_force_shutdown_cancels_drain_deadline_before_forcing_connections :: proc(t:
 	state: State
 	testing.expect_value(t, register_connection(&state), Result.Accepted)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	testing.expect_value(t, request_shutdown(&state, &timers, 101, 500, 100), Result.Draining)
 	testing.expect_value(t, timers.count, 1)
 	testing.expect_value(t, force_shutdown(&state, &timers), Result.Force_Connections)

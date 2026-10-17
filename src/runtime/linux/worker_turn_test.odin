@@ -55,7 +55,8 @@ test_descriptor_limit_pauses_listener_until_owner_resumes_it :: proc(t: ^testing
 	accepted_storage: [1]socket.Accepted_Connection
 	connection_storage: [1]Worker_Connection
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	expired_timer_storage: [1]transport.Timer_Expiration
 	shutdown_state: shutdown.State
 	turn := run_worker_turn(
@@ -204,7 +205,8 @@ test_full_connection_table_keeps_new_clients_in_backlog_until_a_slot_frees :: pr
 	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
 	shutdown_state: shutdown.State
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	native_events: [1]linux.EPoll_Event
 	readiness_events: [1]transport.Readiness_Event
 	accepted_storage: [1]socket.Accepted_Connection
@@ -383,7 +385,8 @@ test_worker_turn_bounds_events_rotates_ready_streams_and_assigns_accepted_slots 
 	accepted_storage: [2]socket.Accepted_Connection
 	connection_storage: [2]Worker_Connection
 	timer_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	expired_timer_storage: [1]transport.Timer_Expiration
 	testing.expect_value(
 		t,
@@ -581,7 +584,8 @@ test_forced_shutdown_closes_owned_connections_and_completes :: proc(t: ^testing.
 	}
 
 	timer_storage: [4]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [4 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	testing.expect_value(
 		t,
 		shutdown.request_shutdown(&shutdown_state, &timers, 1201, 50, 100),

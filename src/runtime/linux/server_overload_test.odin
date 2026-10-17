@@ -8,7 +8,8 @@ import "veylor:transport"
 @(test)
 test_listener_descriptor_limit_retries_after_bounded_backoff :: proc(t: ^testing.T) {
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	worker := Static_Worker {
 		timers                  = &timers,
 		descriptor_limit_paused = true,
@@ -46,7 +47,8 @@ test_listener_descriptor_limit_retries_after_bounded_backoff :: proc(t: ^testing
 @(test)
 test_listener_retry_rejects_full_timer_storage_and_deadline_overflow :: proc(t: ^testing.T) {
 	full_storage: [1]transport.Timer_Expiration
-	full_timers := transport.init_timer_queue(full_storage[:])
+	full_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	full_timers := transport.init_timer_queue(full_storage[:], full_index_storage[:])
 	testing.expect_value(
 		t,
 		transport.schedule_timer(
@@ -64,7 +66,8 @@ test_listener_retry_rejects_full_timer_storage_and_deadline_overflow :: proc(t: 
 	testing.expect_value(t, full_timers.count, 1)
 
 	overflow_storage: [1]transport.Timer_Expiration
-	overflow_timers := transport.init_timer_queue(overflow_storage[:])
+	overflow_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	overflow_timers := transport.init_timer_queue(overflow_storage[:], overflow_index_storage[:])
 	overflow_worker := Static_Worker {
 		timers                  = &overflow_timers,
 		descriptor_limit_paused = true,

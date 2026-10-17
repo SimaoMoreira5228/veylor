@@ -163,30 +163,40 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, first, 701, .Request_Head),
+		bind_connection_deadline(&table, first, .Request_Head),
 		Connection_Table_Result.Deadline_Set,
 	)
+	first_timer_id := connection_deadline_timer_id(first)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, second, 701, .Request_Head),
-		Connection_Table_Result.Duplicate_Deadline,
-	)
-	testing.expect_value(
-		t,
-		bind_connection_deadline(&table, second, 702, .Body_Progress),
+		bind_connection_deadline(&table, second, .Body_Progress),
 		Connection_Table_Result.Invalid_Transition,
 	)
 	testing.expect_value(
 		t,
-		clear_connection_deadline(&table, first, 702),
-		Connection_Table_Result.Not_Found,
+		bind_connection_deadline(&table, second, .Request_Head),
+		Connection_Table_Result.Deadline_Set,
+	)
+	second_timer_id := connection_deadline_timer_id(second)
+	testing.expect_value(t, second_timer_id != first_timer_id, true)
+	testing.expect_value(
+		t,
+		bind_connection_deadline(&table, second, .Request_Head),
+		Connection_Table_Result.Duplicate_Deadline,
 	)
 	testing.expect_value(
 		t,
-		clear_connection_deadline(&table, first, 701),
+		clear_connection_deadline(&table, first),
 		Connection_Table_Result.Deadline_Cleared,
 	)
-	_, result = expire_connection_deadline(&table, 701)
+	testing.expect_value(
+		t,
+		clear_connection_deadline(&table, second),
+		Connection_Table_Result.Deadline_Cleared,
+	)
+	_, result = expire_connection_deadline(&table, first_timer_id)
+	testing.expect_value(t, result, Connection_Table_Result.Not_Found)
+	_, result = expire_connection_deadline(&table, second_timer_id)
 	testing.expect_value(t, result, Connection_Table_Result.Not_Found)
 
 	testing.expect_value(
@@ -196,7 +206,7 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 	)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, second, 705, .Body_Progress),
+		bind_connection_deadline(&table, second, .Body_Progress),
 		Connection_Table_Result.Deadline_Set,
 	)
 	testing.expect_value(
@@ -205,7 +215,7 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 		Connection_Table_Result.Invalid_Transition,
 	)
 	completed: Connection_Deadline
-	completed, result = expire_connection_deadline(&table, 705)
+	completed, result = expire_connection_deadline(&table, second_timer_id)
 	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
 	testing.expect_value(t, completed.token, second)
 	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Body_Progress)
@@ -221,10 +231,10 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 	)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, second, 706, .Response_Write),
+		bind_connection_deadline(&table, second, .Response_Write),
 		Connection_Table_Result.Deadline_Set,
 	)
-	completed, result = expire_connection_deadline(&table, 706)
+	completed, result = expire_connection_deadline(&table, second_timer_id)
 	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
 	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Response_Write)
 	testing.expect_value(
@@ -234,18 +244,19 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 	)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, second, 707, .Keep_Alive_Idle),
+		bind_connection_deadline(&table, second, .Keep_Alive_Idle),
 		Connection_Table_Result.Deadline_Set,
 	)
-	completed, result = expire_connection_deadline(&table, 707)
+	completed, result = expire_connection_deadline(&table, second_timer_id)
 	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
 	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Keep_Alive_Idle)
 
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, first, 703, .Request_Head),
+		bind_connection_deadline(&table, first, .Request_Head),
 		Connection_Table_Result.Deadline_Set,
 	)
+	stale_timer_id := connection_deadline_timer_id(first)
 	testing.expect_value(
 		t,
 		release_connection(&table, first),
@@ -253,11 +264,11 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 	)
 	testing.expect_value(
 		t,
-		clear_connection_deadline(&table, first, 703),
+		clear_connection_deadline(&table, first),
 		Connection_Table_Result.Deadline_Cleared,
 	)
 	testing.expect_value(t, release_connection(&table, first), Connection_Table_Result.Released)
-	_, result = expire_connection_deadline(&table, 703)
+	_, result = expire_connection_deadline(&table, stale_timer_id)
 	testing.expect_value(t, result, Connection_Table_Result.Not_Found)
 
 	reused: Connection_Token
@@ -267,13 +278,17 @@ test_connection_deadlines_bind_clear_and_expire_only_for_live_tokens :: proc(t: 
 	testing.expect_value(t, reused.generation, first.generation + 1)
 	testing.expect_value(
 		t,
-		bind_connection_deadline(&table, reused, 704, .Request_Head),
+		bind_connection_deadline(&table, reused, .Request_Head),
 		Connection_Table_Result.Deadline_Set,
 	)
-	completed, result = expire_connection_deadline(&table, 704)
+	current_timer_id := connection_deadline_timer_id(reused)
+	testing.expect_value(t, current_timer_id != stale_timer_id, true)
+	_, result = expire_connection_deadline(&table, stale_timer_id)
+	testing.expect_value(t, result, Connection_Table_Result.Not_Found)
+	completed, result = expire_connection_deadline(&table, current_timer_id)
 	testing.expect_value(t, result, Connection_Table_Result.Deadline_Expired)
 	testing.expect_value(t, completed.token, reused)
-	testing.expect_value(t, completed.timer_id, u64(704))
+	testing.expect_value(t, completed.timer_id, current_timer_id)
 	testing.expect_value(t, completed.kind, Connection_Deadline_Kind.Request_Head)
 	testing.expect_value(t, release_connection(&table, second), Connection_Table_Result.Released)
 	testing.expect_value(t, release_connection(&table, reused), Connection_Table_Result.Released)

@@ -29,9 +29,14 @@ test_request_head_timeout_records_a_close_reason :: proc(t: ^testing.T) {
 	testing.expect_value(t, allocation_result, connections.Connection_Table_Result.Ready)
 
 	shutdown_state: shutdown.State
-	testing.expect_value(t, shutdown.register_connection(&shutdown_state), shutdown.Result.Accepted)
+	testing.expect_value(
+		t,
+		shutdown.register_connection(&shutdown_state),
+		shutdown.Result.Accepted,
+	)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 
 	request_input: [128]u8
 	headers: [4]http1.Header
@@ -49,10 +54,7 @@ test_request_head_timeout_records_a_close_reason :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, pool_ready, true)
 	state, state_result := init_static_connection(
-		Worker_Connection {
-			token = token,
-			fd    = sockets[0],
-		},
+		Worker_Connection{token = token, fd = sockets[0]},
 		&workspace_pool,
 	)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
@@ -61,16 +63,18 @@ test_request_head_timeout_records_a_close_reason :: proc(t: ^testing.T) {
 	timeouts := connections.Connection_Timeouts {
 		request_head_ns = 100,
 	}
-	timer_id := static_connection_event_id(token)
 	schedule := connections.schedule_connection_phase_deadline(
 		&table,
 		&timers,
 		token,
-		timer_id,
 		1_000,
 		timeouts,
 	)
-	testing.expect_value(t, schedule.result, connections.Connection_Deadline_Schedule_Result.Scheduled)
+	testing.expect_value(
+		t,
+		schedule.result,
+		connections.Connection_Deadline_Schedule_Result.Scheduled,
+	)
 	timer, timer_result := transport.pop_expired_timer(&timers, schedule.timer.deadline_ns)
 	testing.expect_value(t, timer_result, transport.Timer_Queue_Result.Expired)
 	expired := [?]transport.Timer_Expiration{timer}
@@ -173,7 +177,8 @@ test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testin
 		shutdown.Result.Accepted,
 	)
 	timers_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timers_storage[:])
+	timers_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timers_storage[:], timers_index_storage[:])
 	worker_connection := Worker_Connection {
 		token = token,
 		fd    = sockets[0],
@@ -193,10 +198,7 @@ test_static_worker_gracefully_drains_a_backpressured_response :: proc(t: ^testin
 		workspace_free_stack[:],
 	)
 	testing.expect_value(t, pool_ready, true)
-	state, state_result := init_static_connection(
-		worker_connection,
-		&workspace_pool,
-	)
+	state, state_result := init_static_connection(worker_connection, &workspace_pool)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	connection_register_result, register_error := register_static_connection(poller, &state)
 	testing.expect_value(t, connection_register_result, epoll.Result.Ready)
@@ -405,7 +407,8 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 		shutdown.Result.Accepted,
 	)
 	timer_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	worker_connection := Worker_Connection {
 		token = token,
 		fd    = sockets[0],
@@ -425,10 +428,7 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 		workspace_free_stack[:],
 	)
 	testing.expect_value(t, pool_ready, true)
-	state, state_result := init_static_connection(
-		worker_connection,
-		&workspace_pool,
-	)
+	state, state_result := init_static_connection(worker_connection, &workspace_pool)
 	testing.expect_value(t, state_result, Static_Connection_Result.Need_More)
 	_, register_error := register_static_connection(poller, &state)
 	testing.expect_value(t, register_error, i32(0))
@@ -477,9 +477,7 @@ test_static_worker_forces_shutdown_at_deadline_during_partial_request_head :: pr
 		shutdown.Result.Draining,
 	)
 
-	connection_states := [?]Static_Connection {
-		state,
-	}
+	connection_states := [?]Static_Connection{state}
 	worker_native_events: [1]linux.EPoll_Event
 	worker_readiness_events: [1]transport.Readiness_Event
 	accepted_storage: [1]socket.Accepted_Connection

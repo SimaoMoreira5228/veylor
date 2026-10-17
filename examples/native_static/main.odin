@@ -88,7 +88,7 @@ run_static_server :: proc(duration_seconds: int, port: u16, worker_count: int) -
 
 	fmt.println(
 		"Listening on http://127.0.0.1:",
-		storage.server_worker_storage[0].listener.local_address.port,
+		storage.worker_storage[0].worker.listener.local_address.port,
 		"/health /assets/<path> workers:",
 		worker_count,
 		sep = "",

@@ -121,7 +121,6 @@ read_connection_head_turn_with_deadline :: proc(
 	table: ^connections.Connection_Table,
 	token: connections.Connection_Token,
 	timers: ^transport.Timer_Queue,
-	timer_id: u64,
 	now_ns: u64,
 	timeouts: connections.Connection_Timeouts,
 ) -> Head_Read_Turn {
@@ -130,7 +129,6 @@ read_connection_head_turn_with_deadline :: proc(
 			table,
 			timers,
 			token,
-			timer_id,
 			now_ns,
 			timeouts,
 		)
@@ -178,7 +176,6 @@ read_connection_body_turn_with_deadline :: proc(
 	table: ^connections.Connection_Table,
 	token: connections.Connection_Token,
 	timers: ^transport.Timer_Queue,
-	timer_id: u64,
 	now_ns: u64,
 	timeouts: connections.Connection_Timeouts,
 ) -> Body_Read_Turn {
@@ -199,7 +196,6 @@ read_connection_body_turn_with_deadline :: proc(
 			table,
 			timers,
 			token,
-			timer_id,
 			now_ns,
 			timeouts,
 		)
@@ -264,7 +260,6 @@ read_connection_body_turn_with_deadline :: proc(
 			table,
 			timers,
 			token,
-			timer_id,
 			now_ns,
 			timeouts,
 		)
@@ -287,19 +282,11 @@ write_connection_turn_with_deadline :: proc(
 	table: ^connections.Connection_Table,
 	token: connections.Connection_Token,
 	timers: ^transport.Timer_Queue,
-	timer_id: u64,
 	now_ns: u64,
 	timeouts: connections.Connection_Timeouts,
 ) -> Write_Turn {
 	if driver.state == .Complete && keep_alive {
-		idle := connections.start_keep_alive_idle_deadline(
-			table,
-			timers,
-			token,
-			timer_id,
-			now_ns,
-			timeouts,
-		)
+		idle := connections.start_keep_alive_idle_deadline(table, timers, token, now_ns, timeouts)
 		return Write_Turn {
 			write = connection.connection_write_event(driver),
 			deadline_result = idle.result,
@@ -323,7 +310,6 @@ write_connection_turn_with_deadline :: proc(
 			table,
 			timers,
 			token,
-			timer_id,
 			now_ns,
 			timeouts,
 		)
@@ -377,7 +363,6 @@ write_connection_turn_with_deadline :: proc(
 					table,
 					timers,
 					token,
-					timer_id,
 					now_ns,
 					timeouts,
 				)
@@ -389,7 +374,6 @@ write_connection_turn_with_deadline :: proc(
 			table,
 			timers,
 			token,
-			timer_id,
 			now_ns,
 			timeouts,
 		)
@@ -466,11 +450,7 @@ run_worker_turn :: proc(
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
 
-	if timers.count < 0 {
-		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
-	}
-
-	if timers.count > len(timers.storage) {
+	if !transport.valid_timer_queue(timers) {
 		return Worker_Turn{poll_result = .Invalid, accept_result = .Invalid}
 	}
 

@@ -127,7 +127,8 @@ test_request_head_deadline_survives_partial_reads_and_cancels_on_ready :: proc(t
 	token, table_result = connections.allocate_connection(&table, 903)
 	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	timeouts := connections.Connection_Timeouts {
 		request_head_ns = 50,
 	}
@@ -147,7 +148,6 @@ test_request_head_deadline_survives_partial_reads_and_cancels_on_ready :: proc(t
 			&table,
 			token,
 			&timers,
-			1201,
 			100,
 			timeouts,
 		)
@@ -156,7 +156,11 @@ test_request_head_deadline_survives_partial_reads_and_cancels_on_ready :: proc(t
 
 		if head_event.result == .Need_More {
 			testing.expect_value(t, timers.count, 1)
-			testing.expect_value(t, table.slots[int(token.slot)].deadline_timer_id, u64(1201))
+			testing.expect_value(
+				t,
+				table.slots[int(token.slot)].deadline_timer_id,
+				connections.connection_deadline_timer_id(token),
+			)
 			continue
 		}
 		testing.expect_value(
@@ -192,7 +196,8 @@ test_request_head_deadline_capacity_failure_does_not_read_socket :: proc(t: ^tes
 	token: connections.Connection_Token
 	token, table_result = connections.allocate_connection(&table, 904)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	transport.schedule_timer(
 		&timers,
 		transport.Timer_Expiration{timer_id = 1299, deadline_ns = 50},
@@ -213,7 +218,6 @@ test_request_head_deadline_capacity_failure_does_not_read_socket :: proc(t: ^tes
 		&table,
 		token,
 		&timers,
-		1202,
 		100,
 		timeouts,
 	)

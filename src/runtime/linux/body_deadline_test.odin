@@ -33,7 +33,9 @@ test_body_progress_refreshes_deadline_and_completion_cancels_it :: proc(t: ^test
 	)
 
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
+	timer_id := connections.connection_deadline_timer_id(token)
 	timeouts := connections.Connection_Timeouts {
 		body_progress_ns = 50,
 	}
@@ -56,7 +58,6 @@ test_body_progress_refreshes_deadline_and_completion_cancels_it :: proc(t: ^test
 		&table,
 		token,
 		&timers,
-		1401,
 		100,
 		timeouts,
 	)
@@ -83,7 +84,6 @@ test_body_progress_refreshes_deadline_and_completion_cancels_it :: proc(t: ^test
 		&table,
 		token,
 		&timers,
-		1402,
 		120,
 		timeouts,
 	)
@@ -94,7 +94,7 @@ test_body_progress_refreshes_deadline_and_completion_cancels_it :: proc(t: ^test
 		turn.deadline_result,
 		connections.Connection_Deadline_Schedule_Result.Scheduled,
 	)
-	testing.expect_value(t, timer_storage[0].timer_id, u64(1402))
+	testing.expect_value(t, timer_storage[0].timer_id, timer_id)
 	testing.expect_value(t, timer_storage[0].deadline_ns, u64(170))
 	testing.expect_value(t, string(input[:4]), first_chunk)
 
@@ -113,13 +113,12 @@ test_body_progress_refreshes_deadline_and_completion_cancels_it :: proc(t: ^test
 		&table,
 		token,
 		&timers,
-		1403,
 		140,
 		timeouts,
 	)
 	testing.expect_value(t, turn.body.result, connection.Connection_Body_Result.Data)
 	testing.expect_value(t, turn.body.body_complete, false)
-	testing.expect_value(t, timer_storage[0].timer_id, u64(1403))
+	testing.expect_value(t, timer_storage[0].timer_id, timer_id)
 	testing.expect_value(t, timer_storage[0].deadline_ns, u64(190))
 
 	last_chunk := "ij"
@@ -137,7 +136,6 @@ test_body_progress_refreshes_deadline_and_completion_cancels_it :: proc(t: ^test
 		&table,
 		token,
 		&timers,
-		1404,
 		160,
 		timeouts,
 	)
@@ -174,7 +172,8 @@ test_body_read_does_not_start_without_deadline_storage :: proc(t: ^testing.T) {
 	token, table_result = connections.allocate_connection(&table, 906)
 	connections.transition_connection(&table, token, .Reading_Request_Body)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	transport.schedule_timer(
 		&timers,
 		transport.Timer_Expiration{timer_id = 1499, deadline_ns = 10},
@@ -197,7 +196,6 @@ test_body_read_does_not_start_without_deadline_storage :: proc(t: ^testing.T) {
 		&table,
 		token,
 		&timers,
-		1500,
 		100,
 		connections.Connection_Timeouts{body_progress_ns = 50},
 	)

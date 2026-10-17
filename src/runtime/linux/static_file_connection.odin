@@ -26,7 +26,6 @@ begin_static_file_body :: proc(
 		table,
 		timers,
 		state.token,
-		static_connection_event_id(state.token),
 		now_ns,
 		timeouts,
 	)
@@ -114,7 +113,6 @@ static_file_body_turn :: proc(
 				table,
 				timers,
 				state.token,
-				static_connection_event_id(state.token),
 				now_ns,
 				timeouts,
 			)
@@ -168,7 +166,6 @@ refresh_static_file_write_deadline :: proc(
 		table,
 		timers,
 		state.token,
-		static_connection_event_id(state.token),
 		now_ns,
 		timeouts,
 	)

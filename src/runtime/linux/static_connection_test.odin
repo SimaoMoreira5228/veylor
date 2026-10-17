@@ -145,7 +145,8 @@ test_static_connection_reuses_keep_alive_and_rejects_oversized_continue_body :: 
 	testing.expect_value(t, allocation_result, connections.Connection_Table_Result.Ready)
 
 	timer_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	shutdown_state: shutdown.State
 	testing.expect_value(
 		t,
@@ -359,7 +360,8 @@ test_static_worker_forces_shutdown_during_a_backpressured_response_write :: proc
 		shutdown.Result.Accepted,
 	)
 	timers_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timers_storage[:])
+	timers_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timers_storage[:], timers_index_storage[:])
 	worker_connection := Worker_Connection {
 		token = token,
 		fd    = sockets[0],
@@ -597,7 +599,8 @@ test_static_worker_accepts_and_routes_loopback_keep_alive_requests :: proc(t: ^t
 	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
 	shutdown_state: shutdown.State
 	timer_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	connection_states: [1]Static_Connection
 	request_input: [128]u8
 	request_headers: [4]http1.Header

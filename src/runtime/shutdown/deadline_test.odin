@@ -7,7 +7,8 @@ import "veylor:transport"
 @(test)
 test_shutdown_deadline_is_monotonic_bounded_and_cancellable :: proc(t: ^testing.T) {
 	storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(storage[:])
+	index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(storage[:], index_storage[:])
 	timer, result := schedule_deadline(&timers, 1, 100, 50)
 	testing.expect_value(t, result, Deadline_Result.Scheduled)
 	testing.expect_value(t, timer.deadline_ns, u64(150))
@@ -34,7 +35,8 @@ test_shutdown_deadline_is_monotonic_bounded_and_cancellable :: proc(t: ^testing.
 @(test)
 test_shutdown_deadline_rejects_zero_and_overflowing_timeouts :: proc(t: ^testing.T) {
 	storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(storage[:])
+	index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(storage[:], index_storage[:])
 	_, result := schedule_deadline(&timers, 1, 100, 0)
 	testing.expect_value(t, result, Deadline_Result.Invalid)
 	_, result = schedule_deadline(&timers, 2, 0xffff_ffff_ffff_ffff, 1)

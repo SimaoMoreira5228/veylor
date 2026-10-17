@@ -91,7 +91,8 @@ test_static_worker_serves_cold_request_under_sustained_hot_socket_load :: proc(t
 	testing.expect_value(t, table_result, connections.Connection_Table_Result.Ready)
 	shutdown_state: shutdown.State
 	timer_storage: [4]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [4 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	connection_states: [4]Static_Connection
 	request_inputs: [4][32 * 1024]u8
 	request_headers: [4][4]http1.Header

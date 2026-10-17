@@ -25,11 +25,7 @@ schedule_deadline :: proc(
 		return {}, .Invalid
 	}
 
-	if timers.count < 0 {
-		return {}, .Invalid
-	}
-
-	if timers.count > len(timers.storage) {
+	if !transport.valid_timer_queue(timers) {
 		return {}, .Invalid
 	}
 
@@ -52,7 +48,7 @@ schedule_deadline :: proc(
 		return {}, .Full
 	case .Duplicate:
 		return {}, .Duplicate
-	case .Cancelled, .Not_Found, .Expired, .Not_Due:
+	case .Cancelled, .Not_Found, .Expired, .Not_Due, .Invalid:
 		return {}, .Invalid
 	}
 	return {}, .Invalid
@@ -63,11 +59,7 @@ cancel_deadline :: proc(timers: ^transport.Timer_Queue, timer_id: u64) -> Deadli
 		return .Invalid
 	}
 
-	if timers.count < 0 {
-		return .Invalid
-	}
-
-	if timers.count > len(timers.storage) {
+	if !transport.valid_timer_queue(timers) {
 		return .Invalid
 	}
 	switch transport.cancel_timer(timers, timer_id) {
@@ -75,7 +67,7 @@ cancel_deadline :: proc(timers: ^transport.Timer_Queue, timer_id: u64) -> Deadli
 		return .Cancelled
 	case .Not_Found:
 		return .Not_Found
-	case .Scheduled, .Full, .Duplicate, .Expired, .Not_Due:
+	case .Scheduled, .Full, .Duplicate, .Expired, .Not_Due, .Invalid:
 		return .Invalid
 	}
 	return .Invalid

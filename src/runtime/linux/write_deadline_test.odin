@@ -33,7 +33,9 @@ test_partial_response_writes_refresh_deadline_then_cancel_on_complete :: proc(t:
 	)
 
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
+	timer_id := connections.connection_deadline_timer_id(token)
 	timeouts := connections.Connection_Timeouts {
 		response_write_ns  = 25,
 		keep_alive_idle_ns = 40,
@@ -50,7 +52,6 @@ test_partial_response_writes_refresh_deadline_then_cancel_on_complete :: proc(t:
 		&table,
 		token,
 		&timers,
-		1501,
 		100,
 		timeouts,
 	)
@@ -62,7 +63,7 @@ test_partial_response_writes_refresh_deadline_then_cancel_on_complete :: proc(t:
 		turn.deadline_result,
 		connections.Connection_Deadline_Schedule_Result.Scheduled,
 	)
-	testing.expect_value(t, timer_storage[0].timer_id, u64(1501))
+	testing.expect_value(t, timer_storage[0].timer_id, timer_id)
 	testing.expect_value(t, timer_storage[0].deadline_ns, u64(125))
 
 	turn = write_connection_turn_with_deadline(
@@ -74,13 +75,12 @@ test_partial_response_writes_refresh_deadline_then_cancel_on_complete :: proc(t:
 		&table,
 		token,
 		&timers,
-		1502,
 		110,
 		timeouts,
 	)
 	testing.expect_value(t, turn.write.result, connection.Connection_Write_Result.Progress)
 	testing.expect_value(t, turn.bytes_written, 4)
-	testing.expect_value(t, timer_storage[0].timer_id, u64(1502))
+	testing.expect_value(t, timer_storage[0].timer_id, timer_id)
 	testing.expect_value(t, timer_storage[0].deadline_ns, u64(135))
 
 	turn = write_connection_turn_with_deadline(
@@ -92,7 +92,6 @@ test_partial_response_writes_refresh_deadline_then_cancel_on_complete :: proc(t:
 		&table,
 		token,
 		&timers,
-		1503,
 		120,
 		timeouts,
 	)
@@ -150,7 +149,8 @@ test_response_write_does_not_send_without_deadline_capacity :: proc(t: ^testing.
 	token, table_result = connections.allocate_connection(&table, 908)
 	connections.transition_connection(&table, token, .Writing_Response)
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	transport.schedule_timer(
 		&timers,
 		transport.Timer_Expiration{timer_id = 1599, deadline_ns = 10},
@@ -169,7 +169,6 @@ test_response_write_does_not_send_without_deadline_capacity :: proc(t: ^testing.
 		&table,
 		token,
 		&timers,
-		1600,
 		100,
 		timeouts,
 	)

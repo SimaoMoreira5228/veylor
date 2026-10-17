@@ -159,7 +159,8 @@ test_full_deadline_queue_closes_request_without_blame_response :: proc(t: ^testi
 	)
 
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	testing.expect_value(
 		t,
 		transport.schedule_timer(
@@ -294,7 +295,8 @@ test_full_workspace_pool_closes_request_without_response :: proc(t: ^testing.T) 
 		shutdown.Result.Accepted,
 	)
 	timer_storage: [2]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [2 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 
 	request_input: [128]u8
 	request_headers: [4]http1.Header
@@ -417,7 +419,8 @@ test_full_deadline_queue_closes_response_without_writing :: proc(t: ^testing.T) 
 	)
 
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	testing.expect_value(
 		t,
 		transport.schedule_timer(
@@ -567,7 +570,8 @@ test_response_larger_than_caller_buffer_closes_without_partial_output :: proc(t:
 	)
 
 	timer_storage: [1]transport.Timer_Expiration
-	timers := transport.init_timer_queue(timer_storage[:])
+	timer_index_storage: [transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32
+	timers := transport.init_timer_queue(timer_storage[:], timer_index_storage[:])
 	request_input: [128]u8
 	request_headers: [4]http1.Header
 	response_buffer: [96]u8

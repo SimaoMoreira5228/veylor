@@ -154,11 +154,7 @@ close_connection :: proc(state: ^State, timers: ^transport.Timer_Queue) -> Resul
 			return .Invalid
 		}
 
-		if timers.count < 0 {
-			return .Invalid
-		}
-
-		if timers.count > len(timers.storage) {
+		if !transport.valid_timer_queue(timers) {
 			return .Invalid
 		}
 	}

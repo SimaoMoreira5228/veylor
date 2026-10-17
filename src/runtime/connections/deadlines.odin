@@ -35,7 +35,6 @@ schedule_connection_phase_deadline :: proc(
 	table: ^Connection_Table,
 	timers: ^transport.Timer_Queue,
 	token: Connection_Token,
-	timer_id: u64,
 	now_ns: u64,
 	timeouts: Connection_Timeouts,
 ) -> Connection_Deadline_Schedule {
@@ -47,11 +46,7 @@ schedule_connection_phase_deadline :: proc(
 		return Connection_Deadline_Schedule{result = .Invalid}
 	}
 
-	if timers.count < 0 {
-		return Connection_Deadline_Schedule{result = .Invalid}
-	}
-
-	if timers.count > len(timers.storage) {
+	if !transport.valid_timer_queue(timers) {
 		return Connection_Deadline_Schedule{result = .Invalid}
 	}
 
@@ -63,6 +58,9 @@ schedule_connection_phase_deadline :: proc(
 
 	if lookup_result != .Found {
 		return Connection_Deadline_Schedule{result = .Invalid}
+	}
+	if table.slots[int(token.slot)].has_deadline {
+		return Connection_Deadline_Schedule{result = .Connection_Already_Timed}
 	}
 
 	kind, valid := connection_deadline_kind(phase)
@@ -81,6 +79,7 @@ schedule_connection_phase_deadline :: proc(
 		return Connection_Deadline_Schedule{result = .Deadline_Overflow}
 	}
 
+	timer_id := connection_deadline_timer_id(token)
 	timer := transport.Timer_Expiration {
 		timer_id    = timer_id,
 		deadline_ns = now_ns + timeout_ns,
@@ -99,7 +98,7 @@ schedule_connection_phase_deadline :: proc(
 		return Connection_Deadline_Schedule{result = .Invalid}
 	}
 
-	bind_result := bind_connection_deadline(table, token, timer_id, kind)
+	bind_result := bind_connection_deadline(table, token, kind)
 
 	if bind_result != .Deadline_Set {
 		transport.cancel_timer(timers, timer_id)
@@ -114,7 +113,6 @@ start_keep_alive_idle_deadline :: proc(
 	table: ^Connection_Table,
 	timers: ^transport.Timer_Queue,
 	token: Connection_Token,
-	timer_id: u64,
 	now_ns: u64,
 	timeouts: Connection_Timeouts,
 ) -> Connection_Deadline_Schedule {
@@ -126,14 +124,7 @@ start_keep_alive_idle_deadline :: proc(
 		return Connection_Deadline_Schedule{result = .Phase_Mismatch}
 	}
 
-	schedule := schedule_connection_phase_deadline(
-		table,
-		timers,
-		token,
-		timer_id,
-		now_ns,
-		timeouts,
-	)
+	schedule := schedule_connection_phase_deadline(table, timers, token, now_ns, timeouts)
 
 	if schedule.result != .Scheduled {
 		transition_connection(table, token, .Closing)
@@ -187,11 +178,7 @@ cancel_connection_phase_deadline :: proc(
 		return .Invalid
 	}
 
-	if timers.count < 0 {
-		return .Invalid
-	}
-
-	if timers.count > len(timers.storage) {
+	if !transport.valid_timer_queue(timers) {
 		return .Invalid
 	}
 
@@ -227,7 +214,7 @@ cancel_connection_phase_deadline :: proc(
 		return .Timer_Missing
 	}
 
-	if clear_connection_deadline(table, token, timer_id) != .Deadline_Cleared {
+	if clear_connection_deadline(table, token) != .Deadline_Cleared {
 		return .Invalid
 	}
 	return .Cancelled
