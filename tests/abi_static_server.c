@@ -15,19 +15,25 @@ _Static_assert(sizeof(vyl_config) == 24, "vyl_config layout changed");
 _Static_assert(offsetof(vyl_config, shutdown_grace_ns) == 16,
                "vyl_config offset changed");
 _Static_assert(sizeof(vyl_bytes) == 16, "vyl_bytes layout changed");
-_Static_assert(sizeof(vyl_request_token) == 24,
+_Static_assert(sizeof(vyl_request_token) == 32,
                "vyl_request_token layout changed");
-_Static_assert(sizeof(vyl_host_event) == 64,
+_Static_assert(offsetof(vyl_request_token, request_seq) == 8,
+               "vyl_request_token request_seq offset changed");
+_Static_assert(sizeof(vyl_host_event) == 72,
                 "vyl_host_event layout changed");
-_Static_assert(offsetof(vyl_host_event, body_ready) == 56,
+_Static_assert(offsetof(vyl_host_event, body_ready) == 64,
                "vyl_host_event body_ready offset changed");
-_Static_assert(offsetof(vyl_host_event, body_complete) == 60,
+_Static_assert(offsetof(vyl_host_event, body_complete) == 68,
                "vyl_host_event body_complete offset changed");
 _Static_assert(offsetof(vyl_host_event, token) == 8,
                "vyl_host_event.token offset changed");
-_Static_assert(offsetof(vyl_host_event, method_offset) == 40,
+_Static_assert(offsetof(vyl_host_event, method_offset) == 48,
                "vyl_host_event method offset changed");
 _Static_assert(sizeof(vyl_batch_info) == 16, "vyl_batch_info layout changed");
+_Static_assert(sizeof(vyl_header_ref) == 16,
+               "vyl_header_ref layout changed");
+_Static_assert(sizeof(vyl_trailer_info) == 16,
+               "vyl_trailer_info layout changed");
 _Static_assert(VYL_WOULD_BLOCK == 10, "vyl_result WOULD_BLOCK changed");
 _Static_assert(VYL_STALE_TOKEN == 11, "vyl_result STALE_TOKEN changed");
 _Static_assert(VYL_END_OF_BODY == 12, "vyl_result END_OF_BODY changed");
@@ -475,6 +481,66 @@ int main(void) {
     return 1;
   }
 
+  uint8_t trailer_method[] = "POST";
+  uint8_t trailer_path[] = "/trailers";
+  uint8_t trailer_allow_0[] = "x-checksum";
+  uint8_t trailer_allow_1[] = "x-signature";
+  vyl_bytes trailer_names[] = {
+      {trailer_allow_0, sizeof(trailer_allow_0) - 1},
+      {trailer_allow_1, sizeof(trailer_allow_1) - 1},
+  };
+  result = vyl_server_route_managed_with_trailers(
+      server, (vyl_bytes){trailer_method, sizeof(trailer_method) - 1},
+      (vyl_bytes){trailer_path, sizeof(trailer_path) - 1}, trailer_names, 2);
+  if (!expect_result("managed trailer route", result, VYL_OK)) {
+    return 1;
+  }
+
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){trailer_method, sizeof(trailer_method) - 1},
+      (vyl_bytes){trailer_path, sizeof(trailer_path) - 1});
+  if (!expect_result("plain route over trailer route", result,
+                     VYL_DUPLICATE_ROUTE)) {
+    return 1;
+  }
+
+  uint8_t bad_trailer_name[] = "bad name";
+  vyl_bytes bad_trailer_names[] = {
+      {bad_trailer_name, sizeof(bad_trailer_name) - 1},
+  };
+  if (!expect_result("trailer route zero count",
+                     vyl_server_route_managed_with_trailers(
+                         server, (vyl_bytes){trailer_method, 4},
+                         (vyl_bytes){trailer_path, 9}, trailer_names, 0),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("trailer route null names",
+                     vyl_server_route_managed_with_trailers(
+                         server, (vyl_bytes){trailer_method, 4},
+                         (vyl_bytes){trailer_path, 9}, NULL, 1),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("trailer route bad name",
+                     vyl_server_route_managed_with_trailers(
+                         server, (vyl_bytes){trailer_method, 4},
+                         (vyl_bytes){trailer_path, 9}, bad_trailer_names, 1),
+                     VYL_INVALID_ARGUMENT)) {
+    return 1;
+  }
+  {
+    uint8_t many_names[33][8];
+    vyl_bytes many_trailers[33];
+    for (int i = 0; i < 33; i++) {
+      snprintf((char *)many_names[i], sizeof(many_names[i]), "t%03d", i);
+      many_trailers[i] = (vyl_bytes){many_names[i], 4};
+    }
+    if (!expect_result("trailer route over count",
+                       vyl_server_route_managed_with_trailers(
+                           server, (vyl_bytes){trailer_method, 4},
+                           (vyl_bytes){trailer_path, 9}, many_trailers, 33),
+                       VYL_INVALID_ARGUMENT)) {
+      return 1;
+    }
+  }
+
   memset(echo_method, 'X', sizeof(echo_method) - 1);
   memset(echo_path, 'X', sizeof(echo_path) - 1);
   memset(guard_method, 'X', sizeof(guard_method) - 1);
@@ -485,6 +551,10 @@ int main(void) {
   memset(clash_path, 'X', sizeof(clash_path) - 1);
   memset(upload_method, 'X', sizeof(upload_method) - 1);
   memset(upload_path, 'X', sizeof(upload_path) - 1);
+  memset(trailer_method, 'X', sizeof(trailer_method) - 1);
+  memset(trailer_path, 'X', sizeof(trailer_path) - 1);
+  memset(trailer_allow_0, 'X', sizeof(trailer_allow_0) - 1);
+  memset(trailer_allow_1, 'X', sizeof(trailer_allow_1) - 1);
 
   const uint8_t loopback[4] = {127, 0, 0, 1};
   uint16_t bound_port = 0;
@@ -1006,12 +1076,12 @@ int main(void) {
   if (!expect_result("bad response status",
                      vyl_response_start(server, managed_token, 99,
                                         (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
-                                        (vyl_bytes){resp_body, 10}),
+                                        (vyl_bytes){resp_body, sizeof(resp_body) - 1}),
                      VYL_INVALID_ARGUMENT) ||
       !expect_result("bad response reason",
                      vyl_response_start(server, managed_token, 200,
                                         (vyl_bytes){bad_reason, sizeof(bad_reason) - 1},
-                                        (vyl_bytes){resp_body, 10}),
+                                        (vyl_bytes){resp_body, sizeof(resp_body) - 1}),
                      VYL_INVALID_ARGUMENT) ||
       !expect_result("oversized response body",
                      vyl_response_start(server, managed_token, 200,
@@ -1021,7 +1091,7 @@ int main(void) {
       !expect_result("null response server",
                      vyl_response_start(NULL, managed_token, 200,
                                         (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
-                                        (vyl_bytes){resp_body, 10}),
+                                        (vyl_bytes){resp_body, sizeof(resp_body) - 1}),
                      VYL_INVALID_ARGUMENT)) {
     close(managed_fd);
     return 1;
@@ -1037,6 +1107,11 @@ int main(void) {
   }
   if (!expect_managed_response(managed_fd, "HTTP/1.1 200 OK\r\n",
                                "managed hello\n", 0, 0)) {
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_request_cancel(server, managed_token);
+  if (!expect_result("cancel after response", result, VYL_STALE_TOKEN)) {
     close(managed_fd);
     return 1;
   }
@@ -1068,7 +1143,21 @@ int main(void) {
     return 1;
   }
   uint8_t again_body[] = "again\n";
-  result = vyl_response_start(server, poll_events[0].token, 200,
+  vyl_request_token reuse_token = poll_events[0].token;
+  if (reuse_token.request_seq == managed_token.request_seq) {
+    fprintf(stderr, "reused request did not advance token seq\n");
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_response_start(server, managed_token, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){again_body, sizeof(again_body) - 1});
+  if (!expect_result("duplicate response with stale seq", result,
+                     VYL_STALE_TOKEN)) {
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_response_start(server, reuse_token, 200,
                               (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
                               (vyl_bytes){again_body, sizeof(again_body) - 1});
   if (!expect_result("managed reuse response", result, VYL_OK)) {
@@ -1078,6 +1167,401 @@ int main(void) {
   if (!expect_managed_response(managed_fd, "HTTP/1.1 200 OK\r\n", "again\n", 0,
                                1)) {
     close(managed_fd);
+    return 1;
+  }
+
+  int cancel_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (cancel_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(cancel_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("connect");
+      close(cancel_fd);
+      return 1;
+    }
+  }
+  const char cancel_request[] = "GET /managed HTTP/1.1\r\n"
+                                "Host: localhost\r\n"
+                                "\r\n";
+  size_t cancel_sent = 0;
+  while (cancel_sent < sizeof(cancel_request) - 1) {
+    ssize_t count = send(cancel_fd, cancel_request + cancel_sent,
+                         sizeof(cancel_request) - 1 - cancel_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(cancel_fd);
+      return 1;
+    }
+    cancel_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(cancel_fd);
+    return 1;
+  }
+  vyl_request_token cancel_token = poll_events[0].token;
+  result = vyl_request_cancel(server, cancel_token);
+  if (!expect_result("cancel parked request", result, VYL_OK)) {
+    close(cancel_fd);
+    return 1;
+  }
+  {
+    char discard[64];
+    ssize_t count = recv(cancel_fd, discard, sizeof(discard), 0);
+    if (count != 0) {
+      fprintf(stderr, "cancelled connection not closed, recv %zd\n", count);
+      close(cancel_fd);
+      return 1;
+    }
+  }
+  close(cancel_fd);
+  if (!expect_result("cancel after close", vyl_request_cancel(server, cancel_token),
+                     VYL_STALE_TOKEN) ||
+      !expect_result("pull after cancel",
+                     vyl_request_pull_body(server, cancel_token, 1024),
+                     VYL_STALE_TOKEN) ||
+      !expect_result("read after cancel",
+                     vyl_request_read(server, cancel_token, body_chunk,
+                                      sizeof(body_chunk), &body_count),
+                     VYL_STALE_TOKEN) ||
+      !expect_result("respond after cancel",
+                     vyl_response_start(server, cancel_token, 200,
+                                        (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                                        (vyl_bytes){resp_body, sizeof(resp_body) - 1}),
+                     VYL_STALE_TOKEN)) {
+    return 1;
+  }
+  {
+    vyl_request_token zero_token = {0};
+    if (!expect_result("null cancel server",
+                       vyl_request_cancel(NULL, cancel_token),
+                       VYL_INVALID_ARGUMENT) ||
+        !expect_result("zero cancel token",
+                       vyl_request_cancel(server, zero_token),
+                       VYL_INVALID_ARGUMENT)) {
+      return 1;
+    }
+  }
+
+  int cancel_upload_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (cancel_upload_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(cancel_upload_fd, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(cancel_upload_fd);
+      return 1;
+    }
+  }
+  const char cancel_upload_head[] = "POST /upload HTTP/1.1\r\n"
+                                    "Host: localhost\r\n"
+                                    "Content-Length: 10\r\n"
+                                    "\r\n"
+                                    "hello";
+  cancel_sent = 0;
+  while (cancel_sent < sizeof(cancel_upload_head) - 1) {
+    ssize_t count = send(cancel_upload_fd, cancel_upload_head + cancel_sent,
+                         sizeof(cancel_upload_head) - 1 - cancel_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(cancel_upload_fd);
+      return 1;
+    }
+    cancel_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(cancel_upload_fd);
+    return 1;
+  }
+  vyl_request_token cancel_upload_token = poll_events[0].token;
+  result = vyl_request_pull_body(server, cancel_upload_token, 1024);
+  if (!expect_result("cancel-upload body pull", result, VYL_OK)) {
+    close(cancel_upload_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(cancel_upload_fd);
+    return 1;
+  }
+  result = vyl_request_cancel(server, cancel_upload_token);
+  if (!expect_result("cancel mid-body request", result, VYL_OK)) {
+    close(cancel_upload_fd);
+    return 1;
+  }
+  {
+    char discard[64];
+    ssize_t count = recv(cancel_upload_fd, discard, sizeof(discard), 0);
+    if (count != 0) {
+      fprintf(stderr, "cancelled upload not closed, recv %zd\n", count);
+      close(cancel_upload_fd);
+      return 1;
+    }
+  }
+  close(cancel_upload_fd);
+  result = vyl_request_read(server, cancel_upload_token, body_chunk,
+                            sizeof(body_chunk), &body_count);
+  if (!expect_result("read after mid-body cancel", result, VYL_STALE_TOKEN)) {
+    return 1;
+  }
+
+  int trailer_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (trailer_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(trailer_fd, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(trailer_fd);
+      return 1;
+    }
+  }
+  const char trailer_request[] = "POST /trailers HTTP/1.1\r\n"
+                                 "Host: localhost\r\n"
+                                 "Transfer-Encoding: chunked\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n"
+                                 "5\r\n"
+                                 "hello\r\n"
+                                 "0\r\n"
+                                 "X-Checksum: abc123\r\n"
+                                 "X-Signature: s3cr3t\r\n"
+                                 "\r\n";
+  size_t trailer_sent = 0;
+  while (trailer_sent < sizeof(trailer_request) - 1) {
+    ssize_t count = send(trailer_fd, trailer_request + trailer_sent,
+                         sizeof(trailer_request) - 1 - trailer_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(trailer_fd);
+      return 1;
+    }
+    trailer_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(trailer_fd);
+    return 1;
+  }
+  vyl_request_token trailer_token = poll_events[0].token;
+  if (poll_events[0].kind != VYL_HOST_REQUEST) {
+    fprintf(stderr, "unexpected trailer request event\n");
+    close(trailer_fd);
+    return 1;
+  }
+
+  vyl_header_ref trailer_refs[4];
+  uint8_t trailer_data[64];
+  vyl_trailer_info trailer_info = {0};
+  result = vyl_request_copy_trailers(server, trailer_token, trailer_refs, 4,
+                                     trailer_data, sizeof(trailer_data),
+                                     &trailer_info);
+  if (!expect_result("trailer copy before body end", result, VYL_WOULD_BLOCK)) {
+    close(trailer_fd);
+    return 1;
+  }
+
+  size_t trailer_body_total = 0;
+  char trailer_body[16] = {0};
+  int trailer_complete = 0;
+  for (int pull = 0; pull < 8 && !trailer_complete; pull++) {
+    result = vyl_request_pull_body(server, trailer_token, 1024);
+    if (!expect_result("trailer body pull", result, VYL_OK)) {
+      close(trailer_fd);
+      return 1;
+    }
+    if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data),
+                    &batch, 1, VYL_OK)) {
+      close(trailer_fd);
+      return 1;
+    }
+    if (poll_events[0].kind != VYL_HOST_BODY_AVAILABLE) {
+      fprintf(stderr, "unexpected trailer body event\n");
+      close(trailer_fd);
+      return 1;
+    }
+    if (poll_events[0].body_complete) {
+      trailer_complete = 1;
+    }
+    for (int read = 0; read < 4; read++) {
+      result = vyl_request_read(server, trailer_token, body_chunk,
+                                sizeof(body_chunk), &body_count);
+      if (result == VYL_WOULD_BLOCK) {
+        break;
+      }
+      if (result != VYL_OK && result != VYL_END_OF_BODY) {
+        fprintf(stderr, "unexpected trailer body read %d\n", result);
+        close(trailer_fd);
+        return 1;
+      }
+      if (trailer_body_total + body_count >= sizeof(trailer_body)) {
+        fprintf(stderr, "trailer body overflow\n");
+        close(trailer_fd);
+        return 1;
+      }
+      memcpy(trailer_body + trailer_body_total, body_chunk, body_count);
+      trailer_body_total += body_count;
+      if (result == VYL_END_OF_BODY) {
+        break;
+      }
+    }
+  }
+  if (!trailer_complete) {
+    fprintf(stderr, "trailer body never completed\n");
+    close(trailer_fd);
+    return 1;
+  }
+  if (trailer_body_total != 5 || memcmp(trailer_body, "hello", 5) != 0) {
+    fprintf(stderr, "unexpected trailer body bytes\n");
+    close(trailer_fd);
+    return 1;
+  }
+
+  result = vyl_request_copy_trailers(server, trailer_token, trailer_refs, 4,
+                                     trailer_data, sizeof(trailer_data),
+                                     &trailer_info);
+  if (!expect_result("trailer copy", result, VYL_OK) ||
+      trailer_info.header_count != 2 || trailer_info.data_used != 33) {
+    fprintf(stderr, "unexpected trailer copy %d/%u/%u\n", result,
+            trailer_info.header_count, trailer_info.data_used);
+    close(trailer_fd);
+    return 1;
+  }
+  if (trailer_refs[0].name_length != 10 ||
+      memcmp(trailer_data + trailer_refs[0].name_offset, "X-Checksum", 10) !=
+          0 ||
+      trailer_refs[0].value_length != 6 ||
+      memcmp(trailer_data + trailer_refs[0].value_offset, "abc123", 6) != 0 ||
+      trailer_refs[1].name_length != 11 ||
+      memcmp(trailer_data + trailer_refs[1].name_offset, "X-Signature", 11) !=
+          0 ||
+      trailer_refs[1].value_length != 6 ||
+      memcmp(trailer_data + trailer_refs[1].value_offset, "s3cr3t", 6) != 0) {
+    fprintf(stderr, "unexpected trailer field bytes\n");
+    close(trailer_fd);
+    return 1;
+  }
+
+  result = vyl_request_copy_trailers(server, trailer_token, trailer_refs, 1,
+                                     trailer_data, sizeof(trailer_data),
+                                     &trailer_info);
+  if (!expect_result("trailer copy small headers", result,
+                     VYL_BUFFER_TOO_SMALL) ||
+      trailer_info.headers_required != 2 || trailer_info.data_required != 33) {
+    fprintf(stderr, "unexpected small-header copy %d/%u/%u\n", result,
+            trailer_info.headers_required, trailer_info.data_required);
+    close(trailer_fd);
+    return 1;
+  }
+
+  uint8_t trailer_resp[] = "done\n";
+  result = vyl_response_start(server, trailer_token, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){trailer_resp, sizeof(trailer_resp) - 1});
+  if (!expect_result("trailer echo response", result, VYL_OK)) {
+    close(trailer_fd);
+    return 1;
+  }
+  if (!expect_managed_response(trailer_fd, "HTTP/1.1 200 OK\r\n", "done\n", 1,
+                               1)) {
+    close(trailer_fd);
+    return 1;
+  }
+
+  int evil_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (evil_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(evil_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("connect");
+      close(evil_fd);
+      return 1;
+    }
+  }
+  const char evil_request[] = "POST /trailers HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "Transfer-Encoding: chunked\r\n"
+                              "Connection: close\r\n"
+                              "\r\n"
+                              "5\r\n"
+                              "hello\r\n"
+                              "0\r\n"
+                              "X-Evil: 1\r\n"
+                              "\r\n";
+  size_t evil_sent = 0;
+  while (evil_sent < sizeof(evil_request) - 1) {
+    ssize_t count = send(evil_fd, evil_request + evil_sent,
+                         sizeof(evil_request) - 1 - evil_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(evil_fd);
+      return 1;
+    }
+    evil_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(evil_fd);
+    return 1;
+  }
+  vyl_request_token evil_token = poll_events[0].token;
+  result = vyl_request_pull_body(server, evil_token, 1024);
+  if (!expect_result("evil body pull", result, VYL_OK)) {
+    close(evil_fd);
+    return 1;
+  }
+  memset(&batch, 0, sizeof(batch));
+  result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                  sizeof(poll_data), 500000000, &batch);
+  if (!expect_result("evil poll quiet", result, VYL_OK) ||
+      batch.event_count != 0) {
+    fprintf(stderr, "expected no events after disallowed trailer, got %u\n",
+            batch.event_count);
+    close(evil_fd);
+    return 1;
+  }
+  {
+    char discard[64];
+    ssize_t count = recv(evil_fd, discard, sizeof(discard), 0);
+    if (count != 0) {
+      fprintf(stderr, "disallowed trailer did not close, recv %zd\n", count);
+      close(evil_fd);
+      return 1;
+    }
+  }
+  close(evil_fd);
+  result = vyl_request_pull_body(server, evil_token, 1024);
+  if (!expect_result("pull after trailer reject", result, VYL_STALE_TOKEN)) {
     return 1;
   }
 
@@ -1251,6 +1735,51 @@ int main(void) {
   }
   if (!expect_result("join from handler", join_guard_result, VYL_BUSY)) {
     return 1;
+  }
+
+  {
+    vyl_host_event shutdown_events[4];
+    uint8_t shutdown_data[256];
+    vyl_batch_info shutdown_batch = {0};
+    uint32_t shutdown_seen = 0;
+    struct timespec shutdown_start;
+    clock_gettime(CLOCK_MONOTONIC, &shutdown_start);
+    for (;;) {
+      memset(&shutdown_batch, 0, sizeof(shutdown_batch));
+      result = vyl_server_poll_events(server, shutdown_events, 4,
+                                      shutdown_data, sizeof(shutdown_data),
+                                      100000000u, &shutdown_batch);
+      if (!expect_result("shutdown drain poll", result, VYL_OK)) {
+        return 1;
+      }
+      for (uint32_t i = 0; i < shutdown_batch.event_count; i++) {
+        if (shutdown_events[i].kind > VYL_HOST_BODY_AVAILABLE) {
+          fprintf(stderr, "unexpected shutdown event kind %u\n",
+                  shutdown_events[i].kind);
+          return 1;
+        }
+        if (shutdown_events[i].kind == VYL_HOST_SHUTDOWN) {
+          shutdown_seen++;
+        }
+      }
+      if (shutdown_seen >= 2) {
+        break;
+      }
+      struct timespec shutdown_now;
+      clock_gettime(CLOCK_MONOTONIC, &shutdown_now);
+      int64_t shutdown_elapsed =
+          (int64_t)(shutdown_now.tv_sec - shutdown_start.tv_sec) * 1000000000ll +
+          ((int64_t)shutdown_now.tv_nsec - (int64_t)shutdown_start.tv_nsec);
+      if (shutdown_elapsed > 5000000000ll) {
+        fprintf(stderr, "timed out waiting for shutdown events, got %u\n",
+                shutdown_seen);
+        return 1;
+      }
+    }
+    if (shutdown_seen != 2) {
+      fprintf(stderr, "expected 2 shutdown events, got %u\n", shutdown_seen);
+      return 1;
+    }
   }
 
   result = vyl_server_join(server);

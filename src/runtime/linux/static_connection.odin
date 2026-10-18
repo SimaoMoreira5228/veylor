@@ -46,23 +46,39 @@ Static_Connection_Close_Reason :: enum u8 {
 	Shutdown_Forced,
 	Initialization_Failed,
 	Internal_Error,
+	Cancelled,
 	Count,
 }
 
 STAGED_BODY_CAPACITY :: 2048
+MANAGED_TRAILER_BYTES_LIMIT :: 8 * 1024
+
+Managed_Trailer_Field :: struct {
+	name_offset:  int,
+	name_length:  int,
+	value_offset: int,
+	value_length: int,
+}
 
 Static_Connection_Workspace :: struct {
-	head_driver:      connection.Connection_Head_Driver,
-	body_driver:      connection.Connection_Body_Driver,
-	managed_route_id: u64,
-	request_input:    []u8,
-	headers:          []http1.Header,
-	response:         []u8,
-	staged_body:      [STAGED_BODY_CAPACITY]u8,
-	body_start:       int,
-	body_valid:       int,
-	staged_length:    int,
-	body_complete:    bool,
+	head_driver:         connection.Connection_Head_Driver,
+	body_driver:         connection.Connection_Body_Driver,
+	managed_route_id:    u64,
+	request_input:       []u8,
+	headers:             []http1.Header,
+	response:            []u8,
+	staged_body:         [STAGED_BODY_CAPACITY]u8,
+	body_start:          int,
+	body_valid:          int,
+	staged_length:       int,
+	body_complete:       bool,
+	trailer_head:        []http1.Header,
+	trailer_allow:       [router.MAX_MANAGED_TRAILER_NAMES]string,
+	trailer_allow_count: int,
+	trailer_count:       int,
+	trailer_fields:      [router.MAX_MANAGED_TRAILER_NAMES]Managed_Trailer_Field,
+	trailer_data:        [MANAGED_TRAILER_BYTES_LIMIT]u8,
+	trailer_data_used:   int,
 }
 
 Static_Workspace_Pool :: struct {
@@ -648,6 +664,10 @@ acquire_static_workspace :: proc(
 	workspace.body_valid = 0
 	workspace.staged_length = 0
 	workspace.body_complete = false
+	workspace.trailer_head = nil
+	workspace.trailer_allow_count = 0
+	workspace.trailer_count = 0
+	workspace.trailer_data_used = 0
 	return workspace, true
 }
 
@@ -691,6 +711,10 @@ reset_static_workspace :: proc(workspace: ^Static_Connection_Workspace) {
 	workspace.body_valid = 0
 	workspace.staged_length = 0
 	workspace.body_complete = false
+	workspace.trailer_head = nil
+	workspace.trailer_allow_count = 0
+	workspace.trailer_count = 0
+	workspace.trailer_data_used = 0
 }
 
 valid_static_workspace_pool :: proc(pool: ^Static_Workspace_Pool) -> bool {

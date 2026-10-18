@@ -120,6 +120,7 @@ drain_host_event_queues :: proc(
 				token = Vyl_Request_Token {
 					worker_id = taken.token.worker_id,
 					slot = taken.token.slot,
+					request_seq = taken.token.request_seq,
 					worker_generation = taken.token.worker_generation,
 					connection_generation = taken.token.generation,
 				},

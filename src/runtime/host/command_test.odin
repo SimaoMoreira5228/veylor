@@ -201,3 +201,35 @@ test_host_command_queue_validates_response_start_bounds :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, pending_host_commands(&queue), 1)
 }
+
+make_cancel_command :: proc(slot: u32, generation: u64) -> Host_Command {
+	return Host_Command{kind = .Cancel, token = make_host_command_token(slot, generation)}
+}
+
+@(test)
+test_host_command_queue_accepts_cancel_without_bounds :: proc(t: ^testing.T) {
+	storage: [2]Host_Command
+	queue := init_host_command_queue(storage[:])
+
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_cancel_command(0, 1)),
+		Host_Command_Result.Enqueued,
+	)
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_cancel_command(1, 2)),
+		Host_Command_Result.Enqueued,
+	)
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_cancel_command(2, 3)),
+		Host_Command_Result.Full,
+	)
+
+	cmd, ok := dequeue_host_command(&queue)
+	testing.expect(t, ok)
+	testing.expect_value(t, cmd.kind, Host_Command_Kind.Cancel)
+	testing.expect_value(t, cmd.token, make_host_command_token(0, 1))
+	testing.expect_value(t, pending_host_commands(&queue), 1)
+}

@@ -10,6 +10,7 @@ HOST_MAX_RESPONSE_BODY_BYTES :: 768
 Host_Command_Kind :: enum {
 	Read_Body,
 	Response_Start,
+	Cancel,
 }
 
 Host_Command :: struct {
@@ -57,7 +58,7 @@ enqueue_host_command :: proc(
 		return .Invalid
 	}
 
-	if cmd.kind != .Read_Body && cmd.kind != .Response_Start {
+	if cmd.kind != .Read_Body && cmd.kind != .Response_Start && cmd.kind != .Cancel {
 		return .Invalid
 	}
 

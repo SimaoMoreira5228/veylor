@@ -59,7 +59,14 @@ park_static_connection_for_host :: proc(
 		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
 	}
 	workspace.managed_route_id = managed_route.route_id
+	if state.token.request_seq == max(u32) {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+	state.token.request_seq += 1
 	stash_managed_request_context(state, head, input, method)
+	bind_managed_trailer_context(workspace, managed_route, head)
 	enqueue_result := host.enqueue_request(
 		state.host_queue,
 		state.token,
@@ -133,6 +140,23 @@ stash_managed_request_context :: proc(
 	state.managed_http11 = http1.bytes_equal(version, "HTTP/1.1")
 	state.managed_req_close = head.connection.close
 	state.managed_req_keep_alive = head.connection.keep_alive
+}
+
+bind_managed_trailer_context :: proc(
+	workspace: ^Static_Connection_Workspace,
+	route: router.Static_Route,
+	head: http1.Request_Head,
+) {
+	workspace.trailer_head = head.headers
+	workspace.trailer_allow_count = 0
+	count := route.managed_trailer_count
+	if count > len(workspace.trailer_allow) {
+		count = len(workspace.trailer_allow)
+	}
+	for i := 0; i < count; i += 1 {
+		workspace.trailer_allow[i] = string(route.managed_trailers[i])
+		workspace.trailer_allow_count += 1
+	}
 }
 
 Managed_Read_Outcome :: enum {
@@ -209,6 +233,7 @@ execute_managed_read_body :: proc(
 	}
 
 	staged_before := workspace.staged_length
+	trailer_before := workspace.trailer_count
 	staged_free := len(workspace.staged_body) - staged_before
 	if staged_free < 0 {
 		staged_free = 0
@@ -216,6 +241,11 @@ execute_managed_read_body :: proc(
 	max_command_bytes := int(cmd.max_bytes)
 	body_event: connection.Connection_Body_Event
 	bytes_read := 0
+	trailer_ctx := body.Chunked_Trailer_Context {
+		headers                 = workspace.trailer_head,
+		head_input              = workspace.request_input,
+		permitted_trailer_names = workspace.trailer_allow[:workspace.trailer_allow_count],
+	}
 
 	if workspace.body_valid > workspace.body_start {
 		feed_length := workspace.body_valid - workspace.body_start
@@ -233,7 +263,7 @@ execute_managed_read_body :: proc(
 			&workspace.body_driver,
 			workspace.request_input[workspace.body_start:workspace.body_start + feed_length],
 			spans[:],
-			body.Chunked_Trailer_Context{},
+			trailer_ctx,
 		)
 		workspace.body_start += body_event.consumed
 		stage_managed_body_spans(workspace, body_event, workspace.body_start - body_event.consumed)
@@ -246,6 +276,17 @@ execute_managed_read_body :: proc(
 			state.close_reason = .Internal_Error
 			state.phase = .Failed
 			return Managed_Read_Turn{outcome = .Closed}
+		}
+		if body_event.result == .Trailer {
+			if !stage_managed_trailer(
+				workspace,
+				body_event.trailer_name,
+				body_event.trailer_value,
+			) {
+				state.close_reason = .Internal_Error
+				state.phase = .Failed
+				return Managed_Read_Turn{outcome = .Closed}
+			}
 		}
 		if workspace.body_driver.state == .Failed || workspace.body_driver.state == .Cancelled {
 			state.close_reason = .Internal_Error
@@ -308,7 +349,7 @@ execute_managed_read_body :: proc(
 			completion,
 			feed,
 			spans[:],
-			body.Chunked_Trailer_Context{},
+			trailer_ctx,
 		)
 		if body_event.result == .Invalid || body_event.result == .Span_Capacity {
 			state.close_reason = .Internal_Error
@@ -319,6 +360,17 @@ execute_managed_read_body :: proc(
 			state.close_reason = .Request_Rejected
 			state.phase = .Failed
 			return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+		}
+		if body_event.result == .Trailer {
+			if !stage_managed_trailer(
+				workspace,
+				body_event.trailer_name,
+				body_event.trailer_value,
+			) {
+				state.close_reason = .Internal_Error
+				state.phase = .Failed
+				return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+			}
 		}
 		workspace.body_start += body_event.consumed
 		stage_managed_body_spans(workspace, body_event, workspace.body_valid - bytes_read)
@@ -346,7 +398,7 @@ execute_managed_read_body :: proc(
 		}
 		return enqueue_managed_body_event(state)
 	}
-	if workspace.staged_length == staged_before {
+	if workspace.staged_length == staged_before && workspace.trailer_count == trailer_before {
 		return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Stalled}
 	}
 	refresh := connections.cancel_connection_phase_deadline(table, timers, state.token)
@@ -391,6 +443,30 @@ stage_managed_body_spans :: proc(
 		)
 		workspace.staged_length += span.length
 	}
+}
+
+stage_managed_trailer :: proc(
+	workspace: ^Static_Connection_Workspace,
+	name: []u8,
+	value: []u8,
+) -> bool {
+	if workspace.trailer_count >= len(workspace.trailer_fields) {
+		return false
+	}
+	if len(name) + len(value) > len(workspace.trailer_data) - workspace.trailer_data_used {
+		return false
+	}
+	field := &workspace.trailer_fields[workspace.trailer_count]
+	field.name_offset = workspace.trailer_data_used
+	field.name_length = len(name)
+	copy(workspace.trailer_data[field.name_offset:], name)
+	workspace.trailer_data_used += len(name)
+	field.value_offset = workspace.trailer_data_used
+	field.value_length = len(value)
+	copy(workspace.trailer_data[field.value_offset:], value)
+	workspace.trailer_data_used += len(value)
+	workspace.trailer_count += 1
+	return true
 }
 
 enqueue_managed_body_event :: proc(state: ^Static_Connection) -> Managed_Read_Turn {
@@ -558,4 +634,39 @@ execute_managed_response_start :: proc(
 		return .Closed
 	}
 	return .Responded
+}
+
+Managed_Cancel_Outcome :: enum {
+	Cancelled,
+	Dropped,
+}
+
+execute_managed_cancel :: proc(
+	state: ^Static_Connection,
+	cmd: host.Host_Command,
+	table: ^connections.Connection_Table,
+) -> Managed_Cancel_Outcome {
+	if cmd.kind != .Cancel {
+		return .Dropped
+	}
+
+	resource_id, lookup_result := connections.lookup_connection(table, cmd.token)
+	if lookup_result != .Found || resource_id != u64(state.fd) || cmd.token != state.token {
+		return .Dropped
+	}
+
+	phase, phase_result := connections.connection_phase(table, cmd.token)
+	if phase_result != .Found {
+		return .Dropped
+	}
+	if phase != .Awaiting_Handler && phase != .Reading_Request_Body {
+		return .Dropped
+	}
+	if state.phase != .Awaiting_Host {
+		return .Dropped
+	}
+
+	state.close_reason = .Cancelled
+	state.phase = .Failed
+	return .Cancelled
 }

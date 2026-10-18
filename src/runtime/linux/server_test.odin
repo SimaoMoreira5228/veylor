@@ -7,6 +7,7 @@ import "core:testing"
 import http1 "veylor:http1"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
+import host "veylor:runtime/host"
 import shutdown "veylor:runtime/shutdown"
 import workers "veylor:runtime/workers"
 import "veylor:transport"
@@ -25,6 +26,8 @@ Managed_Server_Test_Instance :: struct {
 	timer_storage:        [34]transport.Timer_Expiration,
 	timer_index_storage:  [34 * transport.TIMER_QUEUE_INDEX_STORAGE_FACTOR]u32,
 	connection_states:    [32]Static_Connection,
+	host_event_storage:   [host.HOST_QUEUE_DEPTH]host.Host_Event,
+	host_queue:           host.Host_Queue,
 	workspace_storage:    [32]Static_Connection_Workspace,
 	workspace_free_stack: [32]u32,
 	workspace_pool:       Static_Workspace_Pool,
@@ -163,12 +166,16 @@ init_managed_server_test_worker :: proc(
 		return false
 	}
 	instance.workspace_pool = workspace_pool
+
+	instance.host_queue = host.init_host_queue(instance.host_event_storage[:])
+
 	instance.worker = Static_Worker {
 		poller = poller,
 		listener = socket.Listener{fd = listener.fd, local_address = listener.local_address},
 		shutdown_state = &instance.shutdown_state,
 		table = &instance.table,
 		routes = &instance.routes,
+		host_queue = &instance.host_queue,
 		connection_states = instance.connection_states[:],
 		workspace_pool = &instance.workspace_pool,
 		native_events = instance.native_events[:],

@@ -69,6 +69,7 @@ int32_t vyl_server_route_managed(vyl_server *server, vyl_bytes method,
 
 typedef enum {
   VYL_HOST_REQUEST = 0,
+   
   VYL_HOST_SHUTDOWN = 1,
   VYL_HOST_BODY_AVAILABLE = 2
 } vyl_host_event_kind;
@@ -76,6 +77,7 @@ typedef enum {
 typedef struct {
   uint32_t worker_id;
   uint32_t slot;
+  uint32_t request_seq;
   uint64_t worker_generation;
   uint64_t connection_generation;
 } vyl_request_token;
@@ -97,6 +99,20 @@ typedef struct {
   uint32_t data_required;
 } vyl_batch_info;
 
+typedef struct {
+  uint32_t name_offset;
+  uint32_t name_length;
+  uint32_t value_offset;
+  uint32_t value_length;
+} vyl_header_ref;
+
+typedef struct {
+  uint32_t header_count;
+  uint32_t data_used;
+  uint32_t headers_required;
+  uint32_t data_required;
+} vyl_trailer_info;
+
  
 int32_t vyl_server_poll_events(vyl_server *server, vyl_host_event *events,
                                uint32_t event_capacity, uint8_t *data,
@@ -112,10 +128,23 @@ int32_t vyl_request_read(vyl_server *server, vyl_request_token token,
  
 int32_t vyl_response_start(vyl_server *server, vyl_request_token token,
                            int32_t status, vyl_bytes reason, vyl_bytes body);
+ 
+int32_t vyl_request_cancel(vyl_server *server, vyl_request_token token);
+ 
+int32_t vyl_server_route_managed_with_trailers(vyl_server *server,
+                                               vyl_bytes method, vyl_bytes path,
+                                               const vyl_bytes *trailers,
+                                               uint32_t trailer_count);
+ 
+int32_t vyl_request_copy_trailers(vyl_server *server, vyl_request_token token,
+                                  vyl_header_ref *headers, uint32_t header_cap,
+                                  uint8_t *data, uint32_t data_cap,
+                                  vyl_trailer_info *out_info);
 int32_t vyl_server_listen(vyl_server *server, const uint8_t address[4],
                           uint16_t port, uint16_t *bound_port,
                           int32_t *system_error);
 int32_t vyl_server_start(vyl_server *server);
+ 
 int32_t vyl_server_stop_accepting(vyl_server *server);
 int32_t vyl_server_join(vyl_server *server);
 int32_t vyl_server_destroy(vyl_server *server);

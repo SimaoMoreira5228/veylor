@@ -2,8 +2,9 @@ package connections
 
 Connection_Token :: struct {
 	worker_id:         u32,
-	worker_generation: u64,
 	slot:              u32,
+	request_seq:       u32,
+	worker_generation: u64,
 	generation:        u64,
 }
 

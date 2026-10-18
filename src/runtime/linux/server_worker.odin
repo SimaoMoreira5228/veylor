@@ -308,7 +308,7 @@ drain_host_commands :: proc(worker: ^Static_Worker, now_ns: u64) {
 }
 
 execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now_ns: u64) {
-	if cmd.kind != .Read_Body && cmd.kind != .Response_Start {
+	if cmd.kind != .Read_Body && cmd.kind != .Response_Start && cmd.kind != .Cancel {
 		return
 	}
 	resource_id, lookup_result := connections.lookup_connection(worker.table, cmd.token)
@@ -321,6 +321,15 @@ execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now
 	}
 	state := &worker.connection_states[slot]
 	if !state.active || state.token != cmd.token || resource_id != u64(state.fd) {
+		return
+	}
+	if cmd.kind == .Cancel {
+		if execute_managed_cancel(state, cmd, worker.table) == .Cancelled {
+			close_result := close_static_worker_connection(worker, state)
+			if close_result == .Error {
+				worker.managed_result = .Error
+			}
+		}
 		return
 	}
 	if cmd.kind == .Response_Start {

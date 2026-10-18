@@ -273,6 +273,104 @@ vyl_server_route_managed :: proc "c" (
 }
 
 @(export)
+vyl_server_route_managed_with_trailers :: proc "c" (
+	server: ^Vyl_Server,
+	method: Vyl_Bytes,
+	path: Vyl_Bytes,
+	trailers: [^]Vyl_Bytes,
+	trailer_count: u32,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if server == nil || !valid_configuring_server(server) {
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	if !valid_input_bytes(method, VYL_MAX_METHOD_BYTES, false) ||
+	   !valid_input_bytes(path, VYL_MAX_PATH_BYTES, false) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if trailer_count == 0 || trailer_count > VYL_MAX_TRAILER_NAMES {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if trailers == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	method_bytes := method.data[:int(method.length)]
+	path_bytes := path.data[:int(path.length)]
+	trailer_slice := trailers[:int(trailer_count)]
+
+	for i := 0; i < len(trailer_slice); i += 1 {
+		name := trailer_slice[i]
+
+		if !valid_input_bytes(name, VYL_MAX_TRAILER_NAME_BYTES, false) ||
+		   !router.valid_trailer_name(name.data[:int(name.length)]) {
+			return i32(Vyl_Result.Invalid_Argument)
+		}
+	}
+	_, native_conflict := router.find_native_route(&server.native_routes, method_bytes, path_bytes)
+
+	if native_conflict == .Found {
+		return i32(Vyl_Result.Duplicate_Route)
+	}
+
+	for i := 0; i < server.routes.count; i += 1 {
+		static_route := server.routes.routes[i]
+
+		if router.compare_bytes(static_route.method, method_bytes) == 0 &&
+		   router.compare_bytes(static_route.path, path_bytes) == 0 {
+			return i32(Vyl_Result.Duplicate_Route)
+		}
+	}
+
+	bytes_needed := int(method.length + path.length)
+
+	for i := 0; i < len(trailer_slice); i += 1 {
+		bytes_needed += int(trailer_slice[i].length)
+	}
+
+	if server.route_bytes_used > len(server.route_bytes) - bytes_needed {
+		return i32(Vyl_Result.Capacity)
+	}
+	previous_bytes_used := server.route_bytes_used
+	owned_method := retain_route_bytes(server, method_bytes)
+	owned_path := retain_route_bytes(server, path_bytes)
+	owned_names: [router.MAX_MANAGED_TRAILER_NAMES][]u8
+
+	for i := 0; i < len(trailer_slice); i += 1 {
+		owned_names[i] = retain_route_bytes(
+			server,
+			trailer_slice[i].data[:int(trailer_slice[i].length)],
+		)
+	}
+	register_result := router.register_managed_route_with_trailers(
+		&server.routes,
+		owned_method,
+		owned_path,
+		owned_names[:len(trailer_slice)],
+	)
+
+	if register_result != .Added {
+		server.route_bytes_used = previous_bytes_used
+
+		if register_result == .Duplicate {
+			return i32(Vyl_Result.Duplicate_Route)
+		}
+
+		if register_result == .Full {
+			return i32(Vyl_Result.Capacity)
+		}
+
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	return i32(Vyl_Result.Ok)
+}
+
+@(export)
 vyl_server_listen :: proc "c" (
 	server: ^Vyl_Server,
 	address: [^]u8,

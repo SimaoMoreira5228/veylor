@@ -9,6 +9,8 @@ VYL_MAX_METHOD_BYTES :: 16
 VYL_MAX_PATH_BYTES :: 2048
 VYL_MAX_REASON_BYTES :: 64
 VYL_MAX_RESPONSE_BODY_BYTES :: 768
+VYL_MAX_TRAILER_NAMES :: 32
+VYL_MAX_TRAILER_NAME_BYTES :: 128
 
 Vyl_Result :: enum i32 {
 	Ok,
@@ -59,6 +61,7 @@ Vyl_Native_Handler :: #type proc "c" (
 Vyl_Request_Token :: struct {
 	worker_id:             u32,
 	slot:                  u32,
+	request_seq:           u32,
 	worker_generation:     u64,
 	connection_generation: u64,
 }
@@ -87,4 +90,18 @@ Vyl_Batch_Info :: struct {
 	data_used:       u32,
 	events_required: u32,
 	data_required:   u32,
+}
+
+Vyl_Header_Ref :: struct {
+	name_offset:  u32,
+	name_length:  u32,
+	value_offset: u32,
+	value_length: u32,
+}
+
+Vyl_Trailer_Info :: struct {
+	header_count:     u32,
+	data_used:        u32,
+	headers_required: u32,
+	data_required:    u32,
 }

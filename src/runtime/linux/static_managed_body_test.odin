@@ -48,6 +48,7 @@ setup_managed_body_fixture :: proc(
 	path: string,
 	request: string,
 	body_limit: u64,
+	trailers: []string = nil,
 ) -> bool {
 	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &fixture.sockets)
 	testing.expect_value(t, socket_result, linux.Errno.NONE)
@@ -66,11 +67,32 @@ setup_managed_body_fixture :: proc(
 		fixture.route_storage[:],
 		fixture.route_index_storage[:],
 	)
-	testing.expect_value(
-		t,
-		router.register_managed_route(&fixture.routes, transmute([]u8)method, transmute([]u8)path),
-		router.Route_Table_Result.Added,
-	)
+	if len(trailers) == 0 {
+		testing.expect_value(
+			t,
+			router.register_managed_route(
+				&fixture.routes,
+				transmute([]u8)method,
+				transmute([]u8)path,
+			),
+			router.Route_Table_Result.Added,
+		)
+	} else {
+		names := make([][]u8, len(trailers), context.temp_allocator)
+		for allowed, i in trailers {
+			names[i] = transmute([]u8)allowed
+		}
+		testing.expect_value(
+			t,
+			router.register_managed_route_with_trailers(
+				&fixture.routes,
+				transmute([]u8)method,
+				transmute([]u8)path,
+				names,
+			),
+			router.Route_Table_Result.Added,
+		)
+	}
 	testing.expect_value(
 		t,
 		router.freeze_route_table(&fixture.routes),
@@ -193,10 +215,11 @@ test_managed_read_command_stages_partial_body_and_notifies :: proc(t: ^testing.T
 	polled: [4]host.Host_Event
 	poll := host.poll_host_queue(&fixture.host_queue, polled[:])
 	testing.expect_value(t, poll.copied, 1)
+	request_token := polled[0].token
 
 	cmd := host.Host_Command {
 		kind      = .Read_Body,
-		token     = fixture.token,
+		token     = request_token,
 		max_bytes = 1024,
 	}
 	testing.expect_value(
@@ -210,7 +233,7 @@ test_managed_read_command_stages_partial_body_and_notifies :: proc(t: ^testing.T
 	notified := host.poll_host_queue(&fixture.host_queue, polled[:])
 	testing.expect_value(t, notified.copied, 1)
 	testing.expect_value(t, polled[0].kind, host.Host_Event_Kind.Body_Available)
-	testing.expect_value(t, polled[0].token, fixture.token)
+	testing.expect_value(t, polled[0].token, request_token)
 	testing.expect_value(t, polled[0].body_ready, u32(5))
 	testing.expect_value(t, fixture.workspace_storage[0].staged_length, 5)
 	testing.expect_value(
@@ -241,10 +264,11 @@ test_managed_read_completes_body_and_returns_to_awaiting_handler :: proc(t: ^tes
 	}
 	polled: [4]host.Host_Event
 	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
 
 	cmd := host.Host_Command {
 		kind      = .Read_Body,
-		token     = fixture.token,
+		token     = request_token,
 		max_bytes = 1024,
 	}
 	testing.expect_value(
@@ -273,7 +297,7 @@ test_managed_read_completes_body_and_returns_to_awaiting_handler :: proc(t: ^tes
 
 	late := host.Host_Command {
 		kind      = .Read_Body,
-		token     = fixture.token,
+		token     = request_token,
 		max_bytes = 1024,
 	}
 	testing.expect_value(
@@ -296,8 +320,9 @@ test_managed_read_command_with_stale_token_is_dropped :: proc(t: ^testing.T) {
 	}
 	polled: [4]host.Host_Event
 	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
 
-	stale_token := fixture.token
+	stale_token := request_token
 	stale_token.generation += 1
 	cmd := host.Host_Command {
 		kind      = .Read_Body,
@@ -343,10 +368,13 @@ test_managed_read_command_closes_connection_when_event_queue_is_full :: proc(t: 
 		)
 	}
 	testing.expect_value(t, host.pending_host_events(&fixture.host_queue), 4)
+	front, front_ok := host.peek_host_queue(&fixture.host_queue)
+	testing.expect(t, front_ok)
+	request_token := front.token
 
 	cmd := host.Host_Command {
 		kind      = .Read_Body,
-		token     = fixture.token,
+		token     = request_token,
 		max_bytes = 1024,
 	}
 	testing.expect_value(
@@ -428,10 +456,11 @@ test_managed_response_start_serves_keep_alive_get :: proc(t: ^testing.T) {
 	}
 	polled: [4]host.Host_Event
 	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
 	fixture.worker.poller = fixture.poller
 	fixture.worker.shutdown_state = &fixture.shutdown_state
 
-	cmd := make_managed_response_command(fixture.token, 200, "OK", "hello")
+	cmd := make_managed_response_command(request_token, 200, "OK", "hello")
 	testing.expect_value(
 		t,
 		host.enqueue_host_command(&fixture.command_queue, cmd),
@@ -494,10 +523,11 @@ test_managed_response_start_closes_with_unread_body :: proc(t: ^testing.T) {
 	}
 	polled: [4]host.Host_Event
 	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
 	fixture.worker.poller = fixture.poller
 	fixture.worker.shutdown_state = &fixture.shutdown_state
 
-	cmd := make_managed_response_command(fixture.token, 200, "OK", "done")
+	cmd := make_managed_response_command(request_token, 200, "OK", "done")
 	testing.expect_value(
 		t,
 		host.enqueue_host_command(&fixture.command_queue, cmd),
@@ -518,6 +548,250 @@ test_managed_response_start_closes_with_unread_body :: proc(t: ^testing.T) {
 		t,
 		read_managed_socket_text(t, &fixture, response_buffer[:]),
 		"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\ndone",
+	)
+	close_managed_body_fixture(&fixture)
+}
+
+make_managed_cancel_command :: proc(token: connections.Connection_Token) -> host.Host_Command {
+	return host.Host_Command{kind = .Cancel, token = token}
+}
+
+@(test)
+test_managed_cancel_closes_parked_connection :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /managed HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/managed", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(
+			&fixture.command_queue,
+			make_managed_cancel_command(request_token),
+		),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 2000)
+	testing.expect_value(t, fixture.worker_states[0].active, false)
+	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(1))
+	testing.expect_value(
+		t,
+		fixture.worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Cancelled)],
+		u64(1),
+	)
+	testing.expect_value(t, host.pending_host_events(&fixture.host_queue), 0)
+	// NOTE: the worker already closed sockets[0]; closing it again could
+	// release an fd number reused by a parallel test.
+	epoll.close(&fixture.poller)
+	linux.close(fixture.sockets[1])
+}
+
+@(test)
+test_managed_cancel_with_stale_token_is_dropped :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /managed HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/managed", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	stale_token := request_token
+	stale_token.generation += 1
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(
+			&fixture.command_queue,
+			make_managed_cancel_command(stale_token),
+		),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 2000)
+	testing.expect_value(t, fixture.worker_states[0].active, true)
+	testing.expect_value(t, fixture.worker_states[0].phase, Static_Connection_Phase.Awaiting_Host)
+	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(0))
+	close_managed_body_fixture(&fixture)
+}
+
+@(test)
+test_managed_cancel_during_response_write_is_dropped :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /managed HTTP/1.1\r\nHost: example.test\r\n\r\n"
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/managed", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	request_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	respond := make_managed_response_command(request_token, 200, "OK", "hello")
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(&fixture.command_queue, respond),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 2000)
+	testing.expect_value(
+		t,
+		fixture.worker_states[0].phase,
+		Static_Connection_Phase.Writing_Response,
+	)
+
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(
+			&fixture.command_queue,
+			make_managed_cancel_command(request_token),
+		),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 3000)
+	testing.expect_value(
+		t,
+		fixture.worker_states[0].phase,
+		Static_Connection_Phase.Writing_Response,
+	)
+	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(0))
+
+	turn := drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Keep_Alive)
+	close_managed_body_fixture(&fixture)
+}
+
+@(test)
+test_managed_body_stages_allowed_trailers :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	allow := []string{"x-checksum", "x-signature"}
+	request := "POST /upload HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc123\r\nX-Signature: s3cr3t\r\n\r\n"
+
+	if !setup_managed_body_fixture(
+		t,
+		&fixture,
+		"POST",
+		"/upload",
+		request,
+		16 * 1024 * 1024,
+		allow,
+	) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	complete := false
+	saw_available := false
+
+	for _ in 0 ..< 5 {
+		cmd := host.Host_Command {
+			kind      = .Read_Body,
+			token     = polled[0].token,
+			max_bytes = 1024,
+		}
+		testing.expect_value(
+			t,
+			host.enqueue_host_command(&fixture.command_queue, cmd),
+			host.Host_Command_Result.Enqueued,
+		)
+		drain_host_commands(&fixture.worker, 2000)
+		notified := host.poll_host_queue(&fixture.host_queue, polled[:])
+
+		if notified.copied == 0 {
+			continue
+		}
+		testing.expect_value(t, notified.copied, 1)
+		testing.expect_value(t, polled[0].kind, host.Host_Event_Kind.Body_Available)
+		saw_available = true
+
+		if polled[0].body_complete == 1 {
+			complete = true
+			break
+		}
+	}
+	testing.expect(t, saw_available)
+	testing.expect(t, complete)
+	testing.expect_value(t, fixture.workspace_storage[0].trailer_count, 2)
+	trailer_data := fixture.workspace_storage[0].trailer_data[:]
+	first := fixture.workspace_storage[0].trailer_fields[0]
+	testing.expect_value(
+		t,
+		string(trailer_data[first.name_offset:first.name_offset + first.name_length]),
+		"X-Checksum",
+	)
+	testing.expect_value(
+		t,
+		string(trailer_data[first.value_offset:first.value_offset + first.value_length]),
+		"abc123",
+	)
+	second := fixture.workspace_storage[0].trailer_fields[1]
+	testing.expect_value(
+		t,
+		string(trailer_data[second.name_offset:second.name_offset + second.name_length]),
+		"X-Signature",
+	)
+	testing.expect_value(
+		t,
+		string(trailer_data[second.value_offset:second.value_offset + second.value_length]),
+		"s3cr3t",
+	)
+	close_managed_body_fixture(&fixture)
+}
+
+@(test)
+test_managed_body_rejects_disallowed_trailer :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	allow := []string{"x-checksum"}
+	request := "POST /upload HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Evil: 1\r\n\r\n"
+
+	if !setup_managed_body_fixture(
+		t,
+		&fixture,
+		"POST",
+		"/upload",
+		request,
+		16 * 1024 * 1024,
+		allow,
+	) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+
+	cmd := host.Host_Command {
+		kind      = .Read_Body,
+		token     = polled[0].token,
+		max_bytes = 1024,
+	}
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(&fixture.command_queue, cmd),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 2000)
+	testing.expect_value(t, fixture.worker_states[0].phase, Static_Connection_Phase.Failed)
+	testing.expect_value(
+		t,
+		fixture.worker_states[0].close_reason,
+		Static_Connection_Close_Reason.Internal_Error,
 	)
 	close_managed_body_fixture(&fixture)
 }

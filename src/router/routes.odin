@@ -23,10 +23,14 @@ Static_Route :: struct {
 	route_id:              u64,
 	dynamic_segment_count: int,
 	kind:                  Route_Kind,
+	managed_trailers:      [MAX_MANAGED_TRAILER_NAMES][]u8,
+	managed_trailer_count: int,
 }
 
 MAX_ROUTE_HASH_PROBES :: 8
 MAX_ROUTE_INDEX :: u64(0xffff_ffff)
+MAX_MANAGED_TRAILER_NAMES :: 32
+MAX_MANAGED_TRAILER_NAME_BYTES :: 128
 
 Route_Index_Slot :: u32
 
@@ -137,6 +141,15 @@ register_managed_route :: proc(
 	method: []u8,
 	path: []u8,
 ) -> Route_Table_Result {
+	return register_managed_route_with_trailers(table, method, path, nil)
+}
+
+register_managed_route_with_trailers :: proc(
+	table: ^Route_Table,
+	method: []u8,
+	path: []u8,
+	trailers: [][]u8,
+) -> Route_Table_Result {
 	if table == nil {
 		return .Invalid
 	}
@@ -147,6 +160,16 @@ register_managed_route :: proc(
 
 	if table.state != .Registering {
 		return .Invalid
+	}
+
+	if len(trailers) > MAX_MANAGED_TRAILER_NAMES {
+		return .Invalid
+	}
+
+	for name in trailers {
+		if !valid_trailer_name(name) {
+			return .Invalid
+		}
 	}
 
 	if !valid_route_method(method) {
@@ -171,15 +194,33 @@ register_managed_route :: proc(
 		return .Full
 	}
 
-	table.routes[table.count] = Static_Route {
+	route := Static_Route {
 		method                = method,
 		path                  = path,
 		dynamic_segment_count = dynamic_segments,
 		kind                  = .Managed,
 	}
+	for i := 0; i < len(trailers); i += 1 {
+		route.managed_trailers[i] = trailers[i]
+	}
+	route.managed_trailer_count = len(trailers)
+
+	table.routes[table.count] = route
 
 	table.count += 1
 	return .Added
+}
+
+valid_trailer_name :: proc(name: []u8) -> bool {
+	if len(name) == 0 || len(name) > MAX_MANAGED_TRAILER_NAME_BYTES {
+		return false
+	}
+	for c in name {
+		if !http1.is_token(c) {
+			return false
+		}
+	}
+	return true
 }
 
 freeze_route_table :: proc(table: ^Route_Table) -> Route_Table_Result {

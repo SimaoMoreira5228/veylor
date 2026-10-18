@@ -4,6 +4,7 @@ package linux_runtime
 
 import "core:sys/linux"
 import "core:testing"
+import host "veylor:runtime/host"
 import shutdown "veylor:runtime/shutdown"
 import workers "veylor:runtime/workers"
 import epoll "veylor:transport/linux"
@@ -436,4 +437,19 @@ expect_multi_worker_shutdown_complete :: proc(
 	testing.expect_value(t, instance.second.shutdown_state.active_connections, u64(0))
 	testing.expect_value(t, instance.first.shutdown_state.phase, shutdown.Phase.Complete)
 	testing.expect_value(t, instance.second.shutdown_state.phase, shutdown.Phase.Complete)
+
+	testing.expect_value(t, host.pending_host_events(instance.first.worker.host_queue), 1)
+	testing.expect_value(t, host.pending_host_events(instance.second.worker.host_queue), 1)
+
+	first_event, first_ok := host.peek_host_queue(instance.first.worker.host_queue)
+	testing.expect_value(t, first_ok, true)
+	if first_ok {
+		testing.expect_value(t, first_event.kind, host.Host_Event_Kind.Shutdown)
+	}
+
+	second_event, second_ok := host.peek_host_queue(instance.second.worker.host_queue)
+	testing.expect_value(t, second_ok, true)
+	if second_ok {
+		testing.expect_value(t, second_event.kind, host.Host_Event_Kind.Shutdown)
+	}
 }

@@ -4,6 +4,7 @@ package linux_runtime
 import "core:encoding/endian"
 import "core:sync"
 import "core:sys/linux"
+import host "veylor:runtime/host"
 import shutdown "veylor:runtime/shutdown"
 import workers "veylor:runtime/workers"
 import epoll "veylor:transport/linux"
@@ -375,6 +376,13 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 		}
 
 		if worker.shutdown_state.phase == .Complete {
+			wake_before := host.pending_host_events(worker.host_queue)
+
+			// NOTE: best-effort; a full host queue already fails the connection elsewhere.
+			host.enqueue_shutdown(worker.host_queue)
+
+			signal_host_wakeup_if_queued(worker, wake_before)
+
 			return
 		}
 
