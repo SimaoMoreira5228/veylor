@@ -53,7 +53,7 @@ vyl_request_pull_body :: proc "c" (
 		token     = managed_connection_token(token),
 		max_bytes = max_bytes,
 	}
-	switch host.enqueue_host_command(worker.command_queue, cmd) {
+	switch enqueue_managed_command(worker, cmd) {
 	case .Enqueued:
 		return i32(Vyl_Result.Ok)
 	case .Full:
@@ -171,6 +171,17 @@ managed_connection_token :: proc(token: Vyl_Request_Token) -> connections.Connec
 	}
 }
 
+enqueue_managed_command :: proc(
+	worker: ^server_runtime.Static_Worker,
+	cmd: host.Host_Command,
+) -> host.Host_Command_Result {
+	enqueued := host.enqueue_host_command(worker.command_queue, cmd)
+	if enqueued == .Enqueued || enqueued == .Full {
+		server_runtime.signal_static_worker(worker)
+	}
+	return enqueued
+}
+
 @(export)
 vyl_response_start :: proc "c" (
 	server: ^Vyl_Server,
@@ -231,7 +242,7 @@ vyl_response_start :: proc "c" (
 	if body.length > 0 {
 		copy(cmd.body[:], body.data[:int(body.length)])
 	}
-	switch host.enqueue_host_command(worker.command_queue, cmd) {
+	switch enqueue_managed_command(worker, cmd) {
 	case .Enqueued:
 		return i32(Vyl_Result.Ok)
 	case .Full:
@@ -280,7 +291,7 @@ vyl_request_cancel :: proc "c" (server: ^Vyl_Server, token: Vyl_Request_Token) -
 		kind  = .Cancel,
 		token = managed_connection_token(token),
 	}
-	switch host.enqueue_host_command(worker.command_queue, cmd) {
+	switch enqueue_managed_command(worker, cmd) {
 	case .Enqueued:
 		return i32(Vyl_Result.Ok)
 	case .Full:

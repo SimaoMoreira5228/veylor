@@ -89,8 +89,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	}
 	refresh_static_worker_gauges(worker)
 
-	wake_before := host.pending_host_events(worker.host_queue)
-	defer signal_host_wakeup_if_queued(worker, wake_before)
+	defer signal_host_wakeup_if_queued(worker)
 	if worker.shutdown_state.phase == .Forcing {
 		turn := Static_Worker_Turn {
 			result = .Ready,
@@ -269,12 +268,12 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	return result
 }
 
-signal_host_wakeup_if_queued :: proc(worker: ^Static_Worker, before: int) {
+signal_host_wakeup_if_queued :: proc(worker: ^Static_Worker) {
 	if worker.host_wakeup == nil || worker.host_wakeup.fd < 0 {
 		return
 	}
 
-	if host.pending_host_events(worker.host_queue) <= before {
+	if host.pending_host_events(worker.host_queue) == 0 {
 		return
 	}
 

@@ -1638,6 +1638,90 @@ int main(void) {
   }
   close(wake_fd);
 
+  int lat_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (lat_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(lat_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("connect");
+      close(lat_fd);
+      return 1;
+    }
+  }
+  const char lat_request[] = "POST /upload HTTP/1.1\r\n"
+                             "Host: localhost\r\n"
+                             "Content-Length: 10\r\n"
+                             "Connection: close\r\n"
+                             "\r\n"
+                             "helloworld";
+  size_t lat_sent = 0;
+  while (lat_sent < sizeof(lat_request) - 1) {
+    ssize_t count = send(lat_fd, lat_request + lat_sent,
+                         sizeof(lat_request) - 1 - lat_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(lat_fd);
+      return 1;
+    }
+    lat_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(lat_fd);
+    return 1;
+  }
+  vyl_request_token lat_token = poll_events[0].token;
+  int64_t lat_total_ns = 0;
+  for (int round = 0; round < 3; round++) {
+    struct timespec lat_start, lat_end;
+    clock_gettime(CLOCK_MONOTONIC, &lat_start);
+    result = vyl_request_pull_body(server, lat_token, 4);
+    if (!expect_result("latency pull", result, VYL_OK)) {
+      close(lat_fd);
+      return 1;
+    }
+    memset(&batch, 0, sizeof(batch));
+    result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                    sizeof(poll_data), 5000000000u, &batch);
+    clock_gettime(CLOCK_MONOTONIC, &lat_end);
+    if (!expect_result("latency poll", result, VYL_OK) ||
+        batch.event_count != 1 ||
+        poll_events[0].kind != VYL_HOST_BODY_AVAILABLE) {
+      fprintf(stderr, "unexpected latency poll result\n");
+      close(lat_fd);
+      return 1;
+    }
+    int64_t round_ns =
+        (int64_t)(lat_end.tv_sec - lat_start.tv_sec) * 1000000000ll +
+        ((int64_t)lat_end.tv_nsec - (int64_t)lat_start.tv_nsec);
+    lat_total_ns += round_ns;
+    fprintf(stderr, "command roundtrip %d: %lld ns\n", round,
+            (long long)round_ns);
+  }
+  fprintf(stderr, "command roundtrip total: %lld ns\n",
+          (long long)lat_total_ns);
+  if (lat_total_ns >= 100000000ll) {
+    fprintf(stderr, "managed commands did not wake the worker promptly\n");
+    close(lat_fd);
+    return 1;
+  }
+  result = vyl_request_read(server, lat_token, body_chunk, sizeof(body_chunk),
+                            &body_count);
+  if (!expect_result("latency body read", result, VYL_END_OF_BODY) ||
+      body_count != 10 || memcmp(body_chunk, "helloworld", 10) != 0) {
+    fprintf(stderr, "unexpected latency body: %d/%u\n", result, body_count);
+    close(lat_fd);
+    return 1;
+  }
+  close(lat_fd);
+
   {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {

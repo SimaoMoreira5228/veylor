@@ -376,12 +376,10 @@ managed_server_worker :: proc(worker_id: u32, user_data: rawptr) {
 		}
 
 		if worker.shutdown_state.phase == .Complete {
-			wake_before := host.pending_host_events(worker.host_queue)
-
 			// NOTE: best-effort; a full host queue already fails the connection elsewhere.
 			host.enqueue_shutdown(worker.host_queue)
 
-			signal_host_wakeup_if_queued(worker, wake_before)
+			signal_host_wakeup_if_queued(worker)
 
 			return
 		}
@@ -446,6 +444,13 @@ signal_managed_server_worker :: proc(control_fd: linux.Fd) -> bool {
 		}
 		return write_error == .NONE && written == len(buffer)
 	}
+}
+
+signal_static_worker :: proc(worker: ^Static_Worker) -> bool {
+	if worker == nil || worker.control_fd < 0 {
+		return false
+	}
+	return signal_managed_server_worker(worker.control_fd)
 }
 
 managed_server_start_result :: proc(result: workers.Worker_Pool_Result) -> Managed_Server_Result {
