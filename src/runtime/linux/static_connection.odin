@@ -3,12 +3,14 @@ package linux_runtime
 
 import "core:sys/linux"
 import http1 "veylor:http1"
+import body "veylor:http1/body"
 import connection "veylor:http1/connection"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
 import host "veylor:runtime/host"
 import "veylor:transport"
 import epoll "veylor:transport/linux"
+import socket "veylor:transport/linux/socket"
 
 Static_Connection_Phase :: enum {
 	Reading_Request_Head,
@@ -49,11 +51,19 @@ Static_Connection_Close_Reason :: enum u8 {
 	Count,
 }
 
+STAGED_BODY_CAPACITY :: 2048
+
 Static_Connection_Workspace :: struct {
-	head_driver:   connection.Connection_Head_Driver,
-	request_input: []u8,
-	headers:       []http1.Header,
-	response:      []u8,
+	head_driver:      connection.Connection_Head_Driver,
+	body_driver:      connection.Connection_Body_Driver,
+	managed_route_id: u64,
+	request_input:    []u8,
+	headers:          []http1.Header,
+	response:         []u8,
+	staged_body:      [STAGED_BODY_CAPACITY]u8,
+	body_start:       int,
+	body_valid:       int,
+	staged_length:    int,
 }
 
 Static_Workspace_Pool :: struct {
@@ -376,8 +386,8 @@ static_connection_turn :: proc(
 				workspace,
 				input_length,
 				turn.bytes_read,
+				body_limit,
 				table,
-				timers,
 			)
 			return managed_turn
 		}
@@ -628,6 +638,11 @@ acquire_static_workspace :: proc(
 	workspace.head_driver = connection.begin_connection_head(
 		static_connection_event_id(state.token),
 	)
+	workspace.body_driver = {}
+	workspace.managed_route_id = 0
+	workspace.body_start = 0
+	workspace.body_valid = 0
+	workspace.staged_length = 0
 	return workspace, true
 }
 
@@ -652,7 +667,7 @@ release_static_workspace :: proc(state: ^Static_Connection) -> bool {
 		return false
 	}
 	slot := state.workspace_slot
-	reset_static_workspace_head(&pool.storage[slot])
+	reset_static_workspace(&pool.storage[slot])
 	pool.free_stack[pool.free_count] = u32(slot)
 	pool.free_count += 1
 	pool.active_count -= 1
@@ -662,9 +677,14 @@ release_static_workspace :: proc(state: ^Static_Connection) -> bool {
 	return true
 }
 
-reset_static_workspace_head :: proc(workspace: ^Static_Connection_Workspace) {
+reset_static_workspace :: proc(workspace: ^Static_Connection_Workspace) {
 	workspace.head_driver.parser.input_base = nil
 	workspace.head_driver.parser.header_base = nil
+	workspace.body_driver = {}
+	workspace.managed_route_id = 0
+	workspace.body_start = 0
+	workspace.body_valid = 0
+	workspace.staged_length = 0
 }
 
 valid_static_workspace_pool :: proc(pool: ^Static_Workspace_Pool) -> bool {
@@ -692,8 +712,8 @@ park_static_connection_for_host :: proc(
 	workspace: ^Static_Connection_Workspace,
 	input_length: int,
 	bytes_read: int,
+	body_limit: u64,
 	table: ^connections.Connection_Table,
-	timers: ^transport.Timer_Queue,
 ) -> Static_Connection_Turn {
 	if state.host_queue == nil {
 		state.close_reason = .Internal_Error
@@ -709,12 +729,28 @@ park_static_connection_for_host :: proc(
 		state.phase = .Failed
 		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
 	}
+	if head.has_content_length && head.content_length > body_limit {
+		oversize := encode_static_error_response(workspace.response, 413, "Content Too Large")
+		if oversize.result != .Written {
+			state.close_reason = .Response_Buffer_Limit
+			state.phase = .Failed
+			return Static_Connection_Turn{bytes_read = bytes_read, result = .Response_Buffer_Small}
+		}
+		state.response_length = oversize.written
+		state.keep_alive = false
+		state.close_reason = .Request_Rejected
+		state.phase = .Writing_Response
+		write_turn := register_static_response_write(poller, state, table)
+		write_turn.bytes_read += bytes_read
+		return write_turn
+	}
 	managed_route, managed_result := router.find_static_request_route(routes, head, input)
 	if managed_result != .Found || managed_route.kind != .Managed {
 		state.close_reason = .Internal_Error
 		state.phase = .Failed
 		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
 	}
+	workspace.managed_route_id = managed_route.route_id
 	enqueue_result := host.enqueue_request(
 		state.host_queue,
 		state.token,
@@ -732,6 +768,23 @@ park_static_connection_for_host :: proc(
 		state.phase = .Failed
 		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
 	}
+	body_expected := (head.has_content_length && head.content_length > 0) || head.is_chunked
+	if body_expected {
+		if connections.transition_connection(table, state.token, .Reading_Request_Body) !=
+		   .Transitioned {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+		}
+		workspace.body_driver = connection.begin_connection_body(
+			static_connection_event_id(state.token),
+			head,
+		)
+		workspace.body_start = head.length
+		workspace.body_valid = input_length
+		state.phase = .Awaiting_Host
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Need_More}
+	}
 	if connections.transition_connection(table, state.token, .Awaiting_Handler) != .Transitioned {
 		state.close_reason = .Internal_Error
 		state.phase = .Failed
@@ -744,6 +797,289 @@ park_static_connection_for_host :: proc(
 	}
 	state.phase = .Awaiting_Host
 	return Static_Connection_Turn{bytes_read = bytes_read, result = .Need_More}
+}
+
+Managed_Read_Outcome :: enum {
+	Notified,
+	Stalled,
+	Closed,
+	Dropped,
+}
+
+Managed_Read_Turn :: struct {
+	outcome:    Managed_Read_Outcome,
+	bytes_read: int,
+}
+
+execute_managed_read_body :: proc(
+	state: ^Static_Connection,
+	cmd: host.Host_Command,
+	byte_budget: int,
+	table: ^connections.Connection_Table,
+	timers: ^transport.Timer_Queue,
+	timeouts: connections.Connection_Timeouts,
+	now_ns: u64,
+) -> Managed_Read_Turn {
+	if cmd.kind != .Read_Body {
+		return Managed_Read_Turn{outcome = .Dropped}
+	}
+	if cmd.max_bytes == 0 {
+		return Managed_Read_Turn{outcome = .Dropped}
+	}
+
+	resource_id, lookup_result := connections.lookup_connection(table, cmd.token)
+	if lookup_result != .Found || resource_id != u64(state.fd) || cmd.token != state.token {
+		return Managed_Read_Turn{outcome = .Dropped}
+	}
+
+	phase, phase_result := connections.connection_phase(table, cmd.token)
+	if phase_result != .Found || phase != .Reading_Request_Body {
+		return Managed_Read_Turn{outcome = .Dropped}
+	}
+
+	if state.workspace_slot < 0 {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Managed_Read_Turn{outcome = .Closed}
+	}
+
+	workspace := &state.workspace_pool.storage[state.workspace_slot]
+	if workspace.body_driver.state != .Reading {
+		return Managed_Read_Turn{outcome = .Dropped}
+	}
+
+	schedule := connections.schedule_connection_phase_deadline(
+		table,
+		timers,
+		state.token,
+		now_ns,
+		timeouts,
+	)
+	if schedule.result != .Scheduled &&
+	   schedule.result != .Duplicate_Timer &&
+	   schedule.result != .Connection_Already_Timed {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		if schedule.result == .Full {
+			state.close_reason = .Deadline_Capacity
+		}
+		return Managed_Read_Turn{outcome = .Closed}
+	}
+
+	staged_before := workspace.staged_length
+	staged_free := len(workspace.staged_body) - staged_before
+	if staged_free < 0 {
+		staged_free = 0
+	}
+	max_command_bytes := int(cmd.max_bytes)
+	body_event: connection.Connection_Body_Event
+	bytes_read := 0
+	if workspace.body_valid > workspace.body_start {
+		feed_length := workspace.body_valid - workspace.body_start
+		if feed_length > staged_free {
+			feed_length = staged_free
+		}
+		if feed_length > max_command_bytes {
+			feed_length = max_command_bytes
+		}
+		if feed_length <= 0 {
+			return Managed_Read_Turn{outcome = .Stalled}
+		}
+		spans: [64]http1.Span
+		body_event = connection.consume_buffered_body(
+			&workspace.body_driver,
+			workspace.request_input[workspace.body_start:workspace.body_start + feed_length],
+			spans[:],
+			body.Chunked_Trailer_Context{},
+		)
+		workspace.body_start += body_event.consumed
+		stage_managed_body_spans(
+			state,
+			workspace,
+			body_event,
+			workspace.body_start - body_event.consumed,
+		)
+		if body_event.result == .Too_Large {
+			state.close_reason = .Request_Rejected
+			state.phase = .Failed
+			return Managed_Read_Turn{outcome = .Closed}
+		}
+		if body_event.result == .Invalid {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{outcome = .Closed}
+		}
+		if workspace.body_driver.state == .Failed || workspace.body_driver.state == .Cancelled {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{outcome = .Closed}
+		}
+	} else {
+		input_free := len(workspace.request_input) - workspace.body_valid
+		if input_free < 0 {
+			input_free = 0
+		}
+		read_cap := byte_budget
+		if staged_free < read_cap {
+			read_cap = staged_free
+		}
+		if input_free < read_cap {
+			read_cap = input_free
+		}
+		if max_command_bytes < read_cap {
+			read_cap = max_command_bytes
+		}
+		if read_cap <= 0 {
+			return Managed_Read_Turn{outcome = .Stalled}
+		}
+		budget, budget_valid := socket.begin_stream_byte_budget(read_cap)
+		if !budget_valid {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{outcome = .Closed}
+		}
+		read := socket.read_stream_budgeted(
+			state.fd,
+			workspace.request_input[workspace.body_valid:],
+			&budget,
+		)
+		if read.io.kind != .Progress {
+			if read.io.kind == .Would_Block || read.io.kind == .Interrupted {
+				return Managed_Read_Turn{outcome = .Stalled}
+			}
+			if read.io.kind == .End_Of_Stream || read.io.kind == .Closed {
+				state.close_reason = .Peer_Closed
+			} else {
+				state.close_reason = .Transport_Error
+			}
+			state.phase = .Failed
+			return Managed_Read_Turn{outcome = .Closed}
+		}
+		workspace.body_valid += read.io.transferred_bytes
+		bytes_read = read.io.transferred_bytes
+		feed := workspace.request_input[workspace.body_valid - bytes_read:workspace.body_valid]
+		spans: [64]http1.Span
+		completion := transport.IO_Completion {
+			connection_id = static_connection_event_id(state.token),
+			operation_id  = workspace.body_driver.operation_id + 1,
+			operation     = .Read,
+			result        = read.io,
+		}
+		body_event = connection.consume_body_completion(
+			&workspace.body_driver,
+			completion,
+			feed,
+			spans[:],
+			body.Chunked_Trailer_Context{},
+		)
+		if body_event.result == .Invalid || body_event.result == .Span_Capacity {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+		}
+		if body_event.result == .Too_Large {
+			state.close_reason = .Request_Rejected
+			state.phase = .Failed
+			return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+		}
+		workspace.body_start += body_event.consumed
+		stage_managed_body_spans(state, workspace, body_event, workspace.body_valid - bytes_read)
+		if workspace.body_driver.state == .Failed || workspace.body_driver.state == .Cancelled {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+		}
+	}
+
+	terminal := body_event.body_complete || workspace.body_driver.state != .Reading
+	if terminal {
+		cancel_result := connections.cancel_connection_phase_deadline(table, timers, state.token)
+		if cancel_result != .Cancelled && cancel_result != .Not_Found {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+		}
+		if connections.transition_connection(table, state.token, .Awaiting_Handler) !=
+		   .Transitioned {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+			return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+		}
+		return enqueue_managed_body_event(state)
+	}
+	if workspace.staged_length == staged_before {
+		return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Stalled}
+	}
+	refresh := connections.cancel_connection_phase_deadline(table, timers, state.token)
+	if refresh != .Cancelled {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+	}
+	reschedule := connections.schedule_connection_phase_deadline(
+		table,
+		timers,
+		state.token,
+		now_ns,
+		timeouts,
+	)
+	if reschedule.result != .Scheduled {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		if reschedule.result == .Full {
+			state.close_reason = .Deadline_Capacity
+		}
+		return Managed_Read_Turn{bytes_read = bytes_read, outcome = .Closed}
+	}
+	return enqueue_managed_body_event(state)
+}
+
+stage_managed_body_spans :: proc(
+	state: ^Static_Connection,
+	workspace: ^Static_Connection_Workspace,
+	event: connection.Connection_Body_Event,
+	feed_base: int,
+) {
+	for span in event.spans {
+		if span.length <= 0 {
+			continue
+		}
+		if workspace.staged_length + span.length > len(workspace.staged_body) {
+			continue
+		}
+		copy(
+			workspace.staged_body[workspace.staged_length:],
+			workspace.request_input[feed_base + span.offset:feed_base + span.offset + span.length],
+		)
+		workspace.staged_length += span.length
+	}
+}
+
+
+enqueue_managed_body_event :: proc(state: ^Static_Connection) -> Managed_Read_Turn {
+	if state.host_queue == nil || state.workspace_pool == nil {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Managed_Read_Turn{outcome = .Closed}
+	}
+	if state.workspace_slot < 0 || state.workspace_slot >= len(state.workspace_pool.storage) {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+		return Managed_Read_Turn{outcome = .Closed}
+	}
+	workspace := &state.workspace_pool.storage[state.workspace_slot]
+	event := host.Host_Event {
+		token      = state.token,
+		route_id   = workspace.managed_route_id,
+		body_ready = u32(workspace.staged_length),
+		kind       = .Body_Available,
+	}
+	if host.enqueue_body_available(state.host_queue, event) != .Enqueued {
+		state.close_reason = .Host_Queue_Full
+		state.phase = .Failed
+		return Managed_Read_Turn{outcome = .Closed}
+	}
+	return Managed_Read_Turn{outcome = .Notified}
 }
 
 register_static_response_write :: proc(

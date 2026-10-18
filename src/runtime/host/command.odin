@@ -3,6 +3,8 @@ package host
 import "core:sync"
 import connections "veylor:runtime/connections"
 
+HOST_COMMAND_QUEUE_DEPTH :: 64
+
 Host_Command_Kind :: enum {
 	Read_Body,
 }

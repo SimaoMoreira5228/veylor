@@ -29,6 +29,7 @@ Static_Worker :: struct {
 	file_root:                  ^Static_File_Root,
 	native_routes:              ^router.Native_Table,
 	host_queue:                 ^host.Host_Queue,
+	command_queue:              ^host.Host_Command_Queue,
 	connection_states:          []Static_Connection,
 	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
@@ -136,6 +137,7 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		}
 	}
 	process_static_worker_expirations(worker, turn.expired_timers, &result)
+	drain_host_commands(worker, turn.now_ns)
 
 	for &accepted in turn.accepted {
 		result.accepted_count += 1
@@ -256,6 +258,56 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	}
 	refresh_static_worker_gauges(worker)
 	return result
+}
+
+drain_host_commands :: proc(worker: ^Static_Worker, now_ns: u64) {
+	if worker.command_queue == nil {
+		return
+	}
+	budget := worker.event_budget
+	for budget > 0 {
+		cmd, ok := host.dequeue_host_command(worker.command_queue)
+		if !ok {
+			return
+		}
+		budget -= 1
+		execute_host_command(worker, cmd, now_ns)
+	}
+}
+
+execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now_ns: u64) {
+	if cmd.kind != .Read_Body {
+		return
+	}
+	resource_id, lookup_result := connections.lookup_connection(worker.table, cmd.token)
+	if lookup_result != .Found {
+		return
+	}
+	slot := int(cmd.token.slot)
+	if slot < 0 || slot >= len(worker.connection_states) {
+		return
+	}
+	state := &worker.connection_states[slot]
+	if !state.active || state.token != cmd.token || resource_id != u64(state.fd) {
+		return
+	}
+	turn := execute_managed_read_body(
+		state,
+		cmd,
+		worker.byte_budget,
+		worker.table,
+		worker.timers,
+		worker.timeouts,
+		now_ns,
+	)
+	worker.metrics.bytes_read += u64(turn.bytes_read)
+	if turn.outcome != .Closed {
+		return
+	}
+	close_result := close_static_worker_connection(worker, state)
+	if close_result == .Error {
+		worker.managed_result = .Error
+	}
 }
 
 force_static_worker_connections :: proc(worker: ^Static_Worker, turn: ^Static_Worker_Turn) {

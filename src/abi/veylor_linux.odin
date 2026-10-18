@@ -339,6 +339,9 @@ vyl_server_poll_events :: proc "c" (
 			if taken.kind == .Shutdown {
 				event_kind = .Shutdown
 			}
+			if taken.kind == .Body_Available {
+				event_kind = .Body_Available
+			}
 			out_event := &event_slice[copied]
 			out_event^ = Vyl_Host_Event {
 				kind = event_kind,

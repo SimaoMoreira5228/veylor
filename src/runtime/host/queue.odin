@@ -10,6 +10,7 @@ HOST_QUEUE_DEPTH :: 64
 Host_Event_Kind :: enum {
 	Request,
 	Shutdown,
+	Body_Available,
 }
 
 Host_Event :: struct {
@@ -19,6 +20,7 @@ Host_Event :: struct {
 	path_length:   int,
 	method:        [HOST_MAX_METHOD_BYTES]u8,
 	path:          [HOST_MAX_PATH_BYTES]u8,
+	body_ready:    u32,
 	kind:          Host_Event_Kind,
 }
 
@@ -77,6 +79,13 @@ enqueue_request :: proc(
 		method,
 		path,
 	)
+}
+
+enqueue_body_available :: proc(queue: ^Host_Queue, event: Host_Event) -> Host_Queue_Result {
+	if event.kind != .Body_Available {
+		return .Invalid
+	}
+	return enqueue_event(queue, event, nil, nil)
 }
 
 enqueue_shutdown :: proc(queue: ^Host_Queue) -> Host_Queue_Result {

@@ -54,15 +54,16 @@ Vyl_Native_Handler :: #type proc "c" (
 ) -> i32
 
 Vyl_Request_Token :: struct {
-	worker_id:              u32,
-	slot:                   u32,
-	worker_generation:      u64,
-	connection_generation:  u64,
+	worker_id:             u32,
+	slot:                  u32,
+	worker_generation:     u64,
+	connection_generation: u64,
 }
 
 Vyl_Host_Event_Kind :: enum u32 {
 	Request,
 	Shutdown,
+	Body_Available,
 }
 
 Vyl_Host_Event :: struct {
