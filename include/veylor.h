@@ -23,6 +23,9 @@ typedef enum {
   VYL_WORKER_ERROR,
   VYL_BUSY,
   VYL_BUFFER_TOO_SMALL,
+  VYL_WOULD_BLOCK,
+  VYL_STALE_TOKEN,
+  VYL_END_OF_BODY,
 } vyl_result;
 
 typedef struct {
@@ -66,7 +69,8 @@ int32_t vyl_server_route_managed(vyl_server *server, vyl_bytes method,
 
 typedef enum {
   VYL_HOST_REQUEST = 0,
-  VYL_HOST_SHUTDOWN = 1
+  VYL_HOST_SHUTDOWN = 1,
+  VYL_HOST_BODY_AVAILABLE = 2
 } vyl_host_event_kind;
 
 typedef struct {
@@ -83,6 +87,7 @@ typedef struct {
   uint64_t route_id;
   uint32_t method_offset, method_length;
   uint32_t path_offset, path_length;
+  uint32_t body_ready, body_complete;
 } vyl_host_event;
 
 typedef struct {
@@ -92,10 +97,21 @@ typedef struct {
   uint32_t data_required;
 } vyl_batch_info;
 
+ 
 int32_t vyl_server_poll_events(vyl_server *server, vyl_host_event *events,
                                uint32_t event_capacity, uint8_t *data,
                                uint32_t data_capacity, uint64_t timeout_ns,
                                vyl_batch_info *out_info);
+ 
+int32_t vyl_request_pull_body(vyl_server *server, vyl_request_token token,
+                              uint32_t max_bytes);
+ 
+int32_t vyl_request_read(vyl_server *server, vyl_request_token token,
+                         uint8_t *dst, uint32_t capacity,
+                         uint32_t *read_bytes);
+ 
+int32_t vyl_response_start(vyl_server *server, vyl_request_token token,
+                           int32_t status, vyl_bytes reason, vyl_bytes body);
 int32_t vyl_server_listen(vyl_server *server, const uint8_t address[4],
                           uint16_t port, uint16_t *bound_port,
                           int32_t *system_error);

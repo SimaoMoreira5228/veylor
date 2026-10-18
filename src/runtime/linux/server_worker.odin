@@ -1,6 +1,7 @@
 #+build linux
 package linux_runtime
 
+import "core:encoding/endian"
 import "core:sys/linux"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
@@ -13,6 +14,10 @@ import socket "veylor:transport/linux/socket"
 STATIC_WORKER_CONTROL_EVENT_ID :: u64(0xffff_ffff_ffff_ffff)
 STATIC_LISTENER_RETRY_TIMER_ID :: u64(0xffff_ffff_ffff_fffd)
 STATIC_LISTENER_RETRY_DELAY_NS :: u64(100_000_000)
+
+Host_Wakeup :: struct {
+	fd: linux.Fd,
+}
 
 Static_Worker :: struct {
 	poller:                     epoll.Epoll,
@@ -30,6 +35,7 @@ Static_Worker :: struct {
 	native_routes:              ^router.Native_Table,
 	host_queue:                 ^host.Host_Queue,
 	command_queue:              ^host.Host_Command_Queue,
+	host_wakeup:                ^Host_Wakeup,
 	connection_states:          []Static_Connection,
 	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
@@ -82,6 +88,9 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		return Static_Worker_Turn{result = .Invalid}
 	}
 	refresh_static_worker_gauges(worker)
+
+	wake_before := host.pending_host_events(worker.host_queue)
+	defer signal_host_wakeup_if_queued(worker, wake_before)
 	if worker.shutdown_state.phase == .Forcing {
 		turn := Static_Worker_Turn {
 			result = .Ready,
@@ -260,6 +269,29 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 	return result
 }
 
+signal_host_wakeup_if_queued :: proc(worker: ^Static_Worker, before: int) {
+	if worker.host_wakeup == nil || worker.host_wakeup.fd < 0 {
+		return
+	}
+
+	if host.pending_host_events(worker.host_queue) <= before {
+		return
+	}
+
+	signal: [8]u8
+	if !endian.put_u64(signal[:], endian.PLATFORM_BYTE_ORDER, 1) {
+		return
+	}
+
+	for {
+		_, write_error := linux.write(worker.host_wakeup.fd, signal[:])
+		if write_error == .EINTR {
+			continue
+		}
+		return
+	}
+}
+
 drain_host_commands :: proc(worker: ^Static_Worker, now_ns: u64) {
 	if worker.command_queue == nil {
 		return
@@ -276,7 +308,7 @@ drain_host_commands :: proc(worker: ^Static_Worker, now_ns: u64) {
 }
 
 execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now_ns: u64) {
-	if cmd.kind != .Read_Body {
+	if cmd.kind != .Read_Body && cmd.kind != .Response_Start {
 		return
 	}
 	resource_id, lookup_result := connections.lookup_connection(worker.table, cmd.token)
@@ -289,6 +321,22 @@ execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now
 	}
 	state := &worker.connection_states[slot]
 	if !state.active || state.token != cmd.token || resource_id != u64(state.fd) {
+		return
+	}
+	if cmd.kind == .Response_Start {
+		response_outcome := execute_managed_response_start(
+			state,
+			cmd,
+			worker.poller,
+			worker.table,
+			worker.timers,
+		)
+		if response_outcome == .Closed {
+			close_result := close_static_worker_connection(worker, state)
+			if close_result == .Error {
+				worker.managed_result = .Error
+			}
+		}
 		return
 	}
 	turn := execute_managed_read_body(

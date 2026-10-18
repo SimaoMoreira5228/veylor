@@ -4,15 +4,23 @@ import "core:sync"
 import connections "veylor:runtime/connections"
 
 HOST_COMMAND_QUEUE_DEPTH :: 64
+HOST_MAX_RESPONSE_REASON_BYTES :: 64
+HOST_MAX_RESPONSE_BODY_BYTES :: 768
 
 Host_Command_Kind :: enum {
 	Read_Body,
+	Response_Start,
 }
 
 Host_Command :: struct {
-	kind:      Host_Command_Kind,
-	token:     connections.Connection_Token,
-	max_bytes: u32,
+	kind:          Host_Command_Kind,
+	token:         connections.Connection_Token,
+	max_bytes:     u32,
+	status:        i32,
+	reason_length: u32,
+	body_length:   u32,
+	reason:        [HOST_MAX_RESPONSE_REASON_BYTES]u8,
+	body:          [HOST_MAX_RESPONSE_BODY_BYTES]u8,
 }
 
 Host_Command_Result :: enum {
@@ -49,12 +57,24 @@ enqueue_host_command :: proc(
 		return .Invalid
 	}
 
-	if cmd.kind != .Read_Body {
+	if cmd.kind != .Read_Body && cmd.kind != .Response_Start {
 		return .Invalid
 	}
 
-	if cmd.max_bytes == 0 {
+	if cmd.kind == .Read_Body && cmd.max_bytes == 0 {
 		return .Invalid
+	}
+
+	if cmd.kind == .Response_Start {
+		if cmd.status < 200 || cmd.status > 599 {
+			return .Invalid
+		}
+
+		if cmd.reason_length == 0 ||
+		   cmd.reason_length > HOST_MAX_RESPONSE_REASON_BYTES ||
+		   cmd.body_length > HOST_MAX_RESPONSE_BODY_BYTES {
+			return .Invalid
+		}
 	}
 
 	sync.mutex_lock(&queue.mu)

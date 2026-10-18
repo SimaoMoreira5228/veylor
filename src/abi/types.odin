@@ -21,6 +21,9 @@ Vyl_Result :: enum i32 {
 	Worker_Error,
 	Busy,
 	Buffer_Too_Small,
+	Would_Block,
+	Stale_Token,
+	End_Of_Body,
 }
 
 Vyl_Config :: struct {
@@ -75,6 +78,8 @@ Vyl_Host_Event :: struct {
 	method_length: u32,
 	path_offset:   u32,
 	path_length:   u32,
+	body_ready:    u32,
+	body_complete: u32,
 }
 
 Vyl_Batch_Info :: struct {

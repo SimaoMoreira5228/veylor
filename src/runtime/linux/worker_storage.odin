@@ -166,6 +166,7 @@ init_static_worker_storage :: proc(
 		body_limit = 16 * 1024 * 1024,
 		timeouts = connections.Connection_Timeouts {
 			request_head_ns = 10_000_000_000,
+			body_progress_ns = 10_000_000_000,
 			response_write_ns = 10_000_000_000,
 			keep_alive_idle_ns = 5_000_000_000,
 		},

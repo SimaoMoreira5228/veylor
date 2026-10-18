@@ -21,6 +21,7 @@ Host_Event :: struct {
 	method:        [HOST_MAX_METHOD_BYTES]u8,
 	path:          [HOST_MAX_PATH_BYTES]u8,
 	body_ready:    u32,
+	body_complete: u32,
 	kind:          Host_Event_Kind,
 }
 

@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -16,12 +17,22 @@ _Static_assert(offsetof(vyl_config, shutdown_grace_ns) == 16,
 _Static_assert(sizeof(vyl_bytes) == 16, "vyl_bytes layout changed");
 _Static_assert(sizeof(vyl_request_token) == 24,
                "vyl_request_token layout changed");
-_Static_assert(sizeof(vyl_host_event) == 56, "vyl_host_event layout changed");
+_Static_assert(sizeof(vyl_host_event) == 64,
+                "vyl_host_event layout changed");
+_Static_assert(offsetof(vyl_host_event, body_ready) == 56,
+               "vyl_host_event body_ready offset changed");
+_Static_assert(offsetof(vyl_host_event, body_complete) == 60,
+               "vyl_host_event body_complete offset changed");
 _Static_assert(offsetof(vyl_host_event, token) == 8,
                "vyl_host_event.token offset changed");
 _Static_assert(offsetof(vyl_host_event, method_offset) == 40,
                "vyl_host_event method offset changed");
 _Static_assert(sizeof(vyl_batch_info) == 16, "vyl_batch_info layout changed");
+_Static_assert(VYL_WOULD_BLOCK == 10, "vyl_result WOULD_BLOCK changed");
+_Static_assert(VYL_STALE_TOKEN == 11, "vyl_result STALE_TOKEN changed");
+_Static_assert(VYL_END_OF_BODY == 12, "vyl_result END_OF_BODY changed");
+_Static_assert(VYL_HOST_BODY_AVAILABLE == 2,
+               "vyl_host_event_kind BODY_AVAILABLE changed");
 _Static_assert(sizeof(vyl_native_request) == 32,
                "vyl_native_request layout changed");
 _Static_assert(sizeof(vyl_native_response) == 40,
@@ -209,6 +220,105 @@ static int request_health(uint16_t port) {
   return 1;
 }
 
+static int read_response_head(int fd, char *response, size_t cap,
+                              size_t *header_length) {
+  size_t received = 0;
+  while (received < cap - 1) {
+    ssize_t count = recv(fd, response + received, 1, 0);
+    if (count <= 0) {
+      return 0;
+    }
+    received += (size_t)count;
+    if (received >= 4 &&
+        memcmp(response + received - 4, "\r\n\r\n", 4) == 0) {
+      break;
+    }
+  }
+  response[received] = '\0';
+  *header_length = received;
+  return received < cap;
+}
+
+static int read_exact_body(int fd, char *response, size_t header_length,
+                           size_t body_length) {
+  size_t received = 0;
+  while (received < body_length) {
+    ssize_t count = recv(fd, response + header_length + received,
+                         body_length - received, 0);
+    if (count <= 0) {
+      return 0;
+    }
+    received += (size_t)count;
+  }
+  response[header_length + received] = '\0';
+  return 1;
+}
+
+static int expect_managed_response(int fd, const char *expected_head,
+                                   const char *expected_body, int expect_eof,
+                                   int close_fd) {
+  char response[2048];
+  size_t header_length = 0;
+  if (!read_response_head(fd, response, sizeof(response), &header_length)) {
+    fprintf(stderr, "managed response head missing\n");
+    if (close_fd) {
+      close(fd);
+    }
+    return 0;
+  }
+  if (strstr(response, expected_head) == NULL) {
+    fprintf(stderr, "unexpected managed response head:\n%s\n", response);
+    if (close_fd) {
+      close(fd);
+    }
+    return 0;
+  }
+  long content_length = -1;
+  const char *cl = strstr(response, "Content-Length:");
+  if (cl != NULL) {
+    content_length = strtol(cl + 15, NULL, 10);
+  }
+  size_t want_body = strlen(expected_body);
+  if (content_length != (long)want_body) {
+    fprintf(stderr, "managed content length %ld, want %zu\n", content_length,
+            want_body);
+    if (close_fd) {
+      close(fd);
+    }
+    return 0;
+  }
+  if (!read_exact_body(fd, response, header_length, want_body)) {
+    fprintf(stderr, "managed response body missing\n");
+    if (close_fd) {
+      close(fd);
+    }
+    return 0;
+  }
+  if (strcmp(response + header_length, expected_body) != 0) {
+    fprintf(stderr, "unexpected managed response body:\n%s\n",
+            response + header_length);
+    if (close_fd) {
+      close(fd);
+    }
+    return 0;
+  }
+  if (expect_eof) {
+    char discard;
+    ssize_t count = recv(fd, &discard, 1, 0);
+    if (count != 0) {
+      fprintf(stderr, "managed connection not closed, recv %zd\n", count);
+      if (close_fd) {
+        close(fd);
+      }
+      return 0;
+    }
+  }
+  if (close_fd) {
+    close(fd);
+  }
+  return 1;
+}
+
 int main(void) {
   vyl_config config = {
       .abi_version = VEYLOR_ABI_VERSION,
@@ -348,6 +458,23 @@ int main(void) {
     return 1;
   }
 
+  uint8_t upload_method[] = "POST";
+  uint8_t upload_path[] = "/upload";
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){upload_method, sizeof(upload_method) - 1},
+      (vyl_bytes){upload_path, sizeof(upload_path) - 1});
+  if (!expect_result("managed upload route", result, VYL_OK)) {
+    return 1;
+  }
+
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){upload_method, sizeof(upload_method) - 1},
+      (vyl_bytes){upload_path, sizeof(upload_path) - 1});
+  if (!expect_result("duplicate managed upload route", result,
+                     VYL_DUPLICATE_ROUTE)) {
+    return 1;
+  }
+
   memset(echo_method, 'X', sizeof(echo_method) - 1);
   memset(echo_path, 'X', sizeof(echo_path) - 1);
   memset(guard_method, 'X', sizeof(guard_method) - 1);
@@ -356,6 +483,8 @@ int main(void) {
   memset(managed_path, 'X', sizeof(managed_path) - 1);
   memset(clash_method, 'X', sizeof(clash_method) - 1);
   memset(clash_path, 'X', sizeof(clash_path) - 1);
+  memset(upload_method, 'X', sizeof(upload_method) - 1);
+  memset(upload_path, 'X', sizeof(upload_path) - 1);
 
   const uint8_t loopback[4] = {127, 0, 0, 1};
   uint16_t bound_port = 0;
@@ -562,6 +691,7 @@ int main(void) {
     close(managed_fd);
     return 1;
   }
+  vyl_request_token managed_token = poll_events[0].token;
 
   memset(&batch, 0, sizeof(batch));
   result = vyl_server_poll_events(server, poll_events, 4, poll_data,
@@ -647,15 +777,382 @@ int main(void) {
   }
   close(managed_fd2);
 
-  memset(&batch, 0, sizeof(batch));
-  result = vyl_server_poll_events(server, poll_events, 4, poll_data,
-                                  sizeof(poll_data), 1, &batch);
-  if (!expect_result("host poll nonzero timeout", result,
+  int upload_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (upload_fd < 0) {
+    perror("socket");
+    close(managed_fd);
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(upload_fd, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(upload_fd);
+      close(managed_fd);
+      return 1;
+    }
+  }
+  const char upload_head[] = "POST /upload HTTP/1.1\r\n"
+                             "Host: localhost\r\n"
+                             "Content-Length: 10\r\n"
+                             "Connection: close\r\n"
+                             "\r\n"
+                             "hello";
+  size_t upload_sent = 0;
+  while (upload_sent < sizeof(upload_head) - 1) {
+    ssize_t count = send(upload_fd, upload_head + upload_sent,
+                         sizeof(upload_head) - 1 - upload_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(upload_fd);
+      close(managed_fd);
+      return 1;
+    }
+    upload_sent += (size_t)count;
+  }
+
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  if (poll_events[0].kind != VYL_HOST_REQUEST ||
+      poll_events[0].method_length != 4 ||
+      memcmp(poll_data + poll_events[0].method_offset, "POST", 4) != 0 ||
+      poll_events[0].path_length != 7 ||
+      memcmp(poll_data + poll_events[0].path_offset, "/upload", 7) != 0) {
+    fprintf(stderr, "unexpected upload request event\n");
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  vyl_request_token upload_token = poll_events[0].token;
+  uint64_t upload_route = poll_events[0].route_id;
+
+  uint8_t body_chunk[32];
+  uint32_t body_count = 0;
+  result = vyl_request_read(server, upload_token, body_chunk,
+                            sizeof(body_chunk), &body_count);
+  if (!expect_result("read before pull", result, VYL_WOULD_BLOCK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_request_pull_body(server, upload_token, 1024);
+  if (!expect_result("first body pull", result, VYL_OK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  if (poll_events[0].kind != VYL_HOST_BODY_AVAILABLE ||
+      poll_events[0].route_id != upload_route ||
+      poll_events[0].body_ready != 5 || poll_events[0].body_complete != 0) {
+    fprintf(stderr, "unexpected first body event: kind %u ready %u complete %u\n",
+            poll_events[0].kind, poll_events[0].body_ready,
+            poll_events[0].body_complete);
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_request_read(server, upload_token, body_chunk, 2, &body_count);
+  if (!expect_result("partial read", result, VYL_OK) || body_count != 2 ||
+      memcmp(body_chunk, "he", 2) != 0) {
+    fprintf(stderr, "unexpected partial read: %d/%u\n", result, body_count);
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result =
+      vyl_request_read(server, upload_token, body_chunk, sizeof(body_chunk),
+                       &body_count);
+  if (!expect_result("drain staged", result, VYL_OK) || body_count != 3 ||
+      memcmp(body_chunk, "llo", 3) != 0) {
+    fprintf(stderr, "unexpected staged drain: %d/%u\n", result, body_count);
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_request_read(server, upload_token, body_chunk,
+                            sizeof(body_chunk), &body_count);
+  if (!expect_result("read awaiting remainder", result, VYL_WOULD_BLOCK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+
+  const char upload_tail[] = "world";
+  upload_sent = 0;
+  while (upload_sent < sizeof(upload_tail) - 1) {
+    ssize_t count = send(upload_fd, upload_tail + upload_sent,
+                         sizeof(upload_tail) - 1 - upload_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(upload_fd);
+      close(managed_fd);
+      return 1;
+    }
+    upload_sent += (size_t)count;
+  }
+  result = vyl_request_pull_body(server, upload_token, 1024);
+  if (!expect_result("second body pull", result, VYL_OK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  if (poll_events[0].kind != VYL_HOST_BODY_AVAILABLE ||
+      poll_events[0].body_ready != 5 || poll_events[0].body_complete != 1) {
+    fprintf(stderr, "unexpected final body event: kind %u ready %u complete %u\n",
+            poll_events[0].kind, poll_events[0].body_ready,
+            poll_events[0].body_complete);
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result =
+      vyl_request_read(server, upload_token, body_chunk, sizeof(body_chunk),
+                       &body_count);
+  if (!expect_result("final body read", result, VYL_END_OF_BODY) ||
+      body_count != 5 || memcmp(body_chunk, "world", 5) != 0) {
+    fprintf(stderr, "unexpected final read: %d/%u\n", result, body_count);
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_request_read(server, upload_token, body_chunk,
+                            sizeof(body_chunk), &body_count);
+  if (!expect_result("read after end", result, VYL_END_OF_BODY) ||
+      body_count != 0) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+
+  vyl_request_token stale_token = upload_token;
+  stale_token.connection_generation += 1;
+  result = vyl_request_read(server, stale_token, body_chunk,
+                            sizeof(body_chunk), &body_count);
+  if (!expect_result("stale body read", result, VYL_STALE_TOKEN)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_request_pull_body(server, stale_token, 1024);
+  if (!expect_result("stale body pull", result, VYL_STALE_TOKEN)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  if (!expect_result("null pull server",
+                     vyl_request_pull_body(NULL, upload_token, 1024),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("zero pull bytes",
+                     vyl_request_pull_body(server, upload_token, 0),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("null read destination",
+                     vyl_request_read(server, upload_token, NULL, 16,
+                                      &body_count),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("zero read capacity",
+                     vyl_request_read(server, upload_token, body_chunk, 0,
+                                      &body_count),
+                     VYL_INVALID_ARGUMENT)) {
+    close(upload_fd);
+    close(managed_fd);
+    return 1;
+  }
+  uint8_t resp_reason[] = "OK";
+  uint8_t resp_body[] = "hello back";
+  result = vyl_response_start(server, upload_token, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){resp_body, sizeof(resp_body) - 1});
+  if (!expect_result("managed upload response", result, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (!expect_managed_response(upload_fd, "HTTP/1.1 200 OK\r\n",
+                               "hello back", 1, 1)) {
+    close(managed_fd);
+    return 1;
+  }
+  result = vyl_response_start(server, upload_token, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){resp_body, sizeof(resp_body) - 1});
+  if (!expect_result("duplicate managed response", result, VYL_STALE_TOKEN)) {
+    close(managed_fd);
+    return 1;
+  }
+
+  uint8_t bad_reason[] = "O\r\nK";
+  uint8_t big_body[769];
+  memset(big_body, 'x', sizeof(big_body));
+  if (!expect_result("bad response status",
+                     vyl_response_start(server, managed_token, 99,
+                                        (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                                        (vyl_bytes){resp_body, 10}),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("bad response reason",
+                     vyl_response_start(server, managed_token, 200,
+                                        (vyl_bytes){bad_reason, sizeof(bad_reason) - 1},
+                                        (vyl_bytes){resp_body, 10}),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("oversized response body",
+                     vyl_response_start(server, managed_token, 200,
+                                        (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                                        (vyl_bytes){big_body, sizeof(big_body)}),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("null response server",
+                     vyl_response_start(NULL, managed_token, 200,
+                                        (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                                        (vyl_bytes){resp_body, 10}),
                      VYL_INVALID_ARGUMENT)) {
     close(managed_fd);
     return 1;
   }
-  close(managed_fd);
+
+  uint8_t managed_resp_body[] = "managed hello\n";
+  result = vyl_response_start(
+      server, managed_token, 200, (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+      (vyl_bytes){managed_resp_body, sizeof(managed_resp_body) - 1});
+  if (!expect_result("managed get response", result, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (!expect_managed_response(managed_fd, "HTTP/1.1 200 OK\r\n",
+                               "managed hello\n", 0, 0)) {
+    close(managed_fd);
+    return 1;
+  }
+
+  const char managed_request_again[] = "GET /managed HTTP/1.1\r\n"
+                                       "Host: localhost\r\n"
+                                       "\r\n";
+  managed_sent = 0;
+  while (managed_sent < sizeof(managed_request_again) - 1) {
+    ssize_t count = send(managed_fd, managed_request_again + managed_sent,
+                         sizeof(managed_request_again) - 1 - managed_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(managed_fd);
+      return 1;
+    }
+    managed_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (poll_events[0].kind != VYL_HOST_REQUEST ||
+      poll_events[0].method_length != 3 ||
+      memcmp(poll_data + poll_events[0].method_offset, "GET", 3) != 0) {
+    fprintf(stderr, "unexpected reused managed request event\n");
+    close(managed_fd);
+    return 1;
+  }
+  uint8_t again_body[] = "again\n";
+  result = vyl_response_start(server, poll_events[0].token, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){again_body, sizeof(again_body) - 1});
+  if (!expect_result("managed reuse response", result, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (!expect_managed_response(managed_fd, "HTTP/1.1 200 OK\r\n", "again\n", 0,
+                               1)) {
+    close(managed_fd);
+    return 1;
+  }
+
+  {
+    struct timespec wait_start, wait_end;
+    clock_gettime(CLOCK_MONOTONIC, &wait_start);
+    memset(&batch, 0, sizeof(batch));
+    result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                    sizeof(poll_data), 5000000, &batch);
+    clock_gettime(CLOCK_MONOTONIC, &wait_end);
+    int64_t waited_ns =
+        (int64_t)(wait_end.tv_sec - wait_start.tv_sec) * 1000000000ll +
+        ((int64_t)wait_end.tv_nsec - (int64_t)wait_start.tv_nsec);
+    if (!expect_result("host poll empty timeout", result, VYL_OK)) {
+      return 1;
+    }
+    if (batch.event_count != 0) {
+      fprintf(stderr, "expected empty timed poll, got %u\n", batch.event_count);
+      return 1;
+    }
+    if (waited_ns < 5000000ll) {
+      fprintf(stderr, "timed poll returned early after %lld ns\n",
+              (long long)waited_ns);
+      return 1;
+    }
+  }
+
+  int wake_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (wake_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(wake_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("connect");
+      close(wake_fd);
+      return 1;
+    }
+  }
+  const char wake_request[] = "GET /managed HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "\r\n";
+  size_t wake_sent = 0;
+  while (wake_sent < sizeof(wake_request) - 1) {
+    ssize_t count = send(wake_fd, wake_request + wake_sent,
+                         sizeof(wake_request) - 1 - wake_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(wake_fd);
+      return 1;
+    }
+    wake_sent += (size_t)count;
+  }
+  memset(&batch, 0, sizeof(batch));
+  result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                  sizeof(poll_data), 5000000000u, &batch);
+  if (!expect_result("host poll wakeup", result, VYL_OK)) {
+    close(wake_fd);
+    return 1;
+  }
+  if (batch.event_count != 1 || poll_events[0].kind != VYL_HOST_REQUEST ||
+      poll_events[0].method_length != 3 ||
+      memcmp(poll_data + poll_events[0].method_offset, "GET", 3) != 0 ||
+      poll_events[0].path_length != 8 ||
+      memcmp(poll_data + poll_events[0].path_offset, "/managed", 8) != 0) {
+    fprintf(stderr, "unexpected wakeup poll result\n");
+    close(wake_fd);
+    return 1;
+  }
+  close(wake_fd);
 
   {
     int fd = socket(AF_INET, SOCK_STREAM, 0);

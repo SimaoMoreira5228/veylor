@@ -4,6 +4,7 @@ package abi
 import odin_runtime "base:runtime"
 import "core:mem"
 import "core:sync"
+import "core:sys/linux"
 import response "veylor:http1/response"
 import router "veylor:router"
 import host "veylor:runtime/host"
@@ -37,6 +38,8 @@ Vyl_Server :: struct {
 	poll_cursor:          int,
 	worker_threads:       [VYL_MAX_WORKERS]workers.Worker_Thread,
 	managed_server:       server_runtime.Managed_Server,
+	host_wakeup:          server_runtime.Host_Wakeup,
+	host_wakeup_ready:    bool,
 }
 
 @(export)
@@ -270,129 +273,6 @@ vyl_server_route_managed :: proc "c" (
 }
 
 @(export)
-vyl_server_poll_events :: proc "c" (
-	server: ^Vyl_Server,
-	events: [^]Vyl_Host_Event,
-	event_capacity: u32,
-	data: [^]u8,
-	data_capacity: u32,
-	timeout_ns: u64,
-	out_info: ^Vyl_Batch_Info,
-) -> i32 {
-	context = odin_runtime.default_context()
-
-	if server == nil || out_info == nil {
-		return i32(Vyl_Result.Invalid_Argument)
-	}
-	if event_capacity > 0 && events == nil {
-		return i32(Vyl_Result.Invalid_Argument)
-	}
-	if data_capacity > 0 && data == nil {
-		return i32(Vyl_Result.Invalid_Argument)
-	}
-	if timeout_ns != 0 {
-		return i32(Vyl_Result.Invalid_Argument)
-	}
-	if server.state != .Running && server.state != .Stop_Requested {
-		return i32(Vyl_Result.Bad_State)
-	}
-
-	out_info^ = Vyl_Batch_Info{}
-	worker_count := int(server.config.worker_count)
-	if worker_count <= 0 || worker_count > len(server.server_workers) {
-		return i32(Vyl_Result.Invalid_Argument)
-	}
-
-	event_slice := events[:int(event_capacity)]
-	data_slice := data[:int(data_capacity)]
-	copied := 0
-	used := u32(0)
-	data_need := u32(0)
-	start := server.poll_cursor % worker_count
-	for w := 0; w < worker_count; w += 1 {
-		worker := server.server_workers[(start + w) % worker_count]
-		if worker == nil || worker.host_queue == nil {
-			continue
-		}
-		for host.pending_host_events(worker.host_queue) > 0 {
-			if copied >= int(event_capacity) {
-				break
-			}
-			front, peek_ok := host.peek_host_queue(worker.host_queue)
-			if !peek_ok {
-				break
-			}
-			need := u32(front.method_length + front.path_length)
-			if used + need > data_capacity {
-				if data_need == 0 {
-					data_need = need
-				}
-				break
-			}
-			single: [1]host.Host_Event
-			dequeued := host.poll_host_queue(worker.host_queue, single[:])
-			if dequeued.copied != 1 {
-				break
-			}
-			taken := single[0]
-			event_kind := Vyl_Host_Event_Kind.Request
-			if taken.kind == .Shutdown {
-				event_kind = .Shutdown
-			}
-			if taken.kind == .Body_Available {
-				event_kind = .Body_Available
-			}
-			out_event := &event_slice[copied]
-			out_event^ = Vyl_Host_Event {
-				kind = event_kind,
-				token = Vyl_Request_Token {
-					worker_id = taken.token.worker_id,
-					slot = taken.token.slot,
-					worker_generation = taken.token.worker_generation,
-					connection_generation = taken.token.generation,
-				},
-				route_id = taken.route_id,
-				method_offset = used,
-				method_length = u32(taken.method_length),
-				path_offset = used + u32(taken.method_length),
-				path_length = u32(taken.path_length),
-			}
-			copy(data_slice[used:], taken.method[:taken.method_length])
-			copy(data_slice[used + u32(taken.method_length):], taken.path[:taken.path_length])
-			used += need
-			copied += 1
-		}
-		if copied >= int(event_capacity) {
-			break
-		}
-	}
-	server.poll_cursor = (start + 1) % worker_count
-	remaining := remaining_host_events(server, worker_count)
-	out_info^ = Vyl_Batch_Info {
-		event_count     = u32(copied),
-		data_used       = used,
-		events_required = u32(remaining),
-		data_required   = data_need,
-	}
-	if copied == 0 && remaining > 0 {
-		return i32(Vyl_Result.Buffer_Too_Small)
-	}
-	return i32(Vyl_Result.Ok)
-}
-
-remaining_host_events :: proc(server: ^Vyl_Server, worker_count: int) -> int {
-	remaining := 0
-	for i := 0; i < worker_count; i += 1 {
-		worker := server.server_workers[i]
-		if worker == nil || worker.host_queue == nil {
-			continue
-		}
-		remaining += host.pending_host_events(worker.host_queue)
-	}
-	return remaining
-}
-
-@(export)
 vyl_server_listen :: proc "c" (
 	server: ^Vyl_Server,
 	address: [^]u8,
@@ -418,6 +298,16 @@ vyl_server_listen :: proc "c" (
 	}
 
 	listen_address := [4]u8{address[0], address[1], address[2], address[3]}
+	wakeup_fd, wakeup_error := linux.eventfd(0, {.CLOEXEC, .NONBLOCK})
+	if wakeup_error != .NONE {
+		system_error^ = i32(wakeup_error)
+		server.state = .Failed
+		return i32(Vyl_Result.System_Error)
+	}
+	server.host_wakeup = server_runtime.Host_Wakeup {
+		fd = wakeup_fd,
+	}
+	server.host_wakeup_ready = true
 	worker_count := int(server.config.worker_count)
 	for worker_index := 0; worker_index < worker_count; worker_index += 1 {
 		listen_port := port
@@ -434,6 +324,7 @@ vyl_server_listen :: proc "c" (
 		if listen_result != .Ready {
 			system_error^ = listen_error
 			close_unmanaged_workers(server)
+			close_host_wakeup(server)
 			server.state = .Failed
 			return socket_result(listen_result)
 		}
@@ -451,6 +342,7 @@ vyl_server_listen :: proc "c" (
 		if worker_result.error != .None {
 			system_error^ = worker_result.system_error
 			close_unmanaged_workers(server)
+			close_host_wakeup(server)
 			server.state = .Failed
 			if worker_result.error == .Invalid {
 				return i32(Vyl_Result.Invalid_Argument)
@@ -463,6 +355,7 @@ vyl_server_listen :: proc "c" (
 			return i32(Vyl_Result.System_Error)
 		}
 		server.server_workers[worker_index] = &worker_storage.worker
+		server.server_workers[worker_index].host_wakeup = &server.host_wakeup
 	}
 
 	bound_port^ = server.worker_storage[0].worker.listener.local_address.port
@@ -474,6 +367,7 @@ vyl_server_listen :: proc "c" (
 	)
 	if managed_result != .Initialized {
 		close_unmanaged_workers(server)
+		close_host_wakeup(server)
 		server.state = .Failed
 		return managed_server_result(managed_result)
 	}
@@ -575,6 +469,7 @@ vyl_server_destroy :: proc "c" (server: ^Vyl_Server) -> i32 {
 	} else {
 		close_unmanaged_workers(server)
 	}
+	close_host_wakeup(server)
 
 	if len(server.worker_storage) > 0 {
 		worker_storage_free_error := mem.free(raw_data(server.worker_storage))
@@ -617,6 +512,14 @@ retain_route_bytes :: proc(server: ^Vyl_Server, source: []u8) -> []u8 {
 close_unmanaged_workers :: proc(server: ^Vyl_Server) {
 	for worker_index := 0; worker_index < len(server.worker_storage); worker_index += 1 {
 		server_runtime.close_unmanaged_static_worker_storage(&server.worker_storage[worker_index])
+	}
+}
+
+close_host_wakeup :: proc(server: ^Vyl_Server) {
+	if server.host_wakeup_ready && server.host_wakeup.fd >= 0 {
+		linux.close(server.host_wakeup.fd)
+		server.host_wakeup.fd = -1
+		server.host_wakeup_ready = false
 	}
 }
 

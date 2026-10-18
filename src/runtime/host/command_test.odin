@@ -154,3 +154,50 @@ test_host_command_queue_pending_tracks_enqueue_and_dequeue :: proc(t: ^testing.T
 	testing.expect(t, ok)
 	testing.expect_value(t, pending_host_commands(&queue), 0)
 }
+
+make_response_start_command :: proc(
+	slot: u32,
+	generation: u64,
+	status: i32,
+	reason_length: u32,
+	body_length: u32,
+) -> Host_Command {
+	return Host_Command {
+		kind = .Response_Start,
+		token = make_host_command_token(slot, generation),
+		status = status,
+		reason_length = reason_length,
+		body_length = body_length,
+	}
+}
+
+@(test)
+test_host_command_queue_validates_response_start_bounds :: proc(t: ^testing.T) {
+	storage: [4]Host_Command
+	queue := init_host_command_queue(storage[:])
+
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_response_start_command(0, 1, 200, 2, 9)),
+		Host_Command_Result.Enqueued,
+	)
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_response_start_command(1, 1, 199, 2, 0)),
+		Host_Command_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_response_start_command(1, 1, 200, 0, 0)),
+		Host_Command_Result.Invalid,
+	)
+	testing.expect_value(
+		t,
+		enqueue_host_command(
+			&queue,
+			make_response_start_command(1, 1, 200, 2, HOST_MAX_RESPONSE_BODY_BYTES + 1),
+		),
+		Host_Command_Result.Invalid,
+	)
+	testing.expect_value(t, pending_host_commands(&queue), 1)
+}

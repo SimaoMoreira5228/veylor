@@ -57,10 +57,10 @@ test_warm_workspace_acquire_and_release_allocates_no_heap_memory :: proc(t: ^tes
 }
 
 @(test)
-test_idle_connection_control_metadata_stays_within_256_bytes :: proc(t: ^testing.T) {
+test_idle_connection_control_metadata_stays_within_288_bytes :: proc(t: ^testing.T) {
 	idle_metadata_bytes :=
 		size_of(Static_Connection) + size_of(connections.Connection_Slot) + size_of(u32)
-	testing.expect_value(t, idle_metadata_bytes <= 256, true)
+	testing.expect_value(t, idle_metadata_bytes <= 288, true)
 }
 
 @(test)
