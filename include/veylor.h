@@ -22,6 +22,7 @@ typedef enum {
   VYL_DUPLICATE_ROUTE,
   VYL_WORKER_ERROR,
   VYL_BUSY,
+  VYL_BUFFER_TOO_SMALL,
 } vyl_result;
 
 typedef struct {
@@ -62,6 +63,39 @@ int32_t vyl_server_route_native(vyl_server *server, vyl_bytes method,
                                 void *user_data);
 int32_t vyl_server_route_managed(vyl_server *server, vyl_bytes method,
                                  vyl_bytes path);
+
+typedef enum {
+  VYL_HOST_REQUEST = 0,
+  VYL_HOST_SHUTDOWN = 1
+} vyl_host_event_kind;
+
+typedef struct {
+  uint32_t worker_id;
+  uint32_t slot;
+  uint64_t worker_generation;
+  uint64_t connection_generation;
+} vyl_request_token;
+
+typedef struct {
+  uint32_t kind;
+  uint32_t reserved;
+  vyl_request_token token;
+  uint64_t route_id;
+  uint32_t method_offset, method_length;
+  uint32_t path_offset, path_length;
+} vyl_host_event;
+
+typedef struct {
+  uint32_t event_count;
+  uint32_t data_used;
+  uint32_t events_required;
+  uint32_t data_required;
+} vyl_batch_info;
+
+int32_t vyl_server_poll_events(vyl_server *server, vyl_host_event *events,
+                               uint32_t event_capacity, uint8_t *data,
+                               uint32_t data_capacity, uint64_t timeout_ns,
+                               vyl_batch_info *out_info);
 int32_t vyl_server_listen(vyl_server *server, const uint8_t address[4],
                           uint16_t port, uint16_t *bound_port,
                           int32_t *system_error);

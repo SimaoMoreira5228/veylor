@@ -107,6 +107,18 @@ enqueue_event :: proc(
 	return .Enqueued
 }
 
+peek_host_queue :: proc(queue: ^Host_Queue) -> (event: Host_Event, ok: bool) {
+	if queue == nil || len(queue.storage) == 0 {
+		return {}, false
+	}
+	tail := sync.atomic_load_explicit(&queue.tail, .Acquire)
+	head := sync.atomic_load_explicit(&queue.head, .Acquire)
+	if tail - head <= 0 {
+		return {}, false
+	}
+	return queue.storage[head % len(queue.storage)], true
+}
+
 poll_host_queue :: proc(queue: ^Host_Queue, batch: []Host_Event) -> Host_Poll {
 	if queue == nil || len(queue.storage) == 0 {
 		return Host_Poll{}

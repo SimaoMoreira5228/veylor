@@ -217,6 +217,16 @@ static_connection_turn :: proc(
 	}
 
 	if state.phase == .Awaiting_Host {
+		if readiness.error {
+			state.close_reason = .Transport_Error
+			state.phase = .Failed
+			return Static_Connection_Turn{result = .Transport_Error}
+		}
+		if readiness.peer_closed {
+			state.close_reason = .Peer_Closed
+			state.phase = .Closed
+			return Static_Connection_Turn{result = .Closed}
+		}
 		return Static_Connection_Turn{result = .Need_More}
 	}
 

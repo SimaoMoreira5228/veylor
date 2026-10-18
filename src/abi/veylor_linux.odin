@@ -6,6 +6,7 @@ import "core:mem"
 import "core:sync"
 import response "veylor:http1/response"
 import router "veylor:router"
+import host "veylor:runtime/host"
 import server_runtime "veylor:runtime/linux"
 import workers "veylor:runtime/workers"
 import socket "veylor:transport/linux/socket"
@@ -33,6 +34,7 @@ Vyl_Server :: struct {
 	native_routes:        router.Native_Table,
 	worker_storage:       []server_runtime.Static_Worker_Storage,
 	server_workers:       [VYL_MAX_WORKERS]^server_runtime.Static_Worker,
+	poll_cursor:          int,
 	worker_threads:       [VYL_MAX_WORKERS]workers.Worker_Thread,
 	managed_server:       server_runtime.Managed_Server,
 }
@@ -265,6 +267,126 @@ vyl_server_route_managed :: proc "c" (
 	}
 
 	return i32(Vyl_Result.Ok)
+}
+
+@(export)
+vyl_server_poll_events :: proc "c" (
+	server: ^Vyl_Server,
+	events: [^]Vyl_Host_Event,
+	event_capacity: u32,
+	data: [^]u8,
+	data_capacity: u32,
+	timeout_ns: u64,
+	out_info: ^Vyl_Batch_Info,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if server == nil || out_info == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if event_capacity > 0 && events == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if data_capacity > 0 && data == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if timeout_ns != 0 {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if server.state != .Running && server.state != .Stop_Requested {
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	out_info^ = Vyl_Batch_Info{}
+	worker_count := int(server.config.worker_count)
+	if worker_count <= 0 || worker_count > len(server.server_workers) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	event_slice := events[:int(event_capacity)]
+	data_slice := data[:int(data_capacity)]
+	copied := 0
+	used := u32(0)
+	data_need := u32(0)
+	start := server.poll_cursor % worker_count
+	for w := 0; w < worker_count; w += 1 {
+		worker := server.server_workers[(start + w) % worker_count]
+		if worker == nil || worker.host_queue == nil {
+			continue
+		}
+		for host.pending_host_events(worker.host_queue) > 0 {
+			if copied >= int(event_capacity) {
+				break
+			}
+			front, peek_ok := host.peek_host_queue(worker.host_queue)
+			if !peek_ok {
+				break
+			}
+			need := u32(front.method_length + front.path_length)
+			if used + need > data_capacity {
+				if data_need == 0 {
+					data_need = need
+				}
+				break
+			}
+			single: [1]host.Host_Event
+			dequeued := host.poll_host_queue(worker.host_queue, single[:])
+			if dequeued.copied != 1 {
+				break
+			}
+			taken := single[0]
+			event_kind := Vyl_Host_Event_Kind.Request
+			if taken.kind == .Shutdown {
+				event_kind = .Shutdown
+			}
+			out_event := &event_slice[copied]
+			out_event^ = Vyl_Host_Event {
+				kind = event_kind,
+				token = Vyl_Request_Token {
+					worker_id = taken.token.worker_id,
+					slot = taken.token.slot,
+					worker_generation = taken.token.worker_generation,
+					connection_generation = taken.token.generation,
+				},
+				route_id = taken.route_id,
+				method_offset = used,
+				method_length = u32(taken.method_length),
+				path_offset = used + u32(taken.method_length),
+				path_length = u32(taken.path_length),
+			}
+			copy(data_slice[used:], taken.method[:taken.method_length])
+			copy(data_slice[used + u32(taken.method_length):], taken.path[:taken.path_length])
+			used += need
+			copied += 1
+		}
+		if copied >= int(event_capacity) {
+			break
+		}
+	}
+	server.poll_cursor = (start + 1) % worker_count
+	remaining := remaining_host_events(server, worker_count)
+	out_info^ = Vyl_Batch_Info {
+		event_count     = u32(copied),
+		data_used       = used,
+		events_required = u32(remaining),
+		data_required   = data_need,
+	}
+	if copied == 0 && remaining > 0 {
+		return i32(Vyl_Result.Buffer_Too_Small)
+	}
+	return i32(Vyl_Result.Ok)
+}
+
+remaining_host_events :: proc(server: ^Vyl_Server, worker_count: int) -> int {
+	remaining := 0
+	for i := 0; i < worker_count; i += 1 {
+		worker := server.server_workers[i]
+		if worker == nil || worker.host_queue == nil {
+			continue
+		}
+		remaining += host.pending_host_events(worker.host_queue)
+	}
+	return remaining
 }
 
 @(export)

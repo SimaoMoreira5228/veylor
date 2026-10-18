@@ -20,6 +20,7 @@ Vyl_Result :: enum i32 {
 	Duplicate_Route,
 	Worker_Error,
 	Busy,
+	Buffer_Too_Small,
 }
 
 Vyl_Config :: struct {
@@ -51,3 +52,33 @@ Vyl_Native_Handler :: #type proc "c" (
 	request: ^Vyl_Native_Request,
 	response: ^Vyl_Native_Response,
 ) -> i32
+
+Vyl_Request_Token :: struct {
+	worker_id:              u32,
+	slot:                   u32,
+	worker_generation:      u64,
+	connection_generation:  u64,
+}
+
+Vyl_Host_Event_Kind :: enum u32 {
+	Request,
+	Shutdown,
+}
+
+Vyl_Host_Event :: struct {
+	kind:          Vyl_Host_Event_Kind,
+	reserved:      u32,
+	token:         Vyl_Request_Token,
+	route_id:      u64,
+	method_offset: u32,
+	method_length: u32,
+	path_offset:   u32,
+	path_length:   u32,
+}
+
+Vyl_Batch_Info :: struct {
+	event_count:     u32,
+	data_used:       u32,
+	events_required: u32,
+	data_required:   u32,
+}

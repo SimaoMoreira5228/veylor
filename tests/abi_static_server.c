@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "veylor.h"
 
 #include <arpa/inet.h>
@@ -5,12 +7,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 _Static_assert(sizeof(vyl_config) == 24, "vyl_config layout changed");
 _Static_assert(offsetof(vyl_config, shutdown_grace_ns) == 16,
                "vyl_config offset changed");
 _Static_assert(sizeof(vyl_bytes) == 16, "vyl_bytes layout changed");
+_Static_assert(sizeof(vyl_request_token) == 24,
+               "vyl_request_token layout changed");
+_Static_assert(sizeof(vyl_host_event) == 56, "vyl_host_event layout changed");
+_Static_assert(offsetof(vyl_host_event, token) == 8,
+               "vyl_host_event.token offset changed");
+_Static_assert(offsetof(vyl_host_event, method_offset) == 40,
+               "vyl_host_event method offset changed");
+_Static_assert(sizeof(vyl_batch_info) == 16, "vyl_batch_info layout changed");
 _Static_assert(sizeof(vyl_native_request) == 32,
                "vyl_native_request layout changed");
 _Static_assert(sizeof(vyl_native_response) == 40,
@@ -101,6 +112,31 @@ static int32_t native_echo_handler(void *user_data,
   response->body.data = echo_body;
   response->body.length = (uint32_t)written;
   return VYL_OK;
+}
+
+static int poll_until(vyl_server *server, vyl_host_event *events,
+                      uint32_t event_capacity, uint8_t *data,
+                      uint32_t data_capacity, vyl_batch_info *batch,
+                      uint32_t want_events, int32_t want_result) {
+  int32_t result = VYL_OK;
+  for (int i = 0; i < 200; i++) {
+    memset(batch, 0, sizeof(*batch));
+    result = vyl_server_poll_events(server, events, event_capacity, data,
+                                    data_capacity, 0, batch);
+    if (result == want_result &&
+        (want_result != VYL_OK || batch->event_count == want_events)) {
+      return 1;
+    }
+    if (result != VYL_OK && result != VYL_BUFFER_TOO_SMALL) {
+      fprintf(stderr, "host poll failed: %d\n", result);
+      return 0;
+    }
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 5000000};
+    nanosleep(&delay, NULL);
+  }
+  fprintf(stderr, "host poll timed out waiting for %u events, last result %d\n",
+          want_events, result);
+  return 0;
 }
 
 static int expect_result(const char *operation, int32_t actual,
@@ -464,6 +500,162 @@ int main(void) {
             native_seen_path);
     return 1;
   }
+
+  int managed_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (managed_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(managed_fd, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(managed_fd);
+      return 1;
+    }
+  }
+  const char managed_request[] = "GET /managed HTTP/1.1\r\n"
+                                 "Host: localhost\r\n"
+                                 "\r\n";
+  size_t managed_sent = 0;
+  while (managed_sent < sizeof(managed_request) - 1) {
+    ssize_t count = send(managed_fd, managed_request + managed_sent,
+                         sizeof(managed_request) - 1 - managed_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(managed_fd);
+      return 1;
+    }
+    managed_sent += (size_t)count;
+  }
+
+  vyl_host_event poll_events[4];
+  uint8_t poll_data[256];
+  vyl_batch_info batch = {0};
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (batch.event_count != 1 || batch.events_required != 0) {
+    fprintf(stderr, "unexpected batch counts %u/%u\n", batch.event_count,
+            batch.events_required);
+    close(managed_fd);
+    return 1;
+  }
+  if (poll_events[0].kind != VYL_HOST_REQUEST || poll_events[0].route_id == 0) {
+    fprintf(stderr, "unexpected polled event kind %u route %llu\n",
+            poll_events[0].kind, (unsigned long long)poll_events[0].route_id);
+    close(managed_fd);
+    return 1;
+  }
+  if (poll_events[0].method_length != 3 ||
+      memcmp(poll_data + poll_events[0].method_offset, "GET", 3) != 0 ||
+      poll_events[0].path_length != 8 ||
+      memcmp(poll_data + poll_events[0].path_offset, "/managed", 8) != 0) {
+    fprintf(stderr, "unexpected polled method/path\n");
+    close(managed_fd);
+    return 1;
+  }
+
+  memset(&batch, 0, sizeof(batch));
+  result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                  sizeof(poll_data), 0, &batch);
+  if (!expect_result("host poll empty", result, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (batch.event_count != 0) {
+    fprintf(stderr, "expected empty poll, got %u\n", batch.event_count);
+    close(managed_fd);
+    return 1;
+  }
+
+  int managed_fd2 = socket(AF_INET, SOCK_STREAM, 0);
+  if (managed_fd2 < 0) {
+    perror("socket");
+    close(managed_fd);
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(managed_fd2, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(managed_fd2);
+      close(managed_fd);
+      return 1;
+    }
+  }
+  const char managed_request2[] = "GET /managed HTTP/1.1\r\n"
+                                  "Host: localhost\r\n"
+                                  "Connection: close\r\n"
+                                  "\r\n";
+  managed_sent = 0;
+  while (managed_sent < sizeof(managed_request2) - 1) {
+    ssize_t count = send(managed_fd2, managed_request2 + managed_sent,
+                         sizeof(managed_request2) - 1 - managed_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(managed_fd2);
+      close(managed_fd);
+      return 1;
+    }
+    managed_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 0, poll_data, sizeof(poll_data), &batch,
+                  0, VYL_BUFFER_TOO_SMALL)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (batch.events_required == 0) {
+    fprintf(stderr, "expected required events\n");
+    close(managed_fd);
+    return 1;
+  }
+
+  if (!poll_until(server, poll_events, 4, poll_data, 1, &batch, 0,
+                  VYL_BUFFER_TOO_SMALL)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (batch.data_required != 11) {
+    fprintf(stderr, "expected 11 data bytes required, got %u\n",
+            batch.data_required);
+    close(managed_fd);
+    return 1;
+  }
+
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(managed_fd);
+    return 1;
+  }
+  if (batch.event_count != 1) {
+    fprintf(stderr, "expected drained event, got %u\n", batch.event_count);
+    close(managed_fd);
+    return 1;
+  }
+  close(managed_fd2);
+
+  memset(&batch, 0, sizeof(batch));
+  result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                  sizeof(poll_data), 1, &batch);
+  if (!expect_result("host poll nonzero timeout", result,
+                     VYL_INVALID_ARGUMENT)) {
+    close(managed_fd);
+    return 1;
+  }
+  close(managed_fd);
 
   {
     int fd = socket(AF_INET, SOCK_STREAM, 0);

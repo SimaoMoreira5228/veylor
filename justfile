@@ -8,6 +8,7 @@ check:
     odin check src/runtime/workers -vet -no-entry-point -collection:veylor=src
     odin check src/runtime/host -vet -no-entry-point -collection:veylor=src
     odin check src/router -vet -no-entry-point -collection:veylor=src
+    odin check src/http2 -vet -no-entry-point -collection:veylor=src
     odin check src/http1 -vet -no-entry-point -collection:veylor=src
     odin check src/http1/body -vet -no-entry-point -collection:veylor=src
     odin check src/http1/response -vet -no-entry-point -collection:veylor=src
@@ -25,6 +26,7 @@ test:
     odin test src/runtime/workers -all-packages -collection:veylor=src -out:build/test-runtime-workers
     odin test src/runtime/host -all-packages -collection:veylor=src -out:build/test-runtime-host
     odin test src/router -all-packages -collection:veylor=src -out:build/test-router
+    odin test src/http2 -all-packages -collection:veylor=src -out:build/test-http2
 
 check-linux:
     odin check src/transport/linux -vet -no-entry-point -collection:veylor=src
