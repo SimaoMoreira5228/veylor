@@ -219,3 +219,34 @@ test_pipelined_second_request_served_after_keep_alive :: proc(t: ^testing.T) {
 	)
 	close_managed_body_fixture(&fixture)
 }
+
+@(test)
+test_parked_nobody_request_expires_on_handler_deadline :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /stream HTTP/1.1\r\nHost: example.test\r\n\r\n"
+
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/stream", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+	testing.expect_value(
+		t,
+		fixture.table.slots[int(fixture.token.slot)].deadline_kind,
+		connections.Connection_Deadline_Kind.Awaiting_Handler,
+	)
+
+	expired_storage: [4]transport.Timer_Expiration
+	expired := expire_worker_timers_at(&fixture.timers, expired_storage[:], 1000 + 11_000_000_000)
+	testing.expect_value(t, len(expired), 1)
+
+	turn := Static_Worker_Turn{}
+	process_static_worker_expirations(&fixture.worker, expired, &turn)
+	testing.expect_value(t, fixture.worker_states[0].active, false)
+	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(1))
+	close_managed_body_fixture(&fixture)
+}

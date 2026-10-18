@@ -9,6 +9,8 @@ import "veylor:transport"
 import epoll "veylor:transport/linux"
 
 STREAM_TERMINAL_CHUNK :: "0\r\n\r\n"
+STREAM_TERMINAL_HEAD :: "0\r\n"
+STREAM_TERMINAL_TAIL :: "\r\n"
 
 encode_stream_chunk :: proc(data: []u8, out: []u8) -> (written: int, ok: bool) {
 	if len(data) == 0 || len(data) > host.HOST_MAX_RESPONSE_BODY_BYTES {
@@ -354,6 +356,93 @@ execute_managed_response_end :: proc(
 			workspace.stream_terminal = true
 		}
 
+		write_turn := register_static_response_write(poller, state, table)
+
+		if write_turn.result != .Response_Progress {
+			state.close_reason = .Internal_Error
+			state.phase = .Failed
+
+			return .Closed
+		}
+	}
+
+	return .Responded
+}
+
+execute_managed_response_trailers :: proc(
+	state: ^Static_Connection,
+	cmd: host.Host_Command,
+	poller: epoll.Epoll,
+	table: ^connections.Connection_Table,
+) -> Managed_Response_Outcome {
+	if cmd.kind != .Response_Trailers {
+		return .Dropped
+	}
+
+	if cmd.body_length == 0 || cmd.body_length > host.HOST_MAX_RESPONSE_BODY_BYTES {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+
+		return .Closed
+	}
+
+	resource_id, lookup_result := connections.lookup_connection(table, cmd.token)
+
+	if lookup_result != .Found || resource_id != u64(state.fd) || cmd.token != state.token {
+		return .Dropped
+	}
+
+	phase, phase_result := connections.connection_phase(table, cmd.token)
+
+	if phase_result != .Found || phase != .Writing_Response {
+		return .Dropped
+	}
+
+	if state.phase != .Writing_Response {
+		return .Dropped
+	}
+
+	if state.workspace_slot < 0 || state.workspace_pool == nil {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+
+		return .Closed
+	}
+
+	if state.workspace_slot >= len(state.workspace_pool.storage) {
+		state.close_reason = .Internal_Error
+		state.phase = .Failed
+
+		return .Closed
+	}
+
+	workspace := &state.workspace_pool.storage[state.workspace_slot]
+
+	if !workspace.streaming || workspace.stream_ended {
+		return .Dropped
+	}
+
+	body_storage := cmd.body
+	frame := body_storage[:cmd.body_length]
+	framed := len(STREAM_TERMINAL_HEAD) + len(frame) + len(STREAM_TERMINAL_TAIL)
+
+	if framed > len(workspace.response) - state.response_length {
+		return .Dropped
+	}
+
+	head_room := len(STREAM_TERMINAL_HEAD)
+	copy(workspace.response[state.response_length:], STREAM_TERMINAL_HEAD)
+	copy(workspace.response[state.response_length + head_room:], frame)
+	copy(
+		workspace.response[state.response_length + head_room + len(frame):],
+		STREAM_TERMINAL_TAIL,
+	)
+	state.response_length += framed
+	workspace.stream_ended = true
+	workspace.stream_terminal = true
+	workspace.stream_writable = false
+
+	if state.write_driver.state != .Pending {
 		write_turn := register_static_response_write(poller, state, table)
 
 		if write_turn.result != .Response_Progress {

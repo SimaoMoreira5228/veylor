@@ -26,6 +26,7 @@ Connection_Phase :: enum u8 {
 Connection_Deadline_Kind :: enum u8 {
 	Request_Head,
 	Body_Progress,
+	Awaiting_Handler,
 	Response_Write,
 	Keep_Alive_Idle,
 }
@@ -442,13 +443,16 @@ connection_deadline_kind :: proc(
 	case .Reading_Request_Body:
 		return .Body_Progress, true
 
+	case .Awaiting_Handler:
+		return .Awaiting_Handler, true
+
 	case .Writing_Response:
 		return .Response_Write, true
 
 	case .Keep_Alive_Idle:
 		return .Keep_Alive_Idle, true
 
-	case .Awaiting_Handler, .Closing:
+	case .Closing:
 		return {}, false
 	}
 

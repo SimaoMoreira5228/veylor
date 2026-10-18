@@ -327,6 +327,7 @@ execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now
 	   cmd.kind != .Response_Begin &&
 	   cmd.kind != .Response_Write &&
 	   cmd.kind != .Response_End &&
+	   cmd.kind != .Response_Trailers &&
 	   cmd.kind != .Cancel {
 		return
 	}
@@ -414,6 +415,25 @@ execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now
 
 	if cmd.kind == .Response_End {
 		response_outcome := execute_managed_response_end(state, cmd, worker.poller, worker.table)
+
+		if response_outcome == .Closed {
+			close_result := close_static_worker_connection(worker, state)
+
+			if close_result == .Error {
+				worker.managed_result = .Error
+			}
+		}
+
+		return
+	}
+
+	if cmd.kind == .Response_Trailers {
+		response_outcome := execute_managed_response_trailers(
+			state,
+			cmd,
+			worker.poller,
+			worker.table,
+		)
 
 		if response_outcome == .Closed {
 			close_result := close_static_worker_connection(worker, state)

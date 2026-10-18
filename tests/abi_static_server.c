@@ -1734,6 +1734,134 @@ int main(void) {
     return 1;
   }
 
+  int stream2_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (stream2_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(stream2_fd, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(stream2_fd);
+      return 1;
+    }
+  }
+  const char stream2_request[] = "GET /stream HTTP/1.1\r\n"
+                                 "Host: localhost\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n";
+  size_t stream2_sent = 0;
+  while (stream2_sent < sizeof(stream2_request) - 1) {
+    ssize_t count = send(stream2_fd, stream2_request + stream2_sent,
+                         sizeof(stream2_request) - 1 - stream2_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(stream2_fd);
+      return 1;
+    }
+    stream2_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_REQUEST) {
+    fprintf(stderr, "expected trailer stream request\n");
+    close(stream2_fd);
+    return 1;
+  }
+  vyl_request_token stream2_token = poll_events[0].token;
+  uint8_t bad_trailer_data2[] = "bad name: 1";
+  vyl_header_ref bad_trailer_ref2 = {0, 8, 8, 1};
+  if (!expect_result("trailer bad name",
+                     vyl_response_trailers(server, stream2_token,
+                                           &bad_trailer_ref2, 1,
+                                           bad_trailer_data2,
+                                           sizeof(bad_trailer_data2) - 1),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("trailer zero count",
+                     vyl_response_trailers(server, stream2_token, NULL, 0,
+                                           NULL, 0),
+                     VYL_INVALID_ARGUMENT)) {
+    close(stream2_fd);
+    return 1;
+  }
+  result = vyl_response_begin(server, stream2_token, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1});
+  if (!expect_result("trailer stream begin", result, VYL_OK)) {
+    close(stream2_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_WRITABLE) {
+    fprintf(stderr, "expected writable after trailer stream begin\n");
+    close(stream2_fd);
+    return 1;
+  }
+  uint8_t stream2_chunk[] = "hello";
+  result = vyl_response_write(server, stream2_token,
+                              (vyl_bytes){stream2_chunk, 5});
+  if (!expect_result("trailer stream write", result, VYL_OK)) {
+    close(stream2_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_WRITABLE) {
+    fprintf(stderr, "expected writable after trailer stream write\n");
+    close(stream2_fd);
+    return 1;
+  }
+  uint8_t trailer_data2[] = "X-Checksumabc123";
+  vyl_header_ref trailer_ref2 = {0, 10, 10, 6};
+  result = vyl_response_trailers(server, stream2_token, &trailer_ref2, 1,
+                                 trailer_data2, sizeof(trailer_data2) - 1);
+  if (!expect_result("trailer send", result, VYL_OK)) {
+    close(stream2_fd);
+    return 1;
+  }
+  const char trailer_expect[] = "HTTP/1.1 200 OK\r\n"
+                                "Connection: close\r\n"
+                                "Transfer-Encoding: chunked\r\n"
+                                "\r\n"
+                                "5\r\n"
+                                "hello\r\n"
+                                "0\r\n"
+                                "X-Checksum: abc123\r\n"
+                                "\r\n";
+  char trailer_got[256] = {0};
+  size_t trailer_total = 0;
+  for (;;) {
+    ssize_t count =
+        recv(stream2_fd, trailer_got + trailer_total,
+             sizeof(trailer_got) - trailer_total - 1, 0);
+    if (count < 0) {
+      perror("recv");
+      close(stream2_fd);
+      return 1;
+    }
+    if (count == 0) {
+      break;
+    }
+    trailer_total += (size_t)count;
+    if (trailer_total >= sizeof(trailer_got) - 1) {
+      fprintf(stderr, "trailer response overflow\n");
+      close(stream2_fd);
+      return 1;
+    }
+  }
+  close(stream2_fd);
+  if (trailer_total != sizeof(trailer_expect) - 1 ||
+      memcmp(trailer_got, trailer_expect, trailer_total) != 0) {
+    fprintf(stderr, "unexpected trailer bytes %zu\n", trailer_total);
+    return 1;
+  }
+
   {
     struct timespec wait_start, wait_end;
     clock_gettime(CLOCK_MONOTONIC, &wait_start);

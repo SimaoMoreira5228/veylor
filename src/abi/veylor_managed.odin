@@ -3,6 +3,7 @@ package abi
 
 import odin_runtime "base:runtime"
 import response "veylor:http1/response"
+import router "veylor:router"
 import connections "veylor:runtime/connections"
 import host "veylor:runtime/host"
 import server_runtime "veylor:runtime/linux"
@@ -655,6 +656,123 @@ vyl_response_end :: proc "c" (server: ^Vyl_Server, token: Vyl_Request_Token) -> 
 		kind  = .Response_End,
 		token = managed_connection_token(token),
 	}
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+@(export)
+vyl_response_trailers :: proc "c" (
+	server: ^Vyl_Server,
+	token: Vyl_Request_Token,
+	trailers: [^]Vyl_Header_Ref,
+	trailer_count: u32,
+	data: [^]u8,
+	data_length: u32,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if server == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if trailer_count == 0 || trailer_count > VYL_MAX_TRAILER_NAMES {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if trailers == nil || data == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if data_length > VYL_MAX_TRAILER_DATA_BYTES {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if token.worker_id == 0 || token.worker_generation == 0 || token.connection_generation == 0 {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if server.state != .Running && server.state != .Stop_Requested {
+		return i32(Vyl_Result.Bad_State)
+	}
+	worker, found := managed_worker_for_token(server, token)
+
+	if !found {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	if worker.table.worker_id != token.worker_id ||
+	   worker.table.worker_generation != token.worker_generation {
+		return i32(Vyl_Result.Stale_Token)
+	}
+
+	if int(token.slot) >= len(worker.connection_states) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	state := &worker.connection_states[int(token.slot)]
+
+	if !state.active || state.token != managed_connection_token(token) {
+		return i32(Vyl_Result.Stale_Token)
+	}
+
+	refs := trailers[:int(trailer_count)]
+	host_bytes := data[:int(data_length)]
+	wire: [host.HOST_MAX_RESPONSE_BODY_BYTES]u8
+	used := 0
+
+	for i := 0; i < len(refs); i += 1 {
+		name_end := u64(refs[i].name_offset) + u64(refs[i].name_length)
+		value_end := u64(refs[i].value_offset) + u64(refs[i].value_length)
+
+		if name_end > u64(len(host_bytes)) || value_end > u64(len(host_bytes)) {
+			return i32(Vyl_Result.Invalid_Argument)
+		}
+
+		name := host_bytes[refs[i].name_offset:refs[i].name_offset + refs[i].name_length]
+		value := host_bytes[refs[i].value_offset:refs[i].value_offset + refs[i].value_length]
+
+		if !router.valid_trailer_name(name) {
+			return i32(Vyl_Result.Invalid_Argument)
+		}
+
+		if !response.valid_response_value(value) {
+			return i32(Vyl_Result.Invalid_Argument)
+		}
+
+		field_length := len(name) + len(value) + 4
+
+		if used + field_length > len(wire) {
+			return i32(Vyl_Result.Invalid_Argument)
+		}
+
+		copy(wire[used:], name)
+		used += len(name)
+		copy(wire[used:], ": ")
+		used += 2
+		copy(wire[used:], value)
+		used += len(value)
+		copy(wire[used:], "\r\n")
+		used += 2
+	}
+
+	cmd := host.Host_Command {
+		kind        = .Response_Trailers,
+		token       = managed_connection_token(token),
+		body_length = u32(used),
+	}
+	copy(cmd.body[:], wire[:used])
 
 	switch enqueue_managed_command(worker, cmd) {
 	case .Enqueued:

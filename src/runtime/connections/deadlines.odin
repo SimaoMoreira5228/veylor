@@ -227,10 +227,16 @@ connection_timeout_ns :: proc(
 	switch kind {
 	case .Request_Head:
 		return timeouts.request_head_ns
+
 	case .Body_Progress:
 		return timeouts.body_progress_ns
+
+	case .Awaiting_Handler:
+		return timeouts.body_progress_ns
+
 	case .Response_Write:
 		return timeouts.response_write_ns
+
 	case .Keep_Alive_Idle:
 		return timeouts.keep_alive_idle_ns
 	}

@@ -135,6 +135,10 @@ park_static_connection_for_host :: proc(
 		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
 	}
 
+	if !arm_parked_request_deadline(state, table, timers, timeouts, now_ns) {
+		return Static_Connection_Turn{bytes_read = bytes_read, result = .Invalid}
+	}
+
 	workspace.body_driver = {}
 	workspace.body_start = head.length
 	workspace.body_valid = input_length

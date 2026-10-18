@@ -13,6 +13,7 @@ Host_Command_Kind :: enum {
 	Response_Begin,
 	Response_Write,
 	Response_End,
+	Response_Trailers,
 	Cancel,
 }
 
@@ -66,6 +67,7 @@ enqueue_host_command :: proc(
 	   cmd.kind != .Response_Begin &&
 	   cmd.kind != .Response_Write &&
 	   cmd.kind != .Response_End &&
+	   cmd.kind != .Response_Trailers &&
 	   cmd.kind != .Cancel {
 		return .Invalid
 	}
@@ -100,7 +102,7 @@ enqueue_host_command :: proc(
 		}
 	}
 
-	if cmd.kind == .Response_Write {
+	if cmd.kind == .Response_Write || cmd.kind == .Response_Trailers {
 		if cmd.body_length == 0 || cmd.body_length > HOST_MAX_RESPONSE_BODY_BYTES {
 			return .Invalid
 		}

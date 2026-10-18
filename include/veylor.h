@@ -139,6 +139,11 @@ int32_t vyl_response_write(vyl_server *server, vyl_request_token token,
                            vyl_bytes data);
 int32_t vyl_response_end(vyl_server *server, vyl_request_token token);
  
+int32_t vyl_response_trailers(vyl_server *server, vyl_request_token token,
+                              const vyl_header_ref *trailers,
+                              uint32_t trailer_count, const uint8_t *data,
+                              uint32_t data_length);
+ 
 int32_t vyl_server_route_managed_with_trailers(vyl_server *server,
                                                vyl_bytes method, vyl_bytes path,
                                                const vyl_bytes *trailers,

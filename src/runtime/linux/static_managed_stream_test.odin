@@ -233,3 +233,120 @@ test_managed_stream_begin_rejects_head :: proc(t: ^testing.T) {
 	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(1))
 	close_managed_body_fixture(&fixture)
 }
+
+make_managed_stream_trailers :: proc(
+	token: connections.Connection_Token,
+	name: string,
+	value: string,
+) -> host.Host_Command {
+	cmd := host.Host_Command {
+		kind  = .Response_Trailers,
+		token = token,
+	}
+	name_bytes := transmute([]u8)name
+	value_bytes := transmute([]u8)value
+	used := 0
+	copy(cmd.body[used:], name_bytes)
+	used += len(name_bytes)
+	copy(cmd.body[used:], ": ")
+	used += 2
+	copy(cmd.body[used:], value_bytes)
+	used += len(value_bytes)
+	copy(cmd.body[used:], "\r\n")
+	used += 2
+	cmd.body_length = u32(used)
+	return cmd
+}
+
+@(test)
+test_managed_stream_serves_trailers_then_closes :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /stream HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/stream", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	stream_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	drain_managed_stream_command(t, &fixture, make_managed_stream_begin(stream_token, 200, "OK"))
+	turn := drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Response_Progress)
+	expect_managed_writable(t, &fixture)
+
+	head_buffer: [256]u8
+	head_text := read_managed_socket_text(t, &fixture, head_buffer[:])
+	testing.expect(t, len(head_text) > 0)
+
+	drain_managed_stream_command(t, &fixture, make_managed_stream_write(stream_token, "hello"))
+	turn = drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Response_Progress)
+	expect_managed_writable(t, &fixture)
+
+	chunk_buffer: [32]u8
+	testing.expect_value(
+		t,
+		read_managed_socket_text(t, &fixture, chunk_buffer[:]),
+		"5\r\nhello\r\n",
+	)
+
+	drain_managed_stream_command(
+		t,
+		&fixture,
+		make_managed_stream_trailers(stream_token, "X-Checksum", "abc123"),
+	)
+	turn = drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Closed)
+
+	terminal_buffer: [64]u8
+	testing.expect_value(
+		t,
+		read_managed_socket_text(t, &fixture, terminal_buffer[:]),
+		"0\r\nX-Checksum: abc123\r\n\r\n",
+	)
+	close_managed_body_fixture(&fixture)
+}
+
+@(test)
+test_managed_stream_rejects_write_and_trailers_after_end :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /stream HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/stream", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	stream_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	drain_managed_stream_command(t, &fixture, make_managed_stream_begin(stream_token, 200, "OK"))
+	turn := drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Response_Progress)
+	expect_managed_writable(t, &fixture)
+
+	head_buffer: [256]u8
+	head_text := read_managed_socket_text(t, &fixture, head_buffer[:])
+	testing.expect(t, len(head_text) > 0)
+
+	end_cmd := host.Host_Command {
+		kind  = .Response_End,
+		token = stream_token,
+	}
+	drain_managed_stream_command(t, &fixture, end_cmd)
+	turn = drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Closed)
+
+	trailer_cmd := make_managed_stream_trailers(stream_token, "X-Checksum", "abc123")
+	drain_managed_stream_command(t, &fixture, trailer_cmd)
+	testing.expect_value(t, fixture.worker_states[0].phase, Static_Connection_Phase.Closed)
+	close_managed_body_fixture(&fixture)
+}
