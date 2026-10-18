@@ -111,7 +111,11 @@ test_flow_chunk_size_empty :: proc(t: ^testing.T) {
 @(test)
 test_flow_chunk_size_huge_remaining :: proc(t: ^testing.T) {
 	testing.expect_value(t, flow_chunk_size(100000, 200000, max(u64), 16777215), u32(100000))
-	testing.expect_value(t, flow_chunk_size(FLOW_MAX_WINDOW_SIZE, FLOW_MAX_WINDOW_SIZE, max(u64), 16777215), u32(16777215))
+	testing.expect_value(
+		t,
+		flow_chunk_size(FLOW_MAX_WINDOW_SIZE, FLOW_MAX_WINDOW_SIZE, max(u64), 16777215),
+		u32(16777215),
+	)
 }
 
 @(test)

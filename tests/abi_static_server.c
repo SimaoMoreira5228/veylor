@@ -3,6 +3,7 @@
 #include "veylor.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -541,6 +542,21 @@ int main(void) {
     }
   }
 
+  uint8_t stream_method[] = "GET";
+  uint8_t stream_path[] = "/stream";
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){stream_method, sizeof(stream_method) - 1},
+      (vyl_bytes){stream_path, sizeof(stream_path) - 1});
+  if (!expect_result("managed stream route", result, VYL_OK)) {
+    return 1;
+  }
+  result = vyl_server_route_managed(
+      server, (vyl_bytes){stream_method, sizeof(stream_method) - 1},
+      (vyl_bytes){stream_path, sizeof(stream_path) - 1});
+  if (!expect_result("duplicate stream route", result, VYL_DUPLICATE_ROUTE)) {
+    return 1;
+  }
+
   memset(echo_method, 'X', sizeof(echo_method) - 1);
   memset(echo_path, 'X', sizeof(echo_path) - 1);
   memset(guard_method, 'X', sizeof(guard_method) - 1);
@@ -555,6 +571,8 @@ int main(void) {
   memset(trailer_path, 'X', sizeof(trailer_path) - 1);
   memset(trailer_allow_0, 'X', sizeof(trailer_allow_0) - 1);
   memset(trailer_allow_1, 'X', sizeof(trailer_allow_1) - 1);
+  memset(stream_method, 'X', sizeof(stream_method) - 1);
+  memset(stream_path, 'X', sizeof(stream_path) - 1);
 
   const uint8_t loopback[4] = {127, 0, 0, 1};
   uint16_t bound_port = 0;
@@ -1565,6 +1583,157 @@ int main(void) {
     return 1;
   }
 
+  int stream_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (stream_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(stream_fd, (struct sockaddr *)&address, sizeof(address)) !=
+        0) {
+      perror("connect");
+      close(stream_fd);
+      return 1;
+    }
+  }
+  const char stream_request[] = "GET /stream HTTP/1.1\r\n"
+                                "Host: localhost\r\n"
+                                "Connection: close\r\n"
+                                "\r\n";
+  size_t stream_sent = 0;
+  while (stream_sent < sizeof(stream_request) - 1) {
+    ssize_t count = send(stream_fd, stream_request + stream_sent,
+                         sizeof(stream_request) - 1 - stream_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(stream_fd);
+      return 1;
+    }
+    stream_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK)) {
+    close(stream_fd);
+    return 1;
+  }
+  vyl_request_token stream_token = poll_events[0].token;
+  if (poll_events[0].kind != VYL_HOST_REQUEST) {
+    fprintf(stderr, "unexpected stream request event\n");
+    close(stream_fd);
+    return 1;
+  }
+
+  uint8_t stream_reason[] = "OK";
+  if (!expect_result("stream begin bad status",
+                     vyl_response_begin(server, stream_token, 204,
+                                        (vyl_bytes){stream_reason, 2}),
+                     VYL_INVALID_ARGUMENT) ||
+      !expect_result("stream write empty",
+                     vyl_response_write(server, stream_token,
+                                        (vyl_bytes){NULL, 0}),
+                     VYL_INVALID_ARGUMENT)) {
+    close(stream_fd);
+    return 1;
+  }
+  result = vyl_response_begin(server, stream_token, 200,
+                              (vyl_bytes){stream_reason, 2});
+  if (!expect_result("stream begin", result, VYL_OK)) {
+    close(stream_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_WRITABLE) {
+    fprintf(stderr, "expected writable after begin\n");
+    close(stream_fd);
+    return 1;
+  }
+  uint8_t stream_chunk_1[] = "hello";
+  result = vyl_response_write(server, stream_token,
+                              (vyl_bytes){stream_chunk_1, 5});
+  if (!expect_result("stream write one", result, VYL_OK)) {
+    close(stream_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_WRITABLE) {
+    fprintf(stderr, "expected writable after write one\n");
+    close(stream_fd);
+    return 1;
+  }
+  uint8_t stream_chunk_2[] = "world!";
+  result = vyl_response_write(server, stream_token,
+                              (vyl_bytes){stream_chunk_2, 6});
+  if (!expect_result("stream write two", result, VYL_OK)) {
+    close(stream_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_WRITABLE) {
+    fprintf(stderr, "expected writable after write two\n");
+    close(stream_fd);
+    return 1;
+  }
+  result = vyl_response_end(server, stream_token);
+  if (!expect_result("stream end", result, VYL_OK)) {
+    close(stream_fd);
+    return 1;
+  }
+
+  const char stream_expect[] = "HTTP/1.1 200 OK\r\n"
+                               "Connection: close\r\n"
+                               "Transfer-Encoding: chunked\r\n"
+                               "\r\n"
+                               "5\r\n"
+                               "hello\r\n"
+                               "6\r\n"
+                               "world!\r\n"
+                               "0\r\n"
+                               "\r\n";
+  char stream_got[256] = {0};
+  size_t stream_total = 0;
+  for (;;) {
+    ssize_t count =
+        recv(stream_fd, stream_got + stream_total,
+             sizeof(stream_got) - stream_total - 1, 0);
+    if (count < 0) {
+      perror("recv");
+      close(stream_fd);
+      return 1;
+    }
+    if (count == 0) {
+      break;
+    }
+    stream_total += (size_t)count;
+    if (stream_total >= sizeof(stream_got) - 1) {
+      fprintf(stderr, "stream response overflow\n");
+      close(stream_fd);
+      return 1;
+    }
+  }
+  close(stream_fd);
+  if (stream_total != sizeof(stream_expect) - 1 ||
+      memcmp(stream_got, stream_expect, stream_total) != 0) {
+    fprintf(stderr, "unexpected stream bytes %zu\n", stream_total);
+    return 1;
+  }
+  result = vyl_response_write(server, stream_token,
+                              (vyl_bytes){stream_chunk_1, 5});
+  if (!expect_result("write after stream close", result, VYL_STALE_TOKEN)) {
+    return 1;
+  }
+  result = vyl_response_end(server, stream_token);
+  if (!expect_result("end after stream close", result, VYL_STALE_TOKEN)) {
+    return 1;
+  }
+
   {
     struct timespec wait_start, wait_end;
     clock_gettime(CLOCK_MONOTONIC, &wait_start);
@@ -1721,6 +1890,225 @@ int main(void) {
     return 1;
   }
   close(lat_fd);
+
+  int pipe_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (pipe_fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  {
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(pipe_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("connect");
+      close(pipe_fd);
+      return 1;
+    }
+  }
+  const char pipe_requests[] = "GET /managed HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "\r\n"
+                               "GET /managed HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "\r\n";
+  size_t pipe_sent = 0;
+  while (pipe_sent < sizeof(pipe_requests) - 1) {
+    ssize_t count = send(pipe_fd, pipe_requests + pipe_sent,
+                         sizeof(pipe_requests) - 1 - pipe_sent, 0);
+    if (count <= 0) {
+      perror("send");
+      close(pipe_fd);
+      return 1;
+    }
+    pipe_sent += (size_t)count;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_REQUEST) {
+    fprintf(stderr, "expected pipelined first request\n");
+    close(pipe_fd);
+    return 1;
+  }
+  vyl_request_token pipe_first = poll_events[0].token;
+  uint8_t pipe_body_1[] = "first\n";
+  result = vyl_response_start(server, pipe_first, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){pipe_body_1, sizeof(pipe_body_1) - 1});
+  if (!expect_result("pipelined first response", result, VYL_OK)) {
+    close(pipe_fd);
+    return 1;
+  }
+  if (!expect_managed_response(pipe_fd, "HTTP/1.1 200 OK\r\n", "first\n", 0,
+                               0)) {
+    close(pipe_fd);
+    return 1;
+  }
+  if (!poll_until(server, poll_events, 4, poll_data, sizeof(poll_data), &batch,
+                  1, VYL_OK) ||
+      poll_events[0].kind != VYL_HOST_REQUEST) {
+    fprintf(stderr, "expected pipelined second request\n");
+    close(pipe_fd);
+    return 1;
+  }
+  vyl_request_token pipe_second = poll_events[0].token;
+  if (pipe_second.request_seq == pipe_first.request_seq) {
+    fprintf(stderr, "pipelined request did not advance token seq\n");
+    close(pipe_fd);
+    return 1;
+  }
+  uint8_t pipe_body_2[] = "second\n";
+  result = vyl_response_start(server, pipe_second, 200,
+                              (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                              (vyl_bytes){pipe_body_2, sizeof(pipe_body_2) - 1});
+  if (!expect_result("pipelined second response", result, VYL_OK)) {
+    close(pipe_fd);
+    return 1;
+  }
+  if (!expect_managed_response(pipe_fd, "HTTP/1.1 200 OK\r\n", "second\n", 0,
+                               0)) {
+    close(pipe_fd);
+    return 1;
+  }
+  close(pipe_fd);
+
+  int qf_fds[140];
+  for (int i = 0; i < 140; i++) {
+    qf_fds[i] = -1;
+  }
+  for (int i = 0; i < 140; i++) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      perror("socket");
+      for (int j = 0; j < i; j++) {
+        close(qf_fds[j]);
+      }
+      return 1;
+    }
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(bound_port),
+    };
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("connect");
+      close(fd);
+      for (int j = 0; j < i; j++) {
+        close(qf_fds[j]);
+      }
+      return 1;
+    }
+    qf_fds[i] = fd;
+  }
+  const char qf_request[] = "GET /managed HTTP/1.1\r\n"
+                            "Host: localhost\r\n"
+                            "\r\n";
+  for (int i = 0; i < 140; i++) {
+    size_t sent = 0;
+    while (sent < sizeof(qf_request) - 1) {
+      ssize_t count =
+          send(qf_fds[i], qf_request + sent, sizeof(qf_request) - 1 - sent, 0);
+      if (count <= 0) {
+        perror("send");
+        for (int j = 0; j < 140; j++) {
+          close(qf_fds[j]);
+        }
+        return 1;
+      }
+      sent += (size_t)count;
+    }
+  }
+  vyl_request_token qf_tokens[140];
+  int qf_count = 0;
+  {
+    struct timespec settle = {.tv_sec = 3, .tv_nsec = 0};
+    nanosleep(&settle, NULL);
+  }
+  int qf_empty = 0;
+  for (int iter = 0; iter < 2000 && qf_empty < 200; iter++) {
+    memset(&batch, 0, sizeof(batch));
+    result = vyl_server_poll_events(server, poll_events, 4, poll_data,
+                                    sizeof(poll_data), 0, &batch);
+    if (result != VYL_OK && result != VYL_BUFFER_TOO_SMALL) {
+      fprintf(stderr, "queue fill poll failed %d\n", result);
+      for (int j = 0; j < 140; j++) {
+        close(qf_fds[j]);
+      }
+      return 1;
+    }
+    if (batch.event_count == 0) {
+      qf_empty++;
+      struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000};
+      nanosleep(&delay, NULL);
+
+      continue;
+    }
+    qf_empty = 0;
+    for (uint32_t e = 0; e < batch.event_count && qf_count < 140; e++) {
+      if (poll_events[e].kind != VYL_HOST_REQUEST) {
+        fprintf(stderr, "unexpected event during queue fill: %u\n",
+                poll_events[e].kind);
+        for (int j = 0; j < 140; j++) {
+          close(qf_fds[j]);
+        }
+        return 1;
+      }
+      qf_tokens[qf_count++] = poll_events[e].token;
+    }
+  }
+  {
+    int closed = 0;
+    for (int i = 0; i < 140; i++) {
+      char probe[1];
+      ssize_t count =
+          recv(qf_fds[i], probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+      if (count == 0) {
+        closed++;
+      }
+    }
+    fprintf(stderr, "queue fill: %d queued, %d closed\n", qf_count, closed);
+    if (qf_count + closed != 140 || closed < 12) {
+      fprintf(stderr, "queue fill did not conserve connections under pressure\n");
+      for (int j = 0; j < 140; j++) {
+        close(qf_fds[j]);
+      }
+      return 1;
+    }
+  }
+  uint8_t qf_body[] = "qfull\n";
+  for (int i = 0; i < qf_count; i++) {
+    result = vyl_response_start(server, qf_tokens[i], 200,
+                                (vyl_bytes){resp_reason, sizeof(resp_reason) - 1},
+                                (vyl_bytes){qf_body, sizeof(qf_body) - 1});
+    if (!expect_result("queue fill response", result, VYL_OK)) {
+      for (int j = 0; j < 140; j++) {
+        close(qf_fds[j]);
+      }
+      return 1;
+    }
+  }
+  for (int i = 0; i < 140; i++) {
+    char probe[1];
+    ssize_t count =
+        recv(qf_fds[i], probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+    if (count == 0) {
+      continue;
+    }
+    if (!expect_managed_response(qf_fds[i], "HTTP/1.1 200 OK\r\n", "qfull\n",
+                                 0, 0)) {
+      for (int j = 0; j < 140; j++) {
+        if (j != i) {
+          close(qf_fds[j]);
+        }
+      }
+      return 1;
+    }
+  }
+  for (int i = 0; i < 140; i++) {
+    close(qf_fds[i]);
+  }
 
   {
     int fd = socket(AF_INET, SOCK_STREAM, 0);

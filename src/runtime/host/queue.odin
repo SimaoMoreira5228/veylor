@@ -11,6 +11,7 @@ Host_Event_Kind :: enum {
 	Request,
 	Shutdown,
 	Body_Available,
+	Writable,
 }
 
 Host_Event :: struct {
@@ -46,6 +47,7 @@ init_host_queue :: proc(storage: []Host_Event) -> Host_Queue {
 	for i := 0; i < len(storage); i += 1 {
 		storage[i] = Host_Event{}
 	}
+
 	return Host_Queue{storage = storage}
 }
 
@@ -55,6 +57,7 @@ pending_host_events :: proc(queue: ^Host_Queue) -> int {
 	}
 	tail := sync.atomic_load_explicit(&queue.tail, .Acquire)
 	head := sync.atomic_load_explicit(&queue.head, .Acquire)
+
 	return tail - head
 }
 
@@ -68,12 +71,14 @@ enqueue_request :: proc(
 	if queue == nil {
 		return .Invalid
 	}
+
 	if len(method) == 0 ||
 	   len(method) > HOST_MAX_METHOD_BYTES ||
 	   len(path) == 0 ||
 	   len(path) > HOST_MAX_PATH_BYTES {
 		return .Invalid
 	}
+
 	return enqueue_event(
 		queue,
 		Host_Event{token = token, route_id = route_id, kind = .Request},
@@ -86,6 +91,21 @@ enqueue_body_available :: proc(queue: ^Host_Queue, event: Host_Event) -> Host_Qu
 	if event.kind != .Body_Available {
 		return .Invalid
 	}
+
+	return enqueue_event(queue, event, nil, nil)
+}
+
+enqueue_writable :: proc(
+	queue: ^Host_Queue,
+	token: connections.Connection_Token,
+	route_id: u64,
+) -> Host_Queue_Result {
+	event := Host_Event {
+		token    = token,
+		route_id = route_id,
+		kind     = .Writable,
+	}
+
 	return enqueue_event(queue, event, nil, nil)
 }
 
@@ -93,6 +113,7 @@ enqueue_shutdown :: proc(queue: ^Host_Queue) -> Host_Queue_Result {
 	if queue == nil {
 		return .Invalid
 	}
+
 	return enqueue_event(queue, Host_Event{kind = .Shutdown}, nil, nil)
 }
 
@@ -104,6 +125,7 @@ enqueue_event :: proc(
 ) -> Host_Queue_Result {
 	head := sync.atomic_load_explicit(&queue.head, .Acquire)
 	tail := queue.tail
+
 	if tail - head >= len(queue.storage) {
 		return .Full
 	}
@@ -114,6 +136,7 @@ enqueue_event :: proc(
 	copy(slot.method[:], method)
 	copy(slot.path[:], path)
 	sync.atomic_store_explicit(&queue.tail, tail + 1, .Release)
+
 	return .Enqueued
 }
 
@@ -123,9 +146,11 @@ peek_host_queue :: proc(queue: ^Host_Queue) -> (event: Host_Event, ok: bool) {
 	}
 	tail := sync.atomic_load_explicit(&queue.tail, .Acquire)
 	head := sync.atomic_load_explicit(&queue.head, .Acquire)
+
 	if tail - head <= 0 {
 		return {}, false
 	}
+
 	return queue.storage[head % len(queue.storage)], true
 }
 
@@ -135,15 +160,18 @@ poll_host_queue :: proc(queue: ^Host_Queue, batch: []Host_Event) -> Host_Poll {
 	}
 	tail := sync.atomic_load_explicit(&queue.tail, .Acquire)
 	pending := tail - queue.head
+
 	if pending <= 0 {
 		return Host_Poll{}
 	}
 
 	required := pending
 	copied := min(pending, len(batch))
+
 	for i := 0; i < copied; i += 1 {
 		batch[i] = queue.storage[queue.head % len(queue.storage)]
 		queue.head += 1
 	}
+
 	return Host_Poll{copied = copied, required = required}
 }

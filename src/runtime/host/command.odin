@@ -10,6 +10,9 @@ HOST_MAX_RESPONSE_BODY_BYTES :: 768
 Host_Command_Kind :: enum {
 	Read_Body,
 	Response_Start,
+	Response_Begin,
+	Response_Write,
+	Response_End,
 	Cancel,
 }
 
@@ -58,7 +61,12 @@ enqueue_host_command :: proc(
 		return .Invalid
 	}
 
-	if cmd.kind != .Read_Body && cmd.kind != .Response_Start && cmd.kind != .Cancel {
+	if cmd.kind != .Read_Body &&
+	   cmd.kind != .Response_Start &&
+	   cmd.kind != .Response_Begin &&
+	   cmd.kind != .Response_Write &&
+	   cmd.kind != .Response_End &&
+	   cmd.kind != .Cancel {
 		return .Invalid
 	}
 
@@ -74,6 +82,26 @@ enqueue_host_command :: proc(
 		if cmd.reason_length == 0 ||
 		   cmd.reason_length > HOST_MAX_RESPONSE_REASON_BYTES ||
 		   cmd.body_length > HOST_MAX_RESPONSE_BODY_BYTES {
+			return .Invalid
+		}
+	}
+
+	if cmd.kind == .Response_Begin {
+		if cmd.status < 200 || cmd.status > 599 {
+			return .Invalid
+		}
+
+		if cmd.reason_length == 0 || cmd.reason_length > HOST_MAX_RESPONSE_REASON_BYTES {
+			return .Invalid
+		}
+
+		if cmd.body_length != 0 {
+			return .Invalid
+		}
+	}
+
+	if cmd.kind == .Response_Write {
+		if cmd.body_length == 0 || cmd.body_length > HOST_MAX_RESPONSE_BODY_BYTES {
 			return .Invalid
 		}
 	}

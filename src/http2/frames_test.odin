@@ -5,10 +5,10 @@ import "core:testing"
 
 make_header :: proc(kind: Frame_Type, flags: u8, stream_id: u32, length: u32) -> Frame_Header {
 	return Frame_Header {
-		length    = length,
-		kind      = kind,
-		raw_type  = u8(kind),
-		flags     = flags,
+		length = length,
+		kind = kind,
+		raw_type = u8(kind),
+		flags = flags,
 		stream_id = stream_id,
 	}
 }
@@ -349,9 +349,21 @@ test_settings_value_bounds :: proc(t: ^testing.T) {
 	testing.expect_value(t, settings_parameter_valid(SETTINGS_ENABLE_PUSH, 2), false)
 
 	testing.expect_value(t, settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0), true)
-	testing.expect_value(t, settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0x7fffffff), true)
-	testing.expect_value(t, settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000), false)
-	testing.expect_value(t, settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0xffffffff), false)
+	testing.expect_value(
+		t,
+		settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0x7fffffff),
+		true,
+	)
+	testing.expect_value(
+		t,
+		settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000),
+		false,
+	)
+	testing.expect_value(
+		t,
+		settings_parameter_valid(SETTINGS_INITIAL_WINDOW_SIZE, 0xffffffff),
+		false,
+	)
 
 	testing.expect_value(t, settings_parameter_valid(SETTINGS_MAX_FRAME_SIZE, 16383), false)
 	testing.expect_value(t, settings_parameter_valid(SETTINGS_MAX_FRAME_SIZE, 16384), true)
@@ -359,8 +371,16 @@ test_settings_value_bounds :: proc(t: ^testing.T) {
 	testing.expect_value(t, settings_parameter_valid(SETTINGS_MAX_FRAME_SIZE, 16777216), false)
 
 	testing.expect_value(t, settings_parameter_valid(SETTINGS_HEADER_TABLE_SIZE, 0xffffffff), true)
-	testing.expect_value(t, settings_parameter_valid(SETTINGS_MAX_CONCURRENT_STREAMS, 0xffffffff), true)
-	testing.expect_value(t, settings_parameter_valid(SETTINGS_MAX_HEADER_LIST_SIZE, 0xffffffff), true)
+	testing.expect_value(
+		t,
+		settings_parameter_valid(SETTINGS_MAX_CONCURRENT_STREAMS, 0xffffffff),
+		true,
+	)
+	testing.expect_value(
+		t,
+		settings_parameter_valid(SETTINGS_MAX_HEADER_LIST_SIZE, 0xffffffff),
+		true,
+	)
 	testing.expect_value(t, settings_parameter_valid(0x9, 0xffffffff), true)
 }
 

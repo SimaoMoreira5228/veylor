@@ -173,12 +173,7 @@ encode_priority_fields :: proc(fields: Headers_Priority, out: []u8) -> bool {
 	return true
 }
 
-decode_priority_fields :: proc(
-	fields_bytes: []u8,
-) -> (
-	fields: Headers_Priority,
-	ok: bool,
-) {
+decode_priority_fields :: proc(fields_bytes: []u8) -> (fields: Headers_Priority, ok: bool) {
 	if len(fields_bytes) != PRIORITY_PAYLOAD_LEN {
 		return {}, false
 	}
@@ -390,7 +385,13 @@ decode_rst_stream_payload :: proc(
 	return Error_Code(value), true
 }
 
-encode_settings_payload :: proc(params: []Settings_Parameter, out: []u8) -> (written: int, ok: bool) {
+encode_settings_payload :: proc(
+	params: []Settings_Parameter,
+	out: []u8,
+) -> (
+	written: int,
+	ok: bool,
+) {
 	if len(params) > max(int) / SETTINGS_ENTRY_LEN {
 		return 0, false
 	}
@@ -472,7 +473,10 @@ decode_settings_payload :: proc(
 			return 0, false
 		}
 
-		params_out[i] = Settings_Parameter{id = id, value = value}
+		params_out[i] = Settings_Parameter {
+			id    = id,
+			value = value,
+		}
 	}
 
 	return need, true
@@ -490,13 +494,7 @@ encode_ping_payload :: proc(opaque: [8]u8, out: []u8) -> bool {
 	return true
 }
 
-decode_ping_payload :: proc(
-	header: Frame_Header,
-	payload: []u8,
-) -> (
-	opaque: [8]u8,
-	ok: bool,
-) {
+decode_ping_payload :: proc(header: Frame_Header, payload: []u8) -> (opaque: [8]u8, ok: bool) {
 	if header.kind != .Ping {
 		return {}, false
 	}

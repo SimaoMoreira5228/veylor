@@ -79,6 +79,10 @@ Static_Connection_Workspace :: struct {
 	trailer_fields:      [router.MAX_MANAGED_TRAILER_NAMES]Managed_Trailer_Field,
 	trailer_data:        [MANAGED_TRAILER_BYTES_LIMIT]u8,
 	trailer_data_used:   int,
+	streaming:           bool,
+	stream_ended:        bool,
+	stream_terminal:     bool,
+	stream_writable:     bool,
 }
 
 Static_Workspace_Pool :: struct {
@@ -137,6 +141,7 @@ init_static_workspace_pool :: proc(
 	if len(storage) == 0 || len(free_stack) < len(storage) {
 		return {}, false
 	}
+
 	for i := 0; i < len(storage); i += 1 {
 		if len(storage[i].request_input) == 0 ||
 		   len(storage[i].headers) == 0 ||
@@ -145,6 +150,7 @@ init_static_workspace_pool :: proc(
 		}
 		free_stack[i] = u32(len(storage) - i - 1)
 	}
+
 	return Static_Workspace_Pool {
 			storage = storage,
 			free_stack = free_stack,
@@ -181,6 +187,7 @@ init_static_connection :: proc(
 		phase = .Reading_Request_Head,
 		active = true,
 	}
+
 	return state, .Need_More
 }
 
@@ -204,6 +211,7 @@ register_static_connection :: proc(
 	if result == .Ready {
 		state.registered = true
 	}
+
 	return
 }
 
@@ -222,10 +230,12 @@ static_connection_turn :: proc(
 	if state == nil || routes == nil || table == nil || timers == nil {
 		return Static_Connection_Turn{result = .Invalid}
 	}
+
 	if state.fd < 0 ||
 	   readiness.connection_id != static_connection_event_id(state.token) ||
 	   byte_budget <= 0 {
 		state.close_reason = .Internal_Error
+
 		return Static_Connection_Turn{result = .Invalid}
 	}
 	resource_id, lookup_result := connections.lookup_connection(table, state.token)
@@ -233,16 +243,21 @@ static_connection_turn :: proc(
 	if lookup_result != .Found || resource_id != u64(state.fd) {
 		state.close_reason = .Internal_Error
 		state.phase = .Failed
+
 		return Static_Connection_Turn{result = .Invalid}
 	}
+
 	if readiness.error {
 		state.close_reason = .Transport_Error
 		state.phase = .Failed
+
 		return Static_Connection_Turn{result = .Transport_Error}
 	}
+
 	if readiness.peer_closed && !readiness.readable && state.phase != .Writing_Response {
 		state.close_reason = .Peer_Closed
 		state.phase = .Closed
+
 		return Static_Connection_Turn{result = .Closed}
 	}
 
@@ -250,13 +265,17 @@ static_connection_turn :: proc(
 		if readiness.error {
 			state.close_reason = .Transport_Error
 			state.phase = .Failed
+
 			return Static_Connection_Turn{result = .Transport_Error}
 		}
+
 		if readiness.peer_closed {
 			state.close_reason = .Peer_Closed
 			state.phase = .Closed
+
 			return Static_Connection_Turn{result = .Closed}
 		}
+
 		return Static_Connection_Turn{result = .Need_More}
 	}
 
@@ -269,6 +288,7 @@ static_connection_turn :: proc(
 		if resume_result != .Ready {
 			state.close_reason = .Internal_Error
 			state.phase = .Failed
+
 			return Static_Connection_Turn{result = .Invalid}
 		}
 		state.phase = .Reading_Request_Head
@@ -283,28 +303,92 @@ static_connection_turn :: proc(
 		if !acquired {
 			state.close_reason = .Workspace_Exhausted
 			state.phase = .Failed
+
 			return Static_Connection_Turn{result = .Capacity_Limit}
 		}
-		read_turn := read_connection_head_turn_with_deadline(
-			static_connection_event_id(state.token),
-			state.fd,
-			&workspace.head_driver,
-			workspace.request_input,
-			workspace.headers,
-			byte_budget,
-			table,
-			state.token,
-			timers,
-			now_ns,
-			timeouts,
-		)
+
+		read_turn: Head_Read_Turn
+		primed := workspace.body_valid
+
+		if primed > 0 {
+			workspace.body_start = 0
+			workspace.body_valid = 0
+			primed_completion := transport.IO_Completion {
+				connection_id = static_connection_event_id(state.token),
+				operation_id = workspace.head_driver.operation_id + 1,
+				operation = .Read,
+				result = transport.IO_Result{kind = .Progress, transferred_bytes = primed},
+			}
+			primed_head := connection.consume_read_completion(
+				&workspace.head_driver,
+				primed_completion,
+				workspace.request_input[:primed],
+				workspace.headers,
+			)
+
+			if primed_head.result == .Ready {
+				read_turn = Head_Read_Turn {
+					head = primed_head,
+				}
+			} else if primed_head.result == .Need_More {
+				schedule := connections.schedule_connection_phase_deadline(
+					table,
+					timers,
+					state.token,
+					now_ns,
+					timeouts,
+				)
+
+				if schedule.result != .Scheduled {
+					read_turn = Head_Read_Turn {
+						head = connection.Connection_Head_Event{result = .Invalid},
+						deadline_result = schedule.result,
+					}
+				} else {
+					read_turn = read_connection_head_turn_with_deadline(
+						static_connection_event_id(state.token),
+						state.fd,
+						&workspace.head_driver,
+						workspace.request_input,
+						workspace.headers,
+						byte_budget,
+						table,
+						state.token,
+						timers,
+						now_ns,
+						timeouts,
+					)
+				}
+			} else {
+				read_turn = Head_Read_Turn {
+					head = primed_head,
+				}
+			}
+		} else {
+			read_turn = read_connection_head_turn_with_deadline(
+				static_connection_event_id(state.token),
+				state.fd,
+				&workspace.head_driver,
+				workspace.request_input,
+				workspace.headers,
+				byte_budget,
+				table,
+				state.token,
+				timers,
+				now_ns,
+				timeouts,
+			)
+		}
+
 		input_length := workspace.head_driver.input_length
 		turn := Static_Connection_Turn {
 			bytes_read = read_turn.bytes_read,
 		}
+
 		if read_turn.deadline_result == .Full {
 			state.close_reason = .Deadline_Capacity
 			state.phase = .Failed
+
 			return Static_Connection_Turn {
 				bytes_read = read_turn.bytes_read,
 				result = .Capacity_Limit,
@@ -321,27 +405,35 @@ static_connection_turn :: proc(
 						timers,
 						state.token,
 					)
+
 					if cancel_result != .Cancelled && cancel_result != .Not_Found {
 						state.close_reason = .Internal_Error
 						state.phase = .Failed
+
 						return Static_Connection_Turn{result = .Invalid}
 					}
 				}
+
 				if !release_static_workspace(state) {
 					state.close_reason = .Internal_Error
 					state.phase = .Failed
+
 					return Static_Connection_Turn{result = .Invalid}
 				}
 			}
 			turn.result = .Need_More
+
 			return turn
 		}
+
 		if read_turn.head.result == .Peer_Closed {
 			state.close_reason = .Peer_Closed
 			state.phase = .Closed
 			turn.result = .Closed
+
 			return turn
 		}
+
 		if read_turn.head.result != .Ready {
 			write_error_response := static_error_response_for_head(
 				state,
@@ -353,12 +445,15 @@ static_connection_turn :: proc(
 			if write_error_response.result != .Response_Progress {
 				state.close_reason = static_connection_close_reason(write_error_response.result)
 				state.phase = .Failed
+
 				return write_error_response
 			}
 			write_turn := register_static_response_write(poller, state, table)
 			write_turn.bytes_read += turn.bytes_read
+
 			return write_turn
 		}
+
 		if state.native_routes != nil {
 			native_event := dispatch_native_route_response(
 				state.native_routes,
@@ -367,24 +462,31 @@ static_connection_turn :: proc(
 				workspace.response,
 				body_limit,
 			)
+
 			if native_event.result == .Responded {
 				state.response_length = native_event.written
 				state.keep_alive = native_event.keep_alive
+
 				if !native_event.keep_alive {
 					state.close_reason = .Normal
 				}
 				write_turn := register_static_response_write(poller, state, table)
 				write_turn.bytes_read += turn.bytes_read
+
 				return write_turn
 			}
+
 			if native_event.result == .Buffer_Small {
 				state.close_reason = .Response_Buffer_Limit
 				state.phase = .Failed
+
 				return Static_Connection_Turn{result = .Response_Buffer_Small}
 			}
+
 			if native_event.result == .Invalid {
 				state.close_reason = .Internal_Error
 				state.phase = .Failed
+
 				return Static_Connection_Turn{result = .Invalid}
 			}
 		}
@@ -408,7 +510,11 @@ static_connection_turn :: proc(
 				turn.bytes_read,
 				body_limit,
 				table,
+				timers,
+				timeouts,
+				now_ns,
 			)
+
 			return managed_turn
 		}
 
@@ -417,11 +523,13 @@ static_connection_turn :: proc(
 			state.close_reason = .Internal_Error
 			state.phase = .Failed
 			turn.result = .Invalid
+
 			return turn
 		}
 		state.phase = .Writing_Response
 
 		file_response_ready := false
+
 		if response_event.result == .Route_Not_Found && state.file_root != nil {
 			file_event := encode_static_file_response(
 				state.file_root,
@@ -430,16 +538,19 @@ static_connection_turn :: proc(
 				workspace.response,
 				body_limit,
 			)
+
 			switch file_event.result {
 			case .Encoded:
 				state.response_length = file_event.response_length
 				state.keep_alive = file_event.keep_alive
 				state.file = file_event.file
 				state.has_file = file_event.stream_body
+
 				if file_event.stream_body {
 					state.file_offset = 0
 					state.file_remaining = file_event.file.size
 				}
+
 				if !file_event.keep_alive {
 					state.close_reason = .Normal
 				}
@@ -454,6 +565,7 @@ static_connection_turn :: proc(
 					.Request_Rejected,
 				)
 				file_error.bytes_read = turn.bytes_read
+
 				if file_error.result != .Response_Progress {
 					return file_error
 				}
@@ -468,6 +580,7 @@ static_connection_turn :: proc(
 					.Internal_Error,
 				)
 				file_error.bytes_read = turn.bytes_read
+
 				if file_error.result != .Response_Progress {
 					return file_error
 				}
@@ -476,19 +589,23 @@ static_connection_turn :: proc(
 			case .Buffer_Small:
 				state.close_reason = .Response_Buffer_Limit
 				state.phase = .Failed
+
 				return Static_Connection_Turn{result = .Response_Buffer_Small}
 
 			case .Invalid:
 				state.close_reason = .Internal_Error
 				state.phase = .Failed
+
 				return Static_Connection_Turn{result = .Invalid}
 
 			case .Not_Mounted, .Not_Found:
 			}
 		}
+
 		if file_response_ready {
 			write_turn := register_static_response_write(poller, state, table)
 			write_turn.bytes_read += turn.bytes_read
+
 			return write_turn
 		}
 
@@ -500,6 +617,7 @@ static_connection_turn :: proc(
 				state.close_reason = .Response_Buffer_Limit
 				state.phase = .Failed
 				turn.result = .Response_Buffer_Small
+
 				return turn
 			}
 			state.response_length = error_response.written
@@ -508,21 +626,25 @@ static_connection_turn :: proc(
 			state.close_reason = .Response_Buffer_Limit
 			state.phase = .Failed
 			turn.result = .Response_Buffer_Small
+
 			return turn
 		} else if response_event.result != .Written {
 			state.close_reason = .Internal_Error
 			state.phase = .Failed
 			turn.result = .Invalid
+
 			return turn
 		} else {
 			state.response_length = response_event.written
 			state.keep_alive = response_event.keep_alive
+
 			if !response_event.keep_alive {
 				state.close_reason = .Normal
 			}
 		}
 		write_turn := register_static_response_write(poller, state, table)
 		write_turn.bytes_read += turn.bytes_read
+
 		return write_turn
 	}
 
@@ -545,9 +667,11 @@ static_connection_turn :: proc(
 		turn := Static_Connection_Turn {
 			bytes_written = write_turn.bytes_written,
 		}
+
 		if write_turn.deadline_result == .Full {
 			state.close_reason = .Deadline_Capacity
 			state.phase = .Failed
+
 			return Static_Connection_Turn{result = .Capacity_Limit}
 		}
 
@@ -555,8 +679,27 @@ static_connection_turn :: proc(
 			if state.has_file {
 				file_turn := begin_static_file_body(state, table, timers, timeouts, now_ns)
 				file_turn.bytes_written = write_turn.bytes_written
+
 				return file_turn
 			}
+			stream_turn := continue_managed_stream(state, poller, table)
+
+			if stream_turn == .Error {
+				state.close_reason = .Internal_Error
+				state.phase = .Failed
+
+				return Static_Connection_Turn{result = .Invalid}
+			}
+
+			if stream_turn == .Progress {
+				progress := Static_Connection_Turn {
+					bytes_written = write_turn.bytes_written,
+				}
+				progress.result = .Response_Progress
+
+				return progress
+			}
+
 			if state.keep_alive {
 				epoll_result, error_code := epoll.modify(
 					poller,
@@ -568,25 +711,63 @@ static_connection_turn :: proc(
 				if epoll_result != .Ready {
 					state.close_reason = .Transport_Error
 					state.phase = .Failed
+
 					return Static_Connection_Turn {
 						result = .Transport_Error,
 						error_code = error_code,
 					}
 				}
 				state.phase = .Keep_Alive_Idle
-				if !release_static_workspace(state) {
+				kept := preserve_keep_alive_tail(state)
+
+				if kept < 0 {
 					state.close_reason = .Internal_Error
 					state.phase = .Failed
+
 					return Static_Connection_Turn{result = .Invalid}
 				}
+
+				if kept > 0 {
+					resume := connections.resume_keep_alive_request(table, timers, state.token)
+
+					if resume != .Ready {
+						state.close_reason = .Internal_Error
+						state.phase = .Failed
+
+						return Static_Connection_Turn{result = .Invalid}
+					}
+
+					state.phase = .Reading_Request_Head
+					head_readiness := readiness
+					head_readiness.readable = true
+					head_readiness.writable = false
+					head_turn := static_connection_turn(
+						poller,
+						state,
+						head_readiness,
+						routes,
+						body_limit,
+						byte_budget,
+						table,
+						timers,
+						timeouts,
+						now_ns,
+					)
+					head_turn.bytes_written += turn.bytes_written
+
+					return head_turn
+				}
 				turn.result = .Keep_Alive
+
 				return turn
 			}
 			state.phase = .Closed
+
 			if state.close_reason == .Unknown {
 				state.close_reason = .Normal
 			}
 			turn.result = .Closed
+
 			return turn
 		}
 
@@ -594,14 +775,17 @@ static_connection_turn :: proc(
 		   write_turn.write.result == .Would_Block ||
 		   write_turn.write.result == .Interrupted {
 			turn.result = .Response_Progress
+
 			return turn
 		}
 		state.close_reason = .Transport_Error
 		state.phase = .Failed
 		turn.result = .Transport_Error
 		turn.error_code = write_turn.write.error_code
+
 		return turn
 	}
+
 	if state.phase == .Writing_File_Body {
 		return static_file_body_turn(
 			poller,
@@ -614,9 +798,11 @@ static_connection_turn :: proc(
 			now_ns,
 		)
 	}
+
 	if state.phase == .Closed {
 		return Static_Connection_Turn{result = .Closed}
 	}
+
 	return Static_Connection_Turn{result = .Invalid}
 }
 
@@ -635,17 +821,22 @@ acquire_static_workspace :: proc(
 		if state.workspace_slot >= len(pool.storage) {
 			return nil, false
 		}
+
 		return &pool.storage[state.workspace_slot], true
 	}
+
 	if state.workspace_slot != -1 {
 		return nil, false
 	}
+
 	if pool.free_count == 0 {
 		pool.exhaustion_count += 1
+
 		return nil, false
 	}
 	stack_index := pool.free_count - 1
 	slot := pool.free_stack[stack_index]
+
 	if u64(slot) >= u64(len(pool.storage)) {
 		return nil, false
 	}
@@ -668,6 +859,11 @@ acquire_static_workspace :: proc(
 	workspace.trailer_allow_count = 0
 	workspace.trailer_count = 0
 	workspace.trailer_data_used = 0
+	workspace.streaming = false
+	workspace.stream_ended = false
+	workspace.stream_terminal = false
+	workspace.stream_writable = false
+
 	return workspace, true
 }
 
@@ -675,19 +871,24 @@ release_static_workspace :: proc(state: ^Static_Connection) -> bool {
 	if state == nil {
 		return false
 	}
+
 	if state.workspace_slot == -1 {
 		return true
 	}
+
 	if !valid_static_workspace_pool(state.workspace_pool) {
 		return false
 	}
 	pool := state.workspace_pool
+
 	if state.workspace_slot < 0 || state.workspace_slot >= len(pool.storage) {
 		return false
 	}
+
 	if pool.free_count >= len(pool.storage) {
 		return false
 	}
+
 	if pool.active_count <= 0 {
 		return false
 	}
@@ -699,7 +900,63 @@ release_static_workspace :: proc(state: ^Static_Connection) -> bool {
 	pool.release_count += 1
 	state.workspace_slot = -1
 	state.write_driver = {}
+
 	return true
+}
+
+preserve_keep_alive_tail :: proc(state: ^Static_Connection) -> int {
+	if state.workspace_pool == nil || state.workspace_slot < 0 {
+		return -1
+	}
+
+	if state.workspace_slot >= len(state.workspace_pool.storage) {
+		return -1
+	}
+
+	workspace := &state.workspace_pool.storage[state.workspace_slot]
+	kept := workspace.body_valid - workspace.body_start
+
+	if kept < 0 {
+		kept = 0
+	}
+
+	if kept > len(workspace.request_input) {
+		kept = len(workspace.request_input)
+	}
+
+	if kept > 0 {
+		copy(
+			workspace.request_input,
+			workspace.request_input[workspace.body_start:workspace.body_valid],
+		)
+		// NOTE: retains the slot across keep-alive so pipelined bytes survive;
+		// staging is reset without touching the preserved input.
+		workspace.head_driver = connection.begin_connection_head(
+			static_connection_event_id(state.token),
+		)
+		workspace.body_driver = {}
+		workspace.managed_route_id = 0
+		workspace.body_start = 0
+		workspace.body_valid = kept
+		workspace.staged_length = 0
+		workspace.body_complete = false
+		workspace.trailer_head = nil
+		workspace.trailer_allow_count = 0
+		workspace.trailer_count = 0
+		workspace.trailer_data_used = 0
+		workspace.streaming = false
+		workspace.stream_ended = false
+		workspace.stream_terminal = false
+		workspace.stream_writable = false
+
+		return kept
+	}
+
+	if !release_static_workspace(state) {
+		return -1
+	}
+
+	return 0
 }
 
 reset_static_workspace :: proc(workspace: ^Static_Connection_Workspace) {
@@ -715,12 +972,17 @@ reset_static_workspace :: proc(workspace: ^Static_Connection_Workspace) {
 	workspace.trailer_allow_count = 0
 	workspace.trailer_count = 0
 	workspace.trailer_data_used = 0
+	workspace.streaming = false
+	workspace.stream_ended = false
+	workspace.stream_terminal = false
+	workspace.stream_writable = false
 }
 
 valid_static_workspace_pool :: proc(pool: ^Static_Workspace_Pool) -> bool {
 	if pool == nil || !pool.initialized || len(pool.storage) == 0 {
 		return false
 	}
+
 	if len(pool.free_stack) < len(pool.storage) ||
 	   pool.free_count < 0 ||
 	   pool.free_count > len(pool.storage) ||
@@ -731,6 +993,7 @@ valid_static_workspace_pool :: proc(pool: ^Static_Workspace_Pool) -> bool {
 	   pool.high_water_mark > len(pool.storage) {
 		return false
 	}
+
 	return true
 }
 
@@ -750,14 +1013,18 @@ register_static_response_write :: proc(
 		static_connection_event_id(state.token),
 		workspace.response[:state.response_length],
 	)
+
 	if state.write_driver.state != .Pending {
 		state.phase = .Failed
+
 		return Static_Connection_Turn{result = .Invalid}
 	}
+
 	if state.phase != .Writing_Response {
 		if connections.transition_connection(table, state.token, .Writing_Response) !=
 		   .Transitioned {
 			state.phase = .Failed
+
 			return Static_Connection_Turn{result = .Invalid}
 		}
 	}
@@ -770,9 +1037,11 @@ register_static_response_write :: proc(
 
 	if result != .Ready {
 		state.phase = .Failed
+
 		return Static_Connection_Turn{result = .Transport_Error, error_code = error_code}
 	}
 	state.phase = .Writing_Response
+
 	return Static_Connection_Turn{result = .Response_Progress}
 }
 

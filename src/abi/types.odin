@@ -70,6 +70,7 @@ Vyl_Host_Event_Kind :: enum u32 {
 	Request,
 	Shutdown,
 	Body_Available,
+	Writable,
 }
 
 Vyl_Host_Event :: struct {

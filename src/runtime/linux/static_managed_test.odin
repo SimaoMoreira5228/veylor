@@ -26,6 +26,7 @@ test_managed_route_parks_connection_and_queues_request_handle :: proc(t: ^testin
 	sockets: [2]linux.Fd
 	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
 	testing.expect_value(t, socket_result, linux.Errno.NONE)
+
 	if socket_result != .NONE {
 		return
 	}
@@ -34,6 +35,7 @@ test_managed_route_parks_connection_and_queues_request_handle :: proc(t: ^testin
 
 	poller, poll_result, _ := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
+
 	if poll_result != .Ready {
 		return
 	}
@@ -111,6 +113,7 @@ test_managed_route_parks_connection_and_queues_request_handle :: proc(t: ^testin
 	readiness_events: [4]transport.Readiness_Event
 	batch := epoll.wait(poller, native_events[:], readiness_events[:], 100)
 	testing.expect_value(t, batch.result, epoll.Result.Ready)
+
 	if batch.result != .Ready || len(batch.events) == 0 {
 		return
 	}
@@ -170,6 +173,7 @@ test_managed_route_rejects_oversized_body_without_queuing :: proc(t: ^testing.T)
 	sockets: [2]linux.Fd
 	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
 	testing.expect_value(t, socket_result, linux.Errno.NONE)
+
 	if socket_result != .NONE {
 		return
 	}
@@ -178,6 +182,7 @@ test_managed_route_rejects_oversized_body_without_queuing :: proc(t: ^testing.T)
 
 	poller, poll_result, _ := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
+
 	if poll_result != .Ready {
 		return
 	}
@@ -255,6 +260,7 @@ test_managed_route_rejects_oversized_body_without_queuing :: proc(t: ^testing.T)
 	readiness_events: [4]transport.Readiness_Event
 	batch := epoll.wait(poller, native_events[:], readiness_events[:], 100)
 	testing.expect_value(t, batch.result, epoll.Result.Ready)
+
 	if batch.result != .Ready || len(batch.events) == 0 {
 		return
 	}
@@ -281,10 +287,11 @@ test_managed_route_rejects_oversized_body_without_queuing :: proc(t: ^testing.T)
 }
 
 @(test)
-test_managed_route_with_body_retains_workspace_without_armed_deadline :: proc(t: ^testing.T) {
+test_managed_route_with_body_retains_workspace_with_armed_deadline :: proc(t: ^testing.T) {
 	sockets: [2]linux.Fd
 	socket_result := linux.socketpair(.UNIX, .STREAM, .HOPOPT, &sockets)
 	testing.expect_value(t, socket_result, linux.Errno.NONE)
+
 	if socket_result != .NONE {
 		return
 	}
@@ -293,6 +300,7 @@ test_managed_route_with_body_retains_workspace_without_armed_deadline :: proc(t:
 
 	poller, poll_result, _ := epoll.create()
 	testing.expect_value(t, poll_result, epoll.Result.Ready)
+
 	if poll_result != .Ready {
 		return
 	}
@@ -370,6 +378,7 @@ test_managed_route_with_body_retains_workspace_without_armed_deadline :: proc(t:
 	readiness_events: [4]transport.Readiness_Event
 	batch := epoll.wait(poller, native_events[:], readiness_events[:], 100)
 	testing.expect_value(t, batch.result, epoll.Result.Ready)
+
 	if batch.result != .Ready || len(batch.events) == 0 {
 		return
 	}
@@ -402,6 +411,11 @@ test_managed_route_with_body_retains_workspace_without_armed_deadline :: proc(t:
 	phase, phase_result := connections.connection_phase(&table, token)
 	testing.expect_value(t, phase_result, connections.Connection_Table_Result.Found)
 	testing.expect_value(t, phase, connections.Connection_Phase.Reading_Request_Body)
-	testing.expect_value(t, table.slots[int(token.slot)].deadline_timer_id, u64(0))
+	testing.expect_value(t, table.slots[int(token.slot)].has_deadline, true)
+	testing.expect_value(
+		t,
+		table.slots[int(token.slot)].deadline_kind,
+		connections.Connection_Deadline_Kind.Body_Progress,
+	)
 	testing.expect_value(t, host.pending_host_events(&queue), 1)
 }

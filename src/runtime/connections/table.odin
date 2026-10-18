@@ -82,6 +82,7 @@ connection_token_is_for_worker :: proc(table: ^Connection_Table, token: Connecti
 	if token.worker_id != table.worker_id {
 		return false
 	}
+
 	return token.worker_generation == table.worker_generation
 }
 
@@ -89,6 +90,7 @@ connection_slot_matches_token :: proc(slot: ^Connection_Slot, token: Connection_
 	if slot.state != .Occupied {
 		return false
 	}
+
 	return slot.generation == token.generation
 }
 
@@ -120,6 +122,7 @@ init_connection_table :: proc(
 		}
 		free_stack[i] = u32(len(slots) - i - 1)
 	}
+
 	return Connection_Table {
 			worker_id = worker_id,
 			worker_generation = worker_generation,
@@ -170,6 +173,7 @@ allocate_connection :: proc(
 	slot.resource_id = resource_id
 	slot.state = .Occupied
 	slot.phase = .Reading_Request_Head
+
 	return Connection_Token {
 			worker_id = table.worker_id,
 			worker_generation = table.worker_generation,
@@ -199,6 +203,7 @@ lookup_connection :: proc(
 	if !connection_slot_matches_token(slot, token) {
 		return 0, .Stale
 	}
+
 	return slot.resource_id, .Found
 }
 
@@ -222,6 +227,7 @@ connection_phase :: proc(
 	if !connection_slot_matches_token(slot, token) {
 		return {}, .Stale
 	}
+
 	return slot.phase, .Found
 }
 
@@ -259,6 +265,7 @@ bind_connection_deadline :: proc(
 	slot.deadline_timer_id = connection_deadline_timer_id(token)
 	slot.deadline_kind = kind
 	slot.has_deadline = true
+
 	return .Deadline_Set
 }
 
@@ -286,6 +293,7 @@ clear_connection_deadline :: proc(
 	slot.deadline_timer_id = 0
 	slot.deadline_kind = {}
 	slot.has_deadline = false
+
 	return .Deadline_Cleared
 }
 
@@ -308,6 +316,7 @@ expire_connection_deadline :: proc(
 	}
 
 	slot := &table.slots[int(slot_index)]
+
 	if slot.state != .Occupied || slot.generation != generation || !slot.has_deadline {
 		return {}, .Not_Found
 	}
@@ -329,6 +338,7 @@ expire_connection_deadline :: proc(
 	slot.deadline_timer_id = 0
 	slot.deadline_kind = {}
 	slot.has_deadline = false
+
 	return deadline, .Deadline_Expired
 }
 
@@ -368,6 +378,7 @@ transition_connection :: proc(
 	}
 
 	slot.phase = next
+
 	return .Transitioned
 }
 
@@ -408,12 +419,14 @@ release_connection :: proc(
 
 	if slot.generation == MAX_CONNECTION_GENERATION {
 		slot.state = .Retired
+
 		return .Retired
 	}
 	slot.generation += 1
 	slot.state = .Available
 	table.free_stack[table.free_count] = token.slot
 	table.free_count += 1
+
 	return .Released
 }
 
@@ -428,13 +441,17 @@ connection_deadline_kind :: proc(
 		return .Request_Head, true
 	case .Reading_Request_Body:
 		return .Body_Progress, true
+
 	case .Writing_Response:
 		return .Response_Write, true
+
 	case .Keep_Alive_Idle:
 		return .Keep_Alive_Idle, true
+
 	case .Awaiting_Handler, .Closing:
 		return {}, false
 	}
+
 	return {}, false
 }
 
@@ -445,6 +462,7 @@ connection_phase_transition_allowed :: proc(
 	if next == .Closing {
 		return current != .Closing
 	}
+
 	switch current {
 	case .Reading_Request_Head:
 		if next == .Reading_Request_Body {
@@ -454,11 +472,13 @@ connection_phase_transition_allowed :: proc(
 		if next == .Awaiting_Handler {
 			return true
 		}
+
 		return next == .Writing_Response
 	case .Reading_Request_Body:
 		if next == .Awaiting_Handler {
 			return true
 		}
+
 		return next == .Writing_Response
 	case .Awaiting_Handler:
 		return next == .Writing_Response
@@ -469,5 +489,6 @@ connection_phase_transition_allowed :: proc(
 	case .Closing:
 		return false
 	}
+
 	return false
 }

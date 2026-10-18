@@ -71,7 +71,9 @@ typedef enum {
   VYL_HOST_REQUEST = 0,
    
   VYL_HOST_SHUTDOWN = 1,
-  VYL_HOST_BODY_AVAILABLE = 2
+  VYL_HOST_BODY_AVAILABLE = 2,
+   
+  VYL_HOST_WRITABLE = 3
 } vyl_host_event_kind;
 
 typedef struct {
@@ -130,6 +132,12 @@ int32_t vyl_response_start(vyl_server *server, vyl_request_token token,
                            int32_t status, vyl_bytes reason, vyl_bytes body);
  
 int32_t vyl_request_cancel(vyl_server *server, vyl_request_token token);
+ 
+int32_t vyl_response_begin(vyl_server *server, vyl_request_token token,
+                           int32_t status, vyl_bytes reason);
+int32_t vyl_response_write(vyl_server *server, vyl_request_token token,
+                           vyl_bytes data);
+int32_t vyl_response_end(vyl_server *server, vyl_request_token token);
  
 int32_t vyl_server_route_managed_with_trailers(vyl_server *server,
                                                vyl_bytes method, vyl_bytes path,
