@@ -12,8 +12,10 @@ mod response_write;
 pub use body::{BodyDecoder, BodyEvent, BodyLimits, BodyProgress};
 pub use client_response::{ClientResponse, ClientResponseEvent, ClientResponseProgress};
 pub use connection::{
-    HeadDriver, HeadEvent, HeadResult, HeadState, IoCompletion, IoOperation, IoResult, WriteDriver,
-    WriteEvent, WriteResult, WriteState,
+    BodyDriver, BodyEvent as ConnectionBodyEvent, BodyResult, BodyState, ClientReadEvent,
+    ClientReadResult, ClientReadState, ClientRequestDriver, ClientResponseDriver, HeadDriver,
+    HeadEvent, HeadResult, HeadState, IoCompletion, IoOperation, IoResult, WriteDriver, WriteEvent,
+    WriteResult, WriteState,
 };
 pub use fields::{ConnectionOptions, is_token};
 pub use request_body::{RequestBodyAdmission, RequestBodyDecoder};

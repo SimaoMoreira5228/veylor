@@ -1,6 +1,6 @@
 use super::{
-    HeadDriver, HeadResult, HeadState, IoCompletion, IoOperation, IoResult, WriteDriver,
-    WriteResult, WriteState,
+    ClientReadResult, ClientReadState, ClientResponseDriver, HeadDriver, HeadResult, HeadState,
+    IoCompletion, IoOperation, IoResult, WriteDriver, WriteResult, WriteState,
 };
 
 fn completion(operation_id: u64, result: IoResult) -> IoCompletion {
@@ -19,6 +19,147 @@ fn read_completion(connection_id: u64, operation_id: u64, result: IoResult) -> I
         operation: IoOperation::Read,
         result,
     }
+}
+
+#[test]
+fn client_response_reads_interim_and_final_messages_with_buffered_body() {
+    let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let first = b"HTTP/1.1 100";
+    let mut driver = ClientResponseDriver::new(
+        70,
+        crate::ResponseRequestMethod::Other,
+        b"",
+        crate::BodyLimits::default(),
+    );
+    let mut headers = [crate::Header::default(); 4];
+    let mut trailers = [crate::Header::default(); 4];
+
+    let event = driver.consume(
+        read_completion(
+            70,
+            1,
+            IoResult::Progress {
+                transferred_bytes: first.len(),
+            },
+        ),
+        &bytes[..first.len()],
+        &mut headers,
+        &mut trailers,
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::NeedMore);
+
+    let event = driver.consume(
+        read_completion(
+            70,
+            2,
+            IoResult::Progress {
+                transferred_bytes: bytes.len() - first.len(),
+            },
+        ),
+        bytes,
+        &mut headers,
+        &mut trailers,
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::Informational);
+    let after_interim = &bytes[event.consumed..];
+
+    let event = driver.consume_buffered(
+        after_interim,
+        &mut headers,
+        &mut trailers,
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::Head);
+    let response_body = &after_interim[event.consumed..];
+
+    let event = driver.consume_buffered(
+        response_body,
+        &mut headers,
+        &mut trailers,
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::Body);
+    assert_eq!(event.consumed, 2);
+
+    let event = driver.consume_buffered(b"", &mut headers, &mut trailers, crate::Limits::default());
+    assert_eq!(event.result, ClientReadResult::Complete);
+    assert_eq!(driver.state(), ClientReadState::Complete);
+    assert!(driver.can_reuse());
+}
+
+#[test]
+fn client_response_eof_completes_close_delimited_body_without_reuse() {
+    let bytes = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody";
+    let mut driver = ClientResponseDriver::new(
+        71,
+        crate::ResponseRequestMethod::Other,
+        b"",
+        crate::BodyLimits::default(),
+    );
+    let mut headers = [crate::Header::default(); 4];
+    let mut trailers = [crate::Header::default(); 4];
+    let event = driver.consume(
+        read_completion(
+            71,
+            1,
+            IoResult::Progress {
+                transferred_bytes: bytes.len(),
+            },
+        ),
+        bytes,
+        &mut headers,
+        &mut trailers,
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::Head);
+    let body = &bytes[event.consumed..];
+
+    let event =
+        driver.consume_buffered(body, &mut headers, &mut trailers, crate::Limits::default());
+    assert_eq!(event.result, ClientReadResult::Body);
+    assert_eq!(event.consumed, 4);
+
+    let event = driver.consume(
+        read_completion(71, 2, IoResult::EndOfStream),
+        b"",
+        &mut headers,
+        &mut trailers,
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::Complete);
+    assert_eq!(driver.state(), ClientReadState::Complete);
+    assert!(!driver.can_reuse());
+}
+
+#[test]
+fn client_response_upgrade_returns_unconsumed_tunnel_bytes() {
+    let bytes = b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\nframe";
+    let mut driver = ClientResponseDriver::new(
+        72,
+        crate::ResponseRequestMethod::Other,
+        b"websocket",
+        crate::BodyLimits::default(),
+    );
+    let event = driver.consume(
+        read_completion(
+            72,
+            1,
+            IoResult::Progress {
+                transferred_bytes: bytes.len(),
+            },
+        ),
+        bytes,
+        &mut [crate::Header::default(); 4],
+        &mut [crate::Header::default(); 4],
+        crate::Limits::default(),
+    );
+    assert_eq!(event.result, ClientReadResult::Upgraded);
+    assert_eq!(event.consumed, bytes.len() - b"frame".len());
+    assert_eq!(&bytes[event.consumed..], b"frame");
+    assert_eq!(driver.state(), ClientReadState::Upgraded);
+    assert!(!driver.can_reuse());
 }
 
 #[test]
