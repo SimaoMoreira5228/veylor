@@ -19,6 +19,7 @@ make_managed_stream_begin :: proc(
 	}
 	copy(cmd.reason[:len(reason)], transmute([]u8)reason)
 	cmd.reason_length = u32(len(reason))
+
 	return cmd
 }
 
@@ -32,6 +33,7 @@ make_managed_stream_write :: proc(
 	}
 	copy(cmd.body[:len(data)], transmute([]u8)data)
 	cmd.body_length = u32(len(data))
+
 	return cmd
 }
 
@@ -255,6 +257,7 @@ make_managed_stream_trailers :: proc(
 	copy(cmd.body[used:], "\r\n")
 	used += 2
 	cmd.body_length = u32(used)
+
 	return cmd
 }
 
@@ -348,5 +351,47 @@ test_managed_stream_rejects_write_and_trailers_after_end :: proc(t: ^testing.T) 
 	trailer_cmd := make_managed_stream_trailers(stream_token, "X-Checksum", "abc123")
 	drain_managed_stream_command(t, &fixture, trailer_cmd)
 	testing.expect_value(t, fixture.worker_states[0].phase, Static_Connection_Phase.Closed)
+	close_managed_body_fixture(&fixture)
+}
+
+@(test)
+test_managed_stream_cancel_closes_writing_connection :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /stream HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/stream", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	stream_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	drain_managed_stream_command(t, &fixture, make_managed_stream_begin(stream_token, 200, "OK"))
+	testing.expect_value(
+		t,
+		fixture.worker_states[0].phase,
+		Static_Connection_Phase.Writing_Response,
+	)
+
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(
+			&fixture.command_queue,
+			make_managed_cancel_command(stream_token),
+		),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 2000)
+	testing.expect_value(t, fixture.worker_states[0].active, false)
+	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(1))
+	testing.expect_value(
+		t,
+		fixture.worker.metrics.close_reasons[int(Static_Connection_Close_Reason.Cancelled)],
+		u64(1),
+	)
 	close_managed_body_fixture(&fixture)
 }

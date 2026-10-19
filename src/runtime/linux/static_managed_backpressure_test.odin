@@ -250,3 +250,130 @@ test_parked_nobody_request_expires_on_handler_deadline :: proc(t: ^testing.T) {
 	testing.expect_value(t, fixture.worker.metrics.closed_connections, u64(1))
 	close_managed_body_fixture(&fixture)
 }
+
+@(test)
+test_pipelined_partial_head_completes_after_keep_alive :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	request := "GET /stream HTTP/1.1\r\nHost: example.test\r\n\r\nGET /stream HTTP/1.1\r\nHost: exa"
+	if !setup_managed_body_fixture(t, &fixture, "GET", "/stream", request, 16 * 1024 * 1024) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	first_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	drain_managed_stream_command(
+		t,
+		&fixture,
+		make_managed_response_command(first_token, 200, "OK", "first"),
+	)
+
+	rest := "mple.test\r\n\r\n"
+	write_length, write_error := linux.write(fixture.sockets[1], transmute([]u8)rest)
+	testing.expect_value(t, write_error, linux.Errno.NONE)
+	testing.expect_value(t, write_length, len(rest))
+
+	turn := drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Need_More)
+	testing.expect_value(t, fixture.worker_states[0].phase, Static_Connection_Phase.Awaiting_Host)
+	notified := host.poll_host_queue(&fixture.host_queue, polled[:])
+	testing.expect_value(t, notified.copied, 1)
+	testing.expect_value(t, polled[0].kind, host.Host_Event_Kind.Request)
+	testing.expect(t, polled[0].token.request_seq != first_token.request_seq)
+
+	response_buffer: [256]u8
+	testing.expect_value(
+		t,
+		read_managed_socket_text(t, &fixture, response_buffer[:]),
+		"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+	)
+
+	second_token := polled[0].token
+	drain_managed_stream_command(
+		t,
+		&fixture,
+		make_managed_response_command(second_token, 200, "OK", "second"),
+	)
+	turn = drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Keep_Alive)
+
+	second_buffer: [256]u8
+	testing.expect_value(
+		t,
+		read_managed_socket_text(t, &fixture, second_buffer[:]),
+		"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond",
+	)
+	close_managed_body_fixture(&fixture)
+}
+
+@(test)
+test_pipelined_post_with_body_after_get :: proc(t: ^testing.T) {
+	fixture: Managed_Body_Fixture
+	get_request :: "POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n"
+	post_request :: "POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\nhello"
+	request := transmute([]u8)string(get_request + post_request)
+	if !setup_managed_body_fixture(
+		t,
+		&fixture,
+		"POST",
+		"/upload",
+		string(request),
+		16 * 1024 * 1024,
+	) {
+		close_managed_body_fixture(&fixture)
+
+		return
+	}
+	polled: [4]host.Host_Event
+	testing.expect_value(t, host.poll_host_queue(&fixture.host_queue, polled[:]).copied, 1)
+	first_token := polled[0].token
+	fixture.worker.poller = fixture.poller
+	fixture.worker.shutdown_state = &fixture.shutdown_state
+
+	drain_managed_stream_command(
+		t,
+		&fixture,
+		make_managed_response_command(first_token, 200, "OK", "first"),
+	)
+	turn := drive_managed_write_turn(t, &fixture)
+	testing.expect_value(t, turn.result, Static_Connection_Result.Need_More)
+	testing.expect_value(t, fixture.worker_states[0].phase, Static_Connection_Phase.Awaiting_Host)
+	notified := host.poll_host_queue(&fixture.host_queue, polled[:])
+	testing.expect_value(t, notified.copied, 1)
+	testing.expect_value(t, polled[0].kind, host.Host_Event_Kind.Request)
+
+	second_token := polled[0].token
+	phase, phase_result := connections.connection_phase(&fixture.table, second_token)
+	testing.expect_value(t, phase_result, connections.Connection_Table_Result.Found)
+	testing.expect_value(t, phase, connections.Connection_Phase.Reading_Request_Body)
+
+	pull := host.Host_Command {
+		kind      = .Read_Body,
+		token     = second_token,
+		max_bytes = 1024,
+	}
+	testing.expect_value(
+		t,
+		host.enqueue_host_command(&fixture.command_queue, pull),
+		host.Host_Command_Result.Enqueued,
+	)
+	drain_host_commands(&fixture.worker, 2000)
+	notified = host.poll_host_queue(&fixture.host_queue, polled[:])
+	testing.expect_value(t, notified.copied, 1)
+	testing.expect_value(t, polled[0].kind, host.Host_Event_Kind.Body_Available)
+	testing.expect_value(t, polled[0].body_complete, u32(1))
+
+	testing.expect_value(t, fixture.workspace_storage[0].staged_length, 5)
+	testing.expect(
+		t,
+		string(
+			fixture.workspace_storage[0].staged_body[:fixture.workspace_storage[0].staged_length],
+		) ==
+		"hello",
+	)
+	close_managed_body_fixture(&fixture)
+}
