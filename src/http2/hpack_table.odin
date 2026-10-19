@@ -11,6 +11,7 @@ Hpack_Table :: struct {
 	size:              u64,
 	max_size:          u64,
 	protocol_max_size: u64,
+	signalled_max:     u64,
 }
 
 Hpack_Kind :: enum u8 {
@@ -54,6 +55,8 @@ hpack_table_init :: proc(table: ^Hpack_Table, backing: []Hpack_Entry, protocol_m
 	table.max_size = protocol_max_size
 
 	table.protocol_max_size = protocol_max_size
+
+	table.signalled_max = protocol_max_size
 }
 
 hpack_evict_oldest :: proc(table: ^Hpack_Table) {

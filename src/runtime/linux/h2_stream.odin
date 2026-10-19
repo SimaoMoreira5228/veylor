@@ -3,8 +3,8 @@ package linux_runtime
 
 import http1 "veylor:http1"
 import response "veylor:http1/response"
-import host "veylor:runtime/host"
 import http2 "veylor:http2"
+import host "veylor:runtime/host"
 
 h2_execute_response_start :: proc(
 	worker: ^Static_Worker,
@@ -63,6 +63,12 @@ h2_execute_response_start :: proc(
 	record.resp_started = true
 
 	if !empty {
+		if !h2_write_ready_for(slot, record.stream_id, cmd.body_length) {
+			slot.write_used = snapshot
+			record.resp_started = false
+
+			return .Dropped
+		}
 		body_storage := cmd.body
 		body := body_storage[:cmd.body_length]
 		data_used, data_ok := http2.h2conn_queue_response_data(
@@ -84,6 +90,7 @@ h2_execute_response_start :: proc(
 	record.resp_ended = true
 
 	if record.end_received {
+		h2_refund_dropped_credit(slot, record.stream_id, record.ungranted)
 		h2_release_record(slot, record)
 	}
 
@@ -184,6 +191,13 @@ h2_execute_response_write :: proc(
 
 		return .Dropped
 	}
+
+	if !h2_write_ready_for(slot, record.stream_id, cmd.body_length) {
+		record.write_stalled = true
+		slot.writable_check = true
+
+		return .Dropped
+	}
 	body_storage := cmd.body
 	body := body_storage[:cmd.body_length]
 	data_used, data_ok := http2.h2conn_queue_response_data(
@@ -195,8 +209,7 @@ h2_execute_response_write :: proc(
 	)
 
 	if !data_ok || data_used != 9 + len(body) {
-		record.write_stalled = true
-		slot.writable_check = true
+		h2_cancel_stream_record(slot, record)
 
 		return .Dropped
 	}
@@ -248,6 +261,56 @@ h2_execute_response_end :: proc(
 	record.resp_ended = true
 
 	if record.end_received {
+		h2_refund_dropped_credit(slot, record.stream_id, record.ungranted)
+		h2_release_record(slot, record)
+	}
+
+	if !refresh_h2_connection_deadline(worker, slot, now_ns) {
+		return .Closed
+	}
+
+	return .Responded
+}
+
+h2_execute_response_trailers :: proc(
+	worker: ^Static_Worker,
+	slot: ^H2_Worker_Connection,
+	record: ^H2_Stream_Record,
+	cmd: host.Host_Command,
+	now_ns: u64,
+) -> Managed_Response_Outcome {
+	if cmd.kind != .Response_Trailers {
+		return .Dropped
+	}
+
+	if !record.resp_started || record.resp_ended {
+		return .Dropped
+	}
+
+	if cmd.body_length == 0 {
+		h2_cancel_stream_record(slot, record)
+
+		return .Dropped
+	}
+	body_storage := cmd.body
+	body := body_storage[:cmd.body_length]
+	trailer_used, trailer_ok := http2.h2conn_queue_response_trailers(
+		&slot.conn,
+		record.stream_id,
+		body,
+		slot.write_buf[slot.write_used:],
+	)
+
+	if !trailer_ok {
+		h2_cancel_stream_record(slot, record)
+
+		return .Dropped
+	}
+	slot.write_used += trailer_used
+	record.resp_ended = true
+
+	if record.end_received {
+		h2_refund_dropped_credit(slot, record.stream_id, record.ungranted)
 		h2_release_record(slot, record)
 	}
 

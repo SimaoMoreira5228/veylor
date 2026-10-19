@@ -51,6 +51,18 @@ h2conn_queue_response_headers :: proc(
 	name := transmute([]u8)string(":status")
 	value := status_text[:]
 	fragment: [32]u8
+	prefix := 0
+
+	// NOTE: a lowered table cap must be signalled at the next block or the peer decodes
+	// against the old max and fails the connection.
+	if conn.hpack.max_size != conn.hpack.signalled_max {
+		update_used, update_ok := encode_table_size_update(conn.hpack.max_size, fragment[:])
+
+		if !update_ok {
+			return 0, false
+		}
+		prefix = update_used
+	}
 	frag_used, frag_ok := encode_literal_header(
 		.Without_Indexing,
 		0,
@@ -58,12 +70,13 @@ h2conn_queue_response_headers :: proc(
 		value,
 		false,
 		false,
-		fragment[:],
+		fragment[prefix:],
 	)
 
 	if !frag_ok {
 		return 0, false
 	}
+	frag_used += prefix
 	flags := FLAG_END_HEADERS
 
 	if end_stream {
@@ -102,6 +115,72 @@ h2conn_queue_response_headers :: proc(
 	)
 
 	if !payload_ok {
+		return 0, false
+	}
+	conn.hpack.signalled_max = conn.hpack.max_size
+	slot.state = next
+
+	return FRAME_HEADER_LEN + payload_used, true
+}
+
+h2conn_queue_response_trailers :: proc(
+	conn: ^H2_Connection,
+	stream_id: u32,
+	block: []u8,
+	out: []u8,
+) -> (
+	used: int,
+	ok: bool,
+) {
+	if conn == nil || conn.failed {
+		return 0, false
+	}
+
+	if stream_id == 0 || stream_id > MAX_STREAM_ID {
+		return 0, false
+	}
+
+	if len(block) == 0 {
+		return 0, false
+	}
+	index, found := streams_find(&conn.table, stream_id)
+
+	if !found {
+		return 0, false
+	}
+	slot := &conn.table.slots[index]
+
+	if slot.state != .Open && slot.state != .Half_Closed_Remote {
+		return 0, false
+	}
+	header := Frame_Header {
+		length    = u32(len(block)),
+		kind      = .Headers,
+		flags     = FLAG_END_STREAM | FLAG_END_HEADERS,
+		stream_id = stream_id,
+	}
+
+	if len(out) < FRAME_HEADER_LEN + len(block) {
+		return 0, false
+	}
+
+	if !encode_frame_header(header, out[:FRAME_HEADER_LEN]) {
+		return 0, false
+	}
+	payload_used, payload_ok := encode_headers_payload(block, nil, 0, out[FRAME_HEADER_LEN:])
+
+	if !payload_ok {
+		return 0, false
+	}
+	action, next := stream_state_on_frame(slot.state, .Headers, header.flags, .Sent)
+
+	if action.kind == .Connection_Error {
+		h2_fail(conn, action.code)
+
+		return 0, false
+	}
+
+	if action.kind != .Accept {
 		return 0, false
 	}
 	slot.state = next

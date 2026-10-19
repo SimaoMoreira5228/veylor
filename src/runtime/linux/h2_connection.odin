@@ -12,19 +12,34 @@ H2_WORKER_CONNECTION_CAPACITY :: 8
 H2_WORKER_STREAM_CAPACITY :: 32
 H2_WORKER_REASM_CAPACITY :: 16 * 1024
 H2_WORKER_SCRATCH_CAPACITY :: 16 * 1024
-H2_WORKER_HEADER_CAPACITY :: 64
+// NOTE: sized for a full burst of concurrently opened streams in one read: 32 streams with four
+// pseudo-headers each, plus margin. Larger bursts fail closed at decode time.
+H2_WORKER_HEADER_CAPACITY :: 256
 H2_WORKER_PENDING_CAPACITY :: 32
 H2_WORKER_DYN_ENTRY_CAPACITY :: 64
 H2_WORKER_READ_CAPACITY :: 16 * 1024 + 64
 H2_WORKER_WRITE_CAPACITY :: 16 * 1024 + 64
-H2_WORKER_EVENT_CAPACITY :: 32
+// NOTE: sized alongside the header capacity so one read's worth of HEADERS plus their close
+// events fits a single feed; the host queue still bounds what dispatch can emit per turn.
+H2_WORKER_EVENT_CAPACITY :: 96
+// NOTE: upper bound for a queued response head plus an empty frame; the peek gate holds response
+// commands until at least this much write space is free.
+H2_RESPONSE_HEAD_RESERVE :: 128
 H2_WORKER_STREAM_STAGED_CAPACITY :: 2048
 H2_WORKER_STREAM_METHOD_CAPACITY :: 16
+// NOTE: mirrors the router allowlist bound so any permitted set fits the record.
+H2_WORKER_TRAILER_CAPACITY :: 32
+// NOTE: caps per-stream trailer bytes; the copy API reports short host buffers instead of growing
+// the record. Keep this small because each concurrent stream owns one fixed trailer buffer.
+H2_WORKER_TRAILER_DATA_CAPACITY :: 1024
 
 H2_WORKER_MAX_FRAME_SIZE :: u32(16384)
 H2_WORKER_MAX_HEADER_LIST_SIZE :: u32(16384)
 H2_WORKER_HPACK_TABLE_SIZE :: u64(4096)
-H2_WORKER_INITIAL_WINDOW_SIZE :: u32(16384)
+// NOTE: the advertised stream window matches the per-stream staged reservoir above. A larger
+// window would let a compliant burst overflow staging and force a cancel; grants issued as the
+// host drains pace sustained flow instead.
+H2_WORKER_INITIAL_WINDOW_SIZE :: u32(2048)
 
 H2_Worker_Close_Reason :: enum {
 	Unknown,
@@ -63,30 +78,44 @@ H2_Stream_Record :: struct {
 	resp_started:  bool,
 	resp_ended:    bool,
 	write_stalled: bool,
+	trailers:      [H2_WORKER_TRAILER_CAPACITY]H2_Trailer_Field,
+	trailer_count: int,
+	trailer_data:  [H2_WORKER_TRAILER_DATA_CAPACITY]u8,
+	trailer_used:  int,
+}
+
+H2_Trailer_Field :: struct {
+	name_offset:  int,
+	name_length:  int,
+	value_offset: int,
+	value_length: int,
 }
 
 H2_Worker_Connection :: struct {
-	fd:           linux.Fd,
-	token:        connections.Connection_Token,
-	peer:         transport.Peer_Address,
-	active:       bool,
-	registered:   bool,
-	closing:      bool,
-	close_reason: H2_Worker_Close_Reason,
-	conn:         http2.H2_Connection,
-	streams:      [H2_WORKER_STREAM_CAPACITY]http2.Stream,
-	reasm:        [H2_WORKER_REASM_CAPACITY]u8,
-	dyn_entries:  [H2_WORKER_DYN_ENTRY_CAPACITY]http2.Hpack_Entry,
-	scratch:      [H2_WORKER_SCRATCH_CAPACITY]u8,
-	headers:      [H2_WORKER_HEADER_CAPACITY]http2.Hpack_Header,
-	pending:      [H2_WORKER_PENDING_CAPACITY]http2.H2_Pending,
-	events:       [H2_WORKER_EVENT_CAPACITY]http2.H2_Event,
-	read_buf:     [H2_WORKER_READ_CAPACITY]u8,
-	read_used:    int,
-	write_buf:    [H2_WORKER_WRITE_CAPACITY]u8,
-	write_used:   int,
-	write_sent:   int,
-	records:      [H2_WORKER_STREAM_CAPACITY]H2_Stream_Record,
+	fd:             linux.Fd,
+	token:          connections.Connection_Token,
+	peer:           transport.Peer_Address,
+	active:         bool,
+	registered:     bool,
+	closing:        bool,
+	close_reason:   H2_Worker_Close_Reason,
+	conn:           http2.H2_Connection,
+	streams:        [H2_WORKER_STREAM_CAPACITY]http2.Stream,
+	reasm:          [H2_WORKER_REASM_CAPACITY]u8,
+	dyn_entries:    [H2_WORKER_DYN_ENTRY_CAPACITY]http2.Hpack_Entry,
+	scratch:        [H2_WORKER_SCRATCH_CAPACITY]u8,
+	headers:        [H2_WORKER_HEADER_CAPACITY]http2.Hpack_Header,
+	pending:        [H2_WORKER_PENDING_CAPACITY]http2.H2_Pending,
+	events:         [H2_WORKER_EVENT_CAPACITY]http2.H2_Event,
+	read_buf:       [H2_WORKER_READ_CAPACITY]u8,
+	read_used:      int,
+	write_buf:      [H2_WORKER_WRITE_CAPACITY]u8,
+	write_used:     int,
+	write_sent:     int,
+	// NOTE: per-feed DATA delivery ring; sized to the assembler so any single feed's staged
+	// drain fits without touching the monotonic header scratch.
+	delivery_buf:   [H2_WORKER_REASM_CAPACITY]u8,
+	records:        [H2_WORKER_STREAM_CAPACITY]H2_Stream_Record,
 	writable_check: bool,
 	ungranted_conn: i64,
 }
@@ -138,7 +167,10 @@ h2_acquire_record :: proc(
 
 	for i := 0; i < len(state.records); i += 1 {
 		if !state.records[i].occupied {
-			state.records[i] = H2_Stream_Record{occupied = true, stream_id = stream_id}
+			state.records[i] = H2_Stream_Record {
+				occupied  = true,
+				stream_id = stream_id,
+			}
 
 			return &state.records[i], true
 		}
@@ -194,6 +226,7 @@ h2_worker_connection_init :: proc(
 		state.scratch[:],
 		state.headers[:],
 		state.pending[:],
+		state.delivery_buf[:],
 		H2_WORKER_MAX_FRAME_SIZE,
 		H2_WORKER_STREAM_CAPACITY,
 		H2_WORKER_MAX_HEADER_LIST_SIZE,
@@ -261,7 +294,9 @@ h2_worker_connection_turn :: proc(
 	if byte_budget <= 0 {
 		return H2_Worker_Turn{result = .Invalid}
 	}
-	turn := H2_Worker_Turn{result = .Open}
+	turn := H2_Worker_Turn {
+		result = .Open,
+	}
 	budget := byte_budget
 
 	flush := h2_worker_flush_writes(state, &budget)
@@ -270,7 +305,7 @@ h2_worker_connection_turn :: proc(
 	if flush.fatal {
 		state.close_reason = .Internal_Error
 
-		return H2_Worker_Turn{
+		return H2_Worker_Turn {
 			bytes_read = turn.bytes_read,
 			bytes_written = turn.bytes_written,
 			result = .Error,
@@ -280,7 +315,7 @@ h2_worker_connection_turn :: proc(
 	if flush.peer_closed {
 		state.close_reason = .Peer_Closed
 
-		return H2_Worker_Turn{
+		return H2_Worker_Turn {
 			bytes_read = turn.bytes_read,
 			bytes_written = turn.bytes_written,
 			result = .Closed,
@@ -294,7 +329,7 @@ h2_worker_connection_turn :: proc(
 		if read.fatal {
 			state.close_reason = .Internal_Error
 
-			return H2_Worker_Turn{
+			return H2_Worker_Turn {
 				bytes_read = turn.bytes_read,
 				bytes_written = turn.bytes_written,
 				result = .Error,
@@ -304,14 +339,14 @@ h2_worker_connection_turn :: proc(
 		if read.peer_closed {
 			state.close_reason = .Peer_Closed
 
-			return H2_Worker_Turn{
+			return H2_Worker_Turn {
 				bytes_read = turn.bytes_read,
 				bytes_written = turn.bytes_written,
 				result = .Closed,
 			}
 		}
 
-		if read.transferred > 0 {
+		if read.transferred > 0 || state.conn.staged_active {
 			fed_events, feed_ok := h2_worker_feed_buffered(state)
 
 			if !feed_ok {
@@ -319,7 +354,7 @@ h2_worker_connection_turn :: proc(
 				flush_after_fail := h2_worker_flush_writes(state, &budget)
 				turn.bytes_written += flush_after_fail.transferred
 
-				return H2_Worker_Turn{
+				return H2_Worker_Turn {
 					bytes_read = turn.bytes_read,
 					bytes_written = turn.bytes_written,
 					result = .Closed,
@@ -334,7 +369,7 @@ h2_worker_connection_turn :: proc(
 	if tail_flush.fatal {
 		state.close_reason = .Internal_Error
 
-		return H2_Worker_Turn{
+		return H2_Worker_Turn {
 			bytes_read = turn.bytes_read,
 			bytes_written = turn.bytes_written,
 			result = .Error,
@@ -344,7 +379,7 @@ h2_worker_connection_turn :: proc(
 	if tail_flush.peer_closed {
 		state.close_reason = .Peer_Closed
 
-		return H2_Worker_Turn{
+		return H2_Worker_Turn {
 			bytes_read = turn.bytes_read,
 			bytes_written = turn.bytes_written,
 			result = .Closed,
@@ -352,7 +387,7 @@ h2_worker_connection_turn :: proc(
 	}
 
 	if state.closing && state.write_sent >= state.write_used && !h2_has_live_records(state) {
-		return H2_Worker_Turn{
+		return H2_Worker_Turn {
 			bytes_read = turn.bytes_read,
 			bytes_written = turn.bytes_written,
 			result = .Closed,
@@ -471,7 +506,7 @@ h2_worker_read_available :: proc(
 }
 
 h2_worker_feed_buffered :: proc(state: ^H2_Worker_Connection) -> (events: int, ok: bool) {
-	for state.read_used > 0 {
+	for state.read_used > 0 || state.conn.staged_active {
 		input := state.read_buf[:state.read_used]
 		out_tail := state.write_buf[state.write_used:]
 		consumed, event_count, out_used, feed_ok := http2.h2conn_feed(

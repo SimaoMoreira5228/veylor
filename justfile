@@ -44,5 +44,8 @@ build-native-static:
 
 integration-abi-linux:
 	odin build src/abi -build-mode:shared -collection:veylor=src -o:speed -out:build/libveylor.so
-	clang {{ABI_CFLAGS}} -Iinclude tests/abi_static_server.c -Lbuild -lveylor -o build/test-abi-static-server
+	clang {{ABI_CFLAGS}} -Iinclude \
+		tests/abi_static_server.c tests/abi_h2_server.c \
+		tests/abi_h2_followup.c tests/abi_h2_protocol.c \
+		-Lbuild -lveylor -o build/test-abi-static-server
 	LD_LIBRARY_PATH=build build/test-abi-static-server

@@ -53,6 +53,42 @@ test_host_command_queue_preserves_fifo_order :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_host_command_queue_front_reinsert_preserves_order :: proc(t: ^testing.T) {
+	storage: [8]Host_Command
+	queue := init_host_command_queue(storage[:])
+
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_read_body_command(0, 1, 1024)),
+		Host_Command_Result.Enqueued,
+	)
+	testing.expect_value(
+		t,
+		enqueue_host_command(&queue, make_read_body_command(1, 2, 2048)),
+		Host_Command_Result.Enqueued,
+	)
+
+	head, head_ok := dequeue_host_command(&queue)
+	testing.expect(t, head_ok)
+	testing.expect_value(
+		t,
+		enqueue_host_command_front(&queue, head),
+		Host_Command_Result.Enqueued,
+	)
+	testing.expect_value(t, pending_host_commands(&queue), 2)
+
+	first, first_ok := dequeue_host_command(&queue)
+	testing.expect(t, first_ok)
+	testing.expect_value(t, first.token, make_host_command_token(0, 1))
+
+	second, second_ok := dequeue_host_command(&queue)
+	testing.expect(t, second_ok)
+	testing.expect_value(t, second.token, make_host_command_token(1, 2))
+
+	testing.expect_value(t, pending_host_commands(&queue), 0)
+}
+
+@(test)
 test_host_command_queue_full_rejects_until_dequeue_frees_a_slot :: proc(t: ^testing.T) {
 	storage: [2]Host_Command
 	queue := init_host_command_queue(storage[:])

@@ -14,6 +14,23 @@ h2_scratch_alloc :: proc(conn: ^H2_Connection, n: int) -> ([]u8, bool) {
 	return out, true
 }
 
+// NOTE: staged DATA is delivered to events from this ring, which resets every feed: every span
+// it hands out is consumed synchronously by the turn's dispatch, so no span survives into the
+// next feed. Direct deliveries skip the ring and borrow the feed input instead.
+h2_delivery_alloc :: proc(conn: ^H2_Connection, n: int) -> ([]u8, bool) {
+	if n < 0 {
+		return nil, false
+	}
+
+	if n > len(conn.delivery) - conn.delivery_used {
+		return nil, false
+	}
+	out := conn.delivery[conn.delivery_used:conn.delivery_used + n]
+	conn.delivery_used += n
+
+	return out, true
+}
+
 h2_push_event :: proc(out_events: []H2_Event, events: int, ev: H2_Event) -> (int, bool) {
 	if events >= len(out_events) {
 		return events, false
@@ -221,10 +238,10 @@ h2_deliver_staged :: proc(
 		n = int(avail)
 	}
 	staged := conn.table.assembler.buf[:conn.staged_used]
-	chunk, alloc_ok := h2_scratch_alloc(conn, n)
+	chunk, alloc_ok := h2_delivery_alloc(conn, n)
 
 	if !alloc_ok {
-		h2_fail(conn, .Compression_Error)
+		h2_fail(conn, .Internal_Error)
 
 		return events, true
 	}
@@ -323,17 +340,7 @@ h2_handle_data :: proc(
 	}
 	conn.conn_recv.value -= i64(deliver)
 	slot.recv_window.value -= i64(deliver)
-	chunk, alloc_ok := h2_scratch_alloc(conn, deliver)
-
-	if !alloc_ok {
-		h2_fail(conn, .Compression_Error)
-
-		return events, out_used, true
-	}
-
-	for i in 0 ..< deliver {
-		chunk[i] = data[i]
-	}
+	chunk := data[:deliver]
 	full := deliver == len(data)
 	end := (header.flags & FLAG_END_STREAM != 0) && full
 	next, push_ok := h2_push_event(
@@ -594,7 +601,7 @@ h2_handle_window_update :: proc(
 	}
 
 	if header.stream_id == 0 {
-		if !flow_window_add(&conn.conn_recv, increment) {
+		if !flow_window_add(&conn.conn_send, increment) {
 			h2_fail(conn, .Flow_Control_Error)
 
 			return events, out_used, true
@@ -608,7 +615,7 @@ h2_handle_window_update :: proc(
 			return events, out_used, true
 		}
 
-		if !flow_window_add(&conn.table.slots[index].recv_window, increment) {
+		if !flow_window_add(&conn.table.slots[index].send_window, increment) {
 			h2_fail(conn, .Flow_Control_Error)
 
 			return events, out_used, true

@@ -2,10 +2,10 @@
 package linux_runtime
 
 import http1 "veylor:http1"
+import http2 "veylor:http2"
 import router "veylor:router"
 import connections "veylor:runtime/connections"
 import host "veylor:runtime/host"
-import http2 "veylor:http2"
 
 h2_command_target :: proc(
 	worker: ^Static_Worker,
@@ -70,6 +70,7 @@ h2_dispatch_stream_events :: proc(
 			record, found := h2_find_record(slot, event.stream_id)
 
 			if found {
+				h2_refund_dropped_credit(slot, event.stream_id, record.ungranted)
 				h2_release_record(slot, record)
 			}
 		case .Stream_Closed:
@@ -79,6 +80,7 @@ h2_dispatch_stream_events :: proc(
 				record.end_received = true
 
 				if record.resp_ended {
+					h2_refund_dropped_credit(slot, event.stream_id, record.ungranted)
 					h2_release_record(slot, record)
 				}
 			}
@@ -118,10 +120,8 @@ h2_refuse_stream :: proc(slot: ^H2_Worker_Connection, stream_id: u32) -> bool {
 	return true
 }
 
-h2_cancel_stream_record :: proc(
-	slot: ^H2_Worker_Connection,
-	record: ^H2_Stream_Record,
-) -> bool {
+h2_cancel_stream_record :: proc(slot: ^H2_Worker_Connection, record: ^H2_Stream_Record) -> bool {
+	h2_refund_dropped_credit(slot, record.stream_id, record.ungranted)
 	out := slot.write_buf[slot.write_used:]
 	used, rst_ok := http2.h2conn_queue_rst_stream(&slot.conn, record.stream_id, .Cancel, out)
 
@@ -134,7 +134,11 @@ h2_cancel_stream_record :: proc(
 	return true
 }
 
-h2_pseudo_headers :: proc(headers: []http2.Hpack_Header) -> (method, path, scheme, authority: string) {
+h2_pseudo_headers :: proc(
+	headers: []http2.Hpack_Header,
+) -> (
+	method, path, scheme, authority: string,
+) {
 	for i := 0; i < len(headers); i += 1 {
 		header := headers[i]
 
@@ -196,7 +200,7 @@ h2_dispatch_headers :: proc(
 	record, parked := h2_find_record(slot, event.stream_id)
 
 	if parked {
-		return h2_cancel_stream_record(slot, record)
+		return h2_dispatch_trailers(worker, slot, record, event)
 	}
 	method, path, scheme, authority := h2_pseudo_headers(event.headers)
 
@@ -221,8 +225,8 @@ h2_dispatch_headers :: proc(
 	method_view := input[:len(method)]
 	path_view := input[target_offset:target_offset + len(path)]
 	head := http1.Request_Head {
-		method      = http1.Span{offset = 0, length = len(method_view)},
-		target      = http1.Span{offset = target_offset, length = len(path_view)},
+		method = http1.Span{offset = 0, length = len(method_view)},
+		target = http1.Span{offset = target_offset, length = len(path_view)},
 		target_form = http1.Request_Target_Form.Origin_Form,
 	}
 	route, route_result := router.find_static_request_route(worker.routes, head, input[:])
@@ -259,7 +263,11 @@ h2_dispatch_headers :: proc(
 	return true
 }
 
-h2_dispatch_data :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connection, event: http2.H2_Event) -> bool {
+h2_dispatch_data :: proc(
+	worker: ^Static_Worker,
+	slot: ^H2_Worker_Connection,
+	event: http2.H2_Event,
+) -> bool {
 	record, found := h2_find_record(slot, event.stream_id)
 
 	if !found {
@@ -280,6 +288,8 @@ h2_dispatch_data :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connection, ev
 	}
 
 	if len(event.data) > room {
+		h2_refund_dropped_credit(slot, event.stream_id, i64(len(event.data)))
+
 		return h2_cancel_stream_record(slot, record)
 	}
 	copy(record.staged[record.staged_len:], event.data)
@@ -291,10 +301,10 @@ h2_dispatch_data :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connection, ev
 		record.end_received = true
 	}
 	body_event := host.Host_Event {
-		token         = h2_stream_token(slot, event.stream_id),
-		route_id      = record.route_id,
-		body_ready    = u32(record.staged_len),
-		kind          = .Body_Available,
+		token      = h2_stream_token(slot, event.stream_id),
+		route_id   = record.route_id,
+		body_ready = u32(record.staged_len),
+		kind       = .Body_Available,
 	}
 
 	if record.end_received {
@@ -308,30 +318,47 @@ h2_dispatch_data :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connection, ev
 	return true
 }
 
-h2_grant_dropped_data :: proc(slot: ^H2_Worker_Connection, event: http2.H2_Event) {
-	if len(event.data) == 0 {
+// NOTE: DATA charges both the connection and stream receive windows on arrival. Any teardown
+// that drops received-but-ungranted bytes without refunding them permanently shrinks the shared
+// connection window toward a stall, so every record release carrying ungranted bytes is preceded
+// by a refund. Best-effort on a full write buffer like the other grant paths.
+h2_refund_dropped_credit :: proc(slot: ^H2_Worker_Connection, stream_id: u32, n: i64) {
+	if slot == nil || n <= 0 {
 		return
+	}
+	grant := n
+
+	if grant > 0x7fffffff {
+		grant = 0x7fffffff
 	}
 
 	if len(slot.write_buf) - slot.write_used < 2 * (http2.FRAME_HEADER_LEN + 4) {
 		return
 	}
 	out := slot.write_buf[slot.write_used:]
-	used, stream_ok := http2.h2conn_queue_window_update(
+	stream_used, stream_ok := http2.h2conn_queue_window_update(
 		&slot.conn,
-		event.stream_id,
-		u32(len(event.data)),
+		stream_id,
+		u32(grant),
 		out,
 	)
 
-	if !stream_ok {
+	if stream_ok {
+		slot.write_used += stream_used
 		out = slot.write_buf[slot.write_used:]
-		used, _ = http2.h2conn_queue_window_update(&slot.conn, 0, u32(len(event.data)), out)
 	}
+	conn_used, conn_ok := http2.h2conn_queue_window_update(&slot.conn, 0, u32(grant), out)
 
-	if used > 0 {
-		slot.write_used += used
+	if conn_ok {
+		slot.write_used += conn_used
 	}
+}
+
+h2_grant_dropped_data :: proc(slot: ^H2_Worker_Connection, event: http2.H2_Event) {
+	if len(event.data) == 0 {
+		return
+	}
+	h2_refund_dropped_credit(slot, event.stream_id, i64(len(event.data)))
 }
 
 h2_grant_receive_credit :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connection) {
@@ -387,62 +414,6 @@ h2_grant_receive_credit :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connect
 	}
 }
 
-h2_emit_stream_writable :: proc(
-	worker: ^Static_Worker,
-	slot: ^H2_Worker_Connection,
-	record: ^H2_Stream_Record,
-) -> bool {
-	token := h2_stream_token(slot, record.stream_id)
-
-	return host.enqueue_writable(worker.host_queue, token, record.route_id) == .Enqueued
-}
-
-h2_send_credit :: proc(
-	slot: ^H2_Worker_Connection,
-	stream_id: u32,
-) -> (
-	conn_avail, stream_avail: i64,
-	ok: bool,
-) {
-	return http2.h2conn_send_credit(&slot.conn, stream_id)
-}
-
-h2_emit_stalled_writables :: proc(worker: ^Static_Worker, slot: ^H2_Worker_Connection) {
-	if !slot.writable_check {
-		return
-	}
-	slot.writable_check = false
-
-	for i := 0; i < len(slot.records); i += 1 {
-		record := &slot.records[i]
-
-		if !record.occupied || !record.write_stalled {
-			continue
-		}
-
-		if !record.resp_started || record.resp_ended {
-			record.write_stalled = false
-
-			continue
-		}
-		conn_avail, stream_avail, credit_ok := h2_send_credit(slot, record.stream_id)
-
-		if !credit_ok || conn_avail <= 0 || stream_avail <= 0 {
-			record.write_stalled = true
-			slot.writable_check = true
-
-			continue
-		}
-
-		if h2_emit_stream_writable(worker, slot, record) {
-			record.write_stalled = false
-		} else {
-			record.write_stalled = true
-			slot.writable_check = true
-		}
-	}
-}
-
 refresh_h2_connection_deadline :: proc(
 	worker: ^Static_Worker,
 	slot: ^H2_Worker_Connection,
@@ -451,7 +422,11 @@ refresh_h2_connection_deadline :: proc(
 	if worker == nil || slot == nil || !slot.active {
 		return false
 	}
-	cancel_result := connections.cancel_connection_phase_deadline(worker.table, worker.timers, slot.token)
+	cancel_result := connections.cancel_connection_phase_deadline(
+		worker.table,
+		worker.timers,
+		slot.token,
+	)
 
 	if cancel_result != .Cancelled && cancel_result != .Not_Found {
 		return false
@@ -486,10 +461,10 @@ h2_execute_read_body :: proc(
 		return Managed_Read_Turn{outcome = .Stalled}
 	}
 	body_event := host.Host_Event {
-		token         = h2_stream_token(slot, record.stream_id),
-		route_id      = record.route_id,
-		body_ready    = u32(record.staged_len),
-		kind          = .Body_Available,
+		token      = h2_stream_token(slot, record.stream_id),
+		route_id   = record.route_id,
+		body_ready = u32(record.staged_len),
+		kind       = .Body_Available,
 	}
 
 	if record.end_received {
@@ -594,6 +569,20 @@ execute_h2_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, 
 
 	if cmd.kind == .Response_End {
 		response_outcome := h2_execute_response_end(worker, slot, record, cmd, now_ns)
+
+		if response_outcome == .Closed {
+			close_result := close_h2_worker_connection(worker, slot)
+
+			if close_result == .Error {
+				worker.managed_result = .Error
+			}
+		}
+
+		return
+	}
+
+	if cmd.kind == .Response_Trailers {
+		response_outcome := h2_execute_response_trailers(worker, slot, record, cmd, now_ns)
 
 		if response_outcome == .Closed {
 			close_result := close_h2_worker_connection(worker, slot)

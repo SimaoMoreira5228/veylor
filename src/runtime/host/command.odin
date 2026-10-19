@@ -160,6 +160,51 @@ dequeue_host_command :: proc(queue: ^Host_Command_Queue) -> (cmd: Host_Command, 
 	return cmd, true
 }
 
+// NOTE: reinserts a dequeued command at the head so a transiently unready command keeps its
+// place without blocking later ones from being tried on subsequent turns. Only call this with a
+// command just dequeued from the same queue: the freed slot guarantees room.
+enqueue_host_command_front :: proc(
+	queue: ^Host_Command_Queue,
+	cmd: Host_Command,
+) -> Host_Command_Result {
+	if queue == nil {
+		return .Invalid
+	}
+
+	if len(queue.storage) == 0 {
+		return .Invalid
+	}
+
+	if cmd.kind != .Read_Body &&
+	   cmd.kind != .Response_Start &&
+	   cmd.kind != .Response_Begin &&
+	   cmd.kind != .Response_Write &&
+	   cmd.kind != .Response_End &&
+	   cmd.kind != .Response_Trailers &&
+	   cmd.kind != .Cancel {
+		return .Invalid
+	}
+
+	sync.mutex_lock(&queue.mu)
+
+	if queue.count >= len(queue.storage) {
+		sync.mutex_unlock(&queue.mu)
+
+		return .Full
+	}
+	head := queue.head - 1
+
+	if head < 0 {
+		head = len(queue.storage) - 1
+	}
+	queue.storage[head] = cmd
+	queue.head = head
+	queue.count += 1
+	sync.mutex_unlock(&queue.mu)
+
+	return .Enqueued
+}
+
 pending_host_commands :: proc(queue: ^Host_Command_Queue) -> int {
 	if queue == nil {
 		return 0

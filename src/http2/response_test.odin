@@ -29,6 +29,24 @@ test_h2_status_text_vectors :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_h2_response_headers_signals_table_size_shrink :: proc(t: ^testing.T) {
+	f: H2T_Fixture
+	testing.expect_value(t, h2t_init(&f), true)
+	h2t_open_stream1(&f, t)
+	testing.expect(t, hpack_table_set_max_size(&f.conn.hpack, 0))
+	out: [128]u8
+	used, ok := h2conn_queue_response_headers(&f.conn, 1, 200, false, out[:])
+	testing.expect_value(t, ok, true)
+	testing.expect_value(t, used, 9 + 1 + 13)
+	testing.expect_value(t, out[9], u8(0x20))
+	second: [128]u8
+	used_next, ok_next := h2conn_queue_response_headers(&f.conn, 1, 200, true, second[:])
+	testing.expect_value(t, ok_next, true)
+	testing.expect_value(t, used_next, 9 + 13)
+	testing.expect_value(t, second[9] != u8(0x20), true)
+}
+
+@(test)
 test_h2_queue_response_headers_golden :: proc(t: ^testing.T) {
 	f: H2T_Fixture
 	testing.expect_value(t, h2t_init(&f), true)
@@ -120,7 +138,39 @@ test_h2_queue_response_data_chunks_against_windows :: proc(t: ^testing.T) {
 
 	index, found := streams_find(&f.conn.table, 1)
 	testing.expect_value(t, found, true)
-	testing.expect_value(t, f.conn.table.slots[index].send_window.value, FLOW_INITIAL_WINDOW_SIZE - 5)
+	testing.expect_value(
+		t,
+		f.conn.table.slots[index].send_window.value,
+		FLOW_INITIAL_WINDOW_SIZE - 5,
+	)
+	testing.expect_value(t, f.conn.table.slots[index].state, Stream_State.Open)
+}
+
+@(test)
+test_h2_queue_response_data_chunks_against_remote_max_frame :: proc(t: ^testing.T) {
+	f: H2T_Fixture
+	testing.expect_value(t, h2t_init(&f), true)
+	h2t_open_stream1(&f, t)
+	f.conn.table.remote.max_frame_size = 100
+	out: [256]u8
+	body: [200]u8
+
+	for i in 0 ..< len(body) {
+		body[i] = u8(i % 251)
+	}
+	used, ok := h2conn_queue_response_data(&f.conn, 1, body[:], false, out[:])
+	testing.expect_value(t, ok, true)
+	testing.expect_value(t, used, 9 + 100)
+	testing.expect_value(t, out[2], u8(100))
+	testing.expect_value(t, f.conn.conn_send.value, FLOW_INITIAL_WINDOW_SIZE - 100)
+
+	index, found := streams_find(&f.conn.table, 1)
+	testing.expect_value(t, found, true)
+	testing.expect_value(
+		t,
+		f.conn.table.slots[index].send_window.value,
+		FLOW_INITIAL_WINDOW_SIZE - 100,
+	)
 	testing.expect_value(t, f.conn.table.slots[index].state, Stream_State.Open)
 }
 
@@ -159,6 +209,42 @@ test_h2_queue_response_data_empty_end_sends_header_only :: proc(t: ^testing.T) {
 	index, found := streams_find(&f.conn.table, 1)
 	testing.expect_value(t, found, true)
 	testing.expect_value(t, f.conn.table.slots[index].state, Stream_State.Half_Closed_Local)
+}
+
+@(test)
+test_h2_queue_response_trailers_ends_stream :: proc(t: ^testing.T) {
+	f: H2T_Fixture
+	testing.expect_value(t, h2t_init(&f), true)
+	h2t_handshake(&f, t)
+	open: [11]u8
+	off := h2t_headers_open(open[:], 1, FLAG_END_HEADERS | FLAG_END_STREAM, H2T_Open2[:])
+	_, _, _, open_ok := h2conn_feed(&f.conn, open[:off], f.events[:], f.out[:])
+	testing.expect_value(t, open_ok, true)
+	name := transmute([]u8)string("x-checksum")
+	value := transmute([]u8)string("abc")
+	block: [64]u8
+	n, enc_ok := encode_literal_header(.Without_Indexing, 0, name, value, false, false, block[:])
+	testing.expect_value(t, enc_ok, true)
+	out: [128]u8
+	used, ok := h2conn_queue_response_trailers(&f.conn, 1, block[:n], out[:])
+	testing.expect_value(t, ok, true)
+	testing.expect_value(t, used, 9 + n)
+	testing.expect_value(t, out[3], u8(1))
+	testing.expect_value(t, out[4] & FLAG_END_STREAM, FLAG_END_STREAM)
+	testing.expect_value(t, out[4] & FLAG_END_HEADERS, FLAG_END_HEADERS)
+	index, found := streams_find(&f.conn.table, 1)
+	testing.expect_value(t, found, true)
+	testing.expect_value(t, f.conn.table.slots[index].state, Stream_State.Closed)
+	_, closed_ok := h2conn_queue_response_data(
+		&f.conn,
+		1,
+		transmute([]u8)string("x"),
+		false,
+		out[:],
+	)
+	testing.expect_value(t, closed_ok, false)
+	_, second_ok := h2conn_queue_response_trailers(&f.conn, 1, block[:n], out[:])
+	testing.expect_value(t, second_ok, false)
 }
 
 @(test)

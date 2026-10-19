@@ -3,12 +3,14 @@
 package linux_runtime
 
 import "core:testing"
-import host "veylor:runtime/host"
 import http2 "veylor:http2"
 import connections "veylor:runtime/connections"
+import host "veylor:runtime/host"
 
 h2m_response_cmd :: proc(kind: host.Host_Command_Kind, stream_id: u32) -> host.Host_Command {
-	token := connections.Connection_Token{stream_id = stream_id}
+	token := connections.Connection_Token {
+		stream_id = stream_id,
+	}
 
 	return host.Host_Command{kind = kind, token = token}
 }
@@ -50,7 +52,10 @@ test_h2_response_start_sends_head_and_body :: proc(t: ^testing.T) {
 	testing.expect_value(t, stream, u32(1))
 	testing.expect_value(t, flags & http2.FLAG_END_HEADERS, http2.FLAG_END_HEADERS)
 	head_len := 9 + int(length)
-	kind, stream, flags, length, frame_ok = h2m_parse_first_frame(t, slot.write_buf[base + head_len:])
+	kind, stream, flags, length, frame_ok = h2m_parse_first_frame(
+		t,
+		slot.write_buf[base + head_len:],
+	)
 	testing.expect_value(t, frame_ok, true)
 	testing.expect_value(t, kind, http2.Frame_Type.Data)
 	testing.expect_value(t, stream, u32(1))
@@ -123,11 +128,7 @@ test_h2_response_streaming_begin_write_end :: proc(t: ^testing.T) {
 	testing.expect_value(t, kind, http2.Frame_Type.Data)
 	testing.expect_value(t, length, u32(len(chunk_text)))
 	testing.expect_value(t, flags & http2.FLAG_END_STREAM, u8(0))
-	testing.expect_value(
-		t,
-		string(frames[off + 9:off + 9 + len(chunk_text)]),
-		chunk_text,
-	)
+	testing.expect_value(t, string(frames[off + 9:off + 9 + len(chunk_text)]), chunk_text)
 	off += 9 + int(length)
 	kind, stream, flags, length, frame_ok = h2m_parse_first_frame(t, frames[off:])
 	testing.expect_value(t, frame_ok, true)
@@ -233,7 +234,17 @@ test_h2_response_begin_rejects_head :: proc(t: ^testing.T) {
 	wire: [512]u8
 	head_path := transmute([]u8)string("/managed")
 	head_method := transmute([]u8)string("HEAD")
-	n, frame_ok := h2m_client_headers(wire[:], 1, http2.FLAG_END_HEADERS | http2.FLAG_END_STREAM, 0, head_method, 0, head_path, 6, nil)
+	n, frame_ok := h2m_client_headers(
+		wire[:],
+		1,
+		http2.FLAG_END_HEADERS | http2.FLAG_END_STREAM,
+		0,
+		head_method,
+		0,
+		head_path,
+		6,
+		nil,
+	)
 	testing.expect_value(t, frame_ok, true)
 
 	if !frame_ok {
@@ -258,4 +269,74 @@ test_h2_response_begin_rejects_head :: proc(t: ^testing.T) {
 	execute_h2_host_command(&f.worker, begin, 2_000_000_000)
 	_, gone := h2_find_record(h2m_slot(&f), 1)
 	testing.expect_value(t, gone, false)
+}
+
+@(test)
+test_h2_execute_response_trailers_ends_stream :: proc(t: ^testing.T) {
+	f: H2M_Fixture
+
+	if !h2m_init(&f, t) {
+		return
+	}
+	defer h2m_close(&f)
+
+	if !h2m_handshake(t, &f) {
+		return
+	}
+
+	if !h2m_park(t, &f, 1, true, 2_000_000_000) {
+		return
+	}
+	begin := h2m_response_cmd(.Response_Begin, 1)
+	begin.status = 200
+	begin.reason_length = 2
+	begin.reason[0] = 'O'
+	begin.reason[1] = 'K'
+	execute_h2_host_command(&f.worker, begin, 2_000_000_000)
+	slot := h2m_slot(&f)
+	record, parked := h2_find_record(slot, 1)
+	testing.expect_value(t, parked, true)
+
+	if !parked {
+		return
+	}
+	name := transmute([]u8)string("x-checksum")
+	value := transmute([]u8)string("abc")
+	block: [64]u8
+	n, enc_ok := http2.encode_literal_header(
+		.Without_Indexing,
+		0,
+		name,
+		value,
+		false,
+		false,
+		block[:],
+	)
+	testing.expect_value(t, enc_ok, true)
+	trailers := h2m_response_cmd(.Response_Trailers, 1)
+	trailers.body_length = u32(n)
+	copy(trailers.body[:n], block[:n])
+	execute_h2_host_command(&f.worker, trailers, 2_000_000_000)
+	_, gone := h2_find_record(slot, 1)
+	testing.expect_value(t, gone, false)
+	head_kind, _, _, head_length, head_ok := h2m_parse_first_frame(
+		t,
+		slot.write_buf[:slot.write_used],
+	)
+	testing.expect_value(t, head_ok, true)
+
+	if !head_ok {
+		return
+	}
+	rest := slot.write_buf[9 + int(head_length):]
+	kind, stream, flags, length, frame_ok := h2m_parse_first_frame(t, rest)
+	testing.expect_value(t, frame_ok, true)
+	testing.expect_value(t, kind, http2.Frame_Type.Headers)
+	testing.expect_value(t, stream, u32(1))
+	testing.expect_value(t, flags & http2.FLAG_END_STREAM, http2.FLAG_END_STREAM)
+	testing.expect_value(t, int(length), n)
+	testing.expect_value(t, len(rest) >= 9 + n, true)
+	for i in 0 ..< n {
+		testing.expect_value(t, rest[9 + i], block[i])
+	}
 }

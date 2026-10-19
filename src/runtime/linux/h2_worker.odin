@@ -534,6 +534,65 @@ drive_h2_worker_connections :: proc(
 	}
 }
 
+	// NOTE: host body reads drain staged bytes without socket activity, so no dispatch turn would
+// issue the matching WINDOW_UPDATE grants or surface assembler-held bytes. Sweep connections
+// holding receive credit through the normal turn machinery so grants pace sustained uploads.
+sweep_h2_receive_grants :: proc(
+	worker: ^Static_Worker,
+	byte_budget: int,
+	now_ns: u64,
+	turn: ^Static_Worker_Turn,
+) {
+	if worker == nil || turn == nil {
+		return
+	}
+
+	for i := 0; i < len(worker.h2_states); i += 1 {
+		slot := &worker.h2_states[i]
+
+		if !slot.active || slot.closing {
+			continue
+		}
+
+		if !slot.conn.staged_active && slot.ungranted_conn <= 0 {
+			continue
+		}
+
+		for _ in 0 ..< 8 {
+			connection_turn := h2_worker_connection_turn(slot, byte_budget)
+
+			if connection_turn.bytes_read > 0 {
+				turn.bytes_read += u64(connection_turn.bytes_read)
+				worker.metrics.bytes_read += u64(connection_turn.bytes_read)
+			}
+
+			if connection_turn.bytes_written > 0 {
+				turn.bytes_written += u64(connection_turn.bytes_written)
+				worker.metrics.bytes_written += u64(connection_turn.bytes_written)
+			}
+
+			if connection_turn.result != .Open {
+				close_result := close_h2_worker_connection(worker, slot)
+
+				if close_result == .Error {
+					turn.result = .Error
+				}
+				turn.closed_count += 1
+
+				break
+			}
+
+			if h2_after_open_turn(worker, slot, connection_turn, byte_budget, now_ns, turn) {
+				break
+			}
+
+			if connection_turn.events == 0 && !slot.conn.staged_active {
+				break
+			}
+		}
+	}
+}
+
 drain_h2_worker_connections :: proc(worker: ^Static_Worker) -> bool {
 	for i := 0; i < len(worker.h2_states); i += 1 {
 		slot := &worker.h2_states[i]
