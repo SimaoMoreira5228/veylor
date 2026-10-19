@@ -4,6 +4,7 @@ Connection_Token :: struct {
 	worker_id:         u32,
 	slot:              u32,
 	request_seq:       u32,
+	stream_id:         u32,
 	worker_generation: u64,
 	generation:        u64,
 }

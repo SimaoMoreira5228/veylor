@@ -29,6 +29,7 @@ Static_Worker_Storage_Error :: enum {
 	Connection_Table_Failed,
 	Timer_Queue_Failed,
 	Workspace_Pool_Failed,
+	H2_Pool_Failed,
 }
 
 Static_Worker_Storage_Result :: struct {
@@ -46,6 +47,8 @@ Static_Worker_Storage :: struct {
 	timer_index_storage:   [STATIC_WORKER_TIMER_INDEX_CAPACITY]u32,
 	timers:                transport.Timer_Queue,
 	connection_states:     [STATIC_WORKER_CONNECTION_CAPACITY]Static_Connection,
+	h2_slots:              [H2_WORKER_CONNECTION_CAPACITY]H2_Worker_Connection,
+	h2_free_stack:         [H2_WORKER_CONNECTION_CAPACITY]u32,
 	workspace_storage:     [STATIC_WORKER_WORKSPACE_CAPACITY]Static_Connection_Workspace,
 	workspace_free_stack:  [STATIC_WORKER_WORKSPACE_CAPACITY]u32,
 	workspace_pool:        Static_Workspace_Pool,
@@ -141,6 +144,11 @@ init_static_worker_storage :: proc(
 	}
 	storage.workspace_pool = workspace_pool
 
+	if !init_h2_worker_pool(storage.h2_slots[:], storage.h2_free_stack[:]) {
+		epoll.close(&poller)
+		return {error = .H2_Pool_Failed}
+	}
+
 	storage.worker = Static_Worker {
 		poller = poller,
 		listener = listener,
@@ -152,6 +160,10 @@ init_static_worker_storage :: proc(
 		host_queue = &storage.host_queue,
 		command_queue = &storage.command_queue,
 		connection_states = storage.connection_states[:],
+		h2_states = storage.h2_slots[:],
+		h2_free_stack = storage.h2_free_stack[:],
+		h2_free_count = H2_WORKER_CONNECTION_CAPACITY,
+		h2_listener = socket.Listener{fd = -1},
 		workspace_pool = &storage.workspace_pool,
 		native_events = storage.native_events[:],
 		readiness_events = storage.readiness_events[:],
@@ -186,6 +198,10 @@ close_unmanaged_static_worker_storage :: proc(storage: ^Static_Worker_Storage) {
 
 	if storage.worker.listener.fd >= 0 {
 		socket.close_listener(&storage.worker.listener)
+	}
+
+	if storage.worker.h2_listener.fd >= 0 {
+		socket.close_listener(&storage.worker.h2_listener)
 	}
 
 	storage.initialized = false

@@ -37,6 +37,11 @@ Static_Worker :: struct {
 	command_queue:              ^host.Host_Command_Queue,
 	host_wakeup:                ^Host_Wakeup,
 	connection_states:          []Static_Connection,
+	h2_states:                  []H2_Worker_Connection,
+	h2_free_stack:              []u32,
+	h2_free_count:              int,
+	h2_listener:                socket.Listener,
+	h2_listener_registered:     bool,
 	workspace_pool:             ^Static_Workspace_Pool,
 	native_events:              []linux.EPoll_Event,
 	readiness_events:           []transport.Readiness_Event,
@@ -108,10 +113,24 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			}
 			worker.listener_registered = false
 		}
+
+		if worker.h2_listener_registered {
+			h2_unregister_result, _ := epoll.unregister(worker.poller, worker.h2_listener.fd)
+
+			if h2_unregister_result != .Ready {
+				turn.result = .Error
+			}
+			worker.h2_listener_registered = false
+		}
 		force_static_worker_connections(worker, &turn)
+		force_h2_worker_connections(worker, &turn)
 		refresh_static_worker_gauges(worker)
 
 		return turn
+	}
+
+	if !sync_h2_listener_registration(worker) {
+		return Static_Worker_Turn{result = .Error}
 	}
 	turn := run_worker_turn(
 		worker.poller,
@@ -201,6 +220,11 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 			continue
 		}
 
+		if readiness.connection_id == STATIC_WORKER_H2_LISTENER_ID {
+			accept_h2_worker_connections(worker, readiness, turn.now_ns, &result)
+			continue
+		}
+
 		if readiness.connection_id == 0 {
 			result.result = .Invalid
 			continue
@@ -214,6 +238,13 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		state := &worker.connection_states[slot_index]
 
 		if !state.active {
+			dispatch_h2_worker_readiness(
+				worker,
+				readiness,
+				turn.byte_budget_per_connection,
+				turn.now_ns,
+				&result,
+			)
 			continue
 		}
 
@@ -267,11 +298,19 @@ run_static_worker_turn :: proc(worker: ^Static_Worker) -> Static_Worker_Turn {
 		}
 	}
 
+	if worker.shutdown_state.phase == .Draining {
+		if !drain_h2_worker_connections(worker) {
+			result.result = .Error
+		}
+	}
+	drive_h2_worker_connections(worker, turn.byte_budget_per_connection, turn.now_ns, &result)
+
 	if worker.shutdown_state.phase == .Forcing {
 		if !cancel_static_worker_listener_retry(worker) {
 			result.result = .Error
 		}
 		force_static_worker_connections(worker, &result)
+		force_h2_worker_connections(worker, &result)
 	}
 	refresh_static_worker_gauges(worker)
 
@@ -329,6 +368,12 @@ execute_host_command :: proc(worker: ^Static_Worker, cmd: host.Host_Command, now
 	   cmd.kind != .Response_End &&
 	   cmd.kind != .Response_Trailers &&
 	   cmd.kind != .Cancel {
+		return
+	}
+
+	if cmd.token.stream_id != 0 {
+		execute_h2_host_command(worker, cmd, now_ns)
+
 		return
 	}
 	resource_id, lookup_result := connections.lookup_connection(worker.table, cmd.token)
@@ -520,6 +565,14 @@ valid_static_worker :: proc(worker: ^Static_Worker) -> bool {
 		return false
 	}
 
+	if len(worker.h2_states) != len(worker.h2_free_stack) {
+		return false
+	}
+
+	if worker.h2_free_count < 0 || worker.h2_free_count > len(worker.h2_states) {
+		return false
+	}
+
 	if !valid_static_workspace_pool(worker.workspace_pool) {
 		return false
 	}
@@ -593,7 +646,14 @@ process_static_worker_expirations :: proc(
 		}
 		state := &worker.connection_states[slot_index]
 
-		if !state.active || state.token.generation != deadline.token.generation {
+		if !state.active {
+			if !expire_h2_worker_deadline(worker, slot_index, deadline, turn) {
+				turn.result = .Invalid
+			}
+			continue
+		}
+
+		if state.token.generation != deadline.token.generation {
 			turn.result = .Invalid
 			continue
 		}

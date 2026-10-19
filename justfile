@@ -35,6 +35,7 @@ check-linux:
 
 test-linux:
     odin test src/runtime/linux -all-packages -collection:veylor=src -out:build/test-runtime-linux
+    odin test src/abi -all-packages -collection:veylor=src -out:build/test-abi
 
 integration-linux: check-linux test-linux
 

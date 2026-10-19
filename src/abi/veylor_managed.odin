@@ -45,6 +45,10 @@ vyl_request_pull_body :: proc "c" (
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
 	}
+
+	if token.stream_id != 0 {
+		return h2_request_pull_body(server, worker, token, max_bytes)
+	}
 	state := &worker.connection_states[int(token.slot)]
 
 	if !state.active || state.token != managed_connection_token(token) {
@@ -114,6 +118,9 @@ vyl_request_read :: proc "c" (
 
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if token.stream_id != 0 {
+		return h2_request_read(server, worker, token, dst, capacity, read_bytes)
 	}
 	state := &worker.connection_states[int(token.slot)]
 
@@ -200,6 +207,7 @@ managed_connection_token :: proc(token: Vyl_Request_Token) -> connections.Connec
 		worker_id = token.worker_id,
 		slot = token.slot,
 		request_seq = token.request_seq,
+		stream_id = token.stream_id,
 		worker_generation = token.worker_generation,
 		generation = token.connection_generation,
 	}
@@ -216,6 +224,322 @@ enqueue_managed_command :: proc(
 	}
 
 	return enqueued
+}
+
+h2_request_pull_body :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+	max_bytes: u32,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+	_, _, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok {
+		return i32(Vyl_Result.Stale_Token)
+	}
+	cmd := host.Host_Command {
+		kind      = .Read_Body,
+		token     = managed_connection_token(token),
+		max_bytes = max_bytes,
+	}
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+h2_request_read :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+	dst: [^]u8,
+	capacity: u32,
+	read_bytes: ^u32,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	_, record, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok {
+		return i32(Vyl_Result.Stale_Token)
+	}
+	staged := record.staged_len
+
+	if staged < 0 {
+		staged = 0
+	}
+
+	if staged > len(record.staged) {
+		staged = len(record.staged)
+	}
+	take := int(capacity)
+
+	if take > staged {
+		take = staged
+	}
+
+	if take > 0 {
+		copy(dst[:take], record.staged[:take])
+		remaining := staged - take
+
+		if remaining > 0 {
+			copy(record.staged[:remaining], record.staged[take:staged])
+		}
+		record.staged_len = remaining
+	}
+	read_bytes^ = u32(take)
+
+	if record.end_received && record.staged_len == 0 {
+		return i32(Vyl_Result.End_Of_Body)
+	}
+
+	if take > 0 {
+		return i32(Vyl_Result.Ok)
+	}
+
+	return i32(Vyl_Result.Would_Block)
+}
+
+h2_response_start :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+	status: i32,
+	reason: Vyl_Bytes,
+	body: Vyl_Bytes,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+	_, record, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok || record.resp_started || record.resp_ended {
+		return i32(Vyl_Result.Stale_Token)
+	}
+	cmd := host.Host_Command {
+		kind          = .Response_Start,
+		token         = managed_connection_token(token),
+		status        = status,
+		reason_length = reason.length,
+		body_length   = body.length,
+	}
+	copy(cmd.reason[:], reason.data[:int(reason.length)])
+
+	if body.length > 0 {
+		copy(cmd.body[:], body.data[:int(body.length)])
+	}
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+h2_response_begin :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+	status: i32,
+	reason: Vyl_Bytes,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+	_, record, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok || record.resp_started || record.resp_ended {
+		return i32(Vyl_Result.Stale_Token)
+	}
+
+	if record.method_len == 4 {
+		head_method := record.method[:record.method_len]
+
+		if head_method[0] == 'H' &&
+		   head_method[1] == 'E' &&
+		   head_method[2] == 'A' &&
+		   head_method[3] == 'D' {
+			return i32(Vyl_Result.Invalid_Argument)
+		}
+	}
+	reason_bytes := reason.data[:int(reason.length)]
+
+	if !response.valid_response_value(reason_bytes) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	cmd := host.Host_Command {
+		kind          = .Response_Begin,
+		token         = managed_connection_token(token),
+		status        = status,
+		reason_length = reason.length,
+	}
+	copy(cmd.reason[:], reason.data[:int(reason.length)])
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+h2_response_write :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+	data: Vyl_Bytes,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+	_, record, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok || !record.resp_started || record.resp_ended {
+		return i32(Vyl_Result.Stale_Token)
+	}
+	cmd := host.Host_Command {
+		kind        = .Response_Write,
+		token       = managed_connection_token(token),
+		body_length = data.length,
+	}
+	copy(cmd.body[:], data.data[:int(data.length)])
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+h2_response_end :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+	_, record, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok || !record.resp_started || record.resp_ended {
+		return i32(Vyl_Result.Stale_Token)
+	}
+	cmd := host.Host_Command {
+		kind  = .Response_End,
+		token = managed_connection_token(token),
+	}
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+h2_request_cancel :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if worker.command_queue == nil {
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	if token.stream_id == 0 {
+		slot, found := server_runtime.find_h2_worker_slot(worker, int(token.slot))
+
+		if !found || slot.token.request_seq != token.request_seq {
+			return i32(Vyl_Result.Stale_Token)
+		}
+	} else {
+		_, _, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+		if !h2ok {
+			return i32(Vyl_Result.Stale_Token)
+		}
+	}
+	cmd := host.Host_Command {
+		kind  = .Cancel,
+		token = managed_connection_token(token),
+	}
+
+	switch enqueue_managed_command(worker, cmd) {
+	case .Enqueued:
+		return i32(Vyl_Result.Ok)
+	case .Full:
+		return i32(Vyl_Result.Would_Block)
+	case .Invalid:
+		return i32(Vyl_Result.Bad_State)
+	}
+
+	return i32(Vyl_Result.Bad_State)
+}
+
+h2_request_copy_trailers :: proc "c" (
+	server: ^Vyl_Server,
+	worker: ^server_runtime.Static_Worker,
+	token: Vyl_Request_Token,
+	headers: [^]Vyl_Header_Ref,
+	header_cap: u32,
+	data: [^]u8,
+	data_cap: u32,
+	out_info: ^Vyl_Trailer_Info,
+) -> i32 {
+	context = odin_runtime.default_context()
+	out_info^ = Vyl_Trailer_Info{}
+
+	_, record, h2ok := server_runtime.h2_command_target(worker, managed_connection_token(token))
+
+	if !h2ok {
+		return i32(Vyl_Result.Stale_Token)
+	}
+
+	if !record.end_received {
+		return i32(Vyl_Result.Would_Block)
+	}
+
+	return i32(Vyl_Result.Ok)
 }
 
 @(export)
@@ -270,6 +594,9 @@ vyl_response_start :: proc "c" (
 
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if token.stream_id != 0 {
+		return h2_response_start(server, worker, token, status, reason, body)
 	}
 	state := &worker.connection_states[int(token.slot)]
 
@@ -333,6 +660,9 @@ vyl_request_cancel :: proc "c" (server: ^Vyl_Server, token: Vyl_Request_Token) -
 
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if token.stream_id != 0 {
+		return h2_request_cancel(server, worker, token)
 	}
 	state := &worker.connection_states[int(token.slot)]
 
@@ -404,6 +734,18 @@ vyl_request_copy_trailers :: proc "c" (
 
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if token.stream_id != 0 {
+		return h2_request_copy_trailers(
+			server,
+			worker,
+			token,
+			headers,
+			header_cap,
+			data,
+			data_cap,
+			out_info,
+		)
 	}
 	state := &worker.connection_states[int(token.slot)]
 
@@ -508,6 +850,9 @@ vyl_response_begin :: proc "c" (
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
 	}
+	if token.stream_id != 0 {
+		return h2_response_begin(server, worker, token, status, reason)
+	}
 	state := &worker.connection_states[int(token.slot)]
 
 	if !state.active || state.token != managed_connection_token(token) {
@@ -590,6 +935,9 @@ vyl_response_write :: proc "c" (
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
 	}
+	if token.stream_id != 0 {
+		return h2_response_write(server, worker, token, data)
+	}
 	state := &worker.connection_states[int(token.slot)]
 
 	if !state.active || state.token != managed_connection_token(token) {
@@ -646,6 +994,9 @@ vyl_response_end :: proc "c" (server: ^Vyl_Server, token: Vyl_Request_Token) -> 
 
 	if int(token.slot) >= len(worker.connection_states) {
 		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if token.stream_id != 0 {
+		return h2_response_end(server, worker, token)
 	}
 	state := &worker.connection_states[int(token.slot)]
 
@@ -719,6 +1070,10 @@ vyl_response_trailers :: proc "c" (
 	}
 
 	if int(token.slot) >= len(worker.connection_states) {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+
+	if token.stream_id != 0 {
 		return i32(Vyl_Result.Invalid_Argument)
 	}
 	state := &worker.connection_states[int(token.slot)]

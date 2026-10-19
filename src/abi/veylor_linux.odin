@@ -447,7 +447,8 @@ vyl_server_listen :: proc "c" (
 			}
 			if worker_result.error == .Connection_Table_Failed ||
 			   worker_result.error == .Timer_Queue_Failed ||
-			   worker_result.error == .Workspace_Pool_Failed {
+			   worker_result.error == .Workspace_Pool_Failed ||
+			   worker_result.error == .H2_Pool_Failed {
 				return i32(Vyl_Result.Capacity)
 			}
 			return i32(Vyl_Result.System_Error)
@@ -471,6 +472,55 @@ vyl_server_listen :: proc "c" (
 	}
 
 	server.state = .Listening
+	return i32(Vyl_Result.Ok)
+}
+
+@(export)
+vyl_server_listen_h2 :: proc "c" (
+	server: ^Vyl_Server,
+	address: [^]u8,
+	port: u16,
+	bound_port: ^u16,
+	system_error: ^i32,
+) -> i32 {
+	context = odin_runtime.default_context()
+
+	if server == nil || address == nil || bound_port == nil || system_error == nil {
+		return i32(Vyl_Result.Invalid_Argument)
+	}
+	if server.state != .Listening {
+		return i32(Vyl_Result.Bad_State)
+	}
+	if server.worker_storage[0].worker.h2_listener.fd >= 0 {
+		return i32(Vyl_Result.Bad_State)
+	}
+	bound_port^ = 0
+	system_error^ = 0
+
+	listen_address := [4]u8{address[0], address[1], address[2], address[3]}
+	worker_count := int(server.config.worker_count)
+	for worker_index := 0; worker_index < worker_count; worker_index += 1 {
+		listen_port := port
+		if worker_index > 0 {
+			listen_port = server.worker_storage[0].worker.h2_listener.local_address.port
+		}
+
+		listener, listen_result, listen_error := socket.listen_ipv4(
+			listen_address,
+			listen_port,
+			VYL_LISTENER_BACKLOG,
+			worker_count > 1,
+		)
+		if listen_result != .Ready {
+			system_error^ = listen_error
+			close_h2_listeners(server, worker_index)
+			server.state = .Failed
+			return socket_result(listen_result)
+		}
+		server.worker_storage[worker_index].worker.h2_listener = listener
+	}
+
+	bound_port^ = server.worker_storage[0].worker.h2_listener.local_address.port
 	return i32(Vyl_Result.Ok)
 }
 
@@ -610,6 +660,16 @@ retain_route_bytes :: proc(server: ^Vyl_Server, source: []u8) -> []u8 {
 close_unmanaged_workers :: proc(server: ^Vyl_Server) {
 	for worker_index := 0; worker_index < len(server.worker_storage); worker_index += 1 {
 		server_runtime.close_unmanaged_static_worker_storage(&server.worker_storage[worker_index])
+	}
+}
+
+close_h2_listeners :: proc(server: ^Vyl_Server, opened: int) {
+	for worker_index := 0; worker_index < opened; worker_index += 1 {
+		h2_listener := &server.worker_storage[worker_index].worker.h2_listener
+
+		if h2_listener.fd >= 0 {
+			socket.close_listener(h2_listener)
+		}
 	}
 }
 

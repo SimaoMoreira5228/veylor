@@ -9,7 +9,7 @@ extern "C" {
 
  
 
-#define VEYLOR_ABI_VERSION 1u
+#define VEYLOR_ABI_VERSION 2u
 #define VEYL_MAX_WORKERS 256u
 
 typedef struct vyl_server vyl_server;
@@ -82,6 +82,7 @@ typedef struct {
   uint32_t worker_id;
   uint32_t slot;
   uint32_t request_seq;
+  uint32_t stream_id;
   uint64_t worker_generation;
   uint64_t connection_generation;
 } vyl_request_token;
@@ -158,6 +159,10 @@ int32_t vyl_request_copy_trailers(vyl_server *server, vyl_request_token token,
 int32_t vyl_server_listen(vyl_server *server, const uint8_t address[4],
                           uint16_t port, uint16_t *bound_port,
                           int32_t *system_error);
+ 
+int32_t vyl_server_listen_h2(vyl_server *server, const uint8_t address[4],
+                             uint16_t port, uint16_t *bound_port,
+                             int32_t *system_error);
 int32_t vyl_server_start(vyl_server *server);
  
 int32_t vyl_server_stop_accepting(vyl_server *server);

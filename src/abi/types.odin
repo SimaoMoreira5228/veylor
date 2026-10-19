@@ -1,6 +1,6 @@
 package abi
 
-VYL_ABI_VERSION :: u32(1)
+VYL_ABI_VERSION :: u32(2)
 VYL_MAX_WORKERS :: 256
 VYL_MAX_ROUTES :: 64
 VYL_ROUTE_INDEX_CAPACITY :: VYL_MAX_ROUTES * 2
@@ -63,6 +63,7 @@ Vyl_Request_Token :: struct {
 	worker_id:             u32,
 	slot:                  u32,
 	request_seq:           u32,
+	stream_id:             u32,
 	worker_generation:     u64,
 	connection_generation: u64,
 }

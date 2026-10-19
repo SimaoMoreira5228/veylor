@@ -172,6 +172,7 @@ init_managed_server_test_worker :: proc(
 	instance.worker = Static_Worker {
 		poller = poller,
 		listener = socket.Listener{fd = listener.fd, local_address = listener.local_address},
+		h2_listener = socket.Listener{fd = -1},
 		shutdown_state = &instance.shutdown_state,
 		table = &instance.table,
 		routes = &instance.routes,

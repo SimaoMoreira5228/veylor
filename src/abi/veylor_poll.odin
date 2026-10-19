@@ -140,6 +140,7 @@ drain_host_event_queues :: proc(
 					worker_id = taken.token.worker_id,
 					slot = taken.token.slot,
 					request_seq = taken.token.request_seq,
+					stream_id = taken.token.stream_id,
 					worker_generation = taken.token.worker_generation,
 					connection_generation = taken.token.generation,
 				},

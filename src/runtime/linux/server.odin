@@ -75,6 +75,9 @@ init_managed_server :: proc(
 		   len(worker.table.free_stack) < len(worker.table.slots) ||
 		   worker.timers.count != 0 ||
 		   worker.listener_registered ||
+		   worker.h2_listener_registered ||
+		   worker.h2_free_count != len(worker.h2_states) ||
+		   len(worker.h2_states) != len(worker.h2_free_stack) ||
 		   worker.control_registered {
 			return .Invalid
 		}
@@ -104,6 +107,10 @@ init_managed_server :: proc(
 		}
 		for j := 0; j < i; j += 1 {
 			previous := server_workers[j]
+			h2_states_aliased :=
+				len(worker.h2_states) > 0 &&
+				len(previous.h2_states) > 0 &&
+				&worker.h2_states[0] == &previous.h2_states[0]
 			if worker == previous ||
 			   worker.table == previous.table ||
 			   &worker.table.slots[0] == &previous.table.slots[0] ||
@@ -116,8 +123,21 @@ init_managed_server :: proc(
 			   worker.poller.fd == previous.poller.fd ||
 			   worker.listener.fd == previous.listener.fd ||
 			   &worker.connection_states[0] == &previous.connection_states[0] ||
+			   h2_states_aliased ||
 			   worker.table.worker_id == previous.table.worker_id {
 				return .Invalid
+			}
+
+			if worker.h2_listener.fd >= 0 || previous.h2_listener.fd >= 0 {
+				if worker.h2_listener.fd == previous.h2_listener.fd ||
+				   worker.h2_listener.local_address.family !=
+					   previous.h2_listener.local_address.family ||
+				   worker.h2_listener.local_address.address !=
+					   previous.h2_listener.local_address.address ||
+				   worker.h2_listener.local_address.port !=
+					   previous.h2_listener.local_address.port {
+					return .Invalid
+				}
 			}
 		}
 	}
@@ -318,6 +338,12 @@ destroy_managed_server :: proc(server: ^Managed_Server) -> Managed_Server_Result
 		if worker.listener.fd >= 0 {
 			listener_result, _ := socket.close_listener(&worker.listener)
 			if listener_result != .Ready {
+				result = .System_Error
+			}
+		}
+		if worker.h2_listener.fd >= 0 {
+			h2_listener_result, _ := socket.close_listener(&worker.h2_listener)
+			if h2_listener_result != .Ready {
 				result = .System_Error
 			}
 		}
