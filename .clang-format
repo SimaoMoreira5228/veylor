@@ -1,0 +1,53 @@
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+ColumnLimit: 100
+ContinuationIndentWidth: 4
+
+BreakBeforeBraces: Attach
+
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AllowShortLambdasOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+SpaceBeforeParens: ControlStatements
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+AlignAfterOpenBracket: BlockIndent
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignOperands: DontAlign
+AlignTrailingComments:
+  Kind: Never
+
+BinPackArguments: false
+BinPackParameters: false
+
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+
+BreakConstructorInitializers: AfterColon
+ConstructorInitializerIndentWidth: 4
+
+Cpp11BracedListStyle: true
+
+IndentCaseLabels: false
+IndentPPDirectives: None
+NamespaceIndentation: None
+
+MaxEmptyLinesToKeep: 1
+
+SortIncludes: CaseSensitive
+
+SpaceAfterTemplateKeyword: true
+SpacesInCStyleCastParentheses: false
+
+FixNamespaceComments: false
+CommentPragmas: "^ SF|AYS|NOLINT"

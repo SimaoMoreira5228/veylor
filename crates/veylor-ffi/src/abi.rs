@@ -14,6 +14,11 @@ pub enum VylResult {
     ProtocolError = 3,
     BufferTooSmall = 4,
     InternalError = 5,
+    Capacity = 6,
+    WouldBlock = 7,
+    BodyTooLong = 8,
+    BadState = 9,
+    WriteOverrun = 10,
 }
 
 pub fn catch_ffi(call: impl FnOnce() -> VylResult) -> VylResult {

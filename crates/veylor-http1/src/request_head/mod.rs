@@ -74,11 +74,15 @@ impl Default for Limits {
         Self {
             request_line_bytes: 8 * 1024,
             header_bytes: 32 * 1024,
-            header_count: 100,
+            header_count: Self::DEFAULT_HEADER_COUNT,
             field_name_bytes: 256,
             field_value_bytes: 8 * 1024,
         }
     }
+}
+
+impl Limits {
+    pub const DEFAULT_HEADER_COUNT: usize = 100;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -172,9 +172,20 @@ impl<'a> ClientRequestWriter<'a> {
 }
 
 pub fn encode_head(request: &Request<'_>, output: &mut [u8]) -> Result<usize, RequestEncodeError> {
+    let mut required_length = 0;
+    encode_head_with_required_length(request, output, &mut required_length)
+}
+
+pub fn encode_head_with_required_length(
+    request: &Request<'_>,
+    output: &mut [u8],
+    required_length: &mut usize,
+) -> Result<usize, RequestEncodeError> {
+    *required_length = 0;
     if request.method.is_empty() || !request.method.iter().copied().all(is_token) {
         return Err(RequestEncodeError::Invalid);
     }
+
     if request.target.is_empty()
         || request
             .target
@@ -186,31 +197,67 @@ pub fn encode_head(request: &Request<'_>, output: &mut [u8]) -> Result<usize, Re
     }
 
     let mut host_count = 0;
+    let mut head_length = request
+        .method
+        .len()
+        .saturating_add(1)
+        .saturating_add(request.target.len())
+        .saturating_add(b" HTTP/1.1\r\n".len())
+        .saturating_add(2);
     for field in request.fields {
         if field.name.is_empty() || !field.name.iter().copied().all(is_token) {
             return Err(RequestEncodeError::InvalidField);
         }
+
         if field.value.iter().any(|byte| {
             *byte == b'\r' || *byte == b'\n' || (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f
         }) {
             return Err(RequestEncodeError::InvalidField);
         }
+
         if field.name.eq_ignore_ascii_case(b"host") {
             if field.value.is_empty() || !crate::request_target::valid_host_field(field.value) {
                 return Err(RequestEncodeError::InvalidField);
             }
             host_count += 1;
         }
+
+        head_length = head_length
+            .saturating_add(field.name.len())
+            .saturating_add(2)
+            .saturating_add(field.value.len())
+            .saturating_add(2);
+
         if field.name.eq_ignore_ascii_case(b"content-length")
             || field.name.eq_ignore_ascii_case(b"transfer-encoding")
         {
             return Err(RequestEncodeError::InvalidFramingField);
         }
     }
+
     match host_count {
         0 => return Err(RequestEncodeError::MissingHost),
         1 => {}
         _ => return Err(RequestEncodeError::DuplicateHost),
+    }
+
+    match request.body {
+        BodyFraming::None => {}
+        BodyFraming::Fixed(length) => {
+            head_length = head_length
+                .saturating_add(b"Content-Length: ".len())
+                .saturating_add(decimal_length(length))
+                .saturating_add(2);
+        }
+        BodyFraming::Chunked => {
+            head_length = head_length.saturating_add(b"Transfer-Encoding: chunked\r\n".len());
+        }
+    }
+
+    *required_length = head_length;
+
+    if output.len() < head_length {
+        return Err(RequestEncodeError::BufferTooSmall);
     }
 
     let mut writer = Writer::new(output);
@@ -224,6 +271,7 @@ pub fn encode_head(request: &Request<'_>, output: &mut [u8]) -> Result<usize, Re
         writer.write(field.value)?;
         writer.write(b"\r\n")?;
     }
+
     match request.body {
         BodyFraming::None => {}
         BodyFraming::Fixed(length) => {
@@ -233,8 +281,18 @@ pub fn encode_head(request: &Request<'_>, output: &mut [u8]) -> Result<usize, Re
         }
         BodyFraming::Chunked => writer.write(b"Transfer-Encoding: chunked\r\n")?,
     }
+
     writer.write(b"\r\n")?;
     Ok(writer.length)
+}
+
+fn decimal_length(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 10 {
+        value /= 10;
+        length += 1;
+    }
+    length
 }
 
 pub fn encode_chunk(chunk: &[u8], output: &mut [u8]) -> Result<usize, RequestEncodeError> {
@@ -250,34 +308,57 @@ pub fn encode_chunk(chunk: &[u8], output: &mut [u8]) -> Result<usize, RequestEnc
 }
 
 pub fn finish_chunks(fields: &[Field<'_>], output: &mut [u8]) -> Result<usize, RequestEncodeError> {
-    let mut writer = Writer::new(output);
-    writer.write(b"0\r\n")?;
-    encode_fields(fields, &mut writer)?;
-    writer.write(b"\r\n")?;
-    Ok(writer.length)
+    let mut required_length = 0;
+    finish_chunks_with_required_length(fields, output, &mut required_length)
 }
 
-fn encode_fields(fields: &[Field<'_>], writer: &mut Writer<'_>) -> Result<(), RequestEncodeError> {
+pub fn finish_chunks_with_required_length(
+    fields: &[Field<'_>],
+    output: &mut [u8],
+    required_length: &mut usize,
+) -> Result<usize, RequestEncodeError> {
+    *required_length = 0;
+    let mut required = b"0\r\n\r\n".len();
     for field in fields {
-        if field.name.is_empty() || !field.name.iter().copied().all(is_token) {
-            return Err(RequestEncodeError::InvalidField);
-        }
-        if field.value.iter().any(|byte| {
-            *byte == b'\r' || *byte == b'\n' || (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f
-        }) {
-            return Err(RequestEncodeError::InvalidField);
-        }
-        if field.name.eq_ignore_ascii_case(b"content-length")
-            || field.name.eq_ignore_ascii_case(b"transfer-encoding")
-            || field.name.eq_ignore_ascii_case(b"host")
-            || field.name.eq_ignore_ascii_case(b"trailer")
-        {
-            return Err(RequestEncodeError::InvalidFramingField);
-        }
+        validate_trailer(field)?;
+        required = required
+            .saturating_add(field.name.len())
+            .saturating_add(2)
+            .saturating_add(field.value.len())
+            .saturating_add(2);
+    }
+    *required_length = required;
+    if output.len() < required {
+        return Err(RequestEncodeError::BufferTooSmall);
+    }
+
+    let mut writer = Writer::new(output);
+    writer.write(b"0\r\n")?;
+    for field in fields {
         writer.write(field.name)?;
         writer.write(b": ")?;
         writer.write(field.value)?;
         writer.write(b"\r\n")?;
+    }
+    writer.write(b"\r\n")?;
+    Ok(writer.length)
+}
+
+fn validate_trailer(field: &Field<'_>) -> Result<(), RequestEncodeError> {
+    if field.name.is_empty() || !field.name.iter().copied().all(is_token) {
+        return Err(RequestEncodeError::InvalidField);
+    }
+    if field.value.iter().any(|byte| {
+        *byte == b'\r' || *byte == b'\n' || (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f
+    }) {
+        return Err(RequestEncodeError::InvalidField);
+    }
+    if field.name.eq_ignore_ascii_case(b"content-length")
+        || field.name.eq_ignore_ascii_case(b"transfer-encoding")
+        || field.name.eq_ignore_ascii_case(b"host")
+        || field.name.eq_ignore_ascii_case(b"trailer")
+    {
+        return Err(RequestEncodeError::InvalidFramingField);
     }
     Ok(())
 }
@@ -379,6 +460,46 @@ mod tests {
         }];
         let length = finish_chunks(&trailers, &mut output).unwrap();
         assert_eq!(&output[..length], b"0\r\nDigest: sha-256=abc\r\n\r\n");
+    }
+
+    #[test]
+    fn reports_required_head_capacity_without_partial_output() {
+        let fields = [Field {
+            name: b"Host",
+            value: b"example.test",
+        }];
+        let request = Request {
+            method: b"POST",
+            target: b"/items",
+            fields: &fields,
+            body: BodyFraming::Fixed(12345),
+        };
+        let mut output = [0xaa; 4];
+        let mut required_length = 0;
+
+        assert_eq!(
+            encode_head_with_required_length(&request, &mut output, &mut required_length),
+            Err(RequestEncodeError::BufferTooSmall)
+        );
+        assert_eq!(required_length, 67);
+        assert_eq!(output, [0xaa; 4]);
+    }
+
+    #[test]
+    fn reports_required_trailer_capacity_without_partial_output() {
+        let trailers = [Field {
+            name: b"Digest",
+            value: b"sha-256=abc",
+        }];
+        let mut output = [0xaa; 4];
+        let mut required_length = 0;
+
+        assert_eq!(
+            finish_chunks_with_required_length(&trailers, &mut output, &mut required_length),
+            Err(RequestEncodeError::BufferTooSmall)
+        );
+        assert_eq!(required_length, b"0\r\nDigest: sha-256=abc\r\n\r\n".len());
+        assert_eq!(output, [0xaa; 4]);
     }
 
     #[test]

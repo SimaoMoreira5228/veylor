@@ -76,6 +76,7 @@ impl<'a> ClientResponse<'a> {
                             consumed: 0,
                         });
                     }
+                    Err(ParseError::HeaderCapacity) => return Err(ParseError::HeaderCapacity),
                     Err(error) => return self.fail(error),
                 };
                 match head.kind {
@@ -108,6 +109,7 @@ impl<'a> ClientResponse<'a> {
             State::Body { decoder, reusable } => {
                 let progress = match decoder.next(input, eof, trailers, limits) {
                     Ok(progress) => progress,
+                    Err(ParseError::HeaderCapacity) => return Err(ParseError::HeaderCapacity),
                     Err(error) => return self.fail(error),
                 };
                 if progress.event == Some(BodyEvent::Complete) {
@@ -146,8 +148,26 @@ impl<'a> ClientResponse<'a> {
         self.reusable && matches!(self.state, State::Complete)
     }
 
+    pub fn is_complete(&self) -> bool {
+        matches!(self.state, State::Complete)
+    }
+
     pub fn is_upgraded(&self) -> bool {
         matches!(self.state, State::Upgrade)
+    }
+
+    pub fn required_header_capacity(&self) -> usize {
+        if matches!(self.state, State::Head) {
+            return self.parser.required_header_capacity();
+        }
+        0
+    }
+
+    pub fn required_trailer_capacity(&self) -> usize {
+        if let State::Body { decoder, .. } = &self.state {
+            return decoder.required_trailer_capacity();
+        }
+        0
     }
 
     pub fn cancel(&mut self) {

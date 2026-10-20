@@ -66,6 +66,7 @@ pub struct BodyDecoder {
     pending_length: usize,
     trailer_base: *mut Header,
     trailer_count: usize,
+    required_trailer_count: usize,
     body_limits: BodyLimits,
     trailer_policy: TrailerPolicy,
     decoded_bytes: u64,
@@ -93,6 +94,7 @@ impl BodyDecoder {
             pending_length: 0,
             trailer_base: core::ptr::null_mut(),
             trailer_count: 0,
+            required_trailer_count: 0,
             body_limits,
             trailer_policy: TrailerPolicy::Response,
             decoded_bytes: 0,
@@ -124,6 +126,7 @@ impl BodyDecoder {
         trailers: &mut [Header],
         limits: Limits,
     ) -> Result<BodyProgress, ParseError> {
+        self.required_trailer_count = 0;
         if let State::Error(error) = self.state {
             return Err(error);
         }
@@ -131,6 +134,7 @@ impl BodyDecoder {
             return self.fail(ParseError::BufferChanged);
         }
         if trailers.len() < self.trailer_count {
+            self.required_trailer_count = self.trailer_count;
             return Err(ParseError::HeaderCapacity);
         }
         if self.trailer_count > 0 && self.trailer_base != trailers.as_mut_ptr() {
@@ -285,6 +289,7 @@ impl BodyDecoder {
                         return self.fail(ParseError::HeaderSectionTooLarge);
                     }
                     if self.trailer_count >= trailers.len() {
+                        self.required_trailer_count = self.trailer_count.saturating_add(1);
                         return Err(ParseError::HeaderCapacity);
                     }
                     let Some(colon) = line.iter().position(|byte| *byte == b':') else {
@@ -357,6 +362,10 @@ impl BodyDecoder {
                 State::Error(error) => return Err(error),
             }
         }
+    }
+
+    pub(crate) fn required_trailer_capacity(&self) -> usize {
+        self.required_trailer_count
     }
 
     fn read_line<'a>(

@@ -23,7 +23,8 @@ pub use request_head::{Header, Limits, ParseError, Parser, RequestHead, Span};
 pub use request_target::TargetForm;
 pub use request_write::{
     BodyFraming, ClientRequestWriter, Field, Request, RequestEncodeError, encode_chunk,
-    encode_head, finish_chunks,
+    encode_head, encode_head_with_required_length, finish_chunks,
+    finish_chunks_with_required_length,
 };
 pub use response_head::{
     RequestMethod as ResponseRequestMethod, ResponseBody, ResponseHead, ResponseKind,
