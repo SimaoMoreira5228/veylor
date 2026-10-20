@@ -1,0 +1,98 @@
+use crate::fields::ConnectionOptions;
+use crate::request_target::TargetForm;
+
+mod parser;
+#[cfg(test)]
+mod tests;
+
+pub use parser::Parser;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Span {
+    pub offset: usize,
+    pub length: usize,
+}
+
+impl Span {
+    fn end(self) -> Option<usize> {
+        self.offset.checked_add(self.length)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Header {
+    pub name: Span,
+    pub value: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestHead {
+    pub method: Span,
+    pub target: Span,
+    pub target_form: TargetForm,
+    pub authority: Span,
+    pub version: Span,
+    pub header_count: usize,
+    pub length: usize,
+    pub content_length: Option<u64>,
+    pub is_chunked: bool,
+    pub expect_continue: bool,
+    pub connection: ConnectionOptions,
+}
+
+impl RequestHead {
+    pub fn method(self, input: &[u8]) -> Option<&[u8]> {
+        slice_at(input, self.method)
+    }
+
+    pub fn target(self, input: &[u8]) -> Option<&[u8]> {
+        slice_at(input, self.target)
+    }
+
+    pub fn version(self, input: &[u8]) -> Option<&[u8]> {
+        slice_at(input, self.version)
+    }
+}
+
+pub(super) fn slice_at(input: &[u8], span: Span) -> Option<&[u8]> {
+    input.get(span.offset..span.end()?)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Limits {
+    pub request_line_bytes: usize,
+    pub header_bytes: usize,
+    pub header_count: usize,
+    pub field_name_bytes: usize,
+    pub field_value_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            request_line_bytes: 8 * 1024,
+            header_bytes: 32 * 1024,
+            header_count: 100,
+            field_name_bytes: 256,
+            field_value_bytes: 8 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseError {
+    Invalid,
+    RequestLineTooLarge,
+    StatusLineTooLarge,
+    HeaderSectionTooLarge,
+    HeaderCapacity,
+    BufferChanged,
+    ExpectationFailed,
+    Incomplete,
+    Cancelled,
+    BodyTooLarge,
+    AdmissionPending,
+    BodyRejected,
+}

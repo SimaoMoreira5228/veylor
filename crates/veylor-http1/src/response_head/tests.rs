@@ -53,6 +53,26 @@ fn parses_response_head_and_selects_body_framing() {
 }
 
 #[test]
+fn resumes_after_caller_header_storage_grows() {
+    let input = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Test: yes\r\n\r\n";
+    let mut parser = ResponseParser::new(RequestMethod::Other, b"");
+    let mut storage = [Header::default(); 2];
+
+    assert_eq!(
+        parser.parse(input, &mut storage[..1], Limits::default()),
+        Err(ParseError::HeaderCapacity)
+    );
+    assert_eq!(parser.required_header_capacity(), 2);
+    let head = parser
+        .parse(input, &mut storage, Limits::default())
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(head.header_count, 2);
+    assert_eq!(head.body, ResponseBody::Fixed(5));
+}
+
+#[test]
 fn honors_no_body_and_upgrade_response_rules() {
     let (head, _) = parse_all(
         b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n",
@@ -137,6 +157,23 @@ fn parses_incremental_heads_and_advances_past_informational_response() {
     assert_eq!(second.end_offset, bytes.len());
     assert_eq!(second.kind, ResponseKind::Final);
     assert_eq!(second.body, ResponseBody::None);
+}
+
+#[test]
+fn refuses_to_advance_past_a_final_response_head() {
+    let input = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata";
+    let mut parser = ResponseParser::new(RequestMethod::Other, b"");
+    let mut headers = [Header::default(); 2];
+    let head = parser
+        .parse(input, &mut headers, Limits::default())
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(head.kind, ResponseKind::Final);
+    assert_eq!(
+        parser.advance(input, head.end_offset),
+        Err(ParseError::Invalid)
+    );
 }
 
 #[test]

@@ -130,6 +130,10 @@ impl<'a> ResponseParser<'a> {
         *self = Self::new(self.request_method, self.requested_upgrade);
     }
 
+    pub fn required_header_capacity(&self) -> usize {
+        self.header_count + usize::from(self.field_value_start.is_some())
+    }
+
     pub fn parse(
         &mut self,
         input: &[u8],
@@ -223,6 +227,7 @@ impl<'a> ResponseParser<'a> {
                         return self.fail(ParseError::HeaderSectionTooLarge);
                     }
                     if self.header_count >= headers.len() {
+                        self.scan_offset = self.line_start;
                         return Err(ParseError::HeaderCapacity);
                     }
                     let line = &input[self.line_start..line_end];
@@ -360,7 +365,10 @@ impl<'a> ResponseParser<'a> {
     }
 
     pub fn advance(&mut self, input: &[u8], next_offset: usize) -> Result<(), ParseError> {
-        if self.state != State::Ready || next_offset != self.head_end {
+        if self.state != State::Ready
+            || next_offset != self.head_end
+            || self.response_head().kind != ResponseKind::Informational
+        {
             return Err(ParseError::Invalid);
         }
         if input.as_ptr() != self.input_base || input.len() < self.input_length {

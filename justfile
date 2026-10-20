@@ -49,3 +49,10 @@ integration-abi-linux:
 		tests/abi_h2_followup.c tests/abi_h2_protocol.c \
 		-Lbuild -lveylor -o build/test-abi-static-server
 	LD_LIBRARY_PATH=build build/test-abi-static-server
+
+integration-rust-ffi-linux:
+	cargo build -p veylor-ffi
+	clang {{ABI_CFLAGS}} -Iinclude tests/rust_ffi_http1.c \
+		-Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
+		-o build/test-rust-ffi-http1
+	build/test-rust-ffi-http1

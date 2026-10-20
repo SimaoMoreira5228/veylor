@@ -1,7 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/veylor-http1", "crates/veylor-router", "crates/veylor-runtime"]
+members = [
+    "crates/veylor-ffi",
+    "crates/veylor-http1",
+    "crates/veylor-router",
+    "crates/veylor-runtime",
+]
 default-members = [
+    "crates/veylor-ffi",
     "crates/veylor-http1",
     "crates/veylor-router",
     "crates/veylor-runtime",
@@ -13,7 +19,8 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
