@@ -1,7 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/veylor-http1", "crates/veylor-router"]
-default-members = ["crates/veylor-http1", "crates/veylor-router"]
+members = ["crates/veylor-http1", "crates/veylor-router", "crates/veylor-runtime"]
+default-members = [
+    "crates/veylor-http1",
+    "crates/veylor-router",
+    "crates/veylor-runtime",
+]
 
 [workspace.package]
 edition = "2024"
