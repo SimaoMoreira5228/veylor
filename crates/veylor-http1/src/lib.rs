@@ -14,8 +14,8 @@ pub use client_response::{ClientResponse, ClientResponseEvent, ClientResponsePro
 pub use connection::{
     BodyDriver, BodyEvent as ConnectionBodyEvent, BodyResult, BodyState, ClientReadEvent,
     ClientReadResult, ClientReadState, ClientRequestDriver, ClientResponseDriver, HeadDriver,
-    HeadEvent, HeadResult, HeadState, IoCompletion, IoOperation, IoResult, WriteDriver, WriteEvent,
-    WriteResult, WriteState,
+    HeadEvent, HeadResult, HeadState, IoCompletion, IoOperation, IoResult, ResponseWriteDriver,
+    WriteDriver, WriteEvent, WriteResult, WriteState,
 };
 pub use fields::{ConnectionOptions, is_token};
 pub use request_body::{RequestBodyAdmission, RequestBodyDecoder};

@@ -2,6 +2,7 @@ mod body;
 mod client_request;
 mod client_response;
 mod head;
+mod response_write;
 mod transport;
 mod write;
 
@@ -11,6 +12,7 @@ pub use client_response::{
     ClientReadEvent, ClientReadResult, ClientReadState, ClientResponseDriver,
 };
 pub use head::{HeadDriver, HeadEvent, HeadResult, HeadState};
+pub use response_write::ResponseWriteDriver;
 pub use transport::{IoCompletion, IoOperation, IoResult};
 pub use write::{WriteDriver, WriteEvent, WriteResult, WriteState};
 
