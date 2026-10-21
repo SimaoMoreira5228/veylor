@@ -34,4 +34,5 @@ pub use response_write::{
     ConnectionHeader, EncodedResponseHead, FixedResponseBodyWriter, ResponseEncodeError,
     ResponseFraming, ResponseToWrite, ResponseWriteCursor, connection_header_for_response,
     encode_response_chunk, encode_response_final_chunk, encode_response_head,
+    encode_response_head_with_required_length,
 };

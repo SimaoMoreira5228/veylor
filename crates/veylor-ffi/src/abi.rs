@@ -2,6 +2,20 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use veylor_http1::{Header, Span};
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VylBytes {
+    pub data: *const u8,
+    pub length: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VylField {
+    pub name: VylBytes,
+    pub value: VylBytes,
+}
+
 pub type VylSpan = Span;
 pub type VylHeader = Header;
 
@@ -19,6 +33,7 @@ pub enum VylResult {
     BodyTooLong = 8,
     BadState = 9,
     WriteOverrun = 10,
+    Cancelled = 11,
 }
 
 pub fn catch_ffi(call: impl FnOnce() -> VylResult) -> VylResult {

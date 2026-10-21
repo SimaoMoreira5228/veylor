@@ -1,8 +1,15 @@
 use std::boxed::Box;
 use std::ptr;
+use std::slice;
 
-use crate::abi::{VylHeader, VylResult, VylSpan, catch_ffi, slice_length_valid};
-use veylor_http1::{Limits, Parser, RequestHead, TargetForm};
+use crate::abi::{
+    VylBytes, VylField, VylHeader, VylResult, VylSpan, catch_ffi, slice_length_valid,
+};
+use veylor_http1::{
+    ConnectionHeader, Limits, Parser, RequestHead, ResponseEncodeError, ResponseFraming,
+    ResponseToWrite, TargetForm, connection_header_for_response,
+    encode_response_head_with_required_length,
+};
 
 pub const VYL_HTTP1_HAS_CONTENT_LENGTH: u32 = 1;
 pub const VYL_HTTP1_CHUNKED: u32 = 2;
@@ -37,12 +44,40 @@ pub enum VylTargetForm {
 
 pub struct VylServerConnection {
     parser: Parser,
+    request: Option<RequestHead>,
+    input_base: *const u8,
+    headers_base: *const VylHeader,
+    response_started: bool,
+}
+
+struct ServerResponseHeadArguments {
+    input: *const u8,
+    input_length: usize,
+    request_headers: *const VylHeader,
+    request_header_capacity: usize,
+    status: u16,
+    reason: VylBytes,
+    fields: *const VylField,
+    field_count: usize,
+    framing: u32,
+    content_length: u64,
+    request_body_complete: u32,
+    response_close: u32,
+    output: *mut u8,
+    output_capacity: usize,
+    out_written: *mut usize,
+    out_body_allowed: *mut u32,
+    out_required: *mut usize,
 }
 
 impl VylServerConnection {
     fn new() -> Self {
         Self {
             parser: Parser::new(),
+            request: None,
+            input_base: core::ptr::null(),
+            headers_base: core::ptr::null(),
+            response_started: false,
         }
     }
 }
@@ -140,6 +175,9 @@ unsafe fn parse_request_head(
         unsafe { std::slice::from_raw_parts_mut(headers, header_capacity) }
     };
     let connection = unsafe { &mut *connection };
+    if connection.response_started {
+        return VylResult::BadState;
+    }
 
     let parsed = match connection.parser.parse(input, headers, Limits::default()) {
         Ok(Some(head)) => head,
@@ -161,10 +199,264 @@ unsafe fn parse_request_head(
         return VylResult::BufferTooSmall;
     }
 
+    connection.request = Some(parsed);
+    connection.input_base = input.as_ptr();
+    connection.headers_base = headers.as_ptr();
+    connection.response_started = false;
+
     unsafe {
         out_head.write(to_ffi_head(parsed));
     }
     VylResult::Ok
+}
+
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_http1_server_connection_encode_response_head(
+    connection: *mut VylServerConnection,
+    input: *const u8,
+    input_length: usize,
+    request_headers: *const VylHeader,
+    request_header_capacity: usize,
+    status: u16,
+    reason: VylBytes,
+    fields: *const VylField,
+    field_count: usize,
+    framing: u32,
+    content_length: u64,
+    request_body_complete: u32,
+    response_close: u32,
+    output: *mut u8,
+    output_capacity: usize,
+    out_written: *mut usize,
+    out_body_allowed: *mut u32,
+    out_required: *mut usize,
+) -> VylResult {
+    let arguments = ServerResponseHeadArguments {
+        input,
+        input_length,
+        request_headers,
+        request_header_capacity,
+        status,
+        reason,
+        fields,
+        field_count,
+        framing,
+        content_length,
+        request_body_complete,
+        response_close,
+        output,
+        output_capacity,
+        out_written,
+        out_body_allowed,
+        out_required,
+    };
+    catch_ffi(|| unsafe { encode_response_head(connection, arguments) })
+}
+
+unsafe fn encode_response_head(
+    connection: *mut VylServerConnection,
+    arguments: ServerResponseHeadArguments,
+) -> VylResult {
+    let ServerResponseHeadArguments {
+        input,
+        input_length,
+        request_headers,
+        request_header_capacity,
+        status,
+        reason,
+        fields,
+        field_count,
+        framing,
+        content_length,
+        request_body_complete,
+        response_close,
+        output,
+        output_capacity,
+        out_written,
+        out_body_allowed,
+        out_required,
+    } = arguments;
+    if connection.is_null()
+        || (input.is_null() && input_length != 0)
+        || (request_headers.is_null() && request_header_capacity != 0)
+        || (fields.is_null() && field_count != 0)
+        || (output.is_null() && output_capacity != 0)
+        || out_written.is_null()
+        || out_body_allowed.is_null()
+        || out_required.is_null()
+        || request_body_complete > 1
+        || response_close > 1
+        || !slice_length_valid::<u8>(input_length)
+        || !slice_length_valid::<VylHeader>(request_header_capacity)
+        || !slice_length_valid::<VylField>(field_count)
+        || !slice_length_valid::<u8>(output_capacity)
+    {
+        return VylResult::InvalidArgument;
+    }
+
+    unsafe {
+        out_written.write(0);
+        out_body_allowed.write(0);
+        out_required.write(0);
+    }
+    if field_count > Limits::DEFAULT_HEADER_COUNT {
+        return VylResult::Capacity;
+    }
+
+    let connection = unsafe { &mut *connection };
+    let Some(request) = connection.request else {
+        return VylResult::BadState;
+    };
+    if connection.response_started
+        || input != connection.input_base
+        || input_length < request.length
+        || request_headers != connection.headers_base
+    {
+        return VylResult::BadState;
+    }
+    if request_header_capacity < request.header_count {
+        unsafe {
+            out_required.write(request.header_count);
+        }
+        return VylResult::BufferTooSmall;
+    }
+
+    let input = if input_length == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_length) }
+    };
+    let request_headers = if request.header_count == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(request_headers, request.header_count) }
+    };
+    let mut requested_upgrade = &[][..];
+    let mut upgrade_seen = false;
+    for header in request_headers {
+        let Some(name) = slice_for_span(input, header.name) else {
+            return VylResult::ProtocolError;
+        };
+        let Some(value) = slice_for_span(input, header.value) else {
+            return VylResult::ProtocolError;
+        };
+        if name.eq_ignore_ascii_case(b"upgrade") {
+            if upgrade_seen {
+                return VylResult::InvalidArgument;
+            }
+            requested_upgrade = value;
+            upgrade_seen = true;
+        }
+    }
+    if status == 101 && (!request.connection.upgrade || !upgrade_seen) {
+        return VylResult::InvalidArgument;
+    }
+
+    let method = request.method(input).ok_or(VylResult::ProtocolError);
+    let method = match method {
+        Ok(method) => method,
+        Err(error) => return error,
+    };
+    let reason = match unsafe { read_bytes(reason) } {
+        Ok(reason) => reason,
+        Err(error) => return error,
+    };
+    let fields = if field_count == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(fields, field_count) }
+    };
+    let empty_field = veylor_http1::Field {
+        name: &[],
+        value: &[],
+    };
+    let mut response_fields = [empty_field; Limits::DEFAULT_HEADER_COUNT];
+    for (destination, field) in response_fields.iter_mut().zip(fields) {
+        let name = match unsafe { read_bytes(field.name) } {
+            Ok(name) => name,
+            Err(error) => return error,
+        };
+        let value = match unsafe { read_bytes(field.value) } {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        *destination = veylor_http1::Field { name, value };
+    }
+
+    let framing = match framing {
+        0 => ResponseFraming::FixedLength,
+        1 => ResponseFraming::Chunked,
+        2 => ResponseFraming::CloseDelimited,
+        _ => return VylResult::InvalidArgument,
+    };
+    let connection_header = if status == 101 {
+        ConnectionHeader::Upgrade
+    } else {
+        connection_header_for_response(
+            request,
+            input,
+            status,
+            framing,
+            request_body_complete != 0,
+            response_close != 0,
+        )
+    };
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade,
+        status,
+        reason,
+        fields: &response_fields[..field_count],
+        framing,
+        content_length,
+        connection: connection_header,
+    };
+    let output = if output_capacity == 0 {
+        &mut []
+    } else {
+        unsafe { slice::from_raw_parts_mut(output, output_capacity) }
+    };
+    let mut required = 0;
+    match encode_response_head_with_required_length(&response, output, &mut required) {
+        Ok(encoded) => {
+            connection.response_started = true;
+            unsafe {
+                out_written.write(encoded.length);
+                out_body_allowed.write(u32::from(encoded.body_allowed));
+                out_required.write(required);
+            }
+            VylResult::Ok
+        }
+        Err(ResponseEncodeError::BufferTooSmall) => {
+            unsafe {
+                out_required.write(required);
+            }
+            VylResult::BufferTooSmall
+        }
+        Err(_) => VylResult::InvalidArgument,
+    }
+}
+
+fn slice_for_span(input: &[u8], span: veylor_http1::Span) -> Option<&[u8]> {
+    input.get(span.offset..span.offset.checked_add(span.length)?)
+}
+
+unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
+    if (bytes.data.is_null() && bytes.length != 0) || !slice_length_valid::<u8>(bytes.length) {
+        return Err(VylResult::InvalidArgument);
+    }
+    if bytes.length == 0 {
+        return Ok(&[]);
+    }
+    Ok(unsafe { slice::from_raw_parts(bytes.data, bytes.length) })
 }
 
 
@@ -185,6 +477,10 @@ unsafe fn reset_connection(connection: *mut VylServerConnection) -> VylResult {
 
     let connection = unsafe { &mut *connection };
     connection.parser.reset();
+    connection.request = None;
+    connection.input_base = core::ptr::null();
+    connection.headers_base = core::ptr::null();
+    connection.response_started = false;
     VylResult::Ok
 }
 

@@ -7,20 +7,6 @@ mod response_read;
 
 use veylor_http1::ClientResponse;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct VylBytes {
-    pub data: *const u8,
-    pub length: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct VylField {
-    pub name: VylBytes,
-    pub value: VylBytes,
-}
-
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VylRequestMethod {
@@ -115,7 +101,7 @@ pub use api::{
 pub use response_read::vyl_http1_client_connection_read_response;
 
 pub use request_write::{
-    vyl_http1_client_connection_advance_request_write,
+    vyl_http1_client_connection_advance_request_write, vyl_http1_client_connection_cancel,
     vyl_http1_client_connection_encode_request_body,
     vyl_http1_client_connection_encode_request_head,
     vyl_http1_client_connection_finish_request_body,

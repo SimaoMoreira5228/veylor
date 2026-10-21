@@ -21,9 +21,15 @@ pub struct RequestBodyDecoder<'a> {
     decoder: BodyDecoder,
     request_input: &'a [u8],
     request_headers: &'a [Header],
-    permitted_trailers: &'a [&'a [u8]],
+    permitted_trailers: PermittedTrailers<'a>,
     admission: AdmissionState,
     failure: Option<ParseError>,
+}
+
+#[derive(Clone, Copy)]
+enum PermittedTrailers<'a> {
+    Slices(&'a [&'a [u8]]),
+    Spans { data: &'a [u8], spans: &'a [Span] },
 }
 
 impl<'a> RequestBodyDecoder<'a> {
@@ -32,6 +38,42 @@ impl<'a> RequestBodyDecoder<'a> {
         request_input: &'a [u8],
         request_headers: &'a [Header],
         permitted_trailers: &'a [&'a [u8]],
+        limits: BodyLimits,
+    ) -> Result<Self, ParseError> {
+        Self::new_with_allowlist(
+            request,
+            request_input,
+            request_headers,
+            PermittedTrailers::Slices(permitted_trailers),
+            limits,
+        )
+    }
+
+    pub fn new_with_trailer_spans(
+        request: RequestHead,
+        request_input: &'a [u8],
+        request_headers: &'a [Header],
+        trailer_name_data: &'a [u8],
+        permitted_trailers: &'a [Span],
+        limits: BodyLimits,
+    ) -> Result<Self, ParseError> {
+        Self::new_with_allowlist(
+            request,
+            request_input,
+            request_headers,
+            PermittedTrailers::Spans {
+                data: trailer_name_data,
+                spans: permitted_trailers,
+            },
+            limits,
+        )
+    }
+
+    fn new_with_allowlist(
+        request: RequestHead,
+        request_input: &'a [u8],
+        request_headers: &'a [Header],
+        permitted_trailers: PermittedTrailers<'a>,
         limits: BodyLimits,
     ) -> Result<Self, ParseError> {
         if request.content_length.is_some() && request.is_chunked {
@@ -44,11 +86,7 @@ impl<'a> RequestBodyDecoder<'a> {
             field(request_input, header.name).ok_or(ParseError::Invalid)?;
             field(request_input, header.value).ok_or(ParseError::Invalid)?;
         }
-        for name in permitted_trailers {
-            if name.is_empty() || !name.iter().copied().all(is_token) {
-                return Err(ParseError::Invalid);
-            }
-        }
+        permitted_trailers.validate()?;
         if request
             .content_length
             .is_some_and(|length| length > limits.total_body_bytes)
@@ -112,6 +150,7 @@ impl<'a> RequestBodyDecoder<'a> {
         }
         let progress = match self.decoder.next(input, eof, trailers, limits) {
             Ok(progress) => progress,
+            Err(ParseError::HeaderCapacity) => return Err(ParseError::HeaderCapacity),
             Err(error) => return self.fail(error),
         };
         if let Some(BodyEvent::Trailers { count }) = progress.event {
@@ -122,11 +161,7 @@ impl<'a> RequestBodyDecoder<'a> {
                 let Some(name) = field(input, trailer.name) else {
                     return self.fail(ParseError::Invalid);
                 };
-                if !self
-                    .permitted_trailers
-                    .iter()
-                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
-                {
+                if !self.permitted_trailers.contains(name) {
                     return self.fail(ParseError::Invalid);
                 }
                 if let Err(error) = self.reject_connection_nominated(name) {
@@ -135,6 +170,10 @@ impl<'a> RequestBodyDecoder<'a> {
             }
         }
         Ok(progress)
+    }
+
+    pub fn required_trailer_capacity(&self) -> usize {
+        self.decoder.required_trailer_capacity()
     }
 
     fn reject_connection_nominated(&self, trailer_name: &[u8]) -> Result<(), ParseError> {
@@ -155,6 +194,43 @@ impl<'a> RequestBodyDecoder<'a> {
         self.failure = Some(error);
         Err(error)
     }
+}
+
+impl PermittedTrailers<'_> {
+    fn validate(self) -> Result<(), ParseError> {
+        match self {
+            Self::Slices(names) => {
+                for name in names {
+                    validate_trailer_name(name)?;
+                }
+            }
+            Self::Spans { data, spans } => {
+                for span in spans {
+                    let name = field(data, *span).ok_or(ParseError::Invalid)?;
+                    validate_trailer_name(name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn contains(self, name: &[u8]) -> bool {
+        match self {
+            Self::Slices(names) => names
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed)),
+            Self::Spans { data, spans } => spans.iter().any(|span| {
+                field(data, *span).is_some_and(|allowed| name.eq_ignore_ascii_case(allowed))
+            }),
+        }
+    }
+}
+
+fn validate_trailer_name(name: &[u8]) -> Result<(), ParseError> {
+    if name.is_empty() || !name.iter().copied().all(is_token) {
+        return Err(ParseError::Invalid);
+    }
+    Ok(())
 }
 
 fn field(input: &[u8], span: Span) -> Option<&[u8]> {

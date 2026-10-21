@@ -332,3 +332,134 @@ fn rejects_prohibited_request_trailer_fields() {
         Err(ParseError::Invalid)
     );
 }
+
+#[test]
+fn matches_borrowed_trailer_name_spans_without_copying() {
+    let request = b"POST /upload HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let (head, headers) = parse_request(request);
+    let allowed_names = b"Digest";
+    let allowed_spans = [Span {
+        offset: 0,
+        length: allowed_names.len(),
+    }];
+    let mut decoder = RequestBodyDecoder::new_with_trailer_spans(
+        head,
+        request,
+        &headers[..head.header_count],
+        allowed_names,
+        &allowed_spans,
+        BodyLimits::default(),
+    )
+    .unwrap();
+    admit_body(&mut decoder);
+    let mut trailers = [Header::default(); 1];
+
+    decoder
+        .next(b"0\r\n", false, &mut trailers, Limits::default())
+        .unwrap();
+    let progress = decoder
+        .next(
+            b"Digest: ok\r\n\r\n",
+            false,
+            &mut trailers,
+            Limits::default(),
+        )
+        .unwrap();
+    assert_eq!(progress.event, None);
+    let progress = decoder
+        .next(
+            b"Digest: ok\r\n\r\n",
+            false,
+            &mut trailers,
+            Limits::default(),
+        )
+        .unwrap();
+
+    assert_eq!(progress.event, Some(BodyEvent::Trailers { count: 1 }));
+}
+
+#[test]
+fn retries_trailer_capacity_after_reporting_required_count() {
+    let request = b"POST /upload HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let (head, headers) = parse_request(request);
+    let allowed_names = b"Digest";
+    let allowed_spans = [Span {
+        offset: 0,
+        length: allowed_names.len(),
+    }];
+    let mut decoder = RequestBodyDecoder::new_with_trailer_spans(
+        head,
+        request,
+        &headers[..head.header_count],
+        allowed_names,
+        &allowed_spans,
+        BodyLimits::default(),
+    )
+    .unwrap();
+    admit_body(&mut decoder);
+    let mut no_trailers = [];
+
+    let framing = decoder
+        .next(
+            b"0\r\nDigest: ok\r\n\r\n",
+            false,
+            &mut no_trailers,
+            Limits::default(),
+        )
+        .unwrap();
+    assert_eq!(framing.consumed, 3);
+
+    assert_eq!(
+        decoder.next(
+            b"Digest: ok\r\n\r\n",
+            false,
+            &mut no_trailers,
+            Limits::default(),
+        ),
+        Err(ParseError::HeaderCapacity)
+    );
+    assert_eq!(decoder.required_trailer_capacity(), 1);
+
+    let mut trailers = [Header::default(); 1];
+    let progress = decoder
+        .next(
+            b"Digest: ok\r\n\r\n",
+            false,
+            &mut trailers,
+            Limits::default(),
+        )
+        .unwrap();
+    assert_eq!(progress.event, None);
+    let progress = decoder
+        .next(
+            b"Digest: ok\r\n\r\n",
+            false,
+            &mut trailers,
+            Limits::default(),
+        )
+        .unwrap();
+    assert_eq!(progress.event, Some(BodyEvent::Trailers { count: 1 }));
+}
+
+#[test]
+fn rejects_invalid_borrowed_trailer_name_spans() {
+    let request = b"POST /upload HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let (head, headers) = parse_request(request);
+    let allowed_spans = [Span {
+        offset: 1,
+        length: 2,
+    }];
+
+    assert_eq!(
+        RequestBodyDecoder::new_with_trailer_spans(
+            head,
+            request,
+            &headers[..head.header_count],
+            b"x",
+            &allowed_spans,
+            BodyLimits::default(),
+        )
+        .err(),
+        Some(ParseError::Invalid)
+    );
+}

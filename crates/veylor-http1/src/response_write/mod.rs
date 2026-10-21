@@ -225,9 +225,20 @@ pub fn encode_response_head(
     response: &ResponseToWrite<'_>,
     output: &mut [u8],
 ) -> Result<EncodedResponseHead, ResponseEncodeError> {
+    let mut required_length = 0;
+    encode_response_head_with_required_length(response, output, &mut required_length)
+}
+
+pub fn encode_response_head_with_required_length(
+    response: &ResponseToWrite<'_>,
+    output: &mut [u8],
+    required_length: &mut usize,
+) -> Result<EncodedResponseHead, ResponseEncodeError> {
+    *required_length = 0;
     validate_response(response)?;
 
     let required = response_head_length(response)?;
+    *required_length = required;
     if required > output.len() {
         return Err(ResponseEncodeError::BufferTooSmall);
     }

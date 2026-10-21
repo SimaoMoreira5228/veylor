@@ -96,6 +96,9 @@ unsafe fn reset_connection(connection: *mut VylClientConnection) -> VylResult {
     }
 
     let connection = unsafe { &mut *connection };
+    if connection.request_writer == super::request_write::RequestWriteState::Cancelled {
+        return VylResult::Cancelled;
+    }
     if connection.response.is_upgraded()
         || (connection.response_started && !connection.response.is_complete())
         || (connection.request_writer == super::request_write::RequestWriteState::Complete

@@ -125,6 +125,7 @@ unsafe fn read_response(
             .next(input, eof != 0, headers, trailers, Limits::default())
         {
             Ok(progress) => progress,
+            Err(veylor_http1::ParseError::Cancelled) => return VylResult::Cancelled,
             Err(veylor_http1::ParseError::HeaderCapacity) => {
                 unsafe {
                     out_headers_required.write(connection.response.required_header_capacity());

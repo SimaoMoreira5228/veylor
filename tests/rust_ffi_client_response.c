@@ -374,7 +374,96 @@ static void test_client_response_reads(void) {
     assert(vyl_http1_client_connection_destroy(connection) == VYL_HTTP1_OK);
 }
 
+static void test_client_cancel_is_terminal(void) {
+    static const uint8_t partial_response[] = "HTTP/1.1 200 OK\r\nContent-Len";
+    static const uint8_t method[] = "POST";
+    static const uint8_t target[] = "/upload";
+    static const uint8_t host_name[] = "Host";
+    static const uint8_t host_value[] = "example.test";
+    vyl_client_connection* connection = NULL;
+    vyl_http1_header headers[4] = {0};
+    vyl_http1_header trailers[4] = {0};
+    vyl_http1_client_read_event event = {0};
+    size_t headers_required = 0;
+    size_t trailers_required = 0;
+    vyl_http1_field fields[] = {{
+        .name = {.data = host_name, .length = sizeof(host_name) - 1},
+        .value = {.data = host_value, .length = sizeof(host_value) - 1},
+    }};
+    uint8_t output[128];
+    size_t written = 0;
+    size_t required = 0;
+    size_t pending = 0;
+
+    assert(
+        vyl_http1_client_connection_new(VYL_HTTP1_REQUEST_OTHER, NULL, 0, &connection) ==
+        VYL_HTTP1_OK
+    );
+    assert(
+        vyl_http1_client_connection_read_response(
+            connection,
+            partial_response,
+            sizeof(partial_response) - 1,
+            0,
+            headers,
+            4,
+            trailers,
+            4,
+            &event,
+            &headers_required,
+            &trailers_required
+        ) == VYL_HTTP1_NEED_MORE
+    );
+    assert(vyl_http1_client_connection_cancel(connection) == VYL_HTTP1_OK);
+    assert(
+        vyl_http1_client_connection_read_response(
+            connection,
+            partial_response,
+            sizeof(partial_response) - 1,
+            0,
+            headers,
+            4,
+            trailers,
+            4,
+            &event,
+            &headers_required,
+            &trailers_required
+        ) == VYL_HTTP1_CANCELLED
+    );
+    assert(vyl_http1_client_connection_reset(connection) == VYL_HTTP1_CANCELLED);
+    assert(vyl_http1_client_connection_destroy(connection) == VYL_HTTP1_OK);
+
+    connection = NULL;
+    assert(
+        vyl_http1_client_connection_new(VYL_HTTP1_REQUEST_OTHER, NULL, 0, &connection) ==
+        VYL_HTTP1_OK
+    );
+    assert(
+        vyl_http1_client_connection_encode_request_head(
+            connection,
+            (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
+            (vyl_http1_bytes){.data = target, .length = sizeof(target) - 1},
+            fields,
+            1,
+            VYL_HTTP1_REQUEST_BODY_FIXED,
+            5,
+            output,
+            sizeof(output),
+            &written,
+            &required
+        ) == VYL_HTTP1_OK
+    );
+    assert(vyl_http1_client_connection_cancel(connection) == VYL_HTTP1_OK);
+    assert(
+        vyl_http1_client_connection_advance_request_write(connection, written, &pending) ==
+        VYL_HTTP1_CANCELLED
+    );
+    assert(vyl_http1_client_connection_reset(connection) == VYL_HTTP1_CANCELLED);
+    assert(vyl_http1_client_connection_destroy(connection) == VYL_HTTP1_OK);
+}
+
 int main(void) {
     test_client_response_reads();
+    test_client_cancel_is_terminal();
     return 0;
 }

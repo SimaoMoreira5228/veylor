@@ -266,7 +266,15 @@ int main(void) {
     static const uint8_t upload_target[] = "/upload";
     static const uint8_t host_name[] = "Host";
     static const uint8_t host_value[] = "example.test";
+    static const uint8_t response_reason[] = "OK";
+    static const uint8_t response_type_name[] = "Content-Type";
+    static const uint8_t response_type_value[] = "text/plain";
     static const uint8_t expected_head[] = "HEAD /health HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    static const uint8_t expected_response[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n";
+    static const uint8_t expected_closed_response[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n"
+        "Content-Length: 5\r\n\r\n";
     static const uint8_t expected_upload_head[] =
         "POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\n";
     static const size_t prefix_length =
@@ -279,11 +287,19 @@ int main(void) {
         .name = {.data = host_name, .length = sizeof(host_name) - 1},
         .value = {.data = host_value, .length = sizeof(host_value) - 1},
     }};
+    vyl_http1_field response_fields[] = {{
+        .name = {.data = response_type_name, .length = sizeof(response_type_name) - 1},
+        .value = {.data = response_type_value, .length = sizeof(response_type_value) - 1},
+    }};
     vyl_http1_field excessive_fields[VYL_HTTP1_MAX_REQUEST_FIELDS + 1] = {0};
     uint8_t request_output[128];
+    uint8_t response_output[128];
     size_t request_written = SIZE_MAX;
     size_t request_required = SIZE_MAX;
     size_t headers_required = SIZE_MAX;
+    size_t response_written = 0;
+    size_t response_required = 0;
+    uint32_t response_body_allowed = 0;
 
     assert(vyl_http1_server_connection_new(&connection) == VYL_HTTP1_OK);
     assert(connection != NULL);
@@ -318,6 +334,82 @@ int main(void) {
     assert(memcmp(request + head.method.offset, "GET", 3) == 0);
     assert(memcmp(request + head.target.offset, "/health", 7) == 0);
 
+    memset(response_output, 0xaa, sizeof(response_output));
+    assert(
+        vyl_http1_server_connection_encode_response_head(
+            connection,
+            request,
+            sizeof(request) - 1,
+            headers,
+            2,
+            200,
+            (vyl_http1_bytes){.data = response_reason, .length = sizeof(response_reason) - 1},
+            response_fields,
+            1,
+            VYL_HTTP1_RESPONSE_FRAMING_FIXED,
+            5,
+            1,
+            0,
+            response_output,
+            8,
+            &response_written,
+            &response_body_allowed,
+            &response_required
+        ) == VYL_HTTP1_BUFFER_TOO_SMALL
+    );
+    assert(response_written == 0);
+    assert(response_body_allowed == 0);
+    assert(response_required == sizeof(expected_response) - 1);
+    assert(response_output[0] == 0xaa);
+    assert(
+        vyl_http1_server_connection_encode_response_head(
+            connection,
+            request,
+            sizeof(request) - 1,
+            headers,
+            2,
+            200,
+            (vyl_http1_bytes){.data = response_reason, .length = sizeof(response_reason) - 1},
+            response_fields,
+            1,
+            VYL_HTTP1_RESPONSE_FRAMING_FIXED,
+            5,
+            1,
+            0,
+            response_output,
+            sizeof(response_output),
+            &response_written,
+            &response_body_allowed,
+            &response_required
+        ) == VYL_HTTP1_OK
+    );
+    assert(response_written == sizeof(expected_response) - 1);
+    assert(response_required == response_written);
+    assert(response_body_allowed == 1);
+    assert(memcmp(response_output, expected_response, response_written) == 0);
+    assert(
+        vyl_http1_server_connection_encode_response_head(
+            connection,
+            request,
+            sizeof(request) - 1,
+            headers,
+            2,
+            200,
+            (vyl_http1_bytes){.data = response_reason, .length = sizeof(response_reason) - 1},
+            response_fields,
+            1,
+            VYL_HTTP1_RESPONSE_FRAMING_FIXED,
+            5,
+            1,
+            0,
+            response_output,
+            sizeof(response_output),
+            &response_written,
+            &response_body_allowed,
+            &response_required
+        ) == VYL_HTTP1_BAD_STATE
+    );
+
     assert(vyl_http1_server_connection_reset(connection) == VYL_HTTP1_OK);
     assert(
         vyl_http1_server_connection_parse_head(
@@ -342,6 +434,30 @@ int main(void) {
             &headers_required
         ) == VYL_HTTP1_OK
     );
+    assert(
+        vyl_http1_server_connection_encode_response_head(
+            connection,
+            request,
+            sizeof(request) - 1,
+            headers,
+            2,
+            200,
+            (vyl_http1_bytes){.data = response_reason, .length = sizeof(response_reason) - 1},
+            response_fields,
+            1,
+            VYL_HTTP1_RESPONSE_FRAMING_FIXED,
+            5,
+            0,
+            0,
+            response_output,
+            sizeof(response_output),
+            &response_written,
+            &response_body_allowed,
+            &response_required
+        ) == VYL_HTTP1_OK
+    );
+    assert(response_written == sizeof(expected_closed_response) - 1);
+    assert(memcmp(response_output, expected_closed_response, response_written) == 0);
 
     assert(vyl_http1_server_connection_reset(connection) == VYL_HTTP1_OK);
     assert(

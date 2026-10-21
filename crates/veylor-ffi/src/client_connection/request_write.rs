@@ -5,11 +5,10 @@ use veylor_http1::{
     encode_head_with_required_length, finish_chunks_with_required_length,
 };
 
-use crate::abi::{VylResult, catch_ffi, slice_length_valid};
+use crate::abi::{VylBytes, VylField, VylResult, catch_ffi, slice_length_valid};
 
 use super::{
-    VYL_HTTP1_MAX_REQUEST_FIELDS, VylBytes, VylClientConnection, VylField, VylRequestBodyKind,
-    VylRequestMethod,
+    VYL_HTTP1_MAX_REQUEST_FIELDS, VylClientConnection, VylRequestBodyKind, VylRequestMethod,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +31,7 @@ pub(super) enum RequestWriteState {
         body: RequestBodyState,
     },
     Complete,
+    Cancelled,
 }
 
 impl RequestWriteState {
@@ -143,6 +143,9 @@ unsafe fn encode_request_head(
     };
 
     let connection = unsafe { &mut *connection };
+    if connection.request_writer == RequestWriteState::Cancelled {
+        return VylResult::Cancelled;
+    }
     if connection.request_writer != RequestWriteState::Idle {
         return VylResult::BadState;
     }
@@ -236,6 +239,7 @@ unsafe fn advance_request_write(
         RequestWriteState::Idle | RequestWriteState::Ready(_) | RequestWriteState::Complete => {
             return VylResult::BadState;
         }
+        RequestWriteState::Cancelled => return VylResult::Cancelled,
     };
     if transferred_bytes > pending {
         return VylResult::WriteOverrun;
@@ -323,6 +327,7 @@ unsafe fn encode_request_body(
         RequestWriteState::HeadPending { .. } | RequestWriteState::Pending { .. } => {
             return VylResult::WouldBlock;
         }
+        RequestWriteState::Cancelled => return VylResult::Cancelled,
         RequestWriteState::Idle | RequestWriteState::Complete => return VylResult::BadState,
     };
 
@@ -448,6 +453,7 @@ unsafe fn finish_request_body(
         RequestWriteState::HeadPending { .. } | RequestWriteState::Pending { .. } => {
             return VylResult::WouldBlock;
         }
+        RequestWriteState::Cancelled => return VylResult::Cancelled,
         RequestWriteState::Idle | RequestWriteState::Complete => return VylResult::BadState,
     };
 
@@ -504,6 +510,32 @@ unsafe fn finish_request_body(
             VylResult::Ok
         }
     }
+}
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_http1_client_connection_cancel(
+    connection: *mut VylClientConnection,
+) -> VylResult {
+    catch_ffi(|| unsafe { cancel_connection(connection) })
+}
+
+unsafe fn cancel_connection(connection: *mut VylClientConnection) -> VylResult {
+    if connection.is_null() {
+        return VylResult::InvalidArgument;
+    }
+
+    let connection = unsafe { &mut *connection };
+    if connection.request_writer == RequestWriteState::Cancelled {
+        return VylResult::Ok;
+    }
+    connection.response.cancel();
+    connection.request_writer = RequestWriteState::Cancelled;
+    VylResult::Ok
 }
 
 fn body_state(framing: BodyFraming) -> RequestBodyState {

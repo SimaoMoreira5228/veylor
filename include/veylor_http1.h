@@ -24,7 +24,8 @@ typedef enum {
     VYL_HTTP1_WOULD_BLOCK = 7,
     VYL_HTTP1_BODY_TOO_LONG = 8,
     VYL_HTTP1_BAD_STATE = 9,
-    VYL_HTTP1_WRITE_OVERRUN = 10
+    VYL_HTTP1_WRITE_OVERRUN = 10,
+    VYL_HTTP1_CANCELLED = 11
 } vyl_http1_result;
 
 typedef enum {
@@ -78,6 +79,12 @@ typedef enum {
     VYL_HTTP1_REQUEST_BODY_FIXED = 1,
     VYL_HTTP1_REQUEST_BODY_CHUNKED = 2
 } vyl_http1_request_body_kind;
+
+typedef enum {
+    VYL_HTTP1_RESPONSE_FRAMING_FIXED = 0,
+    VYL_HTTP1_RESPONSE_FRAMING_CHUNKED = 1,
+    VYL_HTTP1_RESPONSE_FRAMING_CLOSE_DELIMITED = 2
+} vyl_http1_response_framing;
 
 typedef struct {
     vyl_http1_span method;
@@ -153,6 +160,27 @@ vyl_http1_result vyl_http1_server_connection_parse_head(
     vyl_http1_request_head* out_head,
     size_t* out_headers_required
 );
+ 
+vyl_http1_result vyl_http1_server_connection_encode_response_head(
+    vyl_server_connection* connection,
+    const uint8_t* request_input,
+    size_t request_input_length,
+    const vyl_http1_header* request_headers,
+    size_t request_header_capacity,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    const vyl_http1_field* fields,
+    size_t field_count,
+    uint32_t framing,
+    uint64_t content_length,
+    uint32_t request_body_complete,
+    uint32_t response_close,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    uint32_t* out_body_allowed,
+    size_t* out_required
+);
 vyl_http1_result vyl_http1_server_connection_reset(vyl_server_connection* connection);
 vyl_http1_result vyl_http1_server_connection_destroy(vyl_server_connection* connection);
 
@@ -201,6 +229,8 @@ vyl_http1_result vyl_http1_client_connection_finish_request_body(
     size_t* out_written,
     size_t* out_required
 );
+ 
+vyl_http1_result vyl_http1_client_connection_cancel(vyl_client_connection* connection);
 /* NOTE: Keep requested_upgrade alive and unchanged until handle destruction.
    During an incomplete response head, retain the input base and bytes. Use
    event.consumed to keep the unread tail. Keep header/trailer buffers stable
