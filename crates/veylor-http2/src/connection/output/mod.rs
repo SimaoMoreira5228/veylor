@@ -1,8 +1,10 @@
 mod data;
+mod headers;
 #[cfg(test)]
 mod tests;
 
 pub use data::{DataFrameWriter, DataWriteError, QueuedDataFrame};
+pub use headers::{HeadersFrameWriter, HeadersWriteError, QueuedHeadersBlock};
 
 use super::H2FrameAction;
 use crate::frame::{

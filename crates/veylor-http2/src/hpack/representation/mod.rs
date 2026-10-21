@@ -4,7 +4,10 @@ mod tests;
 use super::string::{
     HpackStringError, decode_hpack_string_into, encode_hpack_string_with_plan, plan_hpack_string,
 };
-use super::table::{HpackBytes, HpackField, HpackTable, HpackTableError};
+use super::table::{
+    HPACK_STATIC_TABLE_LEN, HpackBytes, HpackField, HpackTable, HpackTableError, TableInsert,
+    entry_size,
+};
 use super::{HpackError, HpackIntegerError, decode_hpack_integer, encode_hpack_integer};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,6 +22,42 @@ pub enum HpackRepresentation {
 pub struct HpackHeader {
     pub field: HpackField,
     pub representation: HpackRepresentation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HpackFieldToEncode<'a> {
+    pub name: &'a [u8],
+    pub value: &'a [u8],
+    pub representation: HpackRepresentation,
+    pub huffman_name: bool,
+    pub huffman_value: bool,
+}
+
+struct EncoderTableState {
+    retained_original_entries: usize,
+    inserted_entries: usize,
+    first_inserted_field: usize,
+    size: u64,
+    scratch_used: usize,
+}
+
+impl EncoderTableState {
+    fn new(table: &HpackTable<'_>) -> Self {
+        Self {
+            retained_original_entries: table.len(),
+            inserted_entries: 0,
+            first_inserted_field: 0,
+            size: table.size(),
+            scratch_used: table.scratch_used(),
+        }
+    }
+
+    fn clear(&mut self, next_field: usize) {
+        self.retained_original_entries = 0;
+        self.inserted_entries = 0;
+        self.first_inserted_field = next_field;
+        self.size = 0;
+    }
 }
 
 impl HpackHeader {
@@ -211,6 +250,274 @@ pub fn encode_pending_table_size_updates(
     output[..total_length].copy_from_slice(&encoded[..total_length]);
     table.mark_size_updates_sent();
     Ok(total_length)
+}
+
+pub fn encode_header_block(
+    fields: &[HpackFieldToEncode<'_>],
+    table: &mut HpackTable<'_>,
+    output: &mut [u8],
+) -> Result<usize, HpackError> {
+    let size_update_length = pending_table_size_update_length(table)?;
+    let mut table_state = EncoderTableState::new(table);
+    let mut required_length = size_update_length;
+    for (field_index, field) in fields.iter().enumerate() {
+        let name_index =
+            block_name_index(fields, table, &table_state, field_index, field.name).unwrap_or(0);
+        let field_length = field_encoding_length(*field, name_index)?;
+        required_length =
+            required_length
+                .checked_add(field_length)
+                .ok_or(HpackError::BufferTooSmall {
+                    required: usize::MAX,
+                })?;
+        if field.representation == HpackRepresentation::Incremental {
+            preflight_insertion(fields, table, &mut table_state, field_index)?;
+        }
+    }
+    if output.len() < required_length {
+        return Err(HpackError::BufferTooSmall {
+            required: required_length,
+        });
+    }
+
+    let mut offset = size_update_length;
+    for field in fields {
+        let name_index = table.find_name_index(field.name).unwrap_or(0);
+        offset += encode_literal_header(
+            field.representation,
+            name_index,
+            field.name,
+            field.value,
+            field.huffman_name,
+            field.huffman_value,
+            &mut output[offset..],
+        )?;
+        if field.representation == HpackRepresentation::Incremental {
+            match table
+                .insert_bytes(field.name, field.value)
+                .map_err(HpackError::Table)?
+            {
+                TableInsert::Inserted | TableInsert::DiscardedOversized => {}
+            }
+        }
+    }
+
+    if size_update_length != 0 {
+        let written = encode_pending_table_size_updates(table, &mut output[..size_update_length])?;
+        debug_assert_eq!(written, size_update_length);
+    }
+    Ok(offset)
+}
+
+fn pending_table_size_update_length(table: &HpackTable<'_>) -> Result<usize, HpackError> {
+    let current = table.max_size();
+    let minimum = table.pending_min_size();
+    if minimum.is_none() && current == table.signalled_max() {
+        return Ok(0);
+    }
+
+    let first = minimum.unwrap_or(current);
+    let mut scratch = [0; 11];
+    let mut length = encode_table_size_update(first, &mut scratch)?;
+    if first != current {
+        length = length
+            .checked_add(encode_table_size_update(current, &mut scratch)?)
+            .ok_or(HpackError::BufferTooSmall {
+                required: usize::MAX,
+            })?;
+    }
+    Ok(length)
+}
+
+fn field_encoding_length(
+    field: HpackFieldToEncode<'_>,
+    name_index: u64,
+) -> Result<usize, HpackError> {
+    let (prefix_bits, _) = match field.representation {
+        HpackRepresentation::WithoutIndexing | HpackRepresentation::NeverIndexed => (4, 0),
+        HpackRepresentation::Incremental => (6, 0x40),
+        HpackRepresentation::Indexed => {
+            return Err(HpackError::InvalidRepresentation);
+        }
+    };
+    let mut prefix = [0; 11];
+    let index_length =
+        encode_hpack_integer(name_index, prefix_bits, &mut prefix).map_err(map_integer_error)?;
+    let name_length = if name_index == 0 {
+        plan_hpack_string(field.name, field.huffman_name, 7)
+            .map_err(HpackError::String)?
+            .total_length()
+    } else {
+        0
+    };
+    let value_length = plan_hpack_string(field.value, field.huffman_value, 7)
+        .map_err(HpackError::String)?
+        .total_length();
+
+    index_length
+        .checked_add(name_length)
+        .and_then(|length| length.checked_add(value_length))
+        .ok_or(HpackError::BufferTooSmall {
+            required: usize::MAX,
+        })
+}
+
+fn block_name_index(
+    fields: &[HpackFieldToEncode<'_>],
+    table: &HpackTable<'_>,
+    state: &EncoderTableState,
+    field_index: usize,
+    name: &[u8],
+) -> Option<u64> {
+    for index in 1..=HPACK_STATIC_TABLE_LEN as u64 {
+        let field = table.get(index)?;
+        if table.resolve(field.name)? == name {
+            return Some(index);
+        }
+    }
+
+    let mut newer_insertions = 0_u64;
+    for previous_index in (state.first_inserted_field..field_index).rev() {
+        let previous = fields[previous_index];
+        if previous.representation != HpackRepresentation::Incremental {
+            continue;
+        }
+        if previous.name == name {
+            return u64::try_from(HPACK_STATIC_TABLE_LEN)
+                .ok()?
+                .checked_add(newer_insertions)?
+                .checked_add(1);
+        }
+        newer_insertions = newer_insertions.checked_add(1)?;
+    }
+    if usize::try_from(newer_insertions).ok()? != state.inserted_entries {
+        return None;
+    }
+
+    for original_index in 0..state.retained_original_entries {
+        let original_table_index = u64::try_from(HPACK_STATIC_TABLE_LEN)
+            .ok()?
+            .checked_add(u64::try_from(original_index).ok()?)?
+            .checked_add(1)?;
+        let field = table.get(original_table_index)?;
+        if table.resolve(field.name)? == name {
+            return u64::try_from(HPACK_STATIC_TABLE_LEN)
+                .ok()?
+                .checked_add(newer_insertions)?
+                .checked_add(u64::try_from(original_index).ok()?)?
+                .checked_add(1);
+        }
+    }
+    None
+}
+
+fn preflight_insertion(
+    fields: &[HpackFieldToEncode<'_>],
+    table: &HpackTable<'_>,
+    state: &mut EncoderTableState,
+    field_index: usize,
+) -> Result<(), HpackError> {
+    let field = fields[field_index];
+    let size = entry_size(field.name.len(), field.value.len()).map_err(HpackError::Table)?;
+    if size > table.max_size() {
+        state.clear(field_index + 1);
+        return Ok(());
+    }
+
+    while state.size > table.max_size() - size {
+        evict_oldest(fields, table, state, field_index)?;
+    }
+    let entry_count = state
+        .retained_original_entries
+        .checked_add(state.inserted_entries)
+        .ok_or(HpackError::Table(HpackTableError::DescriptorCapacity))?;
+    if entry_count >= table.entries.len() {
+        return Err(HpackError::Table(HpackTableError::DescriptorCapacity));
+    }
+
+    let bytes_length = field
+        .name
+        .len()
+        .checked_add(field.value.len())
+        .ok_or(HpackError::Table(HpackTableError::ScratchCapacity {
+            required: usize::MAX,
+        }))?;
+    let scratch_end = state
+        .scratch_used
+        .checked_add(bytes_length)
+        .ok_or(HpackError::Table(HpackTableError::ScratchCapacity {
+            required: usize::MAX,
+        }))?;
+    if scratch_end > table.scratch.len() {
+        return Err(HpackError::Table(HpackTableError::ScratchCapacity {
+            required: scratch_end,
+        }));
+    }
+
+    state.scratch_used = scratch_end;
+    state.size = state
+        .size
+        .checked_add(size)
+        .ok_or(HpackError::Table(HpackTableError::EntrySizeOverflow))?;
+    if state.inserted_entries == 0 {
+        state.first_inserted_field = field_index;
+    }
+    state.inserted_entries += 1;
+    Ok(())
+}
+
+fn evict_oldest(
+    fields: &[HpackFieldToEncode<'_>],
+    table: &HpackTable<'_>,
+    state: &mut EncoderTableState,
+    next_field: usize,
+) -> Result<(), HpackError> {
+    if state.retained_original_entries > 0 {
+        let index = u64::try_from(HPACK_STATIC_TABLE_LEN)
+            .ok()
+            .and_then(|static_length| {
+                static_length.checked_add(state.retained_original_entries as u64)
+            })
+            .ok_or(HpackError::Table(HpackTableError::EntrySizeOverflow))?;
+        let field = table
+            .get(index)
+            .ok_or(HpackError::Table(HpackTableError::InvalidScratchSpan))?;
+        let name = table
+            .resolve(field.name)
+            .ok_or(HpackError::Table(HpackTableError::InvalidScratchSpan))?;
+        let value = table
+            .resolve(field.value)
+            .ok_or(HpackError::Table(HpackTableError::InvalidScratchSpan))?;
+        let size = entry_size(name.len(), value.len()).map_err(HpackError::Table)?;
+        state.size = state
+            .size
+            .checked_sub(size)
+            .ok_or(HpackError::Table(HpackTableError::EntrySizeOverflow))?;
+        state.retained_original_entries -= 1;
+        return Ok(());
+    }
+
+    if state.inserted_entries == 0 {
+        return Err(HpackError::Table(HpackTableError::DescriptorCapacity));
+    }
+    let oldest = (state.first_inserted_field..next_field)
+        .find(|index| fields[*index].representation == HpackRepresentation::Incremental)
+        .ok_or(HpackError::Table(HpackTableError::DescriptorCapacity))?;
+    let field = fields[oldest];
+    let size = entry_size(field.name.len(), field.value.len()).map_err(HpackError::Table)?;
+    state.size = state
+        .size
+        .checked_sub(size)
+        .ok_or(HpackError::Table(HpackTableError::EntrySizeOverflow))?;
+    state.inserted_entries -= 1;
+    state.first_inserted_field = if state.inserted_entries == 0 {
+        next_field
+    } else {
+        (oldest + 1..next_field)
+            .find(|index| fields[*index].representation == HpackRepresentation::Incremental)
+            .ok_or(HpackError::Table(HpackTableError::DescriptorCapacity))?
+    };
+    Ok(())
 }
 
 fn decode_literal_field(

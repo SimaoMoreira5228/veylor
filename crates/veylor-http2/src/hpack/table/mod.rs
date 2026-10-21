@@ -330,7 +330,7 @@ impl<'a> HpackTable<'a> {
     }
 }
 
-fn entry_size(name_length: usize, value_length: usize) -> Result<u64, HpackTableError> {
+pub(super) fn entry_size(name_length: usize, value_length: usize) -> Result<u64, HpackTableError> {
     let name_length = u64::try_from(name_length).map_err(|_| HpackTableError::EntrySizeOverflow)?;
     let value_length =
         u64::try_from(value_length).map_err(|_| HpackTableError::EntrySizeOverflow)?;

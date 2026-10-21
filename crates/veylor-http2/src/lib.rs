@@ -6,7 +6,8 @@ mod stream;
 
 pub use connection::{
     ControlFrameWriter, DataFrameWriter, DataWriteError, FeedResult, FeedStatus, FrameWriteError,
-    H2FrameAction, H2FrameDriver, HeaderRange, OutputProgress, QueuedDataFrame,
+    H2FrameAction, H2FrameDriver, HeaderRange, HeadersFrameWriter, HeadersWriteError,
+    OutputProgress, QueuedDataFrame, QueuedHeadersBlock,
 };
 pub use flow_control::{
     DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError, MAX_FLOW_WINDOW_SIZE,
@@ -37,11 +38,12 @@ pub use frame::{
 };
 pub use hpack::{
     DecodedHpackString, HPACK_STATIC_TABLE_LEN, HpackBytes, HpackEntrySlot, HpackError, HpackField,
-    HpackHeader, HpackIntegerError, HpackRepresentation, HpackSpan, HpackStringError, HpackTable,
-    HpackTableError, HuffmanError, TableInsert, decode_header_block, decode_header_field,
-    decode_hpack_integer, decode_hpack_string, decode_huffman, encode_hpack_integer,
-    encode_hpack_string, encode_huffman, encode_indexed_header, encode_literal_header,
-    encode_pending_table_size_updates, encode_table_size_update,
+    HpackFieldToEncode, HpackHeader, HpackIntegerError, HpackRepresentation, HpackSpan,
+    HpackStringError, HpackTable, HpackTableError, HuffmanError, TableInsert, decode_header_block,
+    decode_header_field, decode_hpack_integer, decode_hpack_string, decode_huffman,
+    encode_header_block, encode_hpack_integer, encode_hpack_string, encode_huffman,
+    encode_indexed_header, encode_literal_header, encode_pending_table_size_updates,
+    encode_table_size_update,
 };
 pub use stream::{
     CLIENT_CONNECTION_PREFACE, ClientPrefaceError, EndpointSettings, FrameDirection, H2Role,

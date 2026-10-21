@@ -1,3 +1,5 @@
+mod encode_block;
+
 use super::{
     HpackError, HpackHeader, HpackRepresentation, decode_header_block, decode_header_field,
     encode_indexed_header, encode_literal_header, encode_pending_table_size_updates,

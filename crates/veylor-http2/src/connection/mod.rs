@@ -4,8 +4,8 @@ mod output;
 mod tests;
 
 pub use output::{
-    ControlFrameWriter, DataFrameWriter, DataWriteError, FrameWriteError, OutputProgress,
-    QueuedDataFrame,
+    ControlFrameWriter, DataFrameWriter, DataWriteError, FrameWriteError, HeadersFrameWriter,
+    HeadersWriteError, OutputProgress, QueuedDataFrame, QueuedHeadersBlock,
 };
 
 use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError};
