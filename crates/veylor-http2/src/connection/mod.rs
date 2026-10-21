@@ -1,0 +1,311 @@
+mod frames;
+mod output;
+#[cfg(test)]
+mod tests;
+
+pub use output::{ControlFrameWriter, FrameWriteError, OutputProgress};
+
+use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError};
+use crate::frame::{ErrorCode, FRAME_HEADER_LEN, FrameHeaderError, decode_frame_header};
+use crate::hpack::{HpackHeader, HpackTable};
+use crate::stream::{ClientPrefaceError, StreamTable};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderRange {
+    pub start: usize,
+    pub count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H2FrameAction<'input> {
+    Headers {
+        stream_id: u32,
+        headers: HeaderRange,
+        end_stream: bool,
+    },
+    Data {
+        stream_id: u32,
+        data: &'input [u8],
+        end_stream: bool,
+    },
+    StreamReset {
+        stream_id: u32,
+        error_code: ErrorCode,
+    },
+    GoAway {
+        last_stream_id: u32,
+        error_code: ErrorCode,
+        debug_data: &'input [u8],
+    },
+    SettingsAckRequired,
+    PingAck {
+        opaque_data: [u8; 8],
+    },
+    SendReset {
+        stream_id: u32,
+        error_code: ErrorCode,
+    },
+    ConnectionError {
+        error_code: ErrorCode,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedStatus {
+    NeedMoreInput,
+    OutputFull,
+    ConnectionFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeedResult {
+    pub consumed: usize,
+    pub actions: usize,
+    pub headers: usize,
+    pub status: FeedStatus,
+    pub error: Option<ErrorCode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderDisposition {
+    Deliver,
+    Reset(ErrorCode),
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingHeaders {
+    stream_id: u32,
+    end_stream: bool,
+    disposition: HeaderDisposition,
+}
+
+pub struct H2FrameDriver<'stream, 'streams, 'hpack> {
+    streams: &'stream mut StreamTable<'streams>,
+    hpack: &'stream mut HpackTable<'hpack>,
+    connection_receive_window: FlowWindow,
+    connection_send_window: FlowWindow,
+    pending_headers: Option<PendingHeaders>,
+    failed: Option<ErrorCode>,
+}
+
+impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
+    pub fn new(
+        streams: &'stream mut StreamTable<'streams>,
+        hpack: &'stream mut HpackTable<'hpack>,
+    ) -> Result<Self, FlowWindowError> {
+        Ok(Self {
+            streams,
+            hpack,
+            connection_receive_window: FlowWindow::new(DEFAULT_FLOW_WINDOW_SIZE)?,
+            connection_send_window: FlowWindow::new(DEFAULT_FLOW_WINDOW_SIZE)?,
+            pending_headers: None,
+            failed: None,
+        })
+    }
+
+    pub const fn connection_receive_window(&self) -> FlowWindow {
+        self.connection_receive_window
+    }
+
+    pub const fn connection_send_window(&self) -> FlowWindow {
+        self.connection_send_window
+    }
+
+    pub fn add_connection_receive_credit(&mut self, increment: u32) -> Result<(), FlowWindowError> {
+        self.connection_receive_window.add(increment)
+    }
+
+    pub fn add_stream_receive_credit(
+        &mut self,
+        stream_id: u32,
+        increment: u32,
+    ) -> Result<(), FlowWindowError> {
+        self.streams
+            .receive_window_mut(stream_id)
+            .ok_or(FlowWindowError::InvalidAmount)?
+            .add(increment)
+    }
+
+    pub fn take_send_credit(&mut self, stream_id: u32, amount: i64) -> Result<(), FlowWindowError> {
+        if amount < 0 {
+            return Err(FlowWindowError::InvalidAmount);
+        }
+        if amount > self.connection_send_window.value() {
+            return Err(FlowWindowError::InsufficientWindow);
+        }
+        let stream_window = self
+            .streams
+            .find(stream_id)
+            .ok_or(FlowWindowError::InvalidAmount)?
+            .send_window;
+        if amount > stream_window.value() {
+            return Err(FlowWindowError::InsufficientWindow);
+        }
+        self.connection_send_window.take(amount)?;
+        self.streams
+            .send_window_mut(stream_id)
+            .ok_or(FlowWindowError::InvalidAmount)?
+            .take(amount)
+    }
+
+    pub fn streams(&self) -> &StreamTable<'streams> {
+        self.streams
+    }
+
+    pub fn streams_mut(&mut self) -> &mut StreamTable<'streams> {
+        self.streams
+    }
+
+    pub fn resolve_header(&self, header: HpackHeader) -> Option<(&[u8], &[u8])> {
+        Some((
+            self.hpack.resolve(header.field.name)?,
+            self.hpack.resolve(header.field.value)?,
+        ))
+    }
+
+    pub fn failed(&self) -> Option<ErrorCode> {
+        self.failed
+    }
+
+    pub fn feed<'input>(
+        &mut self,
+        input: &'input [u8],
+        actions: &mut [Option<H2FrameAction<'input>>],
+        headers: &mut [HpackHeader],
+    ) -> FeedResult {
+        let mut result = FeedResult {
+            consumed: 0,
+            actions: 0,
+            headers: 0,
+            status: FeedStatus::NeedMoreInput,
+            error: self.failed,
+        };
+        if let Some(error_code) = self.failed {
+            result.status = FeedStatus::ConnectionFailed;
+            result.error = Some(error_code);
+            return result;
+        }
+
+        if !self.streams.client_preface_complete() {
+            let preface_progress = self.streams.client_preface_progress();
+            match self.streams.receive_client_preface_fragment(input) {
+                Ok(consumed) => {
+                    result.consumed = consumed;
+                    if !self.streams.client_preface_complete() {
+                        return result;
+                    }
+                }
+                Err(error) => {
+                    let error_code = match error {
+                        ClientPrefaceError::WrongRole
+                        | ClientPrefaceError::InvalidByte { .. }
+                        | ClientPrefaceError::AlreadyComplete => ErrorCode::ProtocolError,
+                    };
+                    if let ClientPrefaceError::InvalidByte { offset } = error {
+                        result.consumed = offset.saturating_sub(preface_progress).min(input.len());
+                    }
+                    return self.fail(error_code, actions, result);
+                }
+            }
+        }
+
+        while result.consumed < input.len() {
+            if result.actions == actions.len() {
+                result.status = FeedStatus::OutputFull;
+                return result;
+            }
+            let frame_start = result.consumed;
+            let remaining = &input[frame_start..];
+            if remaining.len() < FRAME_HEADER_LEN {
+                result.status = FeedStatus::NeedMoreInput;
+                return result;
+            }
+            let max_frame_size = self.streams.local_settings().max_frame_size;
+            let header = match decode_frame_header(remaining, max_frame_size) {
+                Ok(header) => header,
+                Err(FrameHeaderError::InputTooShort) => {
+                    result.status = FeedStatus::NeedMoreInput;
+                    return result;
+                }
+                Err(FrameHeaderError::FrameTooLarge) => {
+                    return self.fail(ErrorCode::FrameSizeError, actions, result);
+                }
+                Err(FrameHeaderError::InvalidMaxFrameSize) => {
+                    return self.fail(ErrorCode::InternalError, actions, result);
+                }
+                Err(_) => return self.fail(ErrorCode::ProtocolError, actions, result),
+            };
+            let payload_length = match usize::try_from(header.payload_length) {
+                Ok(length) => length,
+                Err(_) => return self.fail(ErrorCode::FrameSizeError, actions, result),
+            };
+            let Some(frame_length) = FRAME_HEADER_LEN.checked_add(payload_length) else {
+                return self.fail(ErrorCode::FrameSizeError, actions, result);
+            };
+            if remaining.len() < frame_length {
+                result.status = FeedStatus::NeedMoreInput;
+                return result;
+            }
+            let payload = &remaining[FRAME_HEADER_LEN..frame_length];
+            match self.process_frame(header, payload, actions, &mut result, headers) {
+                Ok(()) => {
+                    result.consumed = frame_start + frame_length;
+                }
+                Err(error_code) => {
+                    result.consumed = frame_start + frame_length;
+                    return self.fail(error_code, actions, result);
+                }
+            }
+        }
+
+        result.status = FeedStatus::NeedMoreInput;
+        result
+    }
+
+    fn push_action<'input>(
+        actions: &mut [Option<H2FrameAction<'input>>],
+        result: &mut FeedResult,
+        action: H2FrameAction<'input>,
+    ) {
+        actions[result.actions] = Some(action);
+        result.actions += 1;
+    }
+
+    fn queue_reset<'input>(
+        &mut self,
+        stream_id: u32,
+        error_code: ErrorCode,
+        actions: &mut [Option<H2FrameAction<'input>>],
+        result: &mut FeedResult,
+    ) {
+        self.streams.close_stream(stream_id);
+        Self::push_action(
+            actions,
+            result,
+            H2FrameAction::SendReset {
+                stream_id,
+                error_code,
+            },
+        );
+    }
+
+    fn fail<'input>(
+        &mut self,
+        error_code: ErrorCode,
+        actions: &mut [Option<H2FrameAction<'input>>],
+        mut result: FeedResult,
+    ) -> FeedResult {
+        self.failed = Some(error_code);
+        if result.actions < actions.len() {
+            Self::push_action(
+                actions,
+                &mut result,
+                H2FrameAction::ConnectionError { error_code },
+            );
+        }
+        result.status = FeedStatus::ConnectionFailed;
+        result.error = Some(error_code);
+        result
+    }
+}

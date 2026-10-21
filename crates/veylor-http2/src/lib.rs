@@ -1,8 +1,13 @@
+mod connection;
 mod flow_control;
 mod frame;
 mod hpack;
 mod stream;
 
+pub use connection::{
+    ControlFrameWriter, FeedResult, FeedStatus, FrameWriteError, H2FrameAction, H2FrameDriver,
+    HeaderRange, OutputProgress,
+};
 pub use flow_control::{
     DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError, MAX_FLOW_WINDOW_SIZE,
     choose_data_frame_size,
@@ -39,6 +44,7 @@ pub use hpack::{
     encode_pending_table_size_updates, encode_table_size_update,
 };
 pub use stream::{
-    FrameDirection, H2Role, Stream, StreamAction, StreamActionKind, StreamSlot, StreamState,
-    StreamTable, StreamTableError, StreamTransition, stream_is_local_id, stream_state_on_frame,
+    CLIENT_CONNECTION_PREFACE, ClientPrefaceError, EndpointSettings, FrameDirection, H2Role,
+    SettingsError, Stream, StreamAction, StreamActionKind, StreamSlot, StreamState, StreamTable,
+    StreamTableError, StreamTransition, stream_is_local_id, stream_state_on_frame,
 };

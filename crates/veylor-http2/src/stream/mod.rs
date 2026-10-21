@@ -1,17 +1,20 @@
 mod assembler;
+mod preface;
+mod settings;
 mod state;
 #[cfg(test)]
 mod tests;
 
 use assembler::HeadersAssembler;
+pub use preface::{CLIENT_CONNECTION_PREFACE, ClientPrefaceError};
+pub use settings::{EndpointSettings, SettingsError};
 use state::is_active;
 pub use state::stream_state_on_frame;
 
-use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, MAX_FLOW_WINDOW_SIZE};
+use crate::flow_control::{FlowWindow, MAX_FLOW_WINDOW_SIZE};
 use crate::frame::{
     ErrorCode, FrameHeader, FrameType, GOAWAY_FIXED_LEN, HEADERS_FLAG_END_HEADERS, MAX_STREAM_ID,
-    PING_PAYLOAD_LEN, PRIORITY_PAYLOAD_LEN, RST_STREAM_PAYLOAD_LEN, SETTINGS_ACK,
-    SETTINGS_ENTRY_LEN, decode_goaway_payload,
+    PING_PAYLOAD_LEN, PRIORITY_PAYLOAD_LEN, RST_STREAM_PAYLOAD_LEN, decode_goaway_payload,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,10 +133,14 @@ pub struct StreamTable<'a> {
     role: H2Role,
     highest_local: u32,
     highest_remote: u32,
-    local_max_concurrent: u32,
-    remote_max_concurrent: u32,
-    local_initial_window: i64,
-    remote_initial_window: i64,
+    pub(super) local_settings: EndpointSettings,
+    pub(super) remote_settings: EndpointSettings,
+    pub(super) unacked_settings: u32,
+    pub(super) pending_settings_acks: u32,
+    pub(super) first_settings_received: bool,
+    pub(super) first_settings_sent: bool,
+    pub(super) client_preface_bytes: usize,
+    pub(super) client_preface_failed: bool,
     goaway_sent: bool,
     goaway_send_last: u32,
     goaway_received: bool,
@@ -157,10 +164,18 @@ impl<'a> StreamTable<'a> {
             role,
             highest_local: 0,
             highest_remote: 0,
-            local_max_concurrent: u32::MAX,
-            remote_max_concurrent: u32::MAX,
-            local_initial_window: DEFAULT_FLOW_WINDOW_SIZE,
-            remote_initial_window: DEFAULT_FLOW_WINDOW_SIZE,
+            local_settings: EndpointSettings::for_role(role),
+            remote_settings: EndpointSettings::for_role(peer_role(role)),
+            unacked_settings: 0,
+            pending_settings_acks: 0,
+            first_settings_received: false,
+            first_settings_sent: false,
+            client_preface_bytes: if role == H2Role::Server {
+                0
+            } else {
+                CLIENT_CONNECTION_PREFACE.len()
+            },
+            client_preface_failed: false,
             goaway_sent: false,
             goaway_send_last: 0,
             goaway_received: false,
@@ -191,14 +206,6 @@ impl<'a> StreamTable<'a> {
 
     pub const fn highest_remote(&self) -> u32 {
         self.highest_remote
-    }
-
-    pub const fn local_max_concurrent(&self) -> u32 {
-        self.local_max_concurrent
-    }
-
-    pub const fn remote_max_concurrent(&self) -> u32 {
-        self.remote_max_concurrent
     }
 
     pub const fn goaway_sent(&self) -> bool {
@@ -264,20 +271,16 @@ impl<'a> StreamTable<'a> {
         Some(&mut self.slots[index].stream.as_mut()?.receive_window)
     }
 
-    pub fn set_local_max_concurrent(&mut self, maximum: u32) {
-        self.local_max_concurrent = maximum;
-    }
-
-    pub fn set_remote_max_concurrent(&mut self, maximum: u32) {
-        self.remote_max_concurrent = maximum;
-    }
-
-    pub fn set_local_initial_window(&mut self, window: u32) -> Result<(), ErrorCode> {
-        self.adjust_stream_windows(window, true)
-    }
-
-    pub fn set_remote_initial_window(&mut self, window: u32) -> Result<(), ErrorCode> {
-        self.adjust_stream_windows(window, false)
+    pub fn close_stream(&mut self, id: u32) -> bool {
+        let Some(index) = self.find_index(id) else {
+            return false;
+        };
+        let stream = self.slots[index].stream.as_mut().unwrap();
+        if is_active(stream.state) {
+            self.active_streams -= 1;
+        }
+        stream.state = StreamState::Closed;
+        true
     }
 
     pub fn reserve_local(&mut self, id: u32) -> Result<(), StreamTableError> {
@@ -295,6 +298,20 @@ impl<'a> StreamTable<'a> {
         fragment: &[u8],
     ) -> StreamAction {
         let kind = header.frame_type;
+        if self.client_preface_failed {
+            return StreamAction::connection_error(ErrorCode::ProtocolError);
+        }
+        if direction == FrameDirection::Received {
+            if self.role == H2Role::Server && !self.client_preface_complete() {
+                return StreamAction::connection_error(ErrorCode::ProtocolError);
+            }
+            if !self.first_settings_received && kind != FrameType::Settings {
+                return StreamAction::connection_error(ErrorCode::ProtocolError);
+            }
+        } else if !self.first_settings_sent && kind != FrameType::Settings {
+            return StreamAction::REJECT;
+        }
+
         if direction == FrameDirection::Received {
             if self.assembler.active {
                 if kind != FrameType::Continuation || header.stream_id != self.assembler.stream_id {
@@ -322,6 +339,10 @@ impl<'a> StreamTable<'a> {
 
         if matches!(kind, FrameType::Unknown(_)) {
             return StreamAction::IGNORE;
+        }
+
+        if kind == FrameType::Settings {
+            return self.process_settings_frame(header, fragment, direction);
         }
 
         if matches!(
@@ -357,6 +378,12 @@ impl<'a> StreamTable<'a> {
             && !is_local
             && header.stream_id > self.goaway_send_last
         {
+            if kind == FrameType::Headers
+                && header.flags & HEADERS_FLAG_END_HEADERS == 0
+                && !self.assembler.begin(header.stream_id, fragment)
+            {
+                return StreamAction::connection_error(ErrorCode::CompressionError);
+            }
             return StreamAction::IGNORE;
         }
 
@@ -378,8 +405,10 @@ impl<'a> StreamTable<'a> {
             self.on_new_stream(header, direction, is_local)
         };
 
-        if action.kind == StreamActionKind::Accept
-            && direction == FrameDirection::Received
+        if matches!(
+            action.kind,
+            StreamActionKind::Accept | StreamActionKind::SendRst | StreamActionKind::Ignore
+        ) && direction == FrameDirection::Received
             && kind == FrameType::Headers
             && header.flags & HEADERS_FLAG_END_HEADERS == 0
             && !self.assembler.begin(header.stream_id, fragment)
@@ -447,13 +476,6 @@ impl<'a> StreamTable<'a> {
             return StreamAction::connection_error(ErrorCode::ProtocolError);
         }
         match header.frame_type {
-            FrameType::Settings
-                if (header.flags & SETTINGS_ACK != 0 && header.payload_length != 0)
-                    || (header.flags & SETTINGS_ACK == 0
-                        && header.payload_length as usize % SETTINGS_ENTRY_LEN != 0) =>
-            {
-                StreamAction::connection_error(ErrorCode::FrameSizeError)
-            }
             FrameType::Ping if header.payload_length != PING_PAYLOAD_LEN as u32 => {
                 StreamAction::connection_error(ErrorCode::FrameSizeError)
             }
@@ -528,9 +550,9 @@ impl<'a> StreamTable<'a> {
         }
 
         let maximum = if is_local {
-            self.remote_max_concurrent
+            self.remote_settings.max_concurrent_streams
         } else {
-            self.local_max_concurrent
+            self.local_settings.max_concurrent_streams
         };
         if self.active_count() >= usize::try_from(maximum).unwrap_or(usize::MAX) {
             return if is_local {
@@ -598,9 +620,9 @@ impl<'a> StreamTable<'a> {
     }
 
     fn insert(&mut self, id: u32, state: StreamState) -> Result<(), StreamTableError> {
-        let send_window = FlowWindow::new(self.remote_initial_window)
+        let send_window = FlowWindow::new(i64::from(self.remote_settings.initial_window_size))
             .map_err(|_| StreamTableError::SlotCapacity)?;
-        let receive_window = FlowWindow::new(self.local_initial_window)
+        let receive_window = FlowWindow::new(i64::from(self.local_settings.initial_window_size))
             .map_err(|_| StreamTableError::SlotCapacity)?;
         let stream = Stream {
             id,
@@ -637,20 +659,24 @@ impl<'a> StreamTable<'a> {
     }
 
     fn adjust_stream_windows(&mut self, window: u32, local: bool) -> Result<(), ErrorCode> {
+        let requested = window;
         let window = i64::from(window);
         if window > MAX_FLOW_WINDOW_SIZE {
             return Err(ErrorCode::FlowControlError);
         }
         let current = if local {
-            self.local_initial_window
+            i64::from(self.local_settings.initial_window_size)
         } else {
-            self.remote_initial_window
+            i64::from(self.remote_settings.initial_window_size)
         };
         let delta = window - current;
         for slot in &self.slots[..self.used] {
             let Some(stream) = slot.stream else {
                 continue;
             };
+            if stream.state == StreamState::Closed {
+                continue;
+            }
             let current = if local {
                 stream.receive_window.value()
             } else {
@@ -667,6 +693,9 @@ impl<'a> StreamTable<'a> {
             let Some(stream) = slot.stream.as_mut() else {
                 continue;
             };
+            if stream.state == StreamState::Closed {
+                continue;
+            }
             let window = if local {
                 &mut stream.receive_window
             } else {
@@ -677,11 +706,18 @@ impl<'a> StreamTable<'a> {
                 .map_err(|_| ErrorCode::FlowControlError)?;
         }
         if local {
-            self.local_initial_window = window;
+            self.local_settings.initial_window_size = requested;
         } else {
-            self.remote_initial_window = window;
+            self.remote_settings.initial_window_size = requested;
         }
         Ok(())
+    }
+}
+
+const fn peer_role(role: H2Role) -> H2Role {
+    match role {
+        H2Role::Client => H2Role::Server,
+        H2Role::Server => H2Role::Client,
     }
 }
 

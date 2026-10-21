@@ -1,133 +1,41 @@
 use super::*;
+use crate::frame::SETTINGS_ACK;
 
-fn header(frame_type: FrameType, flags: u8, stream_id: u32, payload_length: u32) -> FrameHeader {
+mod preface;
+mod settings;
+mod state;
+
+pub(super) fn establish(table: &mut StreamTable<'_>) {
+    if table.role() == H2Role::Server {
+        assert_eq!(
+            table.receive_client_preface_fragment(CLIENT_CONNECTION_PREFACE),
+            Ok(CLIENT_CONNECTION_PREFACE.len())
+        );
+    }
+
+    let settings = header(FrameType::Settings, 0, 0, 0);
+    assert_eq!(
+        table.on_frame(settings, FrameDirection::Sent, &[]),
+        StreamAction::ACCEPT
+    );
+    assert_eq!(
+        table.on_frame(settings, FrameDirection::Received, &[]),
+        StreamAction::ACCEPT
+    );
+}
+
+pub(super) fn header(
+    frame_type: FrameType,
+    flags: u8,
+    stream_id: u32,
+    payload_length: u32,
+) -> FrameHeader {
     FrameHeader {
         payload_length,
         frame_type,
         flags,
         stream_id,
     }
-}
-
-#[test]
-fn stream_state_transitions_cover_open_half_close_and_closed_states() {
-    let cases = [
-        (
-            StreamState::Idle,
-            FrameType::Headers,
-            FrameDirection::Sent,
-            0,
-            StreamActionKind::Accept,
-            StreamState::Open,
-        ),
-        (
-            StreamState::Idle,
-            FrameType::Headers,
-            FrameDirection::Received,
-            1,
-            StreamActionKind::Accept,
-            StreamState::HalfClosedRemote,
-        ),
-        (
-            StreamState::Open,
-            FrameType::Data,
-            FrameDirection::Sent,
-            1,
-            StreamActionKind::Accept,
-            StreamState::HalfClosedLocal,
-        ),
-        (
-            StreamState::Open,
-            FrameType::Headers,
-            FrameDirection::Received,
-            1,
-            StreamActionKind::Accept,
-            StreamState::HalfClosedRemote,
-        ),
-        (
-            StreamState::HalfClosedLocal,
-            FrameType::Data,
-            FrameDirection::Received,
-            1,
-            StreamActionKind::Accept,
-            StreamState::Closed,
-        ),
-        (
-            StreamState::HalfClosedRemote,
-            FrameType::Headers,
-            FrameDirection::Sent,
-            1,
-            StreamActionKind::Accept,
-            StreamState::Closed,
-        ),
-        (
-            StreamState::Open,
-            FrameType::RstStream,
-            FrameDirection::Received,
-            0,
-            StreamActionKind::Accept,
-            StreamState::Closed,
-        ),
-    ];
-
-    for (state, kind, direction, flags, action, next_state) in cases {
-        let result = stream_state_on_frame(state, kind, flags, direction);
-        assert_eq!(result.action.kind, action);
-        assert_eq!(result.next_state, next_state);
-    }
-}
-
-#[test]
-fn reserved_states_apply_directional_frame_rules() {
-    let local_headers = stream_state_on_frame(
-        StreamState::ReservedLocal,
-        FrameType::Headers,
-        0,
-        FrameDirection::Sent,
-    );
-    assert_eq!(local_headers.action, StreamAction::ACCEPT);
-    assert_eq!(local_headers.next_state, StreamState::HalfClosedRemote);
-
-    let local_end = stream_state_on_frame(
-        StreamState::ReservedLocal,
-        FrameType::Headers,
-        1,
-        FrameDirection::Sent,
-    );
-    assert_eq!(local_end.next_state, StreamState::Closed);
-
-    let remote_headers = stream_state_on_frame(
-        StreamState::ReservedRemote,
-        FrameType::Headers,
-        0,
-        FrameDirection::Received,
-    );
-    assert_eq!(remote_headers.next_state, StreamState::HalfClosedLocal);
-
-    for (state, direction) in [
-        (StreamState::ReservedLocal, FrameDirection::Sent),
-        (StreamState::ReservedRemote, FrameDirection::Received),
-    ] {
-        let invalid_data = stream_state_on_frame(state, FrameType::Data, 0, direction);
-        assert_eq!(invalid_data.action.kind, StreamActionKind::ConnectionError);
-        assert_eq!(invalid_data.action.code, ErrorCode::ProtocolError);
-    }
-
-    let local_received_window = stream_state_on_frame(
-        StreamState::ReservedLocal,
-        FrameType::WindowUpdate,
-        0,
-        FrameDirection::Received,
-    );
-    assert_eq!(local_received_window.action.kind, StreamActionKind::Accept);
-
-    let remote_sent_window = stream_state_on_frame(
-        StreamState::ReservedRemote,
-        FrameType::WindowUpdate,
-        0,
-        FrameDirection::Sent,
-    );
-    assert_eq!(remote_sent_window.action.kind, StreamActionKind::Accept);
 }
 
 #[test]
@@ -214,6 +122,7 @@ fn role_parity_monotonic_ids_and_stream_reuse_are_enforced() {
     let mut slots = [StreamSlot::EMPTY; 1];
     let mut table_header_storage = [0; 256];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut table_header_storage, 0);
+    establish(&mut table);
     assert_eq!(
         table.on_frame(
             header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 1, 0),
@@ -278,6 +187,7 @@ fn concurrent_limits_are_directional_and_reserved_streams_do_not_count() {
     let mut slots = [StreamSlot::EMPTY; 4];
     let mut table_header_storage = [0; 256];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut table_header_storage, 0);
+    establish(&mut table);
     table.set_local_max_concurrent(1);
     assert_eq!(table.reserve_local(2), Ok(()));
     assert_eq!(table.active_count(), 0);
@@ -308,6 +218,7 @@ fn concurrent_limits_are_directional_and_reserved_streams_do_not_count() {
         &mut client_header_storage,
         0,
     );
+    establish(&mut client);
     client.set_remote_max_concurrent(0);
     assert_eq!(
         client.on_frame(
@@ -340,6 +251,7 @@ fn client_and_server_stream_opening_respects_initiator_role() {
         &mut client_header_storage,
         0,
     );
+    establish(&mut client);
     assert_eq!(
         client.on_frame(
             header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 1, 0),
@@ -366,6 +278,7 @@ fn client_and_server_stream_opening_respects_initiator_role() {
         &mut server_header_storage,
         0,
     );
+    establish(&mut server);
     assert_eq!(
         server.on_frame(
             header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 2, 0),
@@ -391,6 +304,7 @@ fn goaway_limits_streams_and_rejects_increasing_last_ids() {
     let mut slots = [StreamSlot::EMPTY; 4];
     let mut table_header_storage = [0; 256];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut table_header_storage, 0);
+    establish(&mut table);
     assert_eq!(
         table.on_frame(
             header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 1, 0),
@@ -462,6 +376,7 @@ fn connection_and_frame_length_rules_are_enforced() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut table_header_storage = [0; 256];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut table_header_storage, 0);
+    establish(&mut table);
     assert_eq!(
         table.on_frame(
             header(FrameType::Ping, 0, 0, 7),
@@ -517,6 +432,7 @@ fn initial_window_adjustments_are_transactional_and_bounded() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut table_header_storage = [0; 256];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut table_header_storage, 0);
+    establish(&mut table);
     assert_eq!(
         table.on_frame(
             header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 1, 0),
@@ -540,11 +456,12 @@ fn initial_window_adjustments_are_transactional_and_bounded() {
         table.find(1).unwrap().send_window.value(),
         MAX_FLOW_WINDOW_SIZE
     );
-    assert_eq!(table.remote_initial_window, 100_000);
+    assert_eq!(table.remote_settings.initial_window_size, 100_000);
 
     let mut next_slots = [StreamSlot::EMPTY; 2];
     let mut next_header_storage = [0; 256];
     let mut next = StreamTable::new(&mut next_slots, H2Role::Server, &mut next_header_storage, 0);
+    establish(&mut next);
     for id in [1, 3] {
         assert_eq!(
             next.on_frame(
@@ -565,7 +482,7 @@ fn initial_window_adjustments_are_transactional_and_bounded() {
         Err(ErrorCode::FlowControlError)
     );
     assert_eq!(next.find(1).unwrap().send_window.value(), 65_535);
-    assert_eq!(next.remote_initial_window, 65_535);
+    assert_eq!(next.remote_settings.initial_window_size, 65_535);
 }
 
 #[test]
@@ -573,6 +490,7 @@ fn continuation_fragments_are_copied_and_reassembled_for_the_matching_stream() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut storage = [0; 16];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut storage, 16);
+    establish(&mut table);
     let mut first_fragment = [0x82, 0x86];
     assert_eq!(
         table.on_frame(
@@ -620,6 +538,7 @@ fn continuation_gate_rejects_strays_wrong_streams_and_interleaving() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut storage = [0; 16];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut storage, 16);
+    establish(&mut table);
     assert_eq!(
         table.on_frame(
             header(
@@ -680,6 +599,7 @@ fn continuation_gate_rejects_strays_wrong_streams_and_interleaving() {
     let mut next_slots = [StreamSlot::EMPTY; 1];
     let mut next_storage = [0; 8];
     let mut next = StreamTable::new(&mut next_slots, H2Role::Server, &mut next_storage, 8);
+    establish(&mut next);
     assert_eq!(
         next.on_frame(
             header(FrameType::Headers, 0, 1, 1),
@@ -708,6 +628,7 @@ fn continuation_assembly_resets_on_storage_or_header_limit_overflow() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut storage = [0; 4];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut storage, 8);
+    establish(&mut table);
     assert_eq!(
         table.on_frame(
             header(FrameType::Headers, 0, 1, 5),
@@ -722,6 +643,7 @@ fn continuation_assembly_resets_on_storage_or_header_limit_overflow() {
     let mut next_slots = [StreamSlot::EMPTY; 2];
     let mut limited_storage = [0; 16];
     let mut limited = StreamTable::new(&mut next_slots, H2Role::Server, &mut limited_storage, 4);
+    establish(&mut limited);
     assert_eq!(
         limited.on_frame(
             header(FrameType::Headers, 0, 1, 3),
