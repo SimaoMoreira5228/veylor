@@ -15,9 +15,13 @@ pub use client_connection::{
     vyl_http1_client_connection_read_response, vyl_http1_client_connection_reset,
 };
 pub use server_connection::{
-    VYL_HTTP1_CHUNKED, VYL_HTTP1_CONNECTION_CLOSE, VYL_HTTP1_CONNECTION_KEEP_ALIVE,
-    VYL_HTTP1_CONNECTION_UPGRADE, VYL_HTTP1_EXPECT_CONTINUE, VYL_HTTP1_HAS_CONTENT_LENGTH,
-    VylRequestHead, VylServerConnection, VylTargetForm, vyl_http1_server_connection_destroy,
+    VYL_HTTP1_ADMISSION_READY, VYL_HTTP1_ADMISSION_REJECTED, VYL_HTTP1_ADMISSION_SEND_CONTINUE,
+    VYL_HTTP1_BODY_COMPLETE, VYL_HTTP1_BODY_DATA, VYL_HTTP1_BODY_NEED_MORE,
+    VYL_HTTP1_BODY_TRAILERS, VYL_HTTP1_CHUNKED, VYL_HTTP1_CONNECTION_CLOSE,
+    VYL_HTTP1_CONNECTION_KEEP_ALIVE, VYL_HTTP1_CONNECTION_UPGRADE, VYL_HTTP1_EXPECT_CONTINUE,
+    VYL_HTTP1_HAS_CONTENT_LENGTH, VylRequestHead, VylServerBodyEvent, VylServerConnection,
+    VylTargetForm, vyl_http1_server_connection_admit_body,
+    vyl_http1_server_connection_continue_sent, vyl_http1_server_connection_destroy,
     vyl_http1_server_connection_new, vyl_http1_server_connection_parse_head,
-    vyl_http1_server_connection_reset,
+    vyl_http1_server_connection_read_body, vyl_http1_server_connection_reset,
 };

@@ -462,8 +462,78 @@ static void test_client_cancel_is_terminal(void) {
     assert(vyl_http1_client_connection_destroy(connection) == VYL_HTTP1_OK);
 }
 
+static void test_client_cancel_mid_body_prevents_reuse(void) {
+    static const uint8_t response[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+    static const uint8_t first_body_part[] = "ab";
+    static const uint8_t unread_body_part[] = "cd";
+    vyl_client_connection* connection = NULL;
+    vyl_http1_header headers[2] = {0};
+    vyl_http1_header trailers[2] = {0};
+    vyl_http1_client_read_event event = {0};
+    size_t headers_required = 0;
+    size_t trailers_required = 0;
+
+    assert(
+        vyl_http1_client_connection_new(VYL_HTTP1_REQUEST_OTHER, NULL, 0, &connection) ==
+        VYL_HTTP1_OK
+    );
+    assert(
+        vyl_http1_client_connection_read_response(
+            connection,
+            response,
+            sizeof(response) - 1,
+            0,
+            headers,
+            2,
+            trailers,
+            2,
+            &event,
+            &headers_required,
+            &trailers_required
+        ) == VYL_HTTP1_OK
+    );
+    assert(event.kind == VYL_HTTP1_CLIENT_HEAD);
+    assert(event.can_reuse == 0);
+    assert(
+        vyl_http1_client_connection_read_response(
+            connection,
+            first_body_part,
+            sizeof(first_body_part) - 1,
+            0,
+            headers,
+            2,
+            trailers,
+            2,
+            &event,
+            &headers_required,
+            &trailers_required
+        ) == VYL_HTTP1_OK
+    );
+    assert(event.kind == VYL_HTTP1_CLIENT_BODY_DATA);
+    assert(event.can_reuse == 0);
+    assert(vyl_http1_client_connection_cancel(connection) == VYL_HTTP1_OK);
+    assert(
+        vyl_http1_client_connection_read_response(
+            connection,
+            unread_body_part,
+            sizeof(unread_body_part) - 1,
+            0,
+            headers,
+            2,
+            trailers,
+            2,
+            &event,
+            &headers_required,
+            &trailers_required
+        ) == VYL_HTTP1_CANCELLED
+    );
+    assert(vyl_http1_client_connection_reset(connection) == VYL_HTTP1_CANCELLED);
+    assert(vyl_http1_client_connection_destroy(connection) == VYL_HTTP1_OK);
+}
+
 int main(void) {
     test_client_response_reads();
     test_client_cancel_is_terminal();
+    test_client_cancel_mid_body_prevents_reuse();
     return 0;
 }

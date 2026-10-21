@@ -130,6 +130,26 @@ typedef struct {
     uint32_t can_reuse;
 } vyl_http1_client_read_event;
 
+typedef enum {
+    VYL_HTTP1_ADMISSION_READY = 0,
+    VYL_HTTP1_ADMISSION_SEND_CONTINUE = 1,
+    VYL_HTTP1_ADMISSION_REJECTED = 2
+} vyl_http1_body_admission;
+
+typedef enum {
+    VYL_HTTP1_BODY_NEED_MORE = 0,
+    VYL_HTTP1_BODY_DATA = 1,
+    VYL_HTTP1_BODY_TRAILERS = 2,
+    VYL_HTTP1_BODY_COMPLETE = 3
+} vyl_http1_body_event_kind;
+
+typedef struct {
+    uint32_t kind;
+    size_t consumed;
+    vyl_http1_span data;
+    size_t trailer_count;
+} vyl_http1_server_body_event;
+
 enum {
     VYL_HTTP1_HAS_CONTENT_LENGTH = 1u,
     VYL_HTTP1_CHUNKED = 2u,
@@ -180,6 +200,34 @@ vyl_http1_result vyl_http1_server_connection_encode_response_head(
     size_t* out_written,
     uint32_t* out_body_allowed,
     size_t* out_required
+);
+/* NOTE: Admission retains the request input and header buffers from parse_head, plus trailer-name
+   data and spans, until reset or destruction. Use continue_sent only after a 100 Continue flushes.
+ */
+vyl_http1_result vyl_http1_server_connection_admit_body(
+    vyl_server_connection* connection,
+    const uint8_t* request_input,
+    size_t request_input_length,
+    const vyl_http1_header* request_headers,
+    const uint8_t* trailer_name_data,
+    size_t trailer_name_data_length,
+    const vyl_http1_span* permitted_trailers,
+    size_t permitted_trailer_count,
+    uint32_t allowed,
+    uint32_t* out_admission
+);
+vyl_http1_result vyl_http1_server_connection_continue_sent(vyl_server_connection* connection);
+/* NOTE: Body spans refer to input. Preserve unread bytes using event.consumed; keep trailer storage
+   at the same base until the body completes or the handle resets. */
+vyl_http1_result vyl_http1_server_connection_read_body(
+    vyl_server_connection* connection,
+    const uint8_t* input,
+    size_t input_length,
+    uint32_t eof,
+    vyl_http1_header* trailers,
+    size_t trailer_capacity,
+    vyl_http1_server_body_event* out_event,
+    size_t* out_trailers_required
 );
 vyl_http1_result vyl_http1_server_connection_reset(vyl_server_connection* connection);
 vyl_http1_result vyl_http1_server_connection_destroy(vyl_server_connection* connection);

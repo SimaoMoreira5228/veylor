@@ -3,12 +3,14 @@ resolver = "3"
 members = [
     "crates/veylor-ffi",
     "crates/veylor-http1",
+    "crates/veylor-http2",
     "crates/veylor-router",
     "crates/veylor-runtime",
 ]
 default-members = [
     "crates/veylor-ffi",
     "crates/veylor-http1",
+    "crates/veylor-http2",
     "crates/veylor-router",
     "crates/veylor-runtime",
 ]

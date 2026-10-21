@@ -43,11 +43,13 @@ pub enum VylTargetForm {
 }
 
 pub struct VylServerConnection {
-    parser: Parser,
-    request: Option<RequestHead>,
-    input_base: *const u8,
-    headers_base: *const VylHeader,
-    response_started: bool,
+    pub(super) parser: Parser,
+    pub(super) request: Option<RequestHead>,
+    pub(super) input_base: *const u8,
+    pub(super) input_length: usize,
+    pub(super) headers_base: *const VylHeader,
+    pub(super) response_started: bool,
+    pub(super) body: Option<veylor_http1::RequestBodyDecoder<'static>>,
 }
 
 struct ServerResponseHeadArguments {
@@ -76,8 +78,10 @@ impl VylServerConnection {
             parser: Parser::new(),
             request: None,
             input_base: core::ptr::null(),
+            input_length: 0,
             headers_base: core::ptr::null(),
             response_started: false,
+            body: None,
         }
     }
 }
@@ -175,7 +179,7 @@ unsafe fn parse_request_head(
         unsafe { std::slice::from_raw_parts_mut(headers, header_capacity) }
     };
     let connection = unsafe { &mut *connection };
-    if connection.response_started {
+    if connection.response_started || connection.body.is_some() {
         return VylResult::BadState;
     }
 
@@ -201,6 +205,7 @@ unsafe fn parse_request_head(
 
     connection.request = Some(parsed);
     connection.input_base = input.as_ptr();
+    connection.input_length = input.len();
     connection.headers_base = headers.as_ptr();
     connection.response_started = false;
 
@@ -427,7 +432,7 @@ unsafe fn encode_response_head(
     let mut required = 0;
     match encode_response_head_with_required_length(&response, output, &mut required) {
         Ok(encoded) => {
-            connection.response_started = true;
+            connection.response_started = status >= 200 || status == 101;
             unsafe {
                 out_written.write(encoded.length);
                 out_body_allowed.write(u32::from(encoded.body_allowed));
@@ -479,8 +484,10 @@ unsafe fn reset_connection(connection: *mut VylServerConnection) -> VylResult {
     connection.parser.reset();
     connection.request = None;
     connection.input_base = core::ptr::null();
+    connection.input_length = 0;
     connection.headers_base = core::ptr::null();
     connection.response_started = false;
+    connection.body = None;
     VylResult::Ok
 }
 
