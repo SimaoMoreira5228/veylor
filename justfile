@@ -61,6 +61,10 @@ integration-rust-ffi-linux:
 	clang {{ABI_CFLAGS}} -Iinclude tests/rust_ffi_server_body.c \
 		-Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
 		-o build/test-rust-ffi-server-body
+	clang {{ABI_CFLAGS}} -Iinclude tests/rust_ffi_server_response.c \
+		-Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
+		-o build/test-rust-ffi-server-response
 	build/test-rust-ffi-http1
 	build/test-rust-ffi-client-response
 	build/test-rust-ffi-server-body
+	build/test-rust-ffi-server-response

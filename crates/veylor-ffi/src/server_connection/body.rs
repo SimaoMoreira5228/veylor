@@ -195,11 +195,20 @@ unsafe fn mark_continue_sent(connection: *mut VylServerConnection) -> VylResult 
     if connection.response_started {
         return VylResult::BadState;
     }
+    if !connection.response_writer.can_flush_continue() {
+        return VylResult::BadState;
+    }
     let Some(body) = connection.body.as_mut() else {
         return VylResult::BadState;
     };
     match body.continue_sent() {
-        Ok(()) => VylResult::Ok,
+        Ok(()) => {
+            if connection.response_writer.continue_flushed() {
+                VylResult::Ok
+            } else {
+                VylResult::BadState
+            }
+        }
         Err(error) => map_parse_error(error),
     }
 }

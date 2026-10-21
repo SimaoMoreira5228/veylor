@@ -50,6 +50,7 @@ pub struct VylServerConnection {
     pub(super) headers_base: *const VylHeader,
     pub(super) response_started: bool,
     pub(super) body: Option<veylor_http1::RequestBodyDecoder<'static>>,
+    pub(super) response_writer: super::response_write::ResponseWriter,
 }
 
 struct ServerResponseHeadArguments {
@@ -82,6 +83,7 @@ impl VylServerConnection {
             headers_base: core::ptr::null(),
             response_started: false,
             body: None,
+            response_writer: super::response_write::ResponseWriter::new(),
         }
     }
 }
@@ -321,6 +323,7 @@ unsafe fn encode_response_head(
         return VylResult::BadState;
     };
     if connection.response_started
+        || !connection.response_writer.can_start_head()
         || input != connection.input_base
         || input_length < request.length
         || request_headers != connection.headers_base
@@ -432,6 +435,13 @@ unsafe fn encode_response_head(
     let mut required = 0;
     match encode_response_head_with_required_length(&response, output, &mut required) {
         Ok(encoded) => {
+            connection.response_writer.start_head(
+                status,
+                framing,
+                content_length,
+                encoded.body_allowed,
+                encoded.length,
+            );
             connection.response_started = status >= 200 || status == 101;
             unsafe {
                 out_written.write(encoded.length);
@@ -488,6 +498,7 @@ unsafe fn reset_connection(connection: *mut VylServerConnection) -> VylResult {
     connection.headers_base = core::ptr::null();
     connection.response_started = false;
     connection.body = None;
+    connection.response_writer = super::response_write::ResponseWriter::new();
     VylResult::Ok
 }
 

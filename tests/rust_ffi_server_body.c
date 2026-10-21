@@ -18,6 +18,7 @@ static void test_fixed_body_waits_for_continue_flush(void) {
     size_t response_required = 0;
     uint32_t response_body_allowed = 0;
     uint32_t admission = UINT32_MAX;
+    size_t response_pending = SIZE_MAX;
     size_t trailers_required = 0;
     vyl_http1_server_body_event event = {0};
 
@@ -83,6 +84,15 @@ static void test_fixed_body_waits_for_continue_flush(void) {
         ) == VYL_HTTP1_OK
     );
     assert(response_body_allowed == 0);
+    assert(vyl_http1_server_connection_continue_sent(connection) == VYL_HTTP1_BAD_STATE);
+    assert(
+        vyl_http1_server_connection_advance_response_write(
+            connection,
+            response_written,
+            &response_pending
+        ) == VYL_HTTP1_OK
+    );
+    assert(response_pending == 0);
     assert(vyl_http1_server_connection_continue_sent(connection) == VYL_HTTP1_OK);
     assert(
         vyl_http1_server_connection_read_body(

@@ -1,7 +1,8 @@
 use super::{
     ConnectionHeader, FixedResponseBodyWriter, ResponseEncodeError, ResponseFraming,
     ResponseToWrite, ResponseWriteCursor, connection_header_for_response, encode_response_chunk,
-    encode_response_final_chunk, encode_response_head,
+    encode_response_chunk_with_required_length, encode_response_final_chunk,
+    encode_response_final_chunk_with_required_length, encode_response_head,
 };
 use crate::request_head::{Header, Limits, Parser};
 use crate::request_write::Field;
@@ -445,5 +446,33 @@ fn encodes_chunked_response_data_and_safe_trailers() {
         encode_response_chunk(b"Wiki", &mut output[..4]),
         Err(ResponseEncodeError::BufferTooSmall)
     );
+    assert!(output.iter().all(|byte| *byte == 0xa5));
+}
+
+#[test]
+fn reports_required_lengths_for_chunk_data_and_trailers() {
+    let mut output = [0xa5; 16];
+    let mut required = usize::MAX;
+    assert_eq!(
+        encode_response_chunk_with_required_length(b"Wiki", &mut output[..7], &mut required),
+        Err(ResponseEncodeError::BufferTooSmall)
+    );
+    assert_eq!(required, 9);
+    assert!(output.iter().all(|byte| *byte == 0xa5));
+
+    let trailers = [Field {
+        name: b"Digest",
+        value: b"ok",
+    }];
+    required = usize::MAX;
+    assert_eq!(
+        encode_response_final_chunk_with_required_length(
+            &trailers,
+            &mut output[..16],
+            &mut required,
+        ),
+        Err(ResponseEncodeError::BufferTooSmall)
+    );
+    assert_eq!(required, 17);
     assert!(output.iter().all(|byte| *byte == 0xa5));
 }

@@ -39,6 +39,22 @@ fn preserves_unknown_frame_types_and_reads_only_the_header() {
 }
 
 #[test]
+fn rejects_unknown_frame_type_values_that_name_registered_types() {
+    let header = FrameHeader {
+        payload_length: 0,
+        frame_type: FrameType::Unknown(1),
+        flags: 0,
+        stream_id: 0,
+    };
+    let mut output = [0xa5; FRAME_HEADER_LEN];
+    assert_eq!(
+        encode_frame_header(header, &mut output, DEFAULT_MAX_FRAME_SIZE),
+        Err(super::FrameHeaderError::InvalidFrameType)
+    );
+    assert_eq!(output, [0xa5; FRAME_HEADER_LEN]);
+}
+
+#[test]
 fn rejects_truncated_headers_and_short_output() {
     let bytes = [0; FRAME_HEADER_LEN];
     for length in 0..FRAME_HEADER_LEN {

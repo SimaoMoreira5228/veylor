@@ -6,6 +6,16 @@ pub fn encode_response_chunk(
     bytes: &[u8],
     output: &mut [u8],
 ) -> Result<usize, ResponseEncodeError> {
+    let mut required_length = 0;
+    encode_response_chunk_with_required_length(bytes, output, &mut required_length)
+}
+
+pub fn encode_response_chunk_with_required_length(
+    bytes: &[u8],
+    output: &mut [u8],
+    required_length: &mut usize,
+) -> Result<usize, ResponseEncodeError> {
+    *required_length = 0;
     if bytes.is_empty() {
         return Err(ResponseEncodeError::Invalid);
     }
@@ -13,6 +23,7 @@ pub fn encode_response_chunk(
         .checked_add(4)
         .and_then(|length| length.checked_add(bytes.len()))
         .ok_or(ResponseEncodeError::BufferTooSmall)?;
+    *required_length = required;
     if required > output.len() {
         return Err(ResponseEncodeError::BufferTooSmall);
     }
@@ -23,6 +34,16 @@ pub fn encode_response_final_chunk(
     trailers: &[Field<'_>],
     output: &mut [u8],
 ) -> Result<usize, ResponseEncodeError> {
+    let mut required_length = 0;
+    encode_response_final_chunk_with_required_length(trailers, output, &mut required_length)
+}
+
+pub fn encode_response_final_chunk_with_required_length(
+    trailers: &[Field<'_>],
+    output: &mut [u8],
+    required_length: &mut usize,
+) -> Result<usize, ResponseEncodeError> {
+    *required_length = 0;
     let mut required = 5_usize;
     for field in trailers {
         if field.name.is_empty()
@@ -41,6 +62,7 @@ pub fn encode_response_final_chunk(
             .and_then(|length| length.checked_add(2))
             .ok_or(ResponseEncodeError::BufferTooSmall)?;
     }
+    *required_length = required;
     if required > output.len() {
         return Err(ResponseEncodeError::BufferTooSmall);
     }

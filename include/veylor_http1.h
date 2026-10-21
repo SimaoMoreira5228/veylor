@@ -201,6 +201,35 @@ vyl_http1_result vyl_http1_server_connection_encode_response_head(
     uint32_t* out_body_allowed,
     size_t* out_required
 );
+/* NOTE: A successful response head is pending output too. Acknowledge every accepted byte count
+   before encoding body bytes; keep each output buffer unchanged until fully acknowledged. */
+vyl_http1_result vyl_http1_server_connection_advance_response_write(
+    vyl_server_connection* connection,
+    size_t transferred_bytes,
+    size_t* out_pending
+);
+/* NOTE: Fixed and close-delimited bodies may be copied partially; chunked input is accepted only
+   when its complete frame fits. Input is borrowed only for the call. */
+vyl_http1_result vyl_http1_server_connection_encode_response_body(
+    vyl_server_connection* connection,
+    vyl_http1_bytes input,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_consumed,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Finishes a fixed or close-delimited body, or writes the final chunk and optional trailers.
+ */
+vyl_http1_result vyl_http1_server_connection_finish_response_body(
+    vyl_server_connection* connection,
+    const vyl_http1_field* trailers,
+    size_t trailer_count,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
 /* NOTE: Admission retains the request input and header buffers from parse_head, plus trailer-name
    data and spans, until reset or destruction. Use continue_sent only after a 100 Continue flushes.
  */
