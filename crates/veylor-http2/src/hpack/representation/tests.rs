@@ -395,6 +395,34 @@ fn rejects_size_updates_after_fields_and_indices_outside_the_table() {
 }
 
 #[test]
+fn decoder_requires_a_conforming_update_after_acknowledged_reduction() {
+    let mut entries = [HpackEntrySlot::EMPTY; 4];
+    let mut scratch = [0; 256];
+    let mut table = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    table.insert_bytes(b"x", &[b'a'; 128]).unwrap();
+    assert!(table.size() > 128);
+    table.set_protocol_max_size(128);
+
+    let mut headers = [HpackHeader::EMPTY; 3];
+    assert_eq!(
+        decode_header_block(&[0x82, 0x86, 0x84], &mut table, &mut headers),
+        Err(HpackError::RequiredTableSizeUpdate { maximum: 128 })
+    );
+
+    let mut block = [0; 8];
+    let update_length = encode_table_size_update(128, &mut block).unwrap();
+    block[update_length..update_length + 3].copy_from_slice(&[0x82, 0x86, 0x84]);
+    let written = update_length + 3;
+    assert_eq!(
+        decode_header_block(&block[..written], &mut table, &mut headers),
+        Ok((3, written))
+    );
+    assert_eq!(table.max_size(), 128);
+    assert_eq!(table.size(), 0);
+    assert_eq!(table.required_size_update(), None);
+}
+
+#[test]
 fn fails_closed_on_truncated_literal_and_caller_capacity_limits() {
     for end in 1..RFC_C21.len() {
         let mut entries = [HpackEntrySlot::EMPTY; 8];

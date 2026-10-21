@@ -3,12 +3,17 @@ mod output;
 #[cfg(test)]
 mod tests;
 
-pub use output::{ControlFrameWriter, FrameWriteError, OutputProgress};
+pub use output::{
+    ControlFrameWriter, DataFrameWriter, DataWriteError, FrameWriteError, OutputProgress,
+    QueuedDataFrame,
+};
 
 use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError};
-use crate::frame::{ErrorCode, FRAME_HEADER_LEN, FrameHeaderError, decode_frame_header};
+use crate::frame::{
+    ErrorCode, FRAME_HEADER_LEN, FrameHeaderError, SettingsParameter, decode_frame_header,
+};
 use crate::hpack::{HpackHeader, HpackTable};
-use crate::stream::{ClientPrefaceError, StreamTable};
+use crate::stream::{ClientPrefaceError, SettingsError, StreamTable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeaderRange {
@@ -80,25 +85,40 @@ struct PendingHeaders {
     disposition: HeaderDisposition,
 }
 
-pub struct H2FrameDriver<'stream, 'streams, 'hpack> {
+pub struct H2FrameDriver<'stream, 'streams, 'decoder, 'encoder> {
     streams: &'stream mut StreamTable<'streams>,
-    hpack: &'stream mut HpackTable<'hpack>,
+    hpack_decoder: &'stream mut HpackTable<'decoder>,
+    hpack_encoder: &'stream mut HpackTable<'encoder>,
+    settings_ack_limits: &'stream mut [u32],
+    settings_ack_head: usize,
+    settings_ack_len: usize,
     connection_receive_window: FlowWindow,
     connection_send_window: FlowWindow,
     pending_headers: Option<PendingHeaders>,
     failed: Option<ErrorCode>,
 }
 
-impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
+impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'decoder, 'encoder> {
     pub fn new(
         streams: &'stream mut StreamTable<'streams>,
-        hpack: &'stream mut HpackTable<'hpack>,
+        hpack_decoder: &'stream mut HpackTable<'decoder>,
+        hpack_encoder: &'stream mut HpackTable<'encoder>,
+        settings_ack_limits: &'stream mut [u32],
     ) -> Result<Self, FlowWindowError> {
+        let connection_receive_window = FlowWindow::new(DEFAULT_FLOW_WINDOW_SIZE)?;
+        let connection_send_window = FlowWindow::new(DEFAULT_FLOW_WINDOW_SIZE)?;
+
+        hpack_encoder.set_peer_max_size(streams.remote_settings().header_table_size);
+
         Ok(Self {
             streams,
-            hpack,
-            connection_receive_window: FlowWindow::new(DEFAULT_FLOW_WINDOW_SIZE)?,
-            connection_send_window: FlowWindow::new(DEFAULT_FLOW_WINDOW_SIZE)?,
+            hpack_decoder,
+            hpack_encoder,
+            settings_ack_limits,
+            settings_ack_head: 0,
+            settings_ack_len: 0,
+            connection_receive_window,
+            connection_send_window,
             pending_headers: None,
             failed: None,
         })
@@ -157,10 +177,37 @@ impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
         self.streams
     }
 
+    pub fn hpack_encoder_mut(&mut self) -> &mut HpackTable<'encoder> {
+        self.hpack_encoder
+    }
+
+    pub fn hpack_decoder(&self) -> &HpackTable<'decoder> {
+        self.hpack_decoder
+    }
+
+    pub fn register_fully_written_local_settings(
+        &mut self,
+        parameters: &[SettingsParameter],
+    ) -> Result<(), SettingsError> {
+        if self.settings_ack_len == self.settings_ack_limits.len() {
+            return Err(SettingsError::Capacity);
+        }
+        if usize::try_from(self.streams.unacked_settings()).ok() != Some(self.settings_ack_len) {
+            return Err(SettingsError::UntrackedSettings);
+        }
+
+        self.streams.record_local_settings_sent(parameters)?;
+        let tail =
+            (self.settings_ack_head + self.settings_ack_len) % self.settings_ack_limits.len();
+        self.settings_ack_limits[tail] = self.streams.local_settings().header_table_size;
+        self.settings_ack_len += 1;
+        Ok(())
+    }
+
     pub fn resolve_header(&self, header: HpackHeader) -> Option<(&[u8], &[u8])> {
         Some((
-            self.hpack.resolve(header.field.name)?,
-            self.hpack.resolve(header.field.value)?,
+            self.hpack_decoder.resolve(header.field.name)?,
+            self.hpack_decoder.resolve(header.field.value)?,
         ))
     }
 

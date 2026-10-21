@@ -5,8 +5,8 @@ mod hpack;
 mod stream;
 
 pub use connection::{
-    ControlFrameWriter, FeedResult, FeedStatus, FrameWriteError, H2FrameAction, H2FrameDriver,
-    HeaderRange, OutputProgress,
+    ControlFrameWriter, DataFrameWriter, DataWriteError, FeedResult, FeedStatus, FrameWriteError,
+    H2FrameAction, H2FrameDriver, HeaderRange, OutputProgress, QueuedDataFrame,
 };
 pub use flow_control::{
     DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError, MAX_FLOW_WINDOW_SIZE,

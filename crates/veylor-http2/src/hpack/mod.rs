@@ -21,6 +21,7 @@ pub enum HpackError {
     InvalidIndex,
     InvalidRepresentation,
     TableSizeUpdateAfterField,
+    RequiredTableSizeUpdate { maximum: u64 },
     HeaderCapacity { required: usize },
     BufferTooSmall { required: usize },
     Integer(HpackIntegerError),

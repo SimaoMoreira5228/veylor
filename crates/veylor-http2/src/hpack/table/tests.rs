@@ -171,6 +171,43 @@ fn descriptor_and_scratch_limits_fail_without_invalidating_existing_entries() {
     assert_eq!(small_table.scratch_used(), 0);
 }
 
+#[test]
+fn decoder_current_size_stays_below_its_protocol_ceiling() {
+    let mut entries = [HpackEntrySlot::EMPTY; 4];
+    let mut scratch = [0; 64];
+    let mut table = HpackTable::new(&mut entries, &mut scratch, 128);
+
+    assert_eq!(table.protocol_max_size(), 128);
+    assert_eq!(table.max_size(), 128);
+    assert_eq!(table.set_max_size(64), Ok(()));
+    assert_eq!(table.protocol_max_size(), 128);
+    assert_eq!(table.max_size(), 64);
+    assert_eq!(
+        table.set_max_size(129),
+        Err(HpackTableError::MaxSizeExceedsProtocol)
+    );
+}
+
+#[test]
+fn peer_limit_shrinks_encoder_and_tracks_later_limit_increases() {
+    let mut entries = [HpackEntrySlot::EMPTY; 4];
+    let mut scratch = [0; 64];
+    let mut table = HpackTable::new(&mut entries, &mut scratch, 4_096);
+
+    table.set_peer_max_size(128);
+
+    assert_eq!(table.protocol_max_size(), 128);
+    assert_eq!(table.max_size(), 128);
+    assert_eq!(table.pending_min_size(), Some(128));
+
+    table.set_peer_max_size(1_024);
+
+    assert_eq!(table.protocol_max_size(), 1_024);
+    assert_eq!(table.max_size(), 128);
+    assert_eq!(table.set_max_size(1_024), Ok(()));
+    assert_eq!(table.pending_min_size(), Some(128));
+}
+
 fn assert_field(table: &HpackTable<'_>, index: u64, name: &[u8], value: &[u8]) {
     let field = table.get(index).unwrap();
     assert_eq!(table.resolve(field.name), Some(name));

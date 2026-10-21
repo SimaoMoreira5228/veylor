@@ -16,7 +16,7 @@ struct FrameOutput<'output, 'input> {
     headers: &'output mut [HpackHeader],
 }
 
-impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
+impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'decoder, 'encoder> {
     pub(super) fn process_frame<'input>(
         &mut self,
         header: FrameHeader,
@@ -168,7 +168,7 @@ impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
             };
             Self::decode_completed_headers(
                 self.streams,
-                self.hpack,
+                self.hpack_decoder,
                 header.stream_id,
                 decoded.fragment,
                 end_stream,
@@ -218,7 +218,7 @@ impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
             };
             Self::decode_completed_headers(
                 streams,
-                self.hpack,
+                self.hpack_decoder,
                 stream_id,
                 block,
                 pending.end_stream,
@@ -300,13 +300,31 @@ impl<'stream, 'streams, 'hpack> H2FrameDriver<'stream, 'streams, 'hpack> {
         actions: &mut [Option<H2FrameAction<'input>>],
         result: &mut FeedResult,
     ) -> Result<(), ErrorCode> {
+        let settings_ack = header.flags & SETTINGS_ACK != 0;
+        if settings_ack
+            && header.stream_id == 0
+            && header.payload_length == 0
+            && payload.is_empty()
+            && usize::try_from(self.streams.unacked_settings()).ok() != Some(self.settings_ack_len)
+        {
+            return Err(ErrorCode::InternalError);
+        }
+
         let action = self
             .streams
             .on_frame(header, FrameDirection::Received, payload);
         if action.kind == StreamActionKind::ConnectionError {
             return Err(action.code);
         }
+        if settings_ack {
+            let limit = self.settings_ack_limits[self.settings_ack_head];
+            self.hpack_decoder.set_protocol_max_size(limit);
+            self.settings_ack_head = (self.settings_ack_head + 1) % self.settings_ack_limits.len();
+            self.settings_ack_len -= 1;
+        }
         if header.flags & SETTINGS_ACK == 0 {
+            self.hpack_encoder
+                .set_peer_max_size(self.streams.remote_settings().header_table_size);
             Self::push_action(actions, result, H2FrameAction::SettingsAckRequired);
         }
         Ok(())

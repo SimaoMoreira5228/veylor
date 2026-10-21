@@ -37,6 +37,8 @@ impl EndpointSettings {
 pub enum SettingsError {
     Protocol,
     FlowControl,
+    Capacity,
+    UntrackedSettings,
 }
 
 impl SettingsError {
@@ -44,6 +46,7 @@ impl SettingsError {
         match self {
             Self::Protocol => ErrorCode::ProtocolError,
             Self::FlowControl => ErrorCode::FlowControlError,
+            Self::Capacity | Self::UntrackedSettings => ErrorCode::InternalError,
         }
     }
 }
@@ -102,6 +105,19 @@ impl<'a> StreamTable<'a> {
         parameters: &[SettingsParameter],
     ) -> Result<(), SettingsError> {
         self.apply_settings(parameters.iter().copied(), true)
+    }
+
+    pub(crate) fn record_local_settings_sent(
+        &mut self,
+        parameters: &[SettingsParameter],
+    ) -> Result<(), SettingsError> {
+        if self.unacked_settings == u32::MAX {
+            return Err(SettingsError::Capacity);
+        }
+        self.apply_settings(parameters.iter().copied(), true)?;
+        self.unacked_settings += 1;
+        self.first_settings_sent = true;
+        Ok(())
     }
 
     pub fn apply_remote_settings(&mut self, parameters: &[SettingsParameter]) -> StreamAction {

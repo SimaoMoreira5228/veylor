@@ -1,3 +1,6 @@
+mod control;
+mod settings;
+
 use super::*;
 use crate::flow_control::{FlowWindowError, MAX_FLOW_WINDOW_SIZE};
 use crate::frame::{
@@ -59,7 +62,7 @@ fn establish(streams: &mut StreamTable<'_>) {
     assert_eq!(received_ack.kind, StreamActionKind::Accept);
 }
 
-fn open_stream(driver: &mut H2FrameDriver<'_, '_, '_>, headers: &mut [HpackHeader]) {
+fn open_stream(driver: &mut H2FrameDriver<'_, '_, '_, '_>, headers: &mut [HpackHeader]) {
     let mut input = [0; FRAME_HEADER_LEN + 3];
     let length = frame(
         &mut input,
@@ -85,7 +88,17 @@ fn feed_preserves_partial_frames_and_consumes_read_ahead_as_whole_frames() {
     let mut entries = [HpackEntrySlot::EMPTY; 8];
     let mut scratch = [0; 256];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
 
     let mut input = [0; 64];
     let first = frame(
@@ -159,7 +172,17 @@ fn fragmented_client_preface_and_first_settings_are_driven_incrementally() {
     let mut entries = [HpackEntrySlot::EMPTY; 8];
     let mut scratch = [0; 256];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
 
     let mut input = [0; 64];
     input[..crate::stream::CLIENT_CONNECTION_PREFACE.len()]
@@ -196,7 +219,17 @@ fn headers_and_continuations_decode_into_caller_descriptors() {
     let mut entries = [HpackEntrySlot::EMPTY; 8];
     let mut scratch = [0; 256];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
 
     let mut input = [0; 64];
     let head = frame(&mut input, FrameType::Headers, 0, 1, &[0x82]);
@@ -234,7 +267,17 @@ fn data_delivery_borrows_payload_and_charges_padding_to_both_windows() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 4];
     open_stream(&mut driver, &mut headers);
     assert_eq!(driver.streams().active_count(), 1);
@@ -279,7 +322,17 @@ fn application_credit_restores_both_receive_windows_without_partial_updates() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 4];
     open_stream(&mut driver, &mut headers);
 
@@ -330,7 +383,17 @@ fn stream_flow_error_still_charges_connection_credit_without_partial_stream_cred
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 4];
     open_stream(&mut driver, &mut headers);
     driver
@@ -385,7 +448,17 @@ fn deprecated_headers_priority_self_dependency_does_not_reject_headers() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut input = [0; FRAME_HEADER_LEN + 6];
     let length = frame(
         &mut input,
@@ -413,7 +486,17 @@ fn window_update_overflow_resets_stream_and_releases_concurrency() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 4];
     open_stream(&mut driver, &mut headers);
     driver
@@ -447,7 +530,17 @@ fn header_stream_error_decodes_hpack_then_closes_the_stream() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 8];
 
     let mut input = [0; FRAME_HEADER_LEN + 3];
@@ -502,7 +595,17 @@ fn connection_flow_error_does_not_decrement_either_window() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 4];
     open_stream(&mut driver, &mut headers);
     driver.connection_receive_window.take(65_531).unwrap();
@@ -527,103 +630,6 @@ fn connection_flow_error_does_not_decrement_either_window() {
 }
 
 #[test]
-fn settings_ping_window_updates_rst_and_goaway_dispatch_control_actions() {
-    let mut slots = [StreamSlot::EMPTY; 2];
-    let mut header_block = [0; 32];
-    let mut streams = StreamTable::new(&mut slots, H2Role::Server, &mut header_block, 32);
-    establish(&mut streams);
-    let mut entries = [HpackEntrySlot::EMPTY; 4];
-    let mut scratch = [0; 128];
-    let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
-    let mut headers = [HpackHeader::EMPTY; 4];
-    open_stream(&mut driver, &mut headers);
-
-    let mut input = [0; 128];
-    let setting = SettingsParameter {
-        id: crate::frame::SETTINGS_MAX_CONCURRENT_STREAMS,
-        value: 7,
-    };
-    let mut setting_payload = [0; SETTINGS_ENTRY_LEN];
-    crate::frame::encode_settings_payload(&[setting], &mut setting_payload).unwrap();
-    let mut offset = frame(&mut input, FrameType::Settings, 0, 0, &setting_payload);
-    offset += frame(&mut input[offset..], FrameType::Ping, 0, 0, b"pingpong");
-    offset += frame(
-        &mut input[offset..],
-        FrameType::WindowUpdate,
-        0,
-        0,
-        &[0, 0, 0, 9],
-    );
-    offset += frame(
-        &mut input[offset..],
-        FrameType::WindowUpdate,
-        0,
-        1,
-        &[0, 0, 0, 11],
-    );
-    offset += frame(
-        &mut input[offset..],
-        FrameType::RstStream,
-        0,
-        1,
-        &[0, 0, 0, 8],
-    );
-    let goaway_payload = [0, 0, 0, 1, 0, 0, 0, 0];
-    offset += frame(
-        &mut input[offset..],
-        FrameType::GoAway,
-        0,
-        0,
-        &goaway_payload,
-    );
-
-    let mut actions = [None; 8];
-    let result = driver.feed(&input[..offset], &mut actions, &mut headers);
-    assert_eq!(result.status, FeedStatus::NeedMoreInput);
-    assert_eq!(result.consumed, offset);
-    assert_eq!(result.actions, 4);
-    assert_eq!(actions[0], Some(H2FrameAction::SettingsAckRequired));
-    assert_eq!(driver.streams().pending_settings_acks(), 1);
-    let settings_ack = FrameHeader {
-        payload_length: 0,
-        frame_type: FrameType::Settings,
-        flags: SETTINGS_ACK,
-        stream_id: 0,
-    };
-    assert_eq!(
-        driver
-            .streams_mut()
-            .on_frame(settings_ack, FrameDirection::Sent, &[])
-            .kind,
-        StreamActionKind::Accept
-    );
-    assert_eq!(driver.streams().pending_settings_acks(), 0);
-    assert_eq!(
-        actions[1],
-        Some(H2FrameAction::PingAck {
-            opaque_data: *b"pingpong",
-        })
-    );
-    assert!(matches!(
-        actions[2],
-        Some(H2FrameAction::StreamReset { stream_id: 1, .. })
-    ));
-    assert!(matches!(
-        actions[3],
-        Some(H2FrameAction::GoAway {
-            last_stream_id: 1,
-            ..
-        })
-    ));
-    assert_eq!(driver.connection_send_window().value(), 65_544);
-    assert_eq!(
-        driver.streams().find(1).unwrap().send_window.value(),
-        65_546
-    );
-}
-
-#[test]
 fn action_capacity_stops_before_the_next_complete_frame() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut header_block = [0; 32];
@@ -632,7 +638,17 @@ fn action_capacity_stops_before_the_next_complete_frame() {
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 128];
     let mut hpack = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut driver = H2FrameDriver::new(&mut streams, &mut hpack).unwrap();
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 8];
+    let mut encoder_scratch = [0; 256];
+    let mut hpack_encoder = HpackTable::new(&mut encoder_entries, &mut encoder_scratch, 4_096);
+    let mut settings_ack_limits = [0; 4];
+    let mut driver = H2FrameDriver::new(
+        &mut streams,
+        &mut hpack,
+        &mut hpack_encoder,
+        &mut settings_ack_limits,
+    )
+    .unwrap();
     let mut headers = [HpackHeader::EMPTY; 4];
     let mut input = [0; 64];
     let first = frame(&mut input, FrameType::Ping, 0, 0, b"pingpong");

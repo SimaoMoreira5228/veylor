@@ -60,6 +60,7 @@ pub struct HpackTable<'a> {
     size: u64,
     max_size: u64,
     protocol_max_size: u64,
+    required_size_update: Option<u64>,
     signalled_max: u64,
     pending_min_size: Option<u64>,
 }
@@ -80,6 +81,7 @@ impl<'a> HpackTable<'a> {
             size: 0,
             max_size: protocol_max_size,
             protocol_max_size,
+            required_size_update: None,
             signalled_max: protocol_max_size,
             pending_min_size: None,
         }
@@ -103,6 +105,14 @@ impl<'a> HpackTable<'a> {
 
     pub const fn protocol_max_size(&self) -> u64 {
         self.protocol_max_size
+    }
+
+    pub(crate) const fn required_size_update(&self) -> Option<u64> {
+        self.required_size_update
+    }
+
+    pub(crate) fn accept_required_size_update(&mut self) {
+        self.required_size_update = None;
     }
 
     pub const fn signalled_max(&self) -> u64 {
@@ -185,6 +195,30 @@ impl<'a> HpackTable<'a> {
         if new_max > self.protocol_max_size {
             return Err(HpackTableError::MaxSizeExceedsProtocol);
         }
+        self.apply_max_size(new_max);
+        Ok(())
+    }
+
+    pub(crate) fn set_protocol_max_size(&mut self, new_max: u32) {
+        let new_max = u64::from(new_max);
+        if new_max < self.protocol_max_size && self.size > new_max {
+            self.required_size_update = Some(
+                self.required_size_update
+                    .map_or(new_max, |required| required.min(new_max)),
+            );
+        }
+        self.protocol_max_size = new_max;
+    }
+
+    pub fn set_peer_max_size(&mut self, new_max: u32) {
+        let new_max = u64::from(new_max);
+        self.protocol_max_size = new_max;
+        if self.max_size > new_max {
+            self.apply_max_size(new_max);
+        }
+    }
+
+    fn apply_max_size(&mut self, new_max: u64) {
         if new_max != self.max_size {
             self.pending_min_size = Some(
                 self.pending_min_size
@@ -195,7 +229,6 @@ impl<'a> HpackTable<'a> {
         while self.size > self.max_size {
             self.evict_oldest();
         }
-        Ok(())
     }
 
     pub fn insert_bytes(
