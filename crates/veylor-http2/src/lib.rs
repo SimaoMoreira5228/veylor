@@ -29,4 +29,9 @@ pub use frame::{
     DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, FrameHeader, FrameHeaderError, FrameType,
     MAX_FRAME_SIZE, MAX_STREAM_ID, MIN_MAX_FRAME_SIZE, decode_frame_header, encode_frame_header,
 };
-pub use hpack::{HpackIntegerError, decode_hpack_integer, encode_hpack_integer};
+pub use hpack::{
+    DecodedHpackString, HPACK_STATIC_TABLE_LEN, HpackBytes, HpackEntrySlot, HpackField,
+    HpackIntegerError, HpackSpan, HpackStringError, HpackTable, HpackTableError, HuffmanError,
+    TableInsert, decode_hpack_integer, decode_hpack_string, decode_huffman, encode_hpack_integer,
+    encode_hpack_string, encode_huffman,
+};
