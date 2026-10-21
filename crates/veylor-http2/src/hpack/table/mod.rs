@@ -53,9 +53,9 @@ pub enum TableInsert {
 }
 
 pub struct HpackTable<'a> {
-    entries: &'a mut [HpackEntrySlot],
-    scratch: &'a mut [u8],
-    scratch_used: usize,
+    pub(super) entries: &'a mut [HpackEntrySlot],
+    pub(super) scratch: &'a mut [u8],
+    pub(super) scratch_used: usize,
     count: usize,
     size: u64,
     max_size: u64,
@@ -115,6 +115,11 @@ impl<'a> HpackTable<'a> {
 
     pub const fn scratch_used(&self) -> usize {
         self.scratch_used
+    }
+
+    pub(super) fn mark_size_updates_sent(&mut self) {
+        self.signalled_max = self.max_size;
+        self.pending_min_size = None;
     }
 
     pub fn resolve(&self, value: HpackBytes) -> Option<&[u8]> {

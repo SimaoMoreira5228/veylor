@@ -69,6 +69,11 @@ impl ResponseWriter {
         self.state == ResponseWriteState::Idle
     }
 
+    pub(super) fn cancel(&mut self) {
+        self.state = ResponseWriteState::Failed(VylResult::Cancelled);
+        self.continue_ready = false;
+    }
+
     pub(super) fn start_head(
         &mut self,
         status: u16,
@@ -156,8 +161,8 @@ impl ResponseWriter {
             }
             ResponseWriteState::Idle
             | ResponseWriteState::Ready(_)
-            | ResponseWriteState::Complete
-            | ResponseWriteState::Failed(_) => return Err(VylResult::BadState),
+            | ResponseWriteState::Complete => return Err(VylResult::BadState),
+            ResponseWriteState::Failed(error) => return Err(error),
         };
         self.state = next;
         Ok(remaining)
@@ -185,15 +190,7 @@ impl ResponseWriter {
             out_written.write(0);
             out_required.write(0);
         }
-        let input = match unsafe { read_bytes(input) } {
-            Ok(input) => input,
-            Err(error) => return error,
-        };
-        let output = if output_capacity == 0 {
-            &mut []
-        } else {
-            unsafe { slice::from_raw_parts_mut(output, output_capacity) }
-        };
+
         let ResponseWriteState::Ready(body) = self.state else {
             return match self.state {
                 ResponseWriteState::HeadPending { .. } | ResponseWriteState::BodyPending { .. } => {
@@ -204,6 +201,15 @@ impl ResponseWriter {
             };
         };
 
+        let input = match unsafe { read_bytes(input) } {
+            Ok(input) => input,
+            Err(error) => return error,
+        };
+        let output = if output_capacity == 0 {
+            &mut []
+        } else {
+            unsafe { slice::from_raw_parts_mut(output, output_capacity) }
+        };
         let (consumed, written, next_body) = match body {
             ResponseBody::Fixed { remaining } => {
                 let Ok(input_length) = u64::try_from(input.len()) else {
@@ -301,9 +307,6 @@ impl ResponseWriter {
             out_written.write(0);
             out_required.write(0);
         }
-        if trailer_count > Limits::DEFAULT_HEADER_COUNT {
-            return VylResult::Capacity;
-        }
         let ResponseWriteState::Ready(body) = self.state else {
             return match self.state {
                 ResponseWriteState::HeadPending { .. } | ResponseWriteState::BodyPending { .. } => {
@@ -313,6 +316,9 @@ impl ResponseWriter {
                 _ => VylResult::BadState,
             };
         };
+        if trailer_count > Limits::DEFAULT_HEADER_COUNT {
+            return VylResult::Capacity;
+        }
 
         match body {
             ResponseBody::Fixed { remaining: 0 } | ResponseBody::CloseDelimited => {

@@ -51,6 +51,7 @@ pub struct VylServerConnection {
     pub(super) response_started: bool,
     pub(super) body: Option<veylor_http1::RequestBodyDecoder<'static>>,
     pub(super) response_writer: super::response_write::ResponseWriter,
+    pub(super) cancelled: bool,
 }
 
 struct ServerResponseHeadArguments {
@@ -84,6 +85,7 @@ impl VylServerConnection {
             response_started: false,
             body: None,
             response_writer: super::response_write::ResponseWriter::new(),
+            cancelled: false,
         }
     }
 }
@@ -170,6 +172,14 @@ unsafe fn parse_request_head(
         out_headers_required.write(0);
     }
 
+    let connection = unsafe { &mut *connection };
+    if connection.cancelled {
+        return VylResult::Cancelled;
+    }
+    if connection.response_started || connection.body.is_some() {
+        return VylResult::BadState;
+    }
+
     let input = if input_length == 0 {
         &[]
     } else {
@@ -180,10 +190,6 @@ unsafe fn parse_request_head(
     } else {
         unsafe { std::slice::from_raw_parts_mut(headers, header_capacity) }
     };
-    let connection = unsafe { &mut *connection };
-    if connection.response_started || connection.body.is_some() {
-        return VylResult::BadState;
-    }
 
     let parsed = match connection.parser.parse(input, headers, Limits::default()) {
         Ok(Some(head)) => head,
@@ -314,11 +320,13 @@ unsafe fn encode_response_head(
         out_body_allowed.write(0);
         out_required.write(0);
     }
+    let connection = unsafe { &mut *connection };
+    if connection.cancelled {
+        return VylResult::Cancelled;
+    }
     if field_count > Limits::DEFAULT_HEADER_COUNT {
         return VylResult::Capacity;
     }
-
-    let connection = unsafe { &mut *connection };
     let Some(request) = connection.request else {
         return VylResult::BadState;
     };
@@ -491,6 +499,9 @@ unsafe fn reset_connection(connection: *mut VylServerConnection) -> VylResult {
     }
 
     let connection = unsafe { &mut *connection };
+    if connection.cancelled {
+        return VylResult::Cancelled;
+    }
     connection.parser.reset();
     connection.request = None;
     connection.input_base = core::ptr::null();

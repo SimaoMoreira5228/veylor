@@ -3,6 +3,8 @@ mod api;
 #[allow(unsafe_code)]
 mod body;
 #[allow(unsafe_code)]
+mod cancel;
+#[allow(unsafe_code)]
 mod response_write;
 
 #[cfg(test)]
@@ -22,6 +24,7 @@ pub use body::{
     VYL_HTTP1_BODY_TRAILERS, VylServerBodyEvent, vyl_http1_server_connection_admit_body,
     vyl_http1_server_connection_continue_sent, vyl_http1_server_connection_read_body,
 };
+pub use cancel::vyl_http1_server_connection_cancel;
 pub use response_write::{
     vyl_http1_server_connection_advance_response_write,
     vyl_http1_server_connection_encode_response_body,

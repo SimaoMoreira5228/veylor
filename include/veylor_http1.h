@@ -258,6 +258,9 @@ vyl_http1_result vyl_http1_server_connection_read_body(
     vyl_http1_server_body_event* out_event,
     size_t* out_trailers_required
 );
+/* NOTE: Stop transport IO and close the connection after cancel; this handle cannot be reset or
+ * reused. */
+vyl_http1_result vyl_http1_server_connection_cancel(vyl_server_connection* connection);
 vyl_http1_result vyl_http1_server_connection_reset(vyl_server_connection* connection);
 vyl_http1_result vyl_http1_server_connection_destroy(vyl_server_connection* connection);
 

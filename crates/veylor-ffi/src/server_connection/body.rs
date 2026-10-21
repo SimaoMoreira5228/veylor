@@ -113,6 +113,9 @@ unsafe fn admit_body(
     }
 
     let connection = unsafe { &mut *connection };
+    if connection.cancelled {
+        return VylResult::Cancelled;
+    }
     let Some(request) = connection.request else {
         return VylResult::BadState;
     };
@@ -192,6 +195,9 @@ unsafe fn mark_continue_sent(connection: *mut VylServerConnection) -> VylResult 
     }
 
     let connection = unsafe { &mut *connection };
+    if connection.cancelled {
+        return VylResult::Cancelled;
+    }
     if connection.response_started {
         return VylResult::BadState;
     }
@@ -273,6 +279,14 @@ unsafe fn read_body(
         out_trailers_required.write(0);
     }
 
+    let connection = unsafe { &mut *connection };
+    if connection.cancelled {
+        return VylResult::Cancelled;
+    }
+    if connection.response_started {
+        return VylResult::BadState;
+    }
+
     let input = if input_length == 0 {
         &[]
     } else {
@@ -283,10 +297,6 @@ unsafe fn read_body(
     } else {
         unsafe { slice::from_raw_parts_mut(trailers, trailer_capacity) }
     };
-    let connection = unsafe { &mut *connection };
-    if connection.response_started {
-        return VylResult::BadState;
-    }
     let Some(body) = connection.body.as_mut() else {
         return VylResult::BadState;
     };

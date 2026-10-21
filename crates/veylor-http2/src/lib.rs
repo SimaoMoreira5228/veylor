@@ -1,6 +1,7 @@
 mod flow_control;
 mod frame;
 mod hpack;
+mod stream;
 
 pub use flow_control::{
     DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError, MAX_FLOW_WINDOW_SIZE,
@@ -30,8 +31,14 @@ pub use frame::{
     MAX_FRAME_SIZE, MAX_STREAM_ID, MIN_MAX_FRAME_SIZE, decode_frame_header, encode_frame_header,
 };
 pub use hpack::{
-    DecodedHpackString, HPACK_STATIC_TABLE_LEN, HpackBytes, HpackEntrySlot, HpackField,
-    HpackIntegerError, HpackSpan, HpackStringError, HpackTable, HpackTableError, HuffmanError,
-    TableInsert, decode_hpack_integer, decode_hpack_string, decode_huffman, encode_hpack_integer,
-    encode_hpack_string, encode_huffman,
+    DecodedHpackString, HPACK_STATIC_TABLE_LEN, HpackBytes, HpackEntrySlot, HpackError, HpackField,
+    HpackHeader, HpackIntegerError, HpackRepresentation, HpackSpan, HpackStringError, HpackTable,
+    HpackTableError, HuffmanError, TableInsert, decode_header_block, decode_header_field,
+    decode_hpack_integer, decode_hpack_string, decode_huffman, encode_hpack_integer,
+    encode_hpack_string, encode_huffman, encode_indexed_header, encode_literal_header,
+    encode_pending_table_size_updates, encode_table_size_update,
+};
+pub use stream::{
+    FrameDirection, H2Role, Stream, StreamAction, StreamActionKind, StreamSlot, StreamState,
+    StreamTable, StreamTableError, StreamTransition, stream_is_local_id, stream_state_on_frame,
 };
