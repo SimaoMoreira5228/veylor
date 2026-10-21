@@ -21,6 +21,13 @@ fn encodes_borrowed_fields_and_round_trips_without_dynamic_insertion() {
             huffman_name: true,
             huffman_value: true,
         },
+        HpackFieldToEncode {
+            name: b":method",
+            value: b"GET",
+            representation: HpackRepresentation::Indexed,
+            huffman_name: false,
+            huffman_value: false,
+        },
     ];
     let mut encoder_entries = [HpackEntrySlot::EMPTY; 4];
     let mut encoder_scratch = [0; 128];
@@ -39,10 +46,10 @@ fn encodes_borrowed_fields_and_round_trips_without_dynamic_insertion() {
     let mut decoder_entries = [HpackEntrySlot::EMPTY; 4];
     let mut decoder_scratch = [0; 128];
     let mut decoder = HpackTable::new(&mut decoder_entries, &mut decoder_scratch, 4_096);
-    let mut headers = [HpackHeader::EMPTY; 2];
+    let mut headers = [HpackHeader::EMPTY; 3];
     assert_eq!(
         decode_header_block(&output[..written], &mut decoder, &mut headers),
-        Ok((2, written))
+        Ok((3, written))
     );
     assert_eq!(
         headers[0].representation,
@@ -65,6 +72,12 @@ fn encodes_borrowed_fields_and_round_trips_without_dynamic_insertion() {
         decoder.resolve(headers[1].field.value),
         Some(&b"sensitive value"[..])
     );
+    assert_eq!(headers[2].representation, HpackRepresentation::Indexed);
+    assert_eq!(
+        decoder.resolve(headers[2].field.name),
+        Some(&b":method"[..])
+    );
+    assert_eq!(decoder.resolve(headers[2].field.value), Some(&b"GET"[..]));
     assert!(decoder.is_empty());
 }
 
@@ -80,6 +93,20 @@ fn indexes_prior_incremental_fields_and_evicts_oldest_entries_in_order() {
             name: b"c",
             value: b"3",
             representation: HpackRepresentation::Incremental,
+            huffman_name: false,
+            huffman_value: false,
+        },
+        HpackFieldToEncode {
+            name: b"b",
+            value: b"2",
+            representation: HpackRepresentation::Indexed,
+            huffman_name: false,
+            huffman_value: false,
+        },
+        HpackFieldToEncode {
+            name: b"c",
+            value: b"3",
+            representation: HpackRepresentation::Indexed,
             huffman_name: false,
             huffman_value: false,
         },
@@ -102,8 +129,10 @@ fn indexes_prior_incremental_fields_and_evicts_oldest_entries_in_order() {
 
     let written = encode_header_block(&fields, &mut encoder, &mut output).unwrap();
 
-    assert_eq!(&output[5..7], &[0x7f, 0]);
-    assert_eq!(&output[9..11], &[0x7f, 0]);
+    assert_eq!(output[5], 0xbf);
+    assert_eq!(output[6], 0xbe);
+    assert_eq!(&output[7..9], &[0x7f, 0]);
+    assert_eq!(&output[11..13], &[0x7f, 0]);
     assert_eq!(encoder.len(), 2);
     assert_eq!(encoder.size(), 68);
     assert_eq!(encoder.scratch_used(), 10);
@@ -115,10 +144,10 @@ fn indexes_prior_incremental_fields_and_evicts_oldest_entries_in_order() {
     let mut decoder = HpackTable::new(&mut decoder_entries, &mut decoder_scratch, 70);
     decoder.insert_bytes(b"a", b"1").unwrap();
     decoder.insert_bytes(b"b", b"2").unwrap();
-    let mut headers = [HpackHeader::EMPTY; 3];
+    let mut headers = [HpackHeader::EMPTY; 5];
     assert_eq!(
         decode_header_block(&output[..written], &mut decoder, &mut headers),
-        Ok((3, written))
+        Ok((5, written))
     );
     assert_field_index(&decoder, 62, b"c", b"4");
     assert_field_index(&decoder, 63, b"b", b"3");
@@ -253,14 +282,23 @@ fn preflights_the_complete_block_before_writing_pending_updates() {
 }
 
 #[test]
-fn rejects_unsupported_representations_before_changing_output_or_table_state() {
-    let field = [HpackFieldToEncode {
-        name: b"x-state",
-        value: b"ready",
-        representation: HpackRepresentation::Indexed,
-        huffman_name: false,
-        huffman_value: false,
-    }];
+fn rejects_unavailable_exact_indexes_before_changing_output_or_table_state() {
+    let fields = [
+        HpackFieldToEncode {
+            name: b"x-state",
+            value: b"ready",
+            representation: HpackRepresentation::Incremental,
+            huffman_name: false,
+            huffman_value: false,
+        },
+        HpackFieldToEncode {
+            name: b"x-missing",
+            value: b"missing",
+            representation: HpackRepresentation::Indexed,
+            huffman_name: false,
+            huffman_value: false,
+        },
+    ];
     let mut entries = [HpackEntrySlot::EMPTY; 4];
     let mut scratch = [0; 64];
     let mut table = HpackTable::new(&mut entries, &mut scratch, 4_096);
@@ -268,8 +306,8 @@ fn rejects_unsupported_representations_before_changing_output_or_table_state() {
     let mut output = [0xa5; 32];
 
     assert_eq!(
-        encode_header_block(&field, &mut table, &mut output),
-        Err(HpackError::InvalidRepresentation)
+        encode_header_block(&fields, &mut table, &mut output),
+        Err(HpackError::InvalidIndex)
     );
     assert_eq!(output, [0xa5; 32]);
     assert_eq!(table.signalled_max(), 4_096);
