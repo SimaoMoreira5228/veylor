@@ -5,11 +5,13 @@ mod hpack;
 mod stream;
 
 pub use connection::{
-    ClientResponseHeaders, ClientResponsePhase, ControlFrameWriter, DataFrameWriter,
-    DataWriteError, FeedResult, FeedStatus, FrameWriteError, H2FrameAction, H2FrameDriver,
-    HeaderRange, HeadersFrameWriter, HeadersWriteError, OutputProgress, QueuedDataFrame,
-    QueuedHeadersBlock, RequestFieldSectionError, ResponseFieldSection, ResponseSectionError,
-    ResponseSectionKind, encode_request_field_section,
+    ClientError, ClientResponseHeaders, ClientResponsePhase, ControlFrameWriter, DataFrameWriter,
+    DataWriteError, FeedResult, FeedStatus, FrameWriteError, H2ClientDriver, H2FrameAction,
+    H2FrameDriver, H2ServerDriver, HeaderRange, HeadersFrameWriter, HeadersWriteError,
+    OutputProgress, QueuedDataFrame, QueuedHeadersBlock, RequestFieldSectionError,
+    ResponseFieldSection, ResponseSectionError, ResponseSectionKind, SentData, SentResponse,
+    SentServerData, ServerError, ServerRequestError, ServerResponseError, StartedRequest,
+    ValidatedServerRequest, encode_request_field_section, validate_server_request_fields,
 };
 pub use flow_control::{
     DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError, MAX_FLOW_WINDOW_SIZE,

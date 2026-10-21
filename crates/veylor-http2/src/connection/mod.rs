@@ -1,10 +1,14 @@
+mod client;
 mod client_request;
 mod client_response;
 mod frames;
 mod output;
+mod server;
+mod server_request;
 #[cfg(test)]
 mod tests;
 
+pub use client::{ClientError, H2ClientDriver, SentData, StartedRequest};
 pub use client_request::{RequestFieldSectionError, encode_request_field_section};
 pub use client_response::{
     ClientResponseHeaders, ClientResponsePhase, ResponseFieldSection, ResponseSectionError,
@@ -13,6 +17,10 @@ pub use client_response::{
 pub use output::{
     ControlFrameWriter, DataFrameWriter, DataWriteError, FrameWriteError, HeadersFrameWriter,
     HeadersWriteError, OutputProgress, QueuedDataFrame, QueuedHeadersBlock,
+};
+pub use server::{H2ServerDriver, SentResponse, SentServerData, ServerError, ServerResponseError};
+pub use server_request::{
+    ServerRequestError, ValidatedServerRequest, validate_server_request_fields,
 };
 
 use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError};

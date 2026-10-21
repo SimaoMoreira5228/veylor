@@ -38,7 +38,10 @@ pub enum ResponseSectionError {
     SwitchingProtocols,
     ProhibitedField,
     ContentLengthNotAllowed,
+    InvalidContentLength,
     ContentNotAllowed,
+    BodyTooLong,
+    ContentLengthMismatch,
     InformationalEndedStream,
     TrailerNotFinal,
     UnexpectedHeaders,
@@ -46,14 +49,24 @@ pub enum ResponseSectionError {
     DataAfterComplete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestMethod {
+    Head,
+    Connect,
+    Other,
+}
+
 pub struct ClientResponseHeaders {
     phase: ClientResponsePhase,
     final_status: Option<u16>,
+    method: RequestMethod,
+    content_length: Option<u64>,
+    remaining: u64,
 }
 
 struct ValidatedFields {
     status: Option<u16>,
-    content_length: bool,
+    content_length: Option<u64>,
 }
 
 impl ClientResponseHeaders {
@@ -61,7 +74,28 @@ impl ClientResponseHeaders {
         Self {
             phase: ClientResponsePhase::AwaitingFinalHeaders,
             final_status: None,
+            method: RequestMethod::Other,
+            content_length: None,
+            remaining: 0,
         }
+    }
+
+    pub const fn new_with_method(method: &[u8]) -> Self {
+        Self {
+            phase: ClientResponsePhase::AwaitingFinalHeaders,
+            final_status: None,
+            method: classify_method(method),
+            content_length: None,
+            remaining: 0,
+        }
+    }
+
+    pub fn reset_with_method(&mut self, method: &[u8]) {
+        self.phase = ClientResponsePhase::AwaitingFinalHeaders;
+        self.final_status = None;
+        self.method = classify_method(method);
+        self.content_length = None;
+        self.remaining = 0;
     }
 
     pub const fn phase(&self) -> ClientResponsePhase {
@@ -70,6 +104,22 @@ impl ClientResponseHeaders {
 
     pub const fn final_status(&self) -> Option<u16> {
         self.final_status
+    }
+
+    pub const fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    pub const fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    pub const fn body_allowed(&self) -> bool {
+        match self.phase {
+            ClientResponsePhase::AwaitingFinalHeaders => false,
+            ClientResponsePhase::Complete => false,
+            ClientResponsePhase::Content => !self.body_forbidden(),
+        }
     }
 
     pub fn classify<'headers>(
@@ -97,12 +147,44 @@ impl ClientResponseHeaders {
                 Err(ResponseSectionError::DataBeforeFinalHeaders)
             }
             ClientResponsePhase::Content => {
-                if payload_length > 0 && matches!(self.final_status, Some(204 | 304)) {
-                    return Err(ResponseSectionError::ContentNotAllowed);
+                if self.body_forbidden() {
+                    if payload_length > 0 {
+                        return Err(ResponseSectionError::ContentNotAllowed);
+                    }
+
+                    if end_stream {
+                        self.phase = ClientResponsePhase::Complete;
+                    }
+
+                    return Ok(self.phase);
                 }
+
+                if self.content_length.is_some() {
+                    let Ok(length) = u64::try_from(payload_length) else {
+                        return Err(ResponseSectionError::BodyTooLong);
+                    };
+
+                    if length > self.remaining {
+                        return Err(ResponseSectionError::BodyTooLong);
+                    }
+
+                    self.remaining -= length;
+
+                    if end_stream {
+                        if self.remaining != 0 {
+                            return Err(ResponseSectionError::ContentLengthMismatch);
+                        }
+
+                        self.phase = ClientResponsePhase::Complete;
+                    }
+
+                    return Ok(self.phase);
+                }
+
                 if end_stream {
                     self.phase = ClientResponsePhase::Complete;
                 }
+
                 Ok(self.phase)
             }
             ClientResponsePhase::Complete => Err(ResponseSectionError::DataAfterComplete),
@@ -125,7 +207,17 @@ impl ClientResponseHeaders {
         if status < 200 && end_stream {
             return Err(ResponseSectionError::InformationalEndedStream);
         }
-        if (status < 200 || status == 204) && validated.content_length {
+        if (status < 200 || status == 204) && validated.content_length.is_some() {
+            return Err(ResponseSectionError::ContentLengthNotAllowed);
+        }
+
+        let method_forbids_body = self.method == RequestMethod::Head
+            || (self.method == RequestMethod::Connect && (200..300).contains(&status));
+
+        if self.method == RequestMethod::Connect
+            && (200..300).contains(&status)
+            && validated.content_length.is_some()
+        {
             return Err(ResponseSectionError::ContentLengthNotAllowed);
         }
 
@@ -134,8 +226,23 @@ impl ClientResponseHeaders {
         } else {
             ResponseSectionKind::Final
         };
+
         if kind == ResponseSectionKind::Final {
+            let body_forbidden = method_forbids_body || matches!(status, 204 | 304);
+
+            let content_length = if body_forbidden {
+                None
+            } else {
+                validated.content_length
+            };
+
+            if end_stream && content_length.is_some_and(|length| length > 0) {
+                return Err(ResponseSectionError::ContentLengthMismatch);
+            }
+
             self.final_status = Some(status);
+            self.content_length = content_length;
+            self.remaining = content_length.unwrap_or(0);
             self.phase = if end_stream {
                 ClientResponsePhase::Complete
             } else {
@@ -159,14 +266,34 @@ impl ClientResponseHeaders {
         if !end_stream {
             return Err(ResponseSectionError::TrailerNotFinal);
         }
+
         validate_fields(driver, fields, false)?;
 
+        if self.content_length.is_some_and(|_| self.remaining > 0) {
+            return Err(ResponseSectionError::ContentLengthMismatch);
+        }
+
         self.phase = ClientResponsePhase::Complete;
+
         Ok(ResponseFieldSection {
             kind: ResponseSectionKind::Trailers,
             status: None,
             fields,
         })
+    }
+
+    const fn body_forbidden(&self) -> bool {
+        if matches!(self.method, RequestMethod::Head) {
+            return true;
+        }
+
+        match self.final_status {
+            Some(204 | 304) => true,
+            Some(status) => {
+                matches!(self.method, RequestMethod::Connect) && status >= 200 && status < 300
+            }
+            None => false,
+        }
     }
 }
 
@@ -183,7 +310,7 @@ fn validate_fields(
 ) -> Result<ValidatedFields, ResponseSectionError> {
     let mut regular_fields_started = false;
     let mut status = None;
-    let mut content_length = false;
+    let mut content_length = None;
 
     for field in fields {
         let (name, value) = driver
@@ -215,7 +342,14 @@ fn validate_fields(
         if !expect_status && is_prohibited_trailer(name) {
             return Err(ResponseSectionError::ProhibitedField);
         }
-        content_length |= name == b"content-length";
+        if name == b"content-length" {
+            let length =
+                parse_content_length(value).ok_or(ResponseSectionError::InvalidContentLength)?;
+            if content_length.is_some_and(|previous| previous != length) {
+                return Err(ResponseSectionError::InvalidContentLength);
+            }
+            content_length = Some(length);
+        }
     }
 
     if expect_status && status.is_none() {
@@ -238,6 +372,51 @@ fn parse_status(value: &[u8]) -> Result<u16, ResponseSectionError> {
         return Err(ResponseSectionError::InvalidStatus);
     }
     Ok(status)
+}
+
+fn parse_content_length(value: &[u8]) -> Option<u64> {
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut length = 0_u64;
+
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+
+        length = length
+            .checked_mul(10)?
+            .checked_add(u64::from(*byte - b'0'))?;
+    }
+
+    Some(length)
+}
+
+const fn classify_method(method: &[u8]) -> RequestMethod {
+    if method.len() == 4
+        && method[0] == b'H'
+        && method[1] == b'E'
+        && method[2] == b'A'
+        && method[3] == b'D'
+    {
+        return RequestMethod::Head;
+    }
+
+    if method.len() == 7
+        && method[0] == b'C'
+        && method[1] == b'O'
+        && method[2] == b'N'
+        && method[3] == b'N'
+        && method[4] == b'E'
+        && method[5] == b'C'
+        && method[6] == b'T'
+    {
+        return RequestMethod::Connect;
+    }
+
+    RequestMethod::Other
 }
 
 fn valid_field_name(name: &[u8]) -> bool {

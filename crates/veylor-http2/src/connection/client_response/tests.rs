@@ -304,3 +304,318 @@ fn rejects_content_for_204_and_304_but_accepts_empty_end_stream_data() {
         );
     });
 }
+
+#[test]
+fn rejects_body_for_head_responses_but_allows_would_be_content_length() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new_with_method(b"HEAD");
+        let headers = [field(b":status", b"200"), field(b"content-length", b"17")];
+        let section = response.classify(driver, &headers, false).unwrap();
+
+        assert_eq!(section.kind, ResponseSectionKind::Final);
+        assert_eq!(response.phase(), ClientResponsePhase::Content);
+        assert_eq!(response.content_length(), None);
+        assert_eq!(response.remaining(), 0);
+        assert!(!response.body_allowed());
+
+        assert_eq!(
+            response.data_received(1, false),
+            Err(ResponseSectionError::ContentNotAllowed)
+        );
+        assert_eq!(response.phase(), ClientResponsePhase::Content);
+        assert_eq!(
+            response.data_received(0, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+    });
+}
+
+#[test]
+fn accepts_head_trailers_and_rejects_head_data_after_trailers() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new_with_method(b"HEAD");
+        response
+            .classify(driver, &[field(b":status", b"200")], false)
+            .unwrap();
+
+        let trailers = [field(b"x-checksum", b"abc")];
+        let section = response.classify(driver, &trailers, true).unwrap();
+
+        assert_eq!(section.kind, ResponseSectionKind::Trailers);
+        assert_eq!(response.phase(), ClientResponsePhase::Complete);
+        assert_eq!(
+            response.data_received(0, false),
+            Err(ResponseSectionError::DataAfterComplete)
+        );
+    });
+}
+
+#[test]
+fn rejects_body_and_content_length_for_successful_connect() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new_with_method(b"CONNECT");
+        let headers = [field(b":status", b"200")];
+        response.classify(driver, &headers, false).unwrap();
+
+        assert!(!response.body_allowed());
+        assert_eq!(
+            response.data_received(4, false),
+            Err(ResponseSectionError::ContentNotAllowed)
+        );
+        assert_eq!(
+            response.data_received(0, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+
+        let mut tunnel_length = ClientResponseHeaders::new_with_method(b"CONNECT");
+        let headers = [field(b":status", b"200"), field(b"content-length", b"0")];
+        assert_eq!(
+            tunnel_length.classify(driver, &headers, false),
+            Err(ResponseSectionError::ContentLengthNotAllowed)
+        );
+        assert_eq!(
+            tunnel_length.phase(),
+            ClientResponsePhase::AwaitingFinalHeaders
+        );
+    });
+}
+
+#[test]
+fn allows_body_for_connect_error_responses_with_content_length_accounting() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new_with_method(b"CONNECT");
+        let headers = [field(b":status", b"407"), field(b"content-length", b"3")];
+        response.classify(driver, &headers, false).unwrap();
+
+        assert!(response.body_allowed());
+        assert_eq!(response.content_length(), Some(3));
+        assert_eq!(response.remaining(), 3);
+        assert_eq!(
+            response.data_received(3, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+    });
+}
+
+#[test]
+fn accounts_content_length_exactly_and_rejects_overrun() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new();
+        let headers = [field(b":status", b"200"), field(b"content-length", b"5")];
+        response.classify(driver, &headers, false).unwrap();
+
+        assert_eq!(response.content_length(), Some(5));
+        assert_eq!(response.remaining(), 5);
+        assert!(response.body_allowed());
+
+        assert_eq!(
+            response.data_received(3, false),
+            Ok(ClientResponsePhase::Content)
+        );
+        assert_eq!(response.remaining(), 2);
+        assert_eq!(
+            response.data_received(3, false),
+            Err(ResponseSectionError::BodyTooLong)
+        );
+        assert_eq!(response.phase(), ClientResponsePhase::Content);
+        assert_eq!(response.remaining(), 2);
+        assert_eq!(
+            response.data_received(2, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+        assert_eq!(response.remaining(), 0);
+    });
+}
+
+#[test]
+fn rejects_short_completion_against_content_length() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new();
+        let headers = [field(b":status", b"200"), field(b"content-length", b"5")];
+        response.classify(driver, &headers, false).unwrap();
+
+        assert_eq!(
+            response.data_received(3, true),
+            Err(ResponseSectionError::ContentLengthMismatch)
+        );
+
+        let mut immediate_end = ClientResponseHeaders::new();
+        assert_eq!(
+            immediate_end.classify(driver, &headers, true),
+            Err(ResponseSectionError::ContentLengthMismatch)
+        );
+
+        let mut trailers_short = ClientResponseHeaders::new();
+        trailers_short.classify(driver, &headers, false).unwrap();
+
+        assert_eq!(
+            trailers_short.data_received(3, false),
+            Ok(ClientResponsePhase::Content)
+        );
+
+        let trailers = [field(b"x-checksum", b"abc")];
+        assert_eq!(
+            trailers_short.classify(driver, &trailers, true),
+            Err(ResponseSectionError::ContentLengthMismatch)
+        );
+    });
+}
+
+#[test]
+fn completes_empty_body_for_zero_content_length() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new();
+        let headers = [field(b":status", b"200"), field(b"content-length", b"0")];
+        response.classify(driver, &headers, false).unwrap();
+
+        assert_eq!(
+            response.data_received(1, false),
+            Err(ResponseSectionError::BodyTooLong)
+        );
+        assert_eq!(
+            response.data_received(0, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+
+        let mut immediate = ClientResponseHeaders::new();
+        let section = immediate.classify(driver, &headers, true).unwrap();
+
+        assert_eq!(section.kind, ResponseSectionKind::Final);
+        assert_eq!(immediate.phase(), ClientResponsePhase::Complete);
+    });
+}
+
+#[test]
+fn rejects_malformed_and_mismatched_content_length() {
+    with_client_driver(|driver| {
+        for value in [b"".as_slice(), b"abc", b"12x", b"-1", b"1,2"] {
+            let mut response = ClientResponseHeaders::new();
+            let headers = [field(b":status", b"200"), field(b"content-length", value)];
+            assert_eq!(
+                response.classify(driver, &headers, false),
+                Err(ResponseSectionError::InvalidContentLength),
+                "value: {:?}",
+                value
+            );
+            assert_eq!(response.phase(), ClientResponsePhase::AwaitingFinalHeaders);
+        }
+
+        let mut overflow = ClientResponseHeaders::new();
+        let headers = [
+            field(b":status", b"200"),
+            field(b"content-length", b"18446744073709551616"),
+        ];
+        assert_eq!(
+            overflow.classify(driver, &headers, false),
+            Err(ResponseSectionError::InvalidContentLength)
+        );
+
+        let mut mismatched = ClientResponseHeaders::new();
+        let headers = [
+            field(b":status", b"200"),
+            field(b"content-length", b"5"),
+            field(b"content-length", b"6"),
+        ];
+        assert_eq!(
+            mismatched.classify(driver, &headers, false),
+            Err(ResponseSectionError::InvalidContentLength)
+        );
+
+        let mut repeated = ClientResponseHeaders::new();
+        let headers = [
+            field(b":status", b"200"),
+            field(b"content-length", b"5"),
+            field(b"content-length", b"5"),
+        ];
+        repeated.classify(driver, &headers, false).unwrap();
+
+        assert_eq!(repeated.content_length(), Some(5));
+        assert_eq!(
+            repeated.data_received(5, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+    });
+}
+
+#[test]
+fn enforces_method_specific_body_rules_for_status_variants() {
+    with_client_driver(|driver| {
+        let mut head_no_content = ClientResponseHeaders::new_with_method(b"HEAD");
+        let headers = [field(b":status", b"204")];
+        head_no_content.classify(driver, &headers, false).unwrap();
+
+        assert!(!head_no_content.body_allowed());
+        assert_eq!(
+            head_no_content.data_received(1, false),
+            Err(ResponseSectionError::ContentNotAllowed)
+        );
+
+        let mut head_length_on_no_content = ClientResponseHeaders::new_with_method(b"HEAD");
+        let headers = [field(b":status", b"204"), field(b"content-length", b"0")];
+        assert_eq!(
+            head_length_on_no_content.classify(driver, &headers, false),
+            Err(ResponseSectionError::ContentLengthNotAllowed)
+        );
+
+        let mut get_connect_tunnel = ClientResponseHeaders::new();
+        let headers = [field(b":status", b"200")];
+        get_connect_tunnel
+            .classify(driver, &headers, false)
+            .unwrap();
+
+        assert!(get_connect_tunnel.body_allowed());
+        assert_eq!(
+            get_connect_tunnel.data_received(4, false),
+            Ok(ClientResponsePhase::Content)
+        );
+    });
+}
+
+#[test]
+fn tracks_method_specific_reuse_state() {
+    with_client_driver(|driver| {
+        let mut response = ClientResponseHeaders::new();
+
+        assert!(matches!(
+            ClientResponseHeaders::new().phase(),
+            ClientResponsePhase::AwaitingFinalHeaders
+        ));
+
+        response
+            .classify(driver, &[field(b":status", b"200")], false)
+            .unwrap();
+
+        assert!(response.body_allowed());
+
+        response.reset_with_method(b"HEAD");
+        assert_eq!(response.phase(), ClientResponsePhase::AwaitingFinalHeaders);
+        assert_eq!(response.final_status(), None);
+        assert_eq!(response.content_length(), None);
+        assert_eq!(response.remaining(), 0);
+
+        response
+            .classify(driver, &[field(b":status", b"200")], false)
+            .unwrap();
+
+        assert!(!response.body_allowed());
+        assert_eq!(
+            response.data_received(1, false),
+            Err(ResponseSectionError::ContentNotAllowed)
+        );
+
+        response.reset_with_method(b"GET");
+        response
+            .classify(
+                driver,
+                &[field(b":status", b"200"), field(b"content-length", b"2")],
+                false,
+            )
+            .unwrap();
+
+        assert!(response.body_allowed());
+        assert_eq!(
+            response.data_received(2, true),
+            Ok(ClientResponsePhase::Complete)
+        );
+    });
+}
