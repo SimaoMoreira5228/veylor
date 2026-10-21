@@ -1,8 +1,15 @@
+mod client_request;
+mod client_response;
 mod frames;
 mod output;
 #[cfg(test)]
 mod tests;
 
+pub use client_request::{RequestFieldSectionError, encode_request_field_section};
+pub use client_response::{
+    ClientResponseHeaders, ClientResponsePhase, ResponseFieldSection, ResponseSectionError,
+    ResponseSectionKind,
+};
 pub use output::{
     ControlFrameWriter, DataFrameWriter, DataWriteError, FrameWriteError, HeadersFrameWriter,
     HeadersWriteError, OutputProgress, QueuedDataFrame, QueuedHeadersBlock,
