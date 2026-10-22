@@ -2,6 +2,7 @@ mod abi;
 mod client_connection;
 mod h2_client;
 mod h2_server;
+mod managed_static;
 mod server_connection;
 
 pub use abi::{
@@ -33,6 +34,13 @@ pub use h2_server::{
     vyl_h2_server_refuse, vyl_h2_server_send_data, vyl_h2_server_send_ping_ack,
     vyl_h2_server_send_reset, vyl_h2_server_send_response, vyl_h2_server_send_settings,
     vyl_h2_server_send_settings_ack, vyl_h2_server_send_window_update,
+};
+pub use managed_static::{
+    VYL_MANAGED_STATIC_ABI_VERSION, VylManagedStaticCloseCounts, VylManagedStaticConfig,
+    VylManagedStaticServer, vyl_managed_static_destroy, vyl_managed_static_join,
+    vyl_managed_static_local_addr, vyl_managed_static_new,
+    vyl_managed_static_register_static_route, vyl_managed_static_start,
+    vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use server_connection::{
     VYL_HTTP1_ADMISSION_READY, VYL_HTTP1_ADMISSION_REJECTED, VYL_HTTP1_ADMISSION_SEND_CONTINUE,

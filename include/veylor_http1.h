@@ -708,6 +708,67 @@ vyl_http1_result vyl_h2_server_goaway_drain(
     size_t* out_required
 );
 
+#define VYL_MANAGED_STATIC_ABI_VERSION 1u
+
+typedef struct vyl_managed_static_server vyl_managed_static_server;
+
+typedef struct {
+    uint32_t abi_version;
+    size_t struct_size;
+    uint64_t request_head_timeout_ns;
+    uint64_t body_progress_timeout_ns;
+    uint64_t response_write_timeout_ns;
+    uint64_t keep_alive_idle_timeout_ns;
+    uint64_t shutdown_grace_ns;
+    uint64_t drain_idle_linger_ns;
+    uint64_t max_accepts_per_turn;
+    uint64_t max_events_per_turn;
+    uint64_t byte_budget_per_turn;
+    int32_t poll_wait_ms;
+    uint16_t port;
+    uint32_t reserved;
+} vyl_managed_static_config;
+
+typedef struct {
+    uint64_t completed;
+    uint64_t peer_closed;
+    uint64_t reset;
+    uint64_t timeout;
+    uint64_t protocol_error;
+    uint64_t response_overflow;
+    uint64_t transport_error;
+    uint64_t shutdown;
+} vyl_managed_static_close_counts;
+
+/* NOTE: Static-only v1: loopback listener, frozen static routes, no host dispatch or events.
+   Register routes before start; start freezes them and spawns the worker. Destroy is valid
+   only before start or after join; a running handle must stop and join first. */
+vyl_http1_result vyl_managed_static_new(
+    const vyl_managed_static_config* config,
+    vyl_managed_static_server** out_server
+);
+vyl_http1_result vyl_managed_static_destroy(vyl_managed_static_server* server);
+/* NOTE: Input bytes are copied before return; nothing is retained. */
+vyl_http1_result vyl_managed_static_register_static_route(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    vyl_http1_bytes body
+);
+vyl_http1_result vyl_managed_static_start(vyl_managed_static_server* server);
+vyl_http1_result vyl_managed_static_stop_accepting(vyl_managed_static_server* server);
+vyl_http1_result vyl_managed_static_stop_force(vyl_managed_static_server* server);
+vyl_http1_result vyl_managed_static_join(
+    vyl_managed_static_server* server,
+    vyl_managed_static_close_counts* out_counts
+);
+vyl_http1_result vyl_managed_static_local_addr(
+    vyl_managed_static_server* server,
+    uint16_t* out_port
+);
+
 #ifdef __cplusplus
 }
 #endif

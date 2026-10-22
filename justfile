@@ -44,9 +44,13 @@ integration-rust-ffi-linux:
     clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_h2_exchange.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
         -o build/test-rust-ffi-h2-exchange
+    clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_managed_static.c \
+        -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
+        -o build/test-rust-ffi-managed-static
     build/test-rust-ffi-http1
     build/test-rust-ffi-client-response
     build/test-rust-ffi-server-body
     build/test-rust-ffi-server-response
     build/test-rust-ffi-server-cancel
     build/test-rust-ffi-h2-exchange
+    build/test-rust-ffi-managed-static

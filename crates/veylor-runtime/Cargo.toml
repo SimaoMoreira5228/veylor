@@ -8,5 +8,9 @@ rust-version.workspace = true
 [target.'cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))'.dependencies]
 mio = { version = "1.2.4", default-features = false, features = ["os-poll", "net"] }
 
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.5" }
+rustix = { version = "0.38", features = ["net"] }
+
 [lints]
 workspace = true

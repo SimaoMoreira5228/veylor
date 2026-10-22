@@ -11,6 +11,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 veylor-http1 = { path = "../veylor-http1" }
 veylor-http2 = { path = "../veylor-http2" }
+veylor-server = { path = "../veylor-server" }
 
 [lints]
 workspace = true

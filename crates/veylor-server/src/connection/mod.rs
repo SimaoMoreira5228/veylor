@@ -44,6 +44,7 @@ pub struct ConnState {
     out_sent: usize,
     pending_len: usize,
     phase: ConnPhase,
+    idle: bool,
     read_ready: bool,
     write_blocked: bool,
     closing: bool,
@@ -66,6 +67,7 @@ impl ConnState {
             out_sent: 0,
             pending_len: 0,
             phase: ConnPhase::ReadingHead,
+            idle: false,
             read_ready: true,
             write_blocked: false,
             closing: false,
@@ -116,8 +118,18 @@ impl ConnState {
 }
 
 pub enum PumpOutcome {
-    Keep,
+    Keep(PumpProgress),
     Close(ConnClose),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PumpProgress {
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub resumed_idle: bool,
+    pub entered_body: bool,
+    pub entered_response: bool,
+    pub response_flushed: bool,
 }
 
 pub fn pump_connection(
@@ -132,6 +144,8 @@ pub fn pump_connection(
     let draining = matches!(conn.phase, ConnPhase::DrainingBody { .. });
     let reading = (conn.phase == ConnPhase::ReadingHead || draining) && conn.len < INPUT_CAP;
     let token = conn.token;
+    let was_idle = conn.idle;
+    let mut progress = PumpProgress::default();
     let read_ready = conn.read_ready;
     let out_sent = conn.out_sent;
     let out_len = conn.out_len;
@@ -164,6 +178,7 @@ pub fn pump_connection(
     match read {
         ReadStatus::Progress(bytes) => {
             conn.len += bytes;
+            progress.bytes_read = bytes as u64;
         }
         ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
         ReadStatus::Closed(CloseReason::PeerClosed) => {
@@ -199,8 +214,13 @@ pub fn pump_connection(
         WriteStatus::Idle => 0,
     };
     conn.out_sent += accepted;
+    progress.bytes_written = accepted as u64;
     if closed.is_some() && !conn.has_pending_output() && conn.phase == ConnPhase::ReadingHead {
         return PumpOutcome::Close(ConnClose::PeerClosed);
+    }
+    if was_idle && (progress.bytes_read > 0 || conn.len > 0) {
+        progress.resumed_idle = true;
+        conn.idle = false;
     }
 
     if let ConnPhase::DrainingBody { remaining } = conn.phase {
@@ -213,6 +233,7 @@ pub fn pump_connection(
             conn.pending_len = 0;
             conn.phase = ConnPhase::SendingResponse;
             conn.write_blocked = false;
+            progress.entered_response = true;
         } else {
             conn.phase = ConnPhase::DrainingBody { remaining: left };
             // NOTE: edge-triggered readiness fires only on new arrivals, so a drain that stopped
@@ -230,6 +251,13 @@ pub fn pump_connection(
             ExchangeOutcome::Responded => {}
             ExchangeOutcome::Close(reason) => return PumpOutcome::Close(reason),
         }
+        if conn.phase == ConnPhase::SendingResponse {
+            progress.entered_response = true;
+            conn.idle = false;
+        } else if matches!(conn.phase, ConnPhase::DrainingBody { .. }) {
+            progress.entered_body = true;
+            conn.idle = false;
+        }
     }
 
     if conn.phase == ConnPhase::SendingResponse && !conn.has_pending_output() {
@@ -237,8 +265,9 @@ pub fn pump_connection(
             return PumpOutcome::Close(conn.close_reason);
         }
         reuse_keep_alive(conn);
+        progress.response_flushed = true;
     }
-    PumpOutcome::Keep
+    PumpOutcome::Keep(progress)
 }
 
 enum ExchangeOutcome {
@@ -347,6 +376,7 @@ fn reuse_keep_alive(conn: &mut ConnState) {
     conn.out_len = 0;
     conn.out_sent = 0;
     conn.phase = ConnPhase::ReadingHead;
+    conn.idle = true;
     conn.parser.reset();
     conn.read_ready = tail > 0;
 }

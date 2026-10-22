@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use veylor_runtime::ConnectionTimeouts;
 use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig};
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -104,6 +105,18 @@ fn get(stream: &mut TcpStream, path: &str) {
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
     stream.write_all(request.as_bytes()).expect("write request");
+}
+
+fn tight_config(head_ns: u64, body_ns: u64, write_ns: u64, idle_ns: u64) -> ServerConfig {
+    ServerConfig {
+        timeouts: ConnectionTimeouts {
+            request_head_ns: head_ns,
+            body_progress_ns: body_ns,
+            response_write_ns: write_ns,
+            keep_alive_idle_ns: idle_ns,
+        },
+        ..ServerConfig::default()
+    }
 }
 
 #[test]
@@ -428,4 +441,71 @@ fn head_falls_back_to_get_without_body() {
     read_eof(&mut stream);
     server.stop_accepting();
     let _ = server.join().expect("join server");
+}
+
+#[test]
+fn trickle_head_times_out_and_slot_reusable() {
+    let config = tight_config(100_000_000, 5_000_000_000, 5_000_000_000, 5_000_000_000);
+    let server = test_server_with_config(config);
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .expect("write partial head");
+    read_eof(&mut stream);
+    let mut again = connect(&server);
+    get(&mut again, "/hello");
+    let response = read_response(&mut again);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.timeout, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn stalled_drain_times_out_mid_body() {
+    let config = tight_config(5_000_000_000, 100_000_000, 5_000_000_000, 5_000_000_000);
+    let server = test_server_with_config(config);
+    let mut stream = connect(&server);
+    let head = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1024\r\n\r\n";
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream.write_all(&[b'a'; 100]).expect("write partial body");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.timeout, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn idle_keep_alive_closes_after_idle_timeout() {
+    let config = tight_config(5_000_000_000, 5_000_000_000, 5_000_000_000, 100_000_000);
+    let server = test_server_with_config(config);
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.timeout, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn generous_timeouts_full_exchange_without_false_timeout() {
+    let config = tight_config(5_000_000_000, 5_000_000_000, 5_000_000_000, 5_000_000_000);
+    let server = test_server_with_config(config);
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    get(&mut stream, "/empty");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert!(second.body.is_empty());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.timeout, 0, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }

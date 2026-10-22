@@ -8,18 +8,20 @@ use std::time::{Duration, Instant};
 use veylor_router::RouteSlot;
 use veylor_runtime::{
     AcceptedConnection, AdmittedConnection, ConnectionDeadline, ConnectionDeadlineKind,
-    ConnectionSlot, ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness,
-    ShutdownPhase, ShutdownState, TIMER_INDEX_STORAGE_FACTOR, TcpListener, TimerExpiration,
-    TurnConfig, TurnInput, WAKE_TOKEN, WakeHandle, Worker, WorkerError, WorkerStorage,
+    ConnectionPhase, ConnectionSlot, ConnectionTimeouts, ConnectionToken, PollInterest, Poller,
+    Readiness, ShutdownPhase, ShutdownState, TIMER_INDEX_STORAGE_FACTOR, TcpListener,
+    TimerExpiration, TurnConfig, TurnInput, WAKE_TOKEN, WakeHandle, Worker, WorkerError,
+    WorkerStorage, bind_reuse_port,
 };
 
-use crate::connection::{ConnClose, ConnState, PumpOutcome, pump_connection};
+use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
 use crate::static_routes::{MAX_ROUTES, RouteBuildError, StaticRoutes};
 
 pub const MAX_CONNECTIONS: usize = 128;
+pub const MAX_WORKERS: usize = 16;
 pub const LISTENER_TOKEN: usize = 0;
 pub const SHUTDOWN_TIMER_ID: u64 = 0xFFFF_FFFE;
-const MAX_EVENTS_PER_TURN: usize = 64;
+pub(crate) const MAX_EVENTS_PER_TURN: usize = 64;
 const MAX_EXPIRED_PER_TURN: usize = 64;
 const SHUTDOWN_GRACE_DEFAULT_NS: u64 = 5_000_000_000;
 const SENTINEL_SLOT: u32 = u32::MAX;
@@ -59,6 +61,7 @@ pub struct ServerConfig {
     pub drain_idle_linger_ns: u64,
     pub turn: TurnConfig,
     pub poll_wait_ms: i32,
+    pub worker_count: usize,
 }
 
 impl Default for ServerConfig {
@@ -74,6 +77,7 @@ impl Default for ServerConfig {
             drain_idle_linger_ns: 200_000_000,
             turn: TurnConfig::DEFAULT,
             poll_wait_ms: 10,
+            worker_count: 1,
         }
     }
 }
@@ -103,15 +107,19 @@ impl From<RouteBuildError> for ServerError {
 }
 
 pub struct Server {
-    listener: TcpListener,
-    config: ServerConfig,
-    routes: StaticRoutes,
+    pub(crate) listener: TcpListener,
+    pub(crate) config: ServerConfig,
+    pub(crate) routes: StaticRoutes,
 }
 
 impl Server {
     pub fn bind(addr: SocketAddr, config: ServerConfig) -> Result<Self, ServerError> {
         validate_config(&config)?;
-        let listener = TcpListener::bind(addr).map_err(ServerError::Bind)?;
+        let listener = if config.worker_count == 1 {
+            TcpListener::bind(addr).map_err(ServerError::Bind)?
+        } else {
+            bind_reuse_port(addr).map_err(ServerError::Bind)?
+        };
         Ok(Self {
             listener,
             config,
@@ -138,6 +146,9 @@ impl Server {
 
     pub fn start(self) -> Result<RunningServer, ServerError> {
         freeze_check(&self.routes)?;
+        if self.config.worker_count > 1 {
+            return crate::multi_worker::start_multi(self);
+        }
         let Server {
             mut listener,
             config,
@@ -152,9 +163,10 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let force = Arc::new(AtomicBool::new(false));
         let ctx = ThreadCtx {
+            worker_id: 0,
             listener,
             config,
-            routes,
+            routes: Arc::new(routes),
             worker_poller,
             stop: Arc::clone(&stop),
             force: Arc::clone(&force),
@@ -164,8 +176,8 @@ impl Server {
             .spawn(|| worker_main(ctx))
             .map_err(|error| ServerError::Thread(error.to_string()))?;
         Ok(RunningServer {
-            handle,
-            waker,
+            handles: vec![handle],
+            wakers: vec![waker],
             stop,
             force,
             addr,
@@ -174,11 +186,11 @@ impl Server {
 }
 
 pub struct RunningServer {
-    handle: JoinHandle<ThreadResult>,
-    waker: WakeHandle,
-    stop: Arc<AtomicBool>,
-    force: Arc<AtomicBool>,
-    addr: SocketAddr,
+    pub(crate) handles: Vec<JoinHandle<ThreadResult>>,
+    pub(crate) wakers: Vec<WakeHandle>,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) force: Arc<AtomicBool>,
+    pub(crate) addr: SocketAddr,
 }
 
 impl RunningServer {
@@ -188,39 +200,71 @@ impl RunningServer {
 
     pub fn stop_accepting(&self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.waker.wake();
+        for waker in &self.wakers {
+            let _ = waker.wake();
+        }
     }
 
     pub fn stop_force(&self) {
         self.force.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
-        let _ = self.waker.wake();
+        for waker in &self.wakers {
+            let _ = waker.wake();
+        }
     }
 
     pub fn join(self) -> Result<CloseCounts, ServerError> {
-        match self.handle.join() {
-            Ok(result) => result.into_counts(),
-            Err(_) => Err(ServerError::Join("worker thread panicked".to_string())),
+        let mut total = CloseCounts::default();
+        for worker in self.join_per_worker()? {
+            total.completed += worker.completed;
+            total.peer_closed += worker.peer_closed;
+            total.reset += worker.reset;
+            total.timeout += worker.timeout;
+            total.protocol_error += worker.protocol_error;
+            total.response_overflow += worker.response_overflow;
+            total.transport_error += worker.transport_error;
+            total.shutdown += worker.shutdown;
+        }
+        Ok(total)
+    }
+
+    pub fn join_per_worker(self) -> Result<Vec<CloseCounts>, ServerError> {
+        let mut counts = Vec::with_capacity(self.handles.len());
+        let mut first_error: Option<ServerError> = None;
+        for handle in self.handles {
+            match handle.join().map(ThreadResult::into_counts) {
+                Ok(Ok(worker)) => counts.push(worker),
+                Ok(Err(error)) => first_error = first_error.or(Some(error)),
+                Err(_) => {
+                    let panic = ServerError::Join("worker thread panicked".to_string());
+                    first_error = first_error.or(Some(panic));
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(counts),
         }
     }
 }
 
-struct ThreadCtx {
-    listener: TcpListener,
-    config: ServerConfig,
-    routes: StaticRoutes,
-    worker_poller: Poller,
-    stop: Arc<AtomicBool>,
-    force: Arc<AtomicBool>,
+pub(crate) struct ThreadCtx {
+    pub(crate) worker_id: u32,
+    pub(crate) listener: TcpListener,
+    pub(crate) config: ServerConfig,
+    pub(crate) routes: Arc<StaticRoutes>,
+    pub(crate) worker_poller: Poller,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) force: Arc<AtomicBool>,
 }
 
-struct ThreadResult {
+pub(crate) struct ThreadResult {
     counts: CloseCounts,
     error: Option<String>,
 }
 
 impl ThreadResult {
-    fn into_counts(self) -> Result<CloseCounts, ServerError> {
+    pub(crate) fn into_counts(self) -> Result<CloseCounts, ServerError> {
         match self.error {
             Some(error) => Err(ServerError::Thread(error)),
             None => Ok(self.counts),
@@ -233,6 +277,9 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         .turn
         .validate()
         .map_err(|_| ServerError::InvalidConfig)?;
+    if config.worker_count == 0 || config.worker_count > MAX_WORKERS {
+        return Err(ServerError::InvalidConfig);
+    }
     if config.poll_wait_ms <= 0 {
         return Err(ServerError::InvalidConfig);
     }
@@ -257,8 +304,9 @@ fn conn_poll_token(slot: usize) -> usize {
     slot + 1
 }
 
-fn worker_main(ctx: ThreadCtx) -> ThreadResult {
+pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let ThreadCtx {
+        worker_id,
         mut listener,
         config,
         routes,
@@ -304,7 +352,7 @@ fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         live: &mut live,
     };
     let mut worker = match Worker::new(
-        0,
+        worker_id,
         1,
         config.turn,
         config.timeouts,
@@ -475,18 +523,22 @@ fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             if draining {
                 conn.begin_drain();
             }
-            match pump_connection(conn, &routes, &table, per_conn_budget) {
-                PumpOutcome::Keep => {}
-                PumpOutcome::Close(reason) => {
-                    close_conn(
-                        index,
-                        reason,
-                        &mut conns,
-                        &mut stream_poller,
-                        &mut worker,
-                        &mut result.counts,
-                    );
+            let hook_close = match pump_connection(conn, &routes, &table, per_conn_budget) {
+                PumpOutcome::Keep(progress) => {
+                    let token = conn.token();
+                    apply_pump_hooks(&mut worker, token, progress, now_ns)
                 }
+                PumpOutcome::Close(reason) => Some(reason),
+            };
+            if let Some(reason) = hook_close {
+                close_conn(
+                    index,
+                    reason,
+                    &mut conns,
+                    &mut stream_poller,
+                    &mut worker,
+                    &mut result.counts,
+                );
             }
         }
         turn_offset = (turn_offset + 1) % MAX_CONNECTIONS;
@@ -584,6 +636,51 @@ fn drain_expired(
             );
         }
     }
+}
+
+// NOTE: hook failures mean the worker table diverged from connection state; a
+// failed transition already parks the slot in Closing, so the server closes the
+// connection instead of running it deadline-less or retrying into the park.
+fn apply_pump_hooks(
+    worker: &mut Worker<'_>,
+    token: ConnectionToken,
+    progress: PumpProgress,
+    now_ns: u64,
+) -> Option<ConnClose> {
+    let bytes = progress.bytes_read.saturating_add(progress.bytes_written);
+    if worker.note_progress(token, bytes, now_ns).is_err() {
+        return Some(ConnClose::TransportError);
+    }
+    if progress.resumed_idle {
+        if worker.cancel_idle(token).is_err() {
+            return Some(ConnClose::TransportError);
+        }
+        let resumed = worker.transition_phase(token, ConnectionPhase::ReadingRequestHead, now_ns);
+        if resumed.is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
+    if progress.entered_body {
+        let entered = worker.transition_phase(token, ConnectionPhase::ReadingRequestBody, now_ns);
+        if entered.is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
+    if progress.entered_response {
+        let entered = worker.transition_phase(token, ConnectionPhase::WritingResponse, now_ns);
+        if entered.is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
+    if progress.response_flushed {
+        if worker.cancel_deadline(token).is_err() {
+            return Some(ConnClose::TransportError);
+        }
+        if worker.schedule_idle(token, now_ns).is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
+    None
 }
 
 fn close_conn(
