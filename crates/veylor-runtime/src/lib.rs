@@ -1,14 +1,23 @@
 mod connections;
 #[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
+mod io;
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 mod polling;
 mod shutdown;
 mod timers;
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
+mod worker;
 
 pub use connections::{
     ConnectionDeadline, ConnectionDeadlineKind, ConnectionPhase, ConnectionSlot, ConnectionTable,
     ConnectionTimeouts, ConnectionToken, DeadlineError, ReleaseOutcome, TableError,
     cancel_phase_deadline, deadline_timer_id, resume_keep_alive_request, schedule_phase_deadline,
     start_keep_alive_idle_deadline,
+};
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
+pub use io::{
+    CloseReason, IoBatch, IoOutcome, ReadStatus, WriteStatus, dispatch, note_completion,
+    note_read_progress, note_write_progress,
 };
 #[cfg(all(
     not(all(target_family = "wasm", not(target_os = "wasi"))),
@@ -27,4 +36,8 @@ pub use shutdown::{
 };
 pub use timers::{
     MAX_TIMER_CAPACITY, TIMER_INDEX_STORAGE_FACTOR, TimerExpiration, TimerQueue, TimerQueueError,
+};
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
+pub use worker::{
+    AdmittedConnection, TurnConfig, TurnInput, TurnOutcome, Worker, WorkerError, WorkerStorage,
 };

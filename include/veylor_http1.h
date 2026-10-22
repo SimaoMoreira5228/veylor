@@ -332,6 +332,382 @@ vyl_http1_result vyl_http1_client_connection_read_response(
 vyl_http1_result vyl_http1_client_connection_reset(vyl_client_connection* connection);
 vyl_http1_result vyl_http1_client_connection_destroy(vyl_client_connection* connection);
 
+#define VYL_H2_MAX_ACTIONS 16u
+#define VYL_H2_MAX_FIELDS 64u
+#define VYL_H2_MAX_SETTINGS 8u
+#define VYL_H2_END_STREAM 1u
+#define VYL_H2_NO_FIELD ((size_t)-1)
+
+typedef struct vyl_h2_client vyl_h2_client;
+typedef struct vyl_h2_server vyl_h2_server;
+
+typedef enum {
+    VYL_H2_ACTION_HEADERS = 0,
+    VYL_H2_ACTION_DATA = 1,
+    VYL_H2_ACTION_STREAM_RESET = 2,
+    VYL_H2_ACTION_GOAWAY = 3,
+    VYL_H2_ACTION_SETTINGS_ACK_REQUIRED = 4,
+    VYL_H2_ACTION_PING_ACK = 5,
+    VYL_H2_ACTION_SEND_RESET = 6,
+    VYL_H2_ACTION_CONNECTION_ERROR = 7
+} vyl_h2_action_kind;
+
+typedef enum {
+    VYL_H2_RESPONSE_INFORMATIONAL = 0,
+    VYL_H2_RESPONSE_FINAL = 1,
+    VYL_H2_RESPONSE_TRAILERS = 2
+} vyl_h2_response_section_kind;
+
+typedef enum {
+    VYL_H2_PHASE_AWAITING_HEADERS = 0,
+    VYL_H2_PHASE_CONTENT = 1,
+    VYL_H2_PHASE_COMPLETE = 2
+} vyl_h2_response_phase;
+
+typedef enum {
+    VYL_H2_INDEXED = 0,
+    VYL_H2_INCREMENTAL = 1,
+    VYL_H2_WITHOUT_INDEXING = 2,
+    VYL_H2_NEVER_INDEXED = 3
+} vyl_h2_representation;
+
+typedef struct {
+    vyl_http1_bytes name;
+    vyl_http1_bytes value;
+    uint32_t representation;
+    uint32_t huffman_name;
+    uint32_t huffman_value;
+} vyl_h2_field_to_encode;
+
+typedef struct {
+    uint32_t id;
+    uint32_t value;
+} vyl_h2_setting;
+
+typedef struct {
+    size_t name_offset;
+    size_t name_length;
+    size_t value_offset;
+    size_t value_length;
+} vyl_h2_field;
+
+typedef struct {
+    uint32_t kind;
+    uint32_t stream_id;
+    uint32_t flags;
+    uint32_t error_code;
+    size_t data_offset;
+    size_t data_length;
+    size_t field_start;
+    size_t field_count;
+    uint8_t ping[8];
+} vyl_h2_action;
+
+typedef struct {
+    uint32_t kind;
+    uint16_t status;
+    uint16_t phase;
+    uint64_t content_length;
+    uint32_t has_content_length;
+    uint32_t end_stream;
+} vyl_h2_response_class;
+
+typedef struct {
+    size_t method_field;
+    size_t scheme_field;
+    size_t authority_field;
+    size_t path_field;
+    uint64_t content_length;
+    uint32_t has_content_length;
+} vyl_h2_validated_request;
+
+/* NOTE: Initial handle storage bounds: 32 streams, 4 KiB header block and
+   HPACK scratch each way, 32-entry HPACK tables, 8 queued settings. These are
+   initial values, not promises. One encoded frame is pending at a time;
+   acknowledge every written byte count before the next send call. Poll copies
+   header and data bytes into caller storage; field entries index the caller's
+   field array and data spans index the caller's data buffer. Classify or
+   accept reported headers before the next poll overwrites them. */
+vyl_http1_result vyl_h2_client_new(vyl_h2_client** out_handle);
+vyl_http1_result vyl_h2_client_destroy(vyl_h2_client* handle);
+/* NOTE: Stop transport IO and close the connection after cancel; the handle
+ * cannot be reused. */
+vyl_http1_result vyl_h2_client_cancel(vyl_h2_client* handle);
+/* NOTE: Copies the 24-byte client connection preface. Keep output unchanged
+    until its bytes are transmitted. */
+vyl_http1_result vyl_h2_client_connection_preface(
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: SETTINGS parameters are copied before return; the local settings take
+    effect only after the encoded bytes are fully acknowledged. */
+vyl_http1_result vyl_h2_client_send_settings(
+    vyl_h2_client* handle,
+    const vyl_h2_setting* parameters,
+    size_t parameter_count,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Acknowledge every accepted byte count before the next send call; keep
+    each output buffer unchanged until fully acknowledged. */
+vyl_http1_result vyl_h2_client_acknowledge(
+    vyl_h2_client* handle,
+    size_t transferred_bytes,
+    size_t* out_pending
+);
+vyl_http1_result vyl_h2_client_send_settings_ack(
+    vyl_h2_client* handle,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_client_send_ping_ack(
+    vyl_h2_client* handle,
+    const uint8_t opaque_data[8],
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Grants matching receive credit alongside the WINDOW_UPDATE frame. */
+vyl_http1_result vyl_h2_client_send_window_update(
+    vyl_h2_client* handle,
+    uint32_t stream_id,
+    uint32_t increment,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Field bytes are copied or encoded before return. The originating
+    method binds to the new stream for later classification. */
+vyl_http1_result vyl_h2_client_start_request(
+    vyl_h2_client* handle,
+    const vyl_h2_field_to_encode* fields,
+    size_t field_count,
+    uint32_t end_stream,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    uint32_t* out_stream_id,
+    size_t* out_required
+);
+/* NOTE: Partial input is accepted under flow-control or output limits; the
+    end-stream flag tells whether the stream closed. */
+vyl_http1_result vyl_h2_client_send_data(
+    vyl_h2_client* handle,
+    uint32_t stream_id,
+    vyl_http1_bytes input,
+    uint32_t end_stream,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_consumed,
+    size_t* out_written,
+    uint32_t* out_end_stream,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_client_cancel_stream(
+    vyl_h2_client* handle,
+    uint32_t stream_id,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_client_send_reset(
+    vyl_h2_client* handle,
+    uint32_t stream_id,
+    uint32_t error_code,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_client_goaway(
+    vyl_h2_client* handle,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Feeds transport bytes and copies out whole actions. Consume
+    out_consumed bytes after every call. On BUFFER_TOO_SMALL the reported
+    bytes are consumed but the input must stay alive until a later call
+    succeeds. Classify reported headers before the next poll. */
+vyl_http1_result vyl_h2_client_poll_feed(
+    vyl_h2_client* handle,
+    const uint8_t* input,
+    size_t input_length,
+    size_t* out_consumed,
+    vyl_h2_action* actions,
+    size_t action_capacity,
+    vyl_h2_field* fields,
+    size_t field_capacity,
+    uint8_t* data,
+    size_t data_capacity,
+    size_t* out_actions,
+    size_t* out_fields,
+    size_t* out_actions_required,
+    size_t* out_fields_required,
+    size_t* out_data_required,
+    uint32_t* out_connection_error
+);
+/* NOTE: header_start/header_count must name a range from the most recent poll;
+    call before the next poll. */
+vyl_http1_result vyl_h2_client_classify_headers(
+    vyl_h2_client* handle,
+    uint32_t stream_id,
+    size_t header_start,
+    size_t header_count,
+    uint32_t end_stream,
+    vyl_h2_response_class* out_class
+);
+/* NOTE: Report each data payload length exactly once. */
+vyl_http1_result vyl_h2_client_account_data(
+    vyl_h2_client* handle,
+    uint32_t stream_id,
+    size_t data_length,
+    uint32_t end_stream,
+    uint32_t* out_phase
+);
+
+vyl_http1_result vyl_h2_server_new(vyl_h2_server** out_handle);
+vyl_http1_result vyl_h2_server_destroy(vyl_h2_server* handle);
+/* NOTE: Stop transport IO and close the connection after cancel; the handle
+ * cannot be reused. */
+vyl_http1_result vyl_h2_server_cancel(vyl_h2_server* handle);
+/* NOTE: SETTINGS parameters are copied before return; the local settings take
+    effect only after the encoded bytes are fully acknowledged. */
+vyl_http1_result vyl_h2_server_send_settings(
+    vyl_h2_server* handle,
+    const vyl_h2_setting* parameters,
+    size_t parameter_count,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Acknowledge every accepted byte count before the next send call; keep
+    each output buffer unchanged until fully acknowledged. */
+vyl_http1_result vyl_h2_server_acknowledge(
+    vyl_h2_server* handle,
+    size_t transferred_bytes,
+    size_t* out_pending
+);
+vyl_http1_result vyl_h2_server_send_settings_ack(
+    vyl_h2_server* handle,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_server_send_ping_ack(
+    vyl_h2_server* handle,
+    const uint8_t opaque_data[8],
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Grants matching receive credit alongside the WINDOW_UPDATE frame. */
+vyl_http1_result vyl_h2_server_send_window_update(
+    vyl_h2_server* handle,
+    uint32_t stream_id,
+    uint32_t increment,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Feeds transport bytes and copies out whole actions. Consume
+    out_consumed bytes after every call. On BUFFER_TOO_SMALL the reported
+    bytes are consumed but the input must stay alive until a later call
+    succeeds. Accept reported headers before the next poll. */
+vyl_http1_result vyl_h2_server_poll_feed(
+    vyl_h2_server* handle,
+    const uint8_t* input,
+    size_t input_length,
+    size_t* out_consumed,
+    vyl_h2_action* actions,
+    size_t action_capacity,
+    vyl_h2_field* fields,
+    size_t field_capacity,
+    uint8_t* data,
+    size_t data_capacity,
+    size_t* out_actions,
+    size_t* out_fields,
+    size_t* out_actions_required,
+    size_t* out_fields_required,
+    size_t* out_data_required,
+    uint32_t* out_connection_error
+);
+/* NOTE: header_start/header_count must name a range from the most recent poll;
+    call before the next poll. Reported field indices address the caller's
+    field array from that same poll one-to-one. */
+vyl_http1_result vyl_h2_server_accept_request(
+    vyl_h2_server* handle,
+    uint32_t stream_id,
+    size_t header_start,
+    size_t header_count,
+    vyl_h2_validated_request* out_request
+);
+/* NOTE: Field bytes are copied or encoded before return. */
+vyl_http1_result vyl_h2_server_send_response(
+    vyl_h2_server* handle,
+    uint32_t stream_id,
+    const vyl_h2_field_to_encode* fields,
+    size_t field_count,
+    uint32_t end_stream,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+/* NOTE: Partial input is accepted under flow-control or output limits; the
+    end-stream flag tells whether the stream closed. */
+vyl_http1_result vyl_h2_server_send_data(
+    vyl_h2_server* handle,
+    uint32_t stream_id,
+    vyl_http1_bytes input,
+    uint32_t end_stream,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_consumed,
+    size_t* out_written,
+    uint32_t* out_end_stream,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_server_refuse(
+    vyl_h2_server* handle,
+    uint32_t stream_id,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_server_send_reset(
+    vyl_h2_server* handle,
+    uint32_t stream_id,
+    uint32_t error_code,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+vyl_http1_result vyl_h2_server_goaway_drain(
+    vyl_h2_server* handle,
+    uint32_t last_stream_id,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* out_written,
+    size_t* out_required
+);
+
 #ifdef __cplusplus
 }
 #endif
