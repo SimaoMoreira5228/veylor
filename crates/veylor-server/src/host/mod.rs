@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 
 use veylor_runtime::{ConnectionToken, WakeHandle};
 
+use crate::connection::{pull_staged_body, push_staged_body};
 use crate::static_routes::MAX_RESPONSE_BODY;
 
 // NOTE: park/poll/respond/cancel discipline mirrors src/runtime/host/queue.odin and the
 // S3.2/S3.6 direction: bounded per-worker event queues, whole-event dequeue with
 // required-capacity reporting, level-triggered wakeups, one Shutdown event per worker.
-// Bodies stay out: routes with body framing park with has_body set and close after the
-// parked response decision, like static v1. Streamed bodies are the next slice.
+// Fixed-length bodies stage per parked record up to the shared static cap: the worker
+// pushes wire bytes into staging, the host pulls with offsets, completion is pull-observed.
 
 // NOTE: depths mirror the Odin HOST_QUEUE_DEPTH so overload behavior stays comparable.
 pub const HOST_QUEUE_DEPTH: usize = 64;
@@ -27,7 +28,7 @@ pub enum HostEventKind {
 }
 
 #[derive(Clone, Debug)]
-enum StagedAction {
+pub(crate) enum StagedAction {
     Respond {
         status: u16,
         reason: Vec<u8>,
@@ -37,20 +38,23 @@ enum StagedAction {
 }
 
 #[derive(Clone, Debug)]
-struct ParkedEntry {
-    token: ConnectionToken,
-    staged: Option<StagedAction>,
+pub(crate) struct ParkedEntry {
+    pub(crate) token: ConnectionToken,
+    pub(crate) staged: Option<StagedAction>,
+    pub(crate) body_total: u64,
+    pub(crate) body: Vec<u8>,
+    pub(crate) body_pulled: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TombCause {
+pub(crate) enum TombCause {
     Responded,
     Cancelled,
     Gone,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Tomb {
+pub(crate) struct Tomb {
     token: ConnectionToken,
     cause: TombCause,
 }
@@ -100,6 +104,9 @@ pub enum RespondOutcome {
     BodyTooLarge,
 }
 
+// NOTE: pull triple (outcome, bytes copied, end-of-body); Duplicate means already answered.
+pub type BodyPull = (RespondOutcome, usize, bool);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancelOutcome {
     Ok,
@@ -129,10 +136,10 @@ pub struct StagedWork {
     pub cancel: bool,
 }
 
-struct HostInner {
+pub(crate) struct HostInner {
     events: Vec<VecDeque<HostEvent>>,
-    parked: Vec<Vec<Option<ParkedEntry>>>,
-    tombs: Vec<VecDeque<Tomb>>,
+    pub(crate) parked: Vec<Vec<Option<ParkedEntry>>>,
+    pub(crate) tombs: Vec<VecDeque<Tomb>>,
     seqs: Vec<Vec<u32>>,
     wakers: Vec<Option<WakeHandle>>,
     next_poll: usize,
@@ -200,6 +207,7 @@ impl HostShared {
         route_id: u64,
         method: &[u8],
         path: &[u8],
+        body_total: u64,
     ) -> Result<ConnectionToken, ParkError> {
         if method.is_empty()
             || method.len() > HOST_MAX_METHOD_BYTES
@@ -247,10 +255,7 @@ impl HostShared {
             event.method[..method.len()].copy_from_slice(method);
             event.path[..path.len()].copy_from_slice(path);
             inner.events[worker].push_back(event);
-            inner.parked[worker][slot] = Some(ParkedEntry {
-                token: event_token,
-                staged: None,
-            });
+            inner.parked[worker][slot] = Some(ParkedEntry::new(event_token, body_total));
             inner.counters.parks += 1;
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (Ok(event_token), waker)
@@ -289,6 +294,11 @@ impl HostShared {
             }
         });
         done.is_some_and(|(closed, _)| closed)
+    }
+
+    pub fn push_body(&self, token: ConnectionToken, bytes: &[u8]) -> bool {
+        let done = self.with_inner(|inner| (push_staged_body(inner, token, bytes), None));
+        done.is_some_and(|(ok, _)| ok)
     }
 
     pub fn stage_respond(
@@ -402,6 +412,12 @@ impl HostShared {
             }
             None => CancelOutcome::Stale,
         }
+    }
+
+    pub fn pull_body(&self, token: ConnectionToken, out: &mut [u8]) -> BodyPull {
+        let done = self.with_inner(|inner| (pull_staged_body(inner, token, out), None));
+        done.map(|(r, _)| r)
+            .unwrap_or((RespondOutcome::Stale, 0, false))
     }
 
     pub fn take_staged(&self, worker_id: u32) -> Vec<StagedWork> {
@@ -574,7 +590,7 @@ impl HostShared {
 
     // NOTE: the closure runs under the queue lock and must only copy bytes, never do IO
     // or parsing. The waker clone leaves under the guard; wake() runs after unlock.
-    fn with_inner<T>(
+    pub(crate) fn with_inner<T>(
         &self,
         op: impl FnOnce(&mut MutexGuard<'_, HostInner>) -> (T, Option<WakeHandle>),
     ) -> Option<(T, Option<WakeHandle>)> {
@@ -617,6 +633,10 @@ impl HostHandle {
         self.shared.stage_cancel(token)
     }
 
+    pub fn pull_body(&self, token: ConnectionToken, out: &mut [u8]) -> BodyPull {
+        self.shared.pull_body(token, out)
+    }
+
     pub fn counters(&self) -> HostCounters {
         self.shared.counters()
     }
@@ -636,7 +656,11 @@ fn push_tomb(inner: &mut HostInner, worker: usize, token: ConnectionToken, cause
     queue.push_back(Tomb { token, cause });
 }
 
-fn find_tomb(inner: &HostInner, worker: usize, token: ConnectionToken) -> Option<TombCause> {
+pub(crate) fn find_tomb(
+    inner: &HostInner,
+    worker: usize,
+    token: ConnectionToken,
+) -> Option<TombCause> {
     inner
         .tombs
         .get(worker)?

@@ -1,13 +1,14 @@
-use veylor_http1::{
-    ConnectionHeader, Header, Limits, ParseError, Parser, ResponseFraming, ResponseToWrite,
-    connection_header_for_response, encode_response_head,
-};
+pub(crate) mod parked;
+
+pub(crate) use parked::{pull_staged_body, push_staged_body};
+
+use veylor_http1::{BodyDecoder, Header, Limits, ParseError, Parser};
 use veylor_router::{RouteKind, RouteTable};
 use veylor_runtime::{
     CloseReason, ConnectionToken, IoBatch, ReadStatus, TcpStream, WriteStatus, dispatch,
 };
 
-use crate::host::{HOST_MAX_METHOD_BYTES, HostShared, ParkError};
+use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_routes::{
     EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_expectation_failed,
     respond_to_head,
@@ -18,20 +19,26 @@ pub const OUTPUT_CAP: usize = 8192;
 pub const HEADER_SLOTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConnPhase {
+pub(crate) enum ConnPhase {
     ReadingHead,
     DrainingBody {
         remaining: u64,
+        responded: bool,
     },
     SendingResponse,
-    // NOTE: the owner-side parked snapshot: method copy for HEAD semantics at respond
-    // time, keep-open decided at park (body framing forces close after the response).
+    // NOTE: the owner-side parked snapshot: method copy for HEAD semantics at respond time,
+    // keep-open from the request line alone, fixed-length body admission with the event token
+    // so worker turns can stage wire bytes for host pulls; unread bytes drain within the cap.
     Parked {
         route_id: u64,
         method_len: u8,
         method: [u8; HOST_MAX_METHOD_BYTES],
-        has_body: bool,
         keep_open: bool,
+        body_total: u64,
+        body_received: u64,
+        event_token: ConnectionToken,
+        chunked: bool,
+        chunked_done: bool,
     },
 }
 
@@ -51,23 +58,24 @@ pub enum ConnClose {
 }
 
 pub struct ConnState {
-    token: ConnectionToken,
-    stream: TcpStream,
-    parser: Parser,
-    headers: Box<[Header; HEADER_SLOTS]>,
-    input: Box<[u8; INPUT_CAP]>,
-    len: usize,
-    head_len: usize,
-    output: Box<[u8; OUTPUT_CAP]>,
-    out_len: usize,
-    out_sent: usize,
-    pending_len: usize,
-    phase: ConnPhase,
-    read_ready: bool,
-    write_blocked: bool,
-    closing: bool,
-    close_reason: ConnClose,
-    error_hint: bool,
+    pub(crate) token: ConnectionToken,
+    pub(crate) stream: TcpStream,
+    pub(crate) parser: Parser,
+    pub(crate) headers: Box<[Header; HEADER_SLOTS]>,
+    pub(crate) input: Box<[u8; INPUT_CAP]>,
+    pub(crate) chunked_decoder: Option<BodyDecoder>,
+    pub(crate) len: usize,
+    pub(crate) head_len: usize,
+    pub(crate) output: Box<[u8; OUTPUT_CAP]>,
+    pub(crate) out_len: usize,
+    pub(crate) out_sent: usize,
+    pub(crate) pending_len: usize,
+    pub(crate) phase: ConnPhase,
+    pub(crate) read_ready: bool,
+    pub(crate) write_blocked: bool,
+    pub(crate) closing: bool,
+    pub(crate) close_reason: ConnClose,
+    pub(crate) error_hint: bool,
 }
 
 impl ConnState {
@@ -78,6 +86,7 @@ impl ConnState {
             parser: Parser::new(),
             headers: Box::new([Header::default(); HEADER_SLOTS]),
             input: Box::new([0; INPUT_CAP]),
+            chunked_decoder: None,
             len: 0,
             head_len: 0,
             output: Box::new([0; OUTPUT_CAP]),
@@ -129,61 +138,6 @@ impl ConnState {
         matches!(self.phase, ConnPhase::Parked { .. })
     }
 
-    // NOTE: one-shot bounded response over the parked snapshot: the static encode path
-    // with the parked method, so HEAD keeps length metadata without body bytes.
-    pub fn complete_parked(
-        &mut self,
-        status: u16,
-        reason: &[u8],
-        body: &[u8],
-    ) -> Result<(), ConnClose> {
-        let ConnPhase::Parked {
-            method_len,
-            method,
-            has_body,
-            keep_open,
-            ..
-        } = self.phase
-        else {
-            return Err(ConnClose::TransportError);
-        };
-        let request_method = &method[..usize::from(method_len)];
-        let connection = if keep_open && !has_body {
-            ConnectionHeader::Omit
-        } else {
-            ConnectionHeader::Close
-        };
-        let response = ResponseToWrite {
-            request_method,
-            requested_upgrade: b"",
-            status,
-            reason,
-            fields: &[],
-            framing: ResponseFraming::FixedLength,
-            content_length: body.len() as u64,
-            connection,
-        };
-        let encoded = encode_response_head(&response, &mut self.output[..])
-            .map_err(|_| ConnClose::TransportError)?;
-        let mut length = encoded.length;
-        if encoded.body_allowed && !body.is_empty() {
-            let end = length + body.len();
-            self.output
-                .get_mut(length..end)
-                .ok_or(ConnClose::ResponseOverflow)?
-                .copy_from_slice(body);
-            length = end;
-        }
-        self.out_len = length;
-        self.out_sent = 0;
-        self.pending_len = 0;
-        self.write_blocked = false;
-        self.closing = !keep_open || has_body;
-        self.close_reason = ConnClose::Completed;
-        self.phase = ConnPhase::SendingResponse;
-        Ok(())
-    }
-
     pub fn begin_drain(&mut self) {
         self.closing = true;
     }
@@ -222,7 +176,7 @@ pub fn pump_connection(
         return PumpOutcome::Close(ConnClose::TransportError);
     }
     if conn.is_parked() {
-        return pump_parked(conn);
+        return parked::pump_parked(conn, host);
     }
     let draining_body = matches!(conn.phase, ConnPhase::DrainingBody { .. });
     let reading = (conn.phase == ConnPhase::ReadingHead || draining_body) && conn.len < INPUT_CAP;
@@ -313,7 +267,11 @@ pub fn pump_connection(
         progress.resumed_idle = true;
     }
 
-    if let ConnPhase::DrainingBody { remaining } = conn.phase {
+    if let ConnPhase::DrainingBody {
+        remaining,
+        responded,
+    } = conn.phase
+    {
         let skip = (conn.len as u64).min(remaining) as usize;
         conn.input.copy_within(skip..conn.len, 0);
         conn.len -= skip;
@@ -323,9 +281,14 @@ pub fn pump_connection(
             conn.pending_len = 0;
             conn.phase = ConnPhase::SendingResponse;
             conn.write_blocked = false;
-            progress.entered_response = true;
+            // NOTE: a parked respond already moved the worker to WritingResponse, so the
+            // drain-complete hook must not transition twice; static drains still report it.
+            progress.entered_response = !responded;
         } else {
-            conn.phase = ConnPhase::DrainingBody { remaining: left };
+            conn.phase = ConnPhase::DrainingBody {
+                remaining: left,
+                responded,
+            };
             // NOTE: edge-triggered readiness fires only on new arrivals, so a drain that stopped
             // short of EAGAIN re-arms its read; a drained socket waits for the next edge instead.
             // An Idle read attempted nothing (no readiness claim), so it leaves the flag alone.
@@ -361,7 +324,7 @@ pub fn pump_connection(
     PumpOutcome::Keep(progress)
 }
 
-enum ExchangeOutcome {
+pub(crate) enum ExchangeOutcome {
     NeedMore,
     Responded,
     Parked,
@@ -409,65 +372,6 @@ fn parse_exchange(
     }
 }
 
-// NOTE: a parked connection owns no response bytes yet, so the pump only reads: it
-// buffers pipelined tail bytes and observes peer close/reset so the slot frees and a
-// later host respond lands on the tomb as Gone instead of reporting success for bytes
-// that went nowhere. Nothing is parsed until the host responds or cancels.
-fn pump_parked(conn: &mut ConnState) -> PumpOutcome {
-    let token = conn.token;
-    let read_ready = conn.read_ready;
-    let read_scratch = if conn.len < INPUT_CAP {
-        &mut conn.input[conn.len..]
-    } else {
-        &mut [] as &mut [u8]
-    };
-    let mut batch = [IoBatch::new(
-        token,
-        &mut conn.stream,
-        read_scratch,
-        read_ready,
-        &[],
-        false,
-    )];
-    dispatch(u64::MAX, &mut batch);
-    let read = batch[0].read;
-    let write = batch[0].write;
-    conn.read_ready = matches!(read, ReadStatus::Progress(_) | ReadStatus::BudgetExhausted);
-    match read {
-        ReadStatus::Progress(bytes) => {
-            conn.len += bytes;
-        }
-        ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
-        ReadStatus::Closed(CloseReason::PeerClosed) => {
-            return PumpOutcome::Close(ConnClose::PeerClosed);
-        }
-        ReadStatus::Closed(CloseReason::Reset) => return PumpOutcome::Close(ConnClose::Reset),
-        ReadStatus::Closed(CloseReason::Error(_)) | ReadStatus::Error(_) => {
-            return PumpOutcome::Close(ConnClose::TransportError);
-        }
-        ReadStatus::Idle
-        | ReadStatus::WouldBlock
-        | ReadStatus::BudgetExhausted
-        | ReadStatus::PausedForWrite
-        | ReadStatus::Interrupted => {}
-    }
-    match write {
-        WriteStatus::Progress(_)
-        | WriteStatus::WouldBlock(_)
-        | WriteStatus::BudgetExhausted(_)
-        | WriteStatus::Interrupted(_) => {}
-        WriteStatus::Closed(CloseReason::PeerClosed) => {
-            return PumpOutcome::Close(ConnClose::PeerClosed);
-        }
-        WriteStatus::Closed(CloseReason::Reset) => return PumpOutcome::Close(ConnClose::Reset),
-        WriteStatus::Closed(CloseReason::Error(_)) | WriteStatus::Error(_) => {
-            return PumpOutcome::Close(ConnClose::TransportError);
-        }
-        WriteStatus::Idle => {}
-    }
-    PumpOutcome::Keep(PumpProgress::default())
-}
-
 fn park_or_respond(
     conn: &mut ConnState,
     routes: &StaticRoutes,
@@ -481,67 +385,10 @@ fn park_or_respond(
     let found = table.find_request(head, &conn.input[..conn.len], &mut captures);
     match found {
         Ok(found) if found.kind == RouteKind::Managed => {
-            park_request(conn, head, found.route_id, worker_id, host, draining)
+            let cap = crate::static_routes::route_cap(found.body);
+            parked::park_request(conn, head, found.route_id, worker_id, host, draining, cap)
         }
         Ok(_) | Err(_) => encode_static(conn, routes, table, head),
-    }
-}
-
-// NOTE: drain stops new parks: a head that arrives mid-drain closes instead of waiting
-// on a host that may have stopped polling. Already-parked requests are in-flight and
-// may still be responded during drain; unresponded parks close at the force deadline.
-fn park_request(
-    conn: &mut ConnState,
-    head: veylor_http1::RequestHead,
-    route_id: u64,
-    worker_id: u32,
-    host: &HostShared,
-    draining: bool,
-) -> ExchangeOutcome {
-    if draining {
-        return ExchangeOutcome::Close(ConnClose::Shutdown);
-    }
-    let len = conn.len;
-    let input = &conn.input[..len];
-    let method_len = head.method(input).map(|method| method.len()).unwrap_or(0);
-    let target_len = head.target(input).map(|target| target.len()).unwrap_or(0);
-    if method_len > HOST_MAX_METHOD_BYTES || method_len == 0 || target_len == 0 {
-        return ExchangeOutcome::Close(ConnClose::TransportError);
-    }
-    // NOTE: bodies stay out: framing is only recorded. The connection closes after the
-    // parked response decision instead of draining, and an admitted 100-continue gets
-    // no interim on a managed route in this slice.
-    let has_body = head.is_chunked || head.content_length.unwrap_or(0) > 0;
-    let connection =
-        connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
-    let keep_open = connection != ConnectionHeader::Close && !has_body;
-    let token = conn.token;
-    let mut snapshot = [0u8; HOST_MAX_METHOD_BYTES];
-    snapshot[..method_len]
-        .copy_from_slice(&input[head.method.offset..head.method.offset + method_len]);
-    let target_start = head.target.offset;
-    match host.try_park(
-        worker_id,
-        token,
-        route_id,
-        &snapshot[..method_len],
-        &conn.input[target_start..target_start + target_len],
-    ) {
-        Ok(_) => {
-            conn.input.copy_within(conn.head_len..conn.len, 0);
-            conn.len -= conn.head_len;
-            conn.head_len = 0;
-            conn.phase = ConnPhase::Parked {
-                route_id,
-                method_len: method_len as u8,
-                method: snapshot,
-                has_body,
-                keep_open,
-            };
-            ExchangeOutcome::Parked
-        }
-        Err(ParkError::Full) => ExchangeOutcome::Close(ConnClose::QueueFull),
-        Err(ParkError::SnapshotTooLarge) => ExchangeOutcome::Close(ConnClose::TransportError),
     }
 }
 
@@ -585,7 +432,10 @@ fn encode_static(
             } else {
                 conn.out_len = interim_len;
                 conn.pending_len = length;
-                conn.phase = ConnPhase::DrainingBody { remaining };
+                conn.phase = ConnPhase::DrainingBody {
+                    remaining,
+                    responded: false,
+                };
                 conn.read_ready = true;
             }
             ExchangeOutcome::Responded

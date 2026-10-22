@@ -278,7 +278,7 @@ fn reject_payload(
     })
 }
 
-fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+pub(crate) fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildError> {
     let interim = ResponseToWrite {
         request_method: b"GET",
         requested_upgrade: b"",
