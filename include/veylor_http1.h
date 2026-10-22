@@ -757,6 +757,26 @@ vyl_http1_result vyl_managed_static_register_static_route(
     vyl_http1_bytes reason,
     vyl_http1_bytes body
 );
+/* NOTE: Same copy rule as above. The cap bounds request-body drain work: zero admits no body
+   bytes, UINT64_MAX leaves the route uncapped except for input-buffer and deadline stops. */
+vyl_http1_result vyl_managed_static_register_static_route_with_body_cap(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    vyl_http1_bytes body,
+    uint64_t max_body_bytes
+);
+/* NOTE: Managed routes park matched requests for a host dispatch call; over-cap declarations
+   reject with 413 like static routes. Same copy and cap rules as above; register before start,
+   duplicates fail. */
+vyl_http1_result vyl_managed_static_register_managed_route(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    uint64_t max_body_bytes
+);
 vyl_http1_result vyl_managed_static_start(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_accepting(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_force(vyl_managed_static_server* server);

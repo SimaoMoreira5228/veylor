@@ -2,8 +2,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use veylor_runtime::ConnectionTimeouts;
-use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig};
+use veylor_runtime::{ConnectionTimeouts, ConnectionToken};
+use veylor_server::{
+    EventSlot, HostEventKind, MAX_STATIC_BODY_BYTES, RespondOutcome, RunningServer, Server,
+    ServerConfig,
+};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -15,13 +18,27 @@ fn test_server_with_config(config: ServerConfig) -> RunningServer {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = Server::bind(addr, config).expect("bind loopback");
     server
-        .register_route(b"GET", b"/hello", 200, b"OK", b"hello")
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
         .expect("register hello");
     server
-        .register_route(b"GET", b"/empty", 200, b"OK", b"")
+        .register_route(b"GET", b"/empty", 200, b"OK", b"", MAX_STATIC_BODY_BYTES)
         .expect("register empty");
     server
-        .register_route(b"POST", b"/submit", 200, b"OK", b"submitted")
+        .register_route(
+            b"POST",
+            b"/submit",
+            200,
+            b"OK",
+            b"submitted",
+            MAX_STATIC_BODY_BYTES,
+        )
         .expect("register submit");
     server.start().expect("start server")
 }
@@ -478,7 +495,14 @@ fn second_server_instance_coexists() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut second = Server::bind(addr, ServerConfig::default()).expect("bind second");
     second
-        .register_route(b"GET", b"/other", 200, b"OK", b"other")
+        .register_route(
+            b"GET",
+            b"/other",
+            200,
+            b"OK",
+            b"other",
+            MAX_STATIC_BODY_BYTES,
+        )
         .expect("register other");
     let second = second.start().expect("start second");
     assert_ne!(first.addr(), second.addr());
@@ -504,11 +528,11 @@ fn duplicate_route_rejected() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
     server
-        .register_route(b"GET", b"/dup", 200, b"OK", b"a")
+        .register_route(b"GET", b"/dup", 200, b"OK", b"a", MAX_STATIC_BODY_BYTES)
         .expect("first register");
     assert!(
         server
-            .register_route(b"GET", b"/dup", 200, b"OK", b"b")
+            .register_route(b"GET", b"/dup", 200, b"OK", b"b", u64::MAX)
             .is_err()
     );
     let running = server.start().expect("start server");
@@ -647,4 +671,140 @@ fn stop_accepting_with_idle_keep_alive_returns_promptly() {
         "stop join stalled"
     );
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+fn capped_server() -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    server
+        .register_route(b"POST", b"/tight", 200, b"OK", b"tight", 16)
+        .expect("tight");
+    server
+        .register_route(b"POST", b"/zero", 200, b"OK", b"zero", 0)
+        .expect("zero");
+    server
+        .register_route(b"POST", b"/huge", 200, b"OK", b"huge", u64::MAX)
+        .expect("huge");
+    server
+        .register_managed(b"POST", b"/mupload", 16)
+        .expect("managed");
+    server.start().expect("start server")
+}
+
+fn post_head(stream: &mut TcpStream, path: &str, length: usize) {
+    let head =
+        format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {length}\r\n\r\n");
+    stream.write_all(head.as_bytes()).expect("write head");
+}
+
+#[test]
+fn tight_cap_drains_at_cap_and_rejects_one_over() {
+    let server = capped_server();
+    let mut stream = connect(&server);
+    post_head(&mut stream, "/tight", 16);
+    stream.write_all(&[b'a'; 16]).expect("write body");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"tight");
+    post_head(&mut stream, "/tight", 0);
+    let reuse = read_response(&mut stream);
+    assert_eq!(reuse.status, 200);
+    let mut over = connect(&server);
+    post_head(&mut over, "/tight", 17);
+    let rejected = read_response(&mut over);
+    assert_eq!(rejected.status, 413);
+    read_closed(&mut over);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn zero_cap_admits_empty_body_and_rejects_one_byte() {
+    let server = capped_server();
+    let mut stream = connect(&server);
+    post_head(&mut stream, "/zero", 0);
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"zero");
+    post_head(&mut stream, "/zero", 1);
+    let rejected = read_response(&mut stream);
+    assert_eq!(rejected.status, 413);
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn uncapped_route_drains_20kib() {
+    let server = capped_server();
+    let mut stream = connect(&server);
+    let body = vec![b'b'; 20_000];
+    post_head(&mut stream, "/huge", body.len());
+    stream.write_all(&body).expect("write body");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"huge");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn managed_cap_rejects_over_cap_and_parks_under_cap() {
+    let server = capped_server();
+    let host = server.host();
+    let mut over = connect(&server);
+    post_head(&mut over, "/mupload", 17);
+    let rejected = read_response(&mut over);
+    assert_eq!(rejected.status, 413);
+    read_closed(&mut over);
+    // NOTE: the 413 above proves the worker consumed the head, so an empty nonblocking
+    // poll proves the rejection parked nothing instead of racing a late event.
+    let report = host.poll(0, &mut [], &mut [], &mut []);
+    assert_eq!(report.copied, 0);
+    assert_eq!(report.events_required, 0);
+    let mut under = connect(&server);
+    post_head(&mut under, "/mupload", 5);
+    under.write_all(b"hello").expect("write body");
+    let token = ConnectionToken {
+        worker_id: 0,
+        slot: 0,
+        request_seq: 0,
+        stream_id: 0,
+        worker_generation: 0,
+        generation: 0,
+    };
+    let mut events = [EventSlot {
+        kind: HostEventKind::Shutdown,
+        token,
+        route_id: 0,
+        method_len: 0,
+        path_len: 0,
+        method_offset: 0,
+        path_offset: 0,
+    }];
+    let mut methods = [0; 64];
+    let mut paths = [0; 4096];
+    let report = host.poll(5_000_000_000, &mut events, &mut methods, &mut paths);
+    assert_eq!(report.copied, 1);
+    assert_eq!(events[0].kind, HostEventKind::Request);
+    let mut staged = [0; 16];
+    assert_eq!(
+        host.pull_body(events[0].token, &mut staged),
+        (RespondOutcome::Ok, 5, true)
+    );
+    assert_eq!(&staged[..5], b"hello");
+    assert_eq!(
+        host.respond(events[0].token, 200, b"OK", b"m-ok"),
+        RespondOutcome::Ok
+    );
+    let done = read_response(&mut under);
+    assert_eq!(done.status, 200);
+    assert_eq!(done.body, b"m-ok");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
 }

@@ -57,6 +57,43 @@ unsafe fn register(server: *mut VylManagedStaticServer, method: &[u8], path: &[u
     );
 }
 
+unsafe fn register_capped(
+    server: *mut VylManagedStaticServer,
+    method: &[u8],
+    path: &[u8],
+    body: &[u8],
+    cap: u64,
+) {
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_static_route_with_body_cap(
+                server,
+                bytes(method),
+                bytes(path),
+                200,
+                bytes(b"OK"),
+                bytes(body),
+                cap,
+            )
+        },
+        VylResult::Ok
+    );
+}
+
+unsafe fn register_managed(
+    server: *mut VylManagedStaticServer,
+    method: &[u8],
+    path: &[u8],
+    cap: u64,
+) {
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_managed_route(server, bytes(method), bytes(path), cap)
+        },
+        VylResult::Ok
+    );
+}
+
 unsafe fn local_port(server: *mut VylManagedStaticServer) -> u16 {
     let mut port = 0;
     assert_eq!(
@@ -288,5 +325,157 @@ fn rejects_null_handles_and_bad_state_transitions() {
     );
     let joined = unsafe { stop_join(server) };
     assert_eq!(counts_total(joined), 0);
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+fn post_exchange(stream: &mut TcpStream, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream.write_all(body).expect("write body");
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).expect("read head byte");
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n".as_slice()) {
+            break;
+        }
+    }
+    let head_text = String::from_utf8(raw).expect("utf8 head");
+    let status = head_text
+        .split_whitespace()
+        .nth(1)
+        .expect("status")
+        .parse()
+        .expect("status int");
+    let length = head_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .expect("content length");
+    let mut response_body = vec![0u8; length];
+    stream.read_exact(&mut response_body).expect("read body");
+    (status, response_body)
+}
+
+fn connect_loopback(port: u16) -> TcpStream {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream
+}
+
+#[test]
+fn tight_cap_drains_at_cap_and_rejects_one_over() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_capped(server, b"POST", b"/tight", b"tight", 16) };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    let (status, body) = post_exchange(&mut stream, "/tight", &[b'a'; 16]);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"tight");
+    let (reuse_status, reuse_body) = post_exchange(&mut stream, "/tight", &[]);
+    assert_eq!(reuse_status, 200);
+    assert_eq!(reuse_body, b"tight");
+    let mut over = connect_loopback(port);
+    let head =
+        "POST /tight HTTP/1.1\r\nHost: test\r\nContent-Length: 17\r\nConnection: close\r\n\r\n";
+    over.write_all(head.as_bytes()).expect("write head");
+    let mut rejected = Vec::new();
+    over.read_to_end(&mut rejected).expect("read rejection");
+    let rejected = String::from_utf8(rejected).expect("utf8 rejection");
+    assert!(
+        rejected.starts_with("HTTP/1.1 413"),
+        "unexpected head: {rejected:?}"
+    );
+    assert!(rejected.contains("Payload Too Large"));
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn managed_cap_rejects_over_cap_and_parks_under_cap() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/mupload", 16) };
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_managed_route(
+                server,
+                bytes(b"POST"),
+                bytes(b"/mupload"),
+                16,
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_static_route(
+                server,
+                bytes(b"POST"),
+                bytes(b"/mupload"),
+                200,
+                bytes(b"OK"),
+                bytes(b"x"),
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut over = connect_loopback(port);
+    let head =
+        "POST /mupload HTTP/1.1\r\nHost: test\r\nContent-Length: 17\r\nConnection: close\r\n\r\n";
+    over.write_all(head.as_bytes()).expect("write head");
+    let mut rejected = Vec::new();
+    over.read_to_end(&mut rejected).expect("read rejection");
+    let rejected = String::from_utf8(rejected).expect("utf8 rejection");
+    assert!(
+        rejected.starts_with("HTTP/1.1 413"),
+        "unexpected head: {rejected:?}"
+    );
+    // NOTE: this ABI slice exposes no host-dispatch calls, so an under-cap managed request
+    // parks with no response bytes until the 5 s handler deadline; silence here proves the
+    // park, where a rejection would answer immediately.
+    let mut under = connect_loopback(port);
+    under
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("read timeout");
+    let head = "POST /mupload HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\n";
+    under.write_all(head.as_bytes()).expect("write head");
+    under.write_all(b"hello").expect("write body");
+    let mut probe = [0u8; 1];
+    let parked = under.read(&mut probe);
+    assert!(
+        matches!(&parked, Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)),
+        "under-cap request must park, got {parked:?}"
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_stop_force(server) },
+        VylResult::Ok
+    );
+    let mut counts = VylManagedStaticCloseCounts::default();
+    assert_eq!(
+        unsafe { vyl_managed_static_join(server, &mut counts) },
+        VylResult::Ok
+    );
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }

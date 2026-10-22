@@ -29,6 +29,10 @@ int main(void) {
     static const uint8_t reason[] = "OK";
     static const uint8_t body[] = "hello";
     static const char request[] = "GET /hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    static const uint8_t post_method[] = "POST";
+    static const uint8_t tiny_path[] = "/tiny";
+    static const uint8_t tiny_body[] = "tiny";
+    static const char over_request[] = "POST /tiny HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
     vyl_managed_static_config config = {0};
     vyl_managed_static_server* server = NULL;
     vyl_managed_static_close_counts counts = {0};
@@ -64,6 +68,17 @@ int main(void) {
             (vyl_http1_bytes){.data = body, .length = sizeof(body) - 1}
         ) == VYL_HTTP1_OK
     );
+    assert(
+        vyl_managed_static_register_static_route_with_body_cap(
+            server,
+            (vyl_http1_bytes){.data = post_method, .length = sizeof(post_method) - 1},
+            (vyl_http1_bytes){.data = tiny_path, .length = sizeof(tiny_path) - 1},
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = tiny_body, .length = sizeof(tiny_body) - 1},
+            4
+        ) == VYL_HTTP1_OK
+    );
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_local_addr(server, &port) == VYL_HTTP1_OK);
     assert(port != 0);
@@ -84,13 +99,30 @@ int main(void) {
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "hello") != NULL);
 
+    fd = connect_loopback(port);
+    assert(send(fd, over_request, sizeof(over_request) - 1, 0) == (ssize_t)(sizeof(over_request) - 1));
+    total = 0;
+    for (;;) {
+        received = recv(fd, response + total, sizeof(response) - 1 - total, 0);
+        assert(received >= 0);
+        if (received == 0) {
+            break;
+        }
+        total += (size_t)received;
+        assert(total < sizeof(response) - 1);
+    }
+    assert(close(fd) == 0);
+    response[total] = '\0';
+    assert(strstr(response, "HTTP/1.1 413") != NULL);
+    assert(strstr(response, "Payload Too Large") != NULL);
+
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 1);
+    assert(counts.completed == 2);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 1
+            counts.shutdown == 2
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

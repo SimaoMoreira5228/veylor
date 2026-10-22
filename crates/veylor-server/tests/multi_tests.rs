@@ -2,7 +2,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use veylor_server::{CloseCounts, RunningServer, Server, ServerConfig, ServerError};
+use veylor_server::{
+    CloseCounts, MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig, ServerError,
+};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 const FANOUT_CLIENTS: usize = 32;
@@ -19,7 +21,14 @@ fn test_multi_server(worker_count: usize) -> RunningServer {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = Server::bind(addr, multi_config(worker_count)).expect("bind loopback");
     server
-        .register_route(b"GET", b"/hello", 200, b"OK", b"hello")
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
         .expect("register hello");
     server.start().expect("start server")
 }
@@ -249,7 +258,14 @@ fn reuse_port_conflict_semantics() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut first = Server::bind(addr, multi_config(2)).expect("bind first");
     first
-        .register_route(b"GET", b"/hello", 200, b"OK", b"hello")
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
         .expect("register hello");
     let first = first.start().expect("start first");
     let bound = first.addr();
@@ -263,7 +279,14 @@ fn reuse_port_conflict_semantics() {
     );
     let mut second = Server::bind(bound, multi_config(2)).expect("second reuse-port bind shares");
     second
-        .register_route(b"GET", b"/hello", 200, b"OK", b"hello")
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
         .expect("register hello");
     let second = second.start().expect("start second");
     let mut shared = connect(&second);

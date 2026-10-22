@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::slice;
 
-use veylor_server::Server;
+use veylor_server::{MAX_STATIC_BODY_BYTES, Server};
 
 use super::{ManagedStaticState, VylManagedStaticCloseCounts, VylManagedStaticConfig};
 use super::{VylManagedStaticServer, server_error_to_result};
@@ -92,7 +92,57 @@ pub unsafe extern "C" fn vyl_managed_static_register_static_route(
     reason: VylBytes,
     body: VylBytes,
 ) -> VylResult {
-    catch_ffi(|| unsafe { register_static_route(server, method, path, status, reason, body) })
+    catch_ffi(|| unsafe {
+        register_static_route(
+            server,
+            method,
+            path,
+            status,
+            reason,
+            body,
+            MAX_STATIC_BODY_BYTES,
+        )
+    })
+}
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_body_cap(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    status: u16,
+    reason: VylBytes,
+    body: VylBytes,
+    max_body_bytes: u64,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        register_static_route(server, method, path, status, reason, body, max_body_bytes)
+    })
+}
+
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_register_managed_route(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    max_body_bytes: u64,
+) -> VylResult {
+    catch_ffi(|| unsafe { register_managed_route(server, method, path, max_body_bytes) })
 }
 
 unsafe fn register_static_route(
@@ -102,6 +152,7 @@ unsafe fn register_static_route(
     status: u16,
     reason: VylBytes,
     body: VylBytes,
+    max_body_bytes: u64,
 ) -> VylResult {
     if server.is_null() {
         return VylResult::InvalidArgument;
@@ -126,7 +177,34 @@ unsafe fn register_static_route(
         Ok(body) => body,
         Err(error) => return error,
     };
-    match routes.register_route(method, path, status, reason, body) {
+    match routes.register_route(method, path, status, reason, body, max_body_bytes) {
+        Ok(()) => VylResult::Ok,
+        Err(error) => server_error_to_result(error),
+    }
+}
+
+unsafe fn register_managed_route(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    max_body_bytes: u64,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    let method = match unsafe { read_bytes(method) } {
+        Ok(method) => method,
+        Err(error) => return error,
+    };
+    let path = match unsafe { read_bytes(path) } {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match routes.register_managed(method, path, max_body_bytes) {
         Ok(()) => VylResult::Ok,
         Err(error) => server_error_to_result(error),
     }

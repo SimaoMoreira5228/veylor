@@ -8,8 +8,10 @@ use veylor_router::{
 
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_RESPONSE_BODY: usize = 4096;
-// NOTE: static routes never consume request bodies, so this cap only bounds drain work: 64 KiB
-// is eight full 8 KiB input buffers of skip work at most, while still admitting small form posts.
+// NOTE: default per-route body cap for callers that keep the old behavior: static routes never
+// consume request bodies, so the cap only bounds drain work. 64 KiB is eight full 8 KiB input
+// buffers of skip work at most, while still admitting small form posts. A zero cap admits no
+// body bytes at all; u64::MAX leaves the route uncapped except for input-buffer/deadline stops.
 pub const MAX_STATIC_BODY_BYTES: u64 = 64 * 1024;
 const CAPTURE_SLOTS: usize = 8;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
@@ -41,11 +43,13 @@ pub struct StaticRoute {
     status: u16,
     reason: Vec<u8>,
     body: Vec<u8>,
+    max_body_bytes: u64,
 }
 
 pub struct ManagedRoute {
     method: Vec<u8>,
     path: Vec<u8>,
+    max_body_bytes: u64,
 }
 
 pub struct StaticRoutes {
@@ -68,6 +72,7 @@ impl StaticRoutes {
         status: u16,
         reason: &[u8],
         body: &[u8],
+        max_body_bytes: u64,
     ) -> Result<(), RouteBuildError> {
         if method.is_empty()
             || !method.iter().copied().all(is_token)
@@ -100,11 +105,17 @@ impl StaticRoutes {
             status,
             reason: reason.to_vec(),
             body: body.to_vec(),
+            max_body_bytes,
         });
         Ok(())
     }
 
-    pub fn register_managed(&mut self, method: &[u8], path: &[u8]) -> Result<(), RouteBuildError> {
+    pub fn register_managed(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        max_body_bytes: u64,
+    ) -> Result<(), RouteBuildError> {
         if method.is_empty()
             || method.len() > crate::host::HOST_MAX_METHOD_BYTES
             || !method.iter().copied().all(is_token)
@@ -130,6 +141,7 @@ impl StaticRoutes {
         self.managed.push(ManagedRoute {
             method: method.to_vec(),
             path: path.to_vec(),
+            max_body_bytes,
         });
         Ok(())
     }
@@ -142,16 +154,23 @@ impl StaticRoutes {
         for route in self.routes.iter() {
             let config = RouteConfig {
                 kind: RouteKind::Static,
-                body: RouteBodyPolicy::Reject,
+                body: RouteBodyPolicy::Stream {
+                    max_body_bytes: route.max_body_bytes,
+                    permitted_trailers: &[],
+                },
             };
             table.register(route.method.as_slice(), route.path.as_slice(), config)?;
         }
         // NOTE: managed routes share the frozen exact table with a distinct kind so the
-        // connection layer can park on match; bodies stay rejected, same as static v1.
+        // connection layer can park on match; the Stream cap carries the per-route admission
+        // limit (static v1 rejected bodies, now each route declares its own bound).
         for route in self.managed.iter() {
             let config = RouteConfig {
                 kind: RouteKind::Managed,
-                body: RouteBodyPolicy::Reject,
+                body: RouteBodyPolicy::Stream {
+                    max_body_bytes: route.max_body_bytes,
+                    permitted_trailers: &[],
+                },
             };
             table.register(route.method.as_slice(), route.path.as_slice(), config)?;
         }
@@ -181,6 +200,15 @@ impl Default for StaticRoutes {
     }
 }
 
+// NOTE: every registered route now carries a Stream cap, so Reject only appears on empty
+// table slots that never match; it falls back to the default rather than failing open.
+pub(crate) fn route_cap(body: RouteBodyPolicy<'_>) -> u64 {
+    match body {
+        RouteBodyPolicy::Stream { max_body_bytes, .. } => max_body_bytes,
+        RouteBodyPolicy::Reject => MAX_STATIC_BODY_BYTES,
+    }
+}
+
 pub struct EncodedStaticResponse {
     pub length: usize,
     pub keep_open: bool,
@@ -197,23 +225,37 @@ pub fn respond_to_head(
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
     let mut captures = [RouteCapture::default(); CAPTURE_SLOTS];
     let found = table.find_request(head, input, &mut captures);
-    let (status, reason, body) = match found {
-        Ok(found) => match routes.lookup(head.method(input).unwrap_or_default(), found.pattern) {
-            Some(route) => (route.status, route.reason.as_slice(), route.body.as_slice()),
-            None => return Err(RouteBuildError::Invalid),
-        },
-        Err(RouteError::NotFound) => (404, b"Not Found".as_slice(), NOT_FOUND_BODY),
+    // NOTE: unmatched requests have no route cap of their own, so 404s keep the default.
+    let (status, reason, body, cap) = match found {
+        Ok(found) => {
+            let cap = route_cap(found.body);
+            match routes.lookup(head.method(input).unwrap_or_default(), found.pattern) {
+                Some(route) => (
+                    route.status,
+                    route.reason.as_slice(),
+                    route.body.as_slice(),
+                    cap,
+                ),
+                None => return Err(RouteBuildError::Invalid),
+            }
+        }
+        Err(RouteError::NotFound) => (
+            404,
+            b"Not Found".as_slice(),
+            NOT_FOUND_BODY,
+            MAX_STATIC_BODY_BYTES,
+        ),
         Err(error) => return Err(RouteBuildError::from(error)),
     };
     let method = head.method(input).unwrap_or_default();
     // NOTE: static routes cannot use trailers, so any chunked request rejects without reading;
-    // oversized declarations reject the same way with no interim. An admitted 100-continue emits
-    // the interim up front while the final response stays held until the drain finishes.
+    // oversized declarations reject the same way with no interim, both against the matched
+    // route's cap (zero admits no body byte at all; u64::MAX is input-buffer bounded).
     if head.is_chunked {
         return reject_payload(output, method);
     }
     let drain_total = match head.content_length {
-        Some(length) if length > MAX_STATIC_BODY_BYTES => return reject_payload(output, method),
+        Some(length) if length > cap => return reject_payload(output, method),
         Some(length) => length,
         None => 0,
     };

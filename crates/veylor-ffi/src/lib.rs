@@ -39,7 +39,8 @@ pub use managed_static::{
     VYL_MANAGED_STATIC_ABI_VERSION, VylManagedStaticCloseCounts, VylManagedStaticConfig,
     VylManagedStaticServer, vyl_managed_static_destroy, vyl_managed_static_join,
     vyl_managed_static_local_addr, vyl_managed_static_new,
-    vyl_managed_static_register_static_route, vyl_managed_static_start,
+    vyl_managed_static_register_managed_route, vyl_managed_static_register_static_route,
+    vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_start,
     vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use server_connection::{
