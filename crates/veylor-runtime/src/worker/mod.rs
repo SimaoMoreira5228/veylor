@@ -7,7 +7,8 @@ use crate::{
     Readiness, ShutdownPhase, ShutdownResult, ShutdownState, TableError, TcpListener, TcpStream,
     TimerExpiration, TimerQueue, TimerQueueError, accept_ready, cancel_phase_deadline,
     close_connection, deadline_timer_id, destroy, force_shutdown, process_deadline,
-    register_connection, request_shutdown, schedule_phase_deadline, start_keep_alive_idle_deadline,
+    register_connection, request_shutdown, resume_keep_alive_request, schedule_phase_deadline,
+    start_keep_alive_idle_deadline,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,9 +390,35 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    // NOTE: resume needs transition_phase(ReadingRequestHead) next to re-arm
-    // the head deadline; this only drops the idle timer so a resumed request
-    // is not killed by idle expiry.
+    // NOTE: single round-trip replacing the cancel_idle+transition_phase pair at
+    // resume sites: drops the idle timer, re-enters ReadingRequestHead, and arms
+    // the head deadline. A re-arm failure parks the slot in Closing so the
+    // server closes it instead of running it deadline-less.
+    pub fn resume_idle(&mut self, token: ConnectionToken, now_ns: u64) -> Result<(), WorkerError> {
+        if let Err(error) = resume_keep_alive_request(&mut self.table, &mut self.timers, token) {
+            return Err(error.into());
+        }
+        if let Err(error) = schedule_phase_deadline(
+            &mut self.table,
+            &mut self.timers,
+            token,
+            now_ns,
+            self.timeouts,
+        ) {
+            let _ = self.table.transition(token, ConnectionPhase::Closing);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub fn phase(&self, token: ConnectionToken) -> Result<ConnectionPhase, WorkerError> {
+        self.table.phase(token).map_err(WorkerError::from)
+    }
+
+    // NOTE: prefer resume_idle for keep-alive resume: it drops the idle timer,
+    // re-enters the head phase, and arms the head deadline in one round-trip.
+    // This only drops the idle timer, so a resumed request still needs its
+    // head deadline armed separately to avoid idle expiry.
     pub fn cancel_idle(&mut self, token: ConnectionToken) -> Result<(), WorkerError> {
         if self.table.phase(token)? != ConnectionPhase::KeepAliveIdle {
             return Err(WorkerError::Invalid);
@@ -443,7 +470,7 @@ impl<'a> Worker<'a> {
         destroy(&mut *self.shutdown)
     }
 
-    pub fn phase(&self) -> ShutdownPhase {
+    pub fn shutdown_phase(&self) -> ShutdownPhase {
         self.shutdown.phase()
     }
 

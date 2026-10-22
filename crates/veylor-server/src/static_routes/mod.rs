@@ -15,6 +15,7 @@ const CAPTURE_SLOTS: usize = 8;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
+const EXPECTATION_FAILED_BODY: &[u8] = b"Expectation Failed";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteBuildError {
@@ -132,6 +133,7 @@ pub struct EncodedStaticResponse {
     pub length: usize,
     pub keep_open: bool,
     pub drain_total: u64,
+    pub interim_len: usize,
 }
 
 pub fn respond_to_head(
@@ -152,8 +154,9 @@ pub fn respond_to_head(
         Err(error) => return Err(RouteBuildError::from(error)),
     };
     let method = head.method(input).unwrap_or_default();
-    // NOTE: v1 never emits an interim 100 Continue on static routes and static routes cannot use
-    // trailers, so any chunked request rejects without reading; small bodies drain silently.
+    // NOTE: static routes cannot use trailers, so any chunked request rejects without reading;
+    // oversized declarations reject the same way with no interim. An admitted 100-continue emits
+    // the interim up front while the final response stays held until the drain finishes.
     if head.is_chunked {
         return reject_payload(output, method);
     }
@@ -161,6 +164,11 @@ pub fn respond_to_head(
         Some(length) if length > MAX_STATIC_BODY_BYTES => return reject_payload(output, method),
         Some(length) => length,
         None => 0,
+    };
+    let interim_len = if head.expect_continue {
+        encode_continue(output)?
+    } else {
+        0
     };
     // NOTE: a declared body at or under the cap is drained by the connection before any response
     // byte is written, so framing treats it as complete now; chunked and oversized already left.
@@ -183,8 +191,12 @@ pub fn respond_to_head(
         content_length: body.len() as u64,
         connection,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
-    let mut length = encoded.length;
+    let final_buf = output
+        .get_mut(interim_len..)
+        .ok_or(RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+    let mut length = interim_len + encoded.length;
     if encoded.body_allowed && !body.is_empty() {
         let end = length + body.len();
         output
@@ -197,6 +209,7 @@ pub fn respond_to_head(
         length,
         keep_open: connection != ConnectionHeader::Close,
         drain_total,
+        interim_len,
     })
 }
 
@@ -209,7 +222,23 @@ fn reject_payload(
         length,
         keep_open: false,
         drain_total: 0,
+        interim_len: 0,
     })
+}
+
+fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+    let interim = ResponseToWrite {
+        request_method: b"GET",
+        requested_upgrade: b"",
+        status: 100,
+        reason: b"Continue",
+        fields: &[],
+        framing: ResponseFraming::FixedLength,
+        content_length: 0,
+        connection: ConnectionHeader::Omit,
+    };
+    let encoded = encode_response_head(&interim, output).map_err(|_| RouteBuildError::Invalid)?;
+    Ok(encoded.length)
 }
 
 pub fn respond_payload_too_large(
@@ -234,6 +263,30 @@ pub fn respond_payload_too_large(
             .get_mut(length..end)
             .ok_or(RouteBuildError::Invalid)?
             .copy_from_slice(PAYLOAD_TOO_LARGE_BODY);
+        length = end;
+    }
+    Ok(length)
+}
+
+pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+    let response = ResponseToWrite {
+        request_method: b"GET",
+        requested_upgrade: b"",
+        status: 417,
+        reason: b"Expectation Failed",
+        fields: &[],
+        framing: ResponseFraming::FixedLength,
+        content_length: EXPECTATION_FAILED_BODY.len() as u64,
+        connection: ConnectionHeader::Close,
+    };
+    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let mut length = encoded.length;
+    if encoded.body_allowed && !EXPECTATION_FAILED_BODY.is_empty() {
+        let end = length + EXPECTATION_FAILED_BODY.len();
+        output
+            .get_mut(length..end)
+            .ok_or(RouteBuildError::Invalid)?
+            .copy_from_slice(EXPECTATION_FAILED_BODY);
         length = end;
     }
     Ok(length)

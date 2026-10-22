@@ -15,6 +15,7 @@ use veylor_runtime::{
 };
 
 use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
+use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::{MAX_ROUTES, RouteBuildError, StaticRoutes};
 
 pub const MAX_CONNECTIONS: usize = 128;
@@ -170,10 +171,11 @@ impl Server {
             worker_poller,
             stop: Arc::clone(&stop),
             force: Arc::clone(&force),
+            peers: Vec::new(),
         };
         let handle = thread::Builder::new()
             .name("veylor-worker".to_string())
-            .spawn(|| worker_main(ctx))
+            .spawn(|| crate::multi_worker::run_worker(ctx))
             .map_err(|error| ServerError::Thread(error.to_string()))?;
         Ok(RunningServer {
             handles: vec![handle],
@@ -248,30 +250,6 @@ impl RunningServer {
     }
 }
 
-pub(crate) struct ThreadCtx {
-    pub(crate) worker_id: u32,
-    pub(crate) listener: TcpListener,
-    pub(crate) config: ServerConfig,
-    pub(crate) routes: Arc<StaticRoutes>,
-    pub(crate) worker_poller: Poller,
-    pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) force: Arc<AtomicBool>,
-}
-
-pub(crate) struct ThreadResult {
-    counts: CloseCounts,
-    error: Option<String>,
-}
-
-impl ThreadResult {
-    pub(crate) fn into_counts(self) -> Result<CloseCounts, ServerError> {
-        match self.error {
-            Some(error) => Err(ServerError::Thread(error)),
-            None => Ok(self.counts),
-        }
-    }
-}
-
 fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     config
         .turn
@@ -313,6 +291,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         mut worker_poller,
         stop,
         force,
+        peers: _,
     } = ctx;
     let mut result = ThreadResult {
         counts: CloseCounts::default(),
@@ -392,7 +371,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         let now_ns = base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         if force.load(Ordering::Acquire) {
             worker.force_shutdown();
-        } else if stop.load(Ordering::Acquire) && worker.phase() == ShutdownPhase::Running {
+        } else if stop.load(Ordering::Acquire) && worker.shutdown_phase() == ShutdownPhase::Running
+        {
             // NOTE: the first observation runs one normal turn so SYNs already in
             // the backlog are admitted and their in-flight bytes served; only the
             // next iteration enters drain. Without the sweep, stop-before-accept
@@ -439,7 +419,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             &mut worker,
             &mut result.counts,
         );
-        let draining = worker.phase() != ShutdownPhase::Running;
+        let draining = worker.shutdown_phase() != ShutdownPhase::Running;
         match turn_result {
             Ok(outcome) => {
                 if outcome.shutdown_complete {
@@ -652,12 +632,18 @@ fn apply_pump_hooks(
         return Some(ConnClose::TransportError);
     }
     if progress.resumed_idle {
-        if worker.cancel_idle(token).is_err() {
-            return Some(ConnClose::TransportError);
-        }
-        let resumed = worker.transition_phase(token, ConnectionPhase::ReadingRequestHead, now_ns);
-        if resumed.is_err() {
-            return Some(ConnClose::TransportError);
+        // NOTE: pump marks a resume candidate on local head-phase read activity or an armed
+        // buffered tail, so quiet turns cost zero lookups. Confirm via one phase query: idle
+        // resumes in a single round-trip, head is a fresh read needing no transition, anything
+        // else (or a stale token) fails closed without retrying into the park.
+        match worker.phase(token) {
+            Ok(ConnectionPhase::KeepAliveIdle) => {
+                if worker.resume_idle(token, now_ns).is_err() {
+                    return Some(ConnClose::TransportError);
+                }
+            }
+            Ok(ConnectionPhase::ReadingRequestHead) => {}
+            Ok(_) | Err(_) => return Some(ConnClose::TransportError),
         }
     }
     if progress.entered_body {

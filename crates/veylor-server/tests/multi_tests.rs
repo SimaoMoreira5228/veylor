@@ -218,6 +218,33 @@ fn forced_stop_two_workers() {
 }
 
 #[test]
+fn force_stop_mid_load_two_workers() {
+    const LOAD: usize = 4;
+    let server = test_multi_server(2);
+    let mut clients = Vec::with_capacity(LOAD);
+    for _ in 0..LOAD {
+        let mut stream = connect(&server);
+        get(&mut stream, "/hello");
+        clients.push(stream);
+    }
+    for stream in clients.iter_mut() {
+        let (status, body) = read_response(stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+    }
+    server.stop_force();
+    for stream in clients.iter_mut() {
+        read_eof(stream);
+    }
+    let per_worker = server.join_per_worker().expect("join server");
+    assert_eq!(per_worker.len(), 2, "workers: {per_worker:?}");
+    let total: u64 = per_worker.iter().map(total_closes).sum();
+    assert_eq!(total, LOAD as u64, "counts: {per_worker:?}");
+    let shutdown: u64 = per_worker.iter().map(|counts| counts.shutdown).sum();
+    assert_eq!(shutdown, LOAD as u64, "counts: {per_worker:?}");
+}
+
+#[test]
 fn reuse_port_conflict_semantics() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut first = Server::bind(addr, multi_config(2)).expect("bind first");

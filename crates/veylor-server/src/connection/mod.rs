@@ -5,7 +5,8 @@ use veylor_runtime::{
 };
 
 use crate::static_routes::{
-    EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_to_head,
+    EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_expectation_failed,
+    respond_to_head,
 };
 
 pub const INPUT_CAP: usize = 8192;
@@ -44,7 +45,6 @@ pub struct ConnState {
     out_sent: usize,
     pending_len: usize,
     phase: ConnPhase,
-    idle: bool,
     read_ready: bool,
     write_blocked: bool,
     closing: bool,
@@ -67,7 +67,6 @@ impl ConnState {
             out_sent: 0,
             pending_len: 0,
             phase: ConnPhase::ReadingHead,
-            idle: false,
             read_ready: true,
             write_blocked: false,
             closing: false,
@@ -144,15 +143,19 @@ pub fn pump_connection(
     let draining = matches!(conn.phase, ConnPhase::DrainingBody { .. });
     let reading = (conn.phase == ConnPhase::ReadingHead || draining) && conn.len < INPUT_CAP;
     let token = conn.token;
-    let was_idle = conn.idle;
     let mut progress = PumpProgress::default();
     let read_ready = conn.read_ready;
     let out_sent = conn.out_sent;
     let out_len = conn.out_len;
-    // NOTE: the encoded response is held while draining and no byte is written until the declared
-    // body is fully skipped, so a drained exchange keeps single-outstanding-response order.
-    let write_ready =
-        conn.phase == ConnPhase::SendingResponse && out_sent < out_len && !conn.write_blocked;
+    // NOTE: the encoded final response is held while draining and no final byte is written until
+    // the declared body is fully skipped, so a drained exchange keeps single-outstanding-response
+    // order. An admitted 100-continue interim is staged ahead of the final and stays writable
+    // during the drain; dispatch serves the write first and pauses reads while it is pending, so
+    // the interim always flushes before further drain bytes are consumed from the wire.
+    let sending = conn.phase == ConnPhase::SendingResponse;
+    let flushing_interim =
+        matches!(conn.phase, ConnPhase::DrainingBody { .. }) && out_sent < out_len;
+    let write_ready = (sending || flushing_interim) && out_sent < out_len && !conn.write_blocked;
     let read_scratch = if reading {
         &mut conn.input[conn.len..]
     } else {
@@ -218,9 +221,12 @@ pub fn pump_connection(
     if closed.is_some() && !conn.has_pending_output() && conn.phase == ConnPhase::ReadingHead {
         return PumpOutcome::Close(ConnClose::PeerClosed);
     }
-    if was_idle && (progress.bytes_read > 0 || conn.len > 0) {
+    // NOTE: resume candidate only: local head phase plus new bytes or an armed buffered tail.
+    // Quiet turns (no bytes, drained tail) stay silent so the hooks skip the phase lookup.
+    if conn.phase == ConnPhase::ReadingHead
+        && (progress.bytes_read > 0 || (conn.len > 0 && read_ready))
+    {
         progress.resumed_idle = true;
-        conn.idle = false;
     }
 
     if let ConnPhase::DrainingBody { remaining } = conn.phase {
@@ -253,10 +259,8 @@ pub fn pump_connection(
         }
         if conn.phase == ConnPhase::SendingResponse {
             progress.entered_response = true;
-            conn.idle = false;
         } else if matches!(conn.phase, ConnPhase::DrainingBody { .. }) {
             progress.entered_body = true;
-            conn.idle = false;
         }
     }
 
@@ -300,6 +304,7 @@ fn parse_exchange(
                     length,
                     keep_open,
                     drain_total,
+                    interim_len,
                 }) => {
                     conn.out_sent = 0;
                     conn.write_blocked = false;
@@ -320,7 +325,7 @@ fn parse_exchange(
                         conn.out_len = length;
                         conn.phase = ConnPhase::SendingResponse;
                     } else {
-                        conn.out_len = 0;
+                        conn.out_len = interim_len;
                         conn.pending_len = length;
                         conn.phase = ConnPhase::DrainingBody { remaining };
                         conn.read_ready = true;
@@ -337,6 +342,10 @@ fn parse_exchange(
             } else {
                 ExchangeOutcome::NeedMore
             }
+        }
+        Err(ParseError::ExpectationFailed) => {
+            send_expectation_failed(conn);
+            ExchangeOutcome::Responded
         }
         Err(ParseError::HeaderCapacity) => {
             send_bad_request(conn);
@@ -368,6 +377,25 @@ fn send_bad_request(conn: &mut ConnState) {
     }
 }
 
+fn send_expectation_failed(conn: &mut ConnState) {
+    conn.close_reason = ConnClose::Completed;
+    match respond_expectation_failed(&mut conn.output[..]) {
+        Ok(length) => {
+            conn.out_len = length;
+            conn.out_sent = 0;
+            conn.phase = ConnPhase::SendingResponse;
+            conn.write_blocked = false;
+            conn.closing = true;
+        }
+        Err(_) => {
+            conn.out_len = 0;
+            conn.out_sent = 0;
+            conn.phase = ConnPhase::SendingResponse;
+            conn.closing = true;
+        }
+    }
+}
+
 fn reuse_keep_alive(conn: &mut ConnState) {
     let tail = conn.len - conn.head_len;
     conn.input.copy_within(conn.head_len..conn.len, 0);
@@ -376,7 +404,6 @@ fn reuse_keep_alive(conn: &mut ConnState) {
     conn.out_len = 0;
     conn.out_sent = 0;
     conn.phase = ConnPhase::ReadingHead;
-    conn.idle = true;
     conn.parser.reset();
     conn.read_ready = tail > 0;
 }

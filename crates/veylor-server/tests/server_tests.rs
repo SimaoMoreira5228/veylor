@@ -143,6 +143,28 @@ fn persistent_double_get_keep_alive() {
 }
 
 #[test]
+fn pipelined_double_get_served_from_tail() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let pipelined = concat!(
+        "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n",
+        "GET /empty HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n",
+    );
+    stream
+        .write_all(pipelined.as_bytes())
+        .expect("write pipelined");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert!(second.body.is_empty());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
 fn unknown_path_returns_404_then_closes() {
     let server = test_server();
     let mut stream = connect(&server);
@@ -303,11 +325,15 @@ fn expect_continue_oversized_rejected_without_interim() {
 }
 
 #[test]
-fn expect_continue_small_body_drained_silently() {
+fn expect_continue_withheld_body_gets_interim_then_final() {
     let server = test_server();
     let mut stream = connect(&server);
-    let request = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
-    stream.write_all(request.as_bytes()).expect("write POST");
+    let head = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n";
+    stream.write_all(head.as_bytes()).expect("write head");
+    let interim = read_response(&mut stream);
+    assert_eq!(interim.status, 100);
+    assert!(interim.body.is_empty());
+    stream.write_all(b"hello").expect("write body");
     let response = read_response(&mut stream);
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"submitted");
@@ -318,6 +344,79 @@ fn expect_continue_small_body_drained_silently() {
     server.stop_accepting();
     let counts = server.join().expect("join server");
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn expect_continue_pipelined_body_gets_interim_before_final() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let interim = read_response(&mut stream);
+    assert_eq!(interim.status, 100);
+    assert!(interim.body.is_empty());
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"submitted");
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn expect_continue_chunked_rejected_without_interim() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write head");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 413);
+    assert_eq!(response.body, b"Payload Too Large");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn unsupported_expectation_rejected_with_417_then_close() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nExpect: chocolate\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write head");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 417);
+    assert_eq!(response.body, b"Expectation Failed");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn http10_expect_ignored_without_interim() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /submit HTTP/1.0\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"submitted");
+    read_eof(&mut stream);
+    let mut other = connect(&server);
+    let bogus = "POST /submit HTTP/1.0\r\nContent-Length: 5\r\nExpect: chocolate\r\n\r\nhello";
+    other.write_all(bogus.as_bytes()).expect("write bogus");
+    let second = read_response(&mut other);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"submitted");
+    read_eof(&mut other);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 2, "counts: {counts:?}");
 }
 
 #[test]
