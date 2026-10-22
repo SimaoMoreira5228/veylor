@@ -2,6 +2,7 @@ mod connection;
 mod flow_control;
 mod frame;
 mod hpack;
+mod service;
 mod stream;
 
 pub use connection::{
@@ -48,6 +49,11 @@ pub use hpack::{
     encode_header_block, encode_hpack_integer, encode_hpack_string, encode_huffman,
     encode_indexed_header, encode_literal_header, encode_pending_table_size_updates,
     encode_table_size_update,
+};
+pub use service::{
+    MAX_STREAM_WRITE, MAX_TRAILERS, METHOD_CAP, RecordRef, RequestTrailer, ResponsePhase,
+    RouteSnapshot, STAGED_BODY_CAP, ServiceBodyPolicy, ServiceError, ServiceStreams, StagedDrain,
+    StartedResponse, StreamRecord, TRAILER_DATA_CAP, TornDown, TrailerOutcome, TrailerSpan,
 };
 pub use stream::{
     CLIENT_CONNECTION_PREFACE, ClientPrefaceError, EndpointSettings, FrameDirection, H2Role,

@@ -6,6 +6,7 @@ members = [
     "crates/veylor-http2",
     "crates/veylor-router",
     "crates/veylor-runtime",
+    "crates/veylor-server",
 ]
 default-members = [
     "crates/veylor-ffi",
@@ -13,6 +14,7 @@ default-members = [
     "crates/veylor-http2",
     "crates/veylor-router",
     "crates/veylor-runtime",
+    "crates/veylor-server",
 ]
 
 [workspace.package]

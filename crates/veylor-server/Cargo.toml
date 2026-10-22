@@ -1,0 +1,14 @@
+[package]
+name = "veylor-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+veylor-runtime = { path = "../veylor-runtime" }
+veylor-router = { path = "../veylor-router" }
+veylor-http1 = { path = "../veylor-http1" }
+
+[lints]
+workspace = true

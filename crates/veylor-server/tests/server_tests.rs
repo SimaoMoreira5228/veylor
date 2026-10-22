@@ -1,0 +1,303 @@
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+use veylor_server::{RunningServer, Server, ServerConfig};
+
+const DEADLINE: Duration = Duration::from_secs(5);
+
+fn test_server() -> RunningServer {
+    test_server_with_config(ServerConfig::default())
+}
+
+fn test_server_with_config(config: ServerConfig) -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_route(b"GET", b"/hello", 200, b"OK", b"hello")
+        .expect("register hello");
+    server
+        .register_route(b"GET", b"/empty", 200, b"OK", b"")
+        .expect("register empty");
+    server.start().expect("start server")
+}
+
+fn connect(server: &RunningServer) -> TcpStream {
+    let stream = TcpStream::connect(server.addr()).expect("connect loopback");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(DEADLINE))
+        .expect("write timeout");
+    stream
+}
+
+struct ClientResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn read_response(stream: &mut TcpStream) -> ClientResponse {
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+        assert!(head.len() < 65536, "head overflow");
+    }
+    let text = String::from_utf8(head).expect("head utf8");
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().expect("status line");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("status int");
+    let mut headers = Vec::new();
+    let mut content_length = 0;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':').expect("header colon");
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse().expect("content length int");
+        }
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    let mut body = vec![0; content_length];
+    stream.read_exact(&mut body).expect("read body");
+    ClientResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+fn read_eof(stream: &mut TcpStream) {
+    let mut byte = [0; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        other => panic!("expected EOF, got {other:?}"),
+    }
+}
+
+fn get(stream: &mut TcpStream, path: &str) {
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("write request");
+}
+
+#[test]
+fn persistent_double_get_keep_alive() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    get(&mut stream, "/empty");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert!(second.body.is_empty());
+    let content_length = second
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .expect("content-length present");
+    assert_eq!(content_length.1, "0");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed + counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn unknown_path_returns_404_then_closes() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/missing");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 404);
+    assert_eq!(response.body, b"Not Found");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn malformed_request_line_closes_with_400() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"BAD REQUEST\r\n\r\n")
+        .expect("write malformed");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 400);
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn request_body_on_static_route_closes_after_response() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello";
+    stream
+        .write_all(request.as_bytes())
+        .expect("write body request");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 404, "static POST has no route");
+    assert_eq!(response.body, b"Not Found");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn unread_get_body_closes_after_response() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello";
+    stream
+        .write_all(request.as_bytes())
+        .expect("write GET with body");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn eight_concurrent_clients() {
+    let server = test_server();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let addr = server.addr();
+        handles.push(std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect loopback");
+            stream
+                .set_read_timeout(Some(DEADLINE))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(DEADLINE))
+                .expect("write timeout");
+            let request = b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            stream.write_all(request).expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response");
+            let text = String::from_utf8(response).expect("response utf8");
+            assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status: {text}");
+            assert!(text.ends_with("hello"), "body: {text}");
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("client thread");
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 8, "counts: {counts:?}");
+}
+
+#[test]
+fn graceful_drain_finishes_in_flight_request() {
+    let server = test_server();
+    let addr = server.addr();
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    server.stop_accepting();
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    read_eof(&mut stream);
+    let counts = server.join().expect("join server");
+    assert!(
+        counts.completed + counts.shutdown >= 1,
+        "counts: {counts:?}"
+    );
+    assert!(
+        TcpStream::connect(addr).is_err(),
+        "listener closed after join"
+    );
+}
+
+#[test]
+fn second_server_instance_coexists() {
+    let first = test_server();
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut second = Server::bind(addr, ServerConfig::default()).expect("bind second");
+    second
+        .register_route(b"GET", b"/other", 200, b"OK", b"other")
+        .expect("register other");
+    let second = second.start().expect("start second");
+    assert_ne!(first.addr(), second.addr());
+
+    let mut stream = connect(&first);
+    get(&mut stream, "/hello");
+    let first_response = read_response(&mut stream);
+    assert_eq!(first_response.body, b"hello");
+
+    let mut other = connect(&second);
+    get(&mut other, "/other");
+    let second_response = read_response(&mut other);
+    assert_eq!(second_response.body, b"other");
+
+    first.stop_accepting();
+    second.stop_accepting();
+    let _ = first.join().expect("join first");
+    let _ = second.join().expect("join second");
+}
+
+#[test]
+fn duplicate_route_rejected() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    server
+        .register_route(b"GET", b"/dup", 200, b"OK", b"a")
+        .expect("first register");
+    assert!(
+        server
+            .register_route(b"GET", b"/dup", 200, b"OK", b"b")
+            .is_err()
+    );
+    let running = server.start().expect("start server");
+    running.stop_accepting();
+    let _ = running.join().expect("join server");
+}
+
+#[test]
+fn head_falls_back_to_get_without_body() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = b"HEAD /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    stream.write_all(request).expect("write HEAD");
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+    }
+    let text = String::from_utf8(head).expect("head utf8");
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status: {text}");
+    assert!(
+        text.contains("Content-Length: 5"),
+        "length preserved: {text}"
+    );
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
