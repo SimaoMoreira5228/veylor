@@ -8,9 +8,13 @@ use veylor_router::{
 
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_RESPONSE_BODY: usize = 4096;
+// NOTE: static routes never consume request bodies, so this cap only bounds drain work: 64 KiB
+// is eight full 8 KiB input buffers of skip work at most, while still admitting small form posts.
+pub const MAX_STATIC_BODY_BYTES: u64 = 64 * 1024;
 const CAPTURE_SLOTS: usize = 8;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
+const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteBuildError {
@@ -127,6 +131,7 @@ impl Default for StaticRoutes {
 pub struct EncodedStaticResponse {
     pub length: usize,
     pub keep_open: bool,
+    pub drain_total: u64,
 }
 
 pub fn respond_to_head(
@@ -147,14 +152,25 @@ pub fn respond_to_head(
         Err(error) => return Err(RouteBuildError::from(error)),
     };
     let method = head.method(input).unwrap_or_default();
-    let body_complete = head.content_length.is_none() && !head.is_chunked;
+    // NOTE: v1 never emits an interim 100 Continue on static routes and static routes cannot use
+    // trailers, so any chunked request rejects without reading; small bodies drain silently.
+    if head.is_chunked {
+        return reject_payload(output, method);
+    }
+    let drain_total = match head.content_length {
+        Some(length) if length > MAX_STATIC_BODY_BYTES => return reject_payload(output, method),
+        Some(length) => length,
+        None => 0,
+    };
+    // NOTE: a declared body at or under the cap is drained by the connection before any response
+    // byte is written, so framing treats it as complete now; chunked and oversized already left.
     let response_close = status == 404;
     let connection = connection_header_for_response(
         head,
         input,
         status,
         ResponseFraming::FixedLength,
-        body_complete,
+        true,
         response_close,
     );
     let response = ResponseToWrite {
@@ -179,8 +195,48 @@ pub fn respond_to_head(
     }
     Ok(EncodedStaticResponse {
         length,
-        keep_open: connection != ConnectionHeader::Close && body_complete,
+        keep_open: connection != ConnectionHeader::Close,
+        drain_total,
     })
+}
+
+fn reject_payload(
+    output: &mut [u8],
+    method: &[u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let length = respond_payload_too_large(output, method)?;
+    Ok(EncodedStaticResponse {
+        length,
+        keep_open: false,
+        drain_total: 0,
+    })
+}
+
+pub fn respond_payload_too_large(
+    output: &mut [u8],
+    method: &[u8],
+) -> Result<usize, RouteBuildError> {
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade: b"",
+        status: 413,
+        reason: b"Payload Too Large",
+        fields: &[],
+        framing: ResponseFraming::FixedLength,
+        content_length: PAYLOAD_TOO_LARGE_BODY.len() as u64,
+        connection: ConnectionHeader::Close,
+    };
+    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let mut length = encoded.length;
+    if encoded.body_allowed && !PAYLOAD_TOO_LARGE_BODY.is_empty() {
+        let end = length + PAYLOAD_TOO_LARGE_BODY.len();
+        output
+            .get_mut(length..end)
+            .ok_or(RouteBuildError::Invalid)?
+            .copy_from_slice(PAYLOAD_TOO_LARGE_BODY);
+        length = end;
+    }
+    Ok(length)
 }
 
 pub fn respond_bad_request(output: &mut [u8]) -> Result<usize, RouteBuildError> {

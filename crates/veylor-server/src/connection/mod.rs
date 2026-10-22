@@ -15,6 +15,7 @@ pub const HEADER_SLOTS: usize = 100;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnPhase {
     ReadingHead,
+    DrainingBody { remaining: u64 },
     SendingResponse,
 }
 
@@ -41,6 +42,7 @@ pub struct ConnState {
     output: Box<[u8; OUTPUT_CAP]>,
     out_len: usize,
     out_sent: usize,
+    pending_len: usize,
     phase: ConnPhase,
     read_ready: bool,
     write_blocked: bool,
@@ -62,6 +64,7 @@ impl ConnState {
             output: Box::new([0; OUTPUT_CAP]),
             out_len: 0,
             out_sent: 0,
+            pending_len: 0,
             phase: ConnPhase::ReadingHead,
             read_ready: true,
             write_blocked: false,
@@ -95,6 +98,10 @@ impl ConnState {
         self.phase == ConnPhase::ReadingHead && self.len > 0
     }
 
+    pub fn read_armed(&self) -> bool {
+        self.read_ready
+    }
+
     pub fn is_idle(&self) -> bool {
         self.phase == ConnPhase::ReadingHead && !self.has_pending_output() && self.len == 0
     }
@@ -122,12 +129,16 @@ pub fn pump_connection(
     if conn.error_hint {
         return PumpOutcome::Close(ConnClose::TransportError);
     }
-    let reading = conn.phase == ConnPhase::ReadingHead && conn.len < INPUT_CAP;
+    let draining = matches!(conn.phase, ConnPhase::DrainingBody { .. });
+    let reading = (conn.phase == ConnPhase::ReadingHead || draining) && conn.len < INPUT_CAP;
     let token = conn.token;
     let read_ready = conn.read_ready;
     let out_sent = conn.out_sent;
     let out_len = conn.out_len;
-    let write_ready = out_sent < out_len && !conn.write_blocked;
+    // NOTE: the encoded response is held while draining and no byte is written until the declared
+    // body is fully skipped, so a drained exchange keeps single-outstanding-response order.
+    let write_ready =
+        conn.phase == ConnPhase::SendingResponse && out_sent < out_len && !conn.write_blocked;
     let read_scratch = if reading {
         &mut conn.input[conn.len..]
     } else {
@@ -142,9 +153,15 @@ pub fn pump_connection(
         write_ready,
     )];
     dispatch(byte_budget, &mut batch);
-    let entry = &batch[0];
-    conn.read_ready = false;
-    match entry.read {
+    let read = batch[0].read;
+    let write = batch[0].write;
+    let closed = batch[0].closed;
+    // NOTE: edge-triggered readiness fires only on new arrivals, so a read that stopped on
+    // partial progress or budget keeps its claim; a drained socket (WouldBlock) waits for the
+    // next edge instead. Without the re-arm, budget-split heads stall until more data arrives.
+    conn.read_ready = matches!(read, ReadStatus::Progress(_) | ReadStatus::BudgetExhausted);
+    let read_drained = matches!(read, ReadStatus::WouldBlock);
+    match read {
         ReadStatus::Progress(bytes) => {
             conn.len += bytes;
         }
@@ -162,12 +179,12 @@ pub fn pump_connection(
         | ReadStatus::PausedForWrite
         | ReadStatus::Interrupted => {}
     }
-    let accepted = match entry.write {
+    let accepted = match write {
         WriteStatus::Progress(accepted)
         | WriteStatus::WouldBlock(accepted)
         | WriteStatus::BudgetExhausted(accepted)
         | WriteStatus::Interrupted(accepted) => {
-            if matches!(entry.write, WriteStatus::WouldBlock(_)) {
+            if matches!(write, WriteStatus::WouldBlock(_)) {
                 conn.write_blocked = true;
             }
             accepted
@@ -182,9 +199,29 @@ pub fn pump_connection(
         WriteStatus::Idle => 0,
     };
     conn.out_sent += accepted;
-    if entry.closed.is_some() && !conn.has_pending_output() && conn.phase == ConnPhase::ReadingHead
-    {
+    if closed.is_some() && !conn.has_pending_output() && conn.phase == ConnPhase::ReadingHead {
         return PumpOutcome::Close(ConnClose::PeerClosed);
+    }
+
+    if let ConnPhase::DrainingBody { remaining } = conn.phase {
+        let skip = (conn.len as u64).min(remaining) as usize;
+        conn.input.copy_within(skip..conn.len, 0);
+        conn.len -= skip;
+        let left = remaining - skip as u64;
+        if left == 0 {
+            conn.out_len = conn.pending_len;
+            conn.pending_len = 0;
+            conn.phase = ConnPhase::SendingResponse;
+            conn.write_blocked = false;
+        } else {
+            conn.phase = ConnPhase::DrainingBody { remaining: left };
+            // NOTE: edge-triggered readiness fires only on new arrivals, so a drain that stopped
+            // short of EAGAIN re-arms its read; a drained socket waits for the next edge instead.
+            // An Idle read attempted nothing (no readiness claim), so it leaves the flag alone.
+            if !matches!(read, ReadStatus::Idle) {
+                conn.read_ready = !read_drained;
+            }
+        }
     }
 
     if conn.phase == ConnPhase::ReadingHead {
@@ -230,13 +267,35 @@ fn parse_exchange(
                 &conn.input[..conn.len],
                 &mut conn.output[..],
             ) {
-                Ok(EncodedStaticResponse { length, keep_open }) => {
-                    conn.out_len = length;
+                Ok(EncodedStaticResponse {
+                    length,
+                    keep_open,
+                    drain_total,
+                }) => {
                     conn.out_sent = 0;
-                    conn.phase = ConnPhase::SendingResponse;
                     conn.write_blocked = false;
                     conn.closing = !keep_open;
                     conn.close_reason = ConnClose::Completed;
+                    // NOTE: bytes already buffered past the head are body bytes by position, so
+                    // skip them in place and drain the rest across pumps; the head is dropped now
+                    // and keep-alive reuse below treats the remainder as pipelined tail. The
+                    // encoded response stays unpublished until the drain finishes, so an idle
+                    // drain waits on poll instead of spinning the worker turn.
+                    let buffered = (conn.len - conn.head_len) as u64;
+                    let skip = buffered.min(drain_total) as usize;
+                    conn.input.copy_within(conn.head_len + skip..conn.len, 0);
+                    conn.len -= conn.head_len + skip;
+                    conn.head_len = 0;
+                    let remaining = drain_total - skip as u64;
+                    if remaining == 0 {
+                        conn.out_len = length;
+                        conn.phase = ConnPhase::SendingResponse;
+                    } else {
+                        conn.out_len = 0;
+                        conn.pending_len = length;
+                        conn.phase = ConnPhase::DrainingBody { remaining };
+                        conn.read_ready = true;
+                    }
                     ExchangeOutcome::Responded
                 }
                 Err(_) => ExchangeOutcome::Close(ConnClose::ResponseOverflow),

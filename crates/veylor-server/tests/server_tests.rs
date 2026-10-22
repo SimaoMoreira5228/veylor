@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use veylor_server::{RunningServer, Server, ServerConfig};
+use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -19,6 +19,9 @@ fn test_server_with_config(config: ServerConfig) -> RunningServer {
     server
         .register_route(b"GET", b"/empty", 200, b"OK", b"")
         .expect("register empty");
+    server
+        .register_route(b"POST", b"/submit", 200, b"OK", b"submitted")
+        .expect("register submit");
     server.start().expect("start server")
 }
 
@@ -85,6 +88,15 @@ fn read_eof(stream: &mut TcpStream) {
     match stream.read(&mut byte) {
         Ok(0) => {}
         other => panic!("expected EOF, got {other:?}"),
+    }
+}
+
+fn read_closed(stream: &mut TcpStream) {
+    let mut byte = [0; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Err(_) => {}
+        Ok(_) => panic!("expected close, got data"),
     }
 }
 
@@ -163,7 +175,7 @@ fn request_body_on_static_route_closes_after_response() {
 }
 
 #[test]
-fn unread_get_body_closes_after_response() {
+fn small_get_body_drained_then_keep_alive_reusable() {
     let server = test_server();
     let mut stream = connect(&server);
     let request = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello";
@@ -173,10 +185,126 @@ fn unread_get_body_closes_after_response() {
     let response = read_response(&mut stream);
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"hello");
-    read_eof(&mut stream);
+    get(&mut stream, "/empty");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert!(second.body.is_empty());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn post_small_body_drained_then_keep_alive_reusable() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request =
+        "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 11\r\n\r\nhello world";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"submitted");
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn post_large_body_drains_across_pumps_then_reusable() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let body = vec![b'a'; 20_000];
+    let head = format!(
+        "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"submitted");
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn oversized_body_rejected_without_reading() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let head = format!(
+        "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        MAX_STATIC_BODY_BYTES + 1024
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 413);
+    assert_eq!(response.body, b"Payload Too Large");
+    let chunk = vec![b'x'; 1024];
+    let _ = stream.write_all(&chunk);
+    read_closed(&mut stream);
     server.stop_accepting();
     let counts = server.join().expect("join server");
     assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn chunked_request_rejected_without_reading() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write head");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 413);
+    assert_eq!(response.body, b"Payload Too Large");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn expect_continue_oversized_rejected_without_interim() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let head = format!(
+        "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+        MAX_STATIC_BODY_BYTES + 1024
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 413);
+    assert_eq!(response.body, b"Payload Too Large");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn expect_continue_small_body_drained_silently() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"submitted");
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
 
 #[test]

@@ -4,9 +4,9 @@ use super::{
     AdmittedConnection, TurnConfig, TurnInput, TurnOutcome, Worker, WorkerError, WorkerStorage,
 };
 use crate::{
-    AcceptedConnection, ConnectionDeadline, ConnectionDeadlineKind, ConnectionSlot,
-    ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness, ShutdownPhase,
-    ShutdownResult, ShutdownState, TcpListener, TimerExpiration,
+    AcceptedConnection, ConnectionDeadline, ConnectionDeadlineKind, ConnectionPhase,
+    ConnectionSlot, ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness,
+    ShutdownPhase, ShutdownResult, ShutdownState, TcpListener, TimerExpiration,
 };
 
 const LISTENER_TOKEN: usize = 7;
@@ -492,4 +492,278 @@ fn timer_exhaustion_fails_closed_without_losing_the_slot() {
     .unwrap();
     assert_eq!(recovered.accepted, 1);
     assert_eq!(worker.live_count(), 1);
+}
+
+#[test]
+fn progress_refresh_moves_deadline_while_zero_bytes_leave_it() {
+    let mut harness = Harness::<4, 8, 24>::new();
+    let (mut worker, mut listener, address) = open_worker(&mut harness, TurnConfig::DEFAULT);
+    let _client = connect(address);
+    let mut events = event_buffer();
+    let mut expired = [deadline_placeholder(); 4];
+    let mut admitted = [(); 4].map(|()| None);
+
+    let start = 40_000_000;
+    drive(
+        &mut worker,
+        &mut listener,
+        start,
+        200,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    let token = take_token(&mut admitted, 0);
+
+    assert!(worker.note_progress(token, 100, start + 500_000).unwrap());
+    let moved = drive(
+        &mut worker,
+        &mut listener,
+        start + 1_000_001,
+        0,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    assert_eq!(moved.expired_deadlines, 0);
+
+    assert!(!worker.note_progress(token, 0, start + 1_000_002).unwrap());
+    let due = drive(
+        &mut worker,
+        &mut listener,
+        start + 1_500_001,
+        0,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    assert_eq!(due.expired_deadlines, 1);
+    assert_eq!(expired[0].kind, ConnectionDeadlineKind::RequestHead);
+    worker.close(token).unwrap();
+}
+
+#[test]
+fn phase_transitions_reschedule_per_phase_timeouts() {
+    let mut harness = Harness::<4, 8, 24>::new();
+    let (mut worker, mut listener, address) = open_worker(&mut harness, TurnConfig::DEFAULT);
+    let _client = connect(address);
+    let mut events = event_buffer();
+    let mut expired = [deadline_placeholder(); 4];
+    let mut admitted = [(); 4].map(|()| None);
+
+    let start = 50_000_000;
+    drive(
+        &mut worker,
+        &mut listener,
+        start,
+        200,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    let token = take_token(&mut admitted, 0);
+
+    worker
+        .transition_phase(token, ConnectionPhase::ReadingRequestBody, start + 200_000)
+        .unwrap();
+    let quiet = drive(
+        &mut worker,
+        &mut listener,
+        start + 1_000_001,
+        0,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    assert_eq!(quiet.expired_deadlines, 0);
+    let body_due = drive(
+        &mut worker,
+        &mut listener,
+        start + 1_200_001,
+        0,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    assert_eq!(body_due.expired_deadlines, 1);
+    assert_eq!(expired[0].kind, ConnectionDeadlineKind::BodyProgress);
+
+    worker
+        .transition_phase(token, ConnectionPhase::WritingResponse, start + 1_200_002)
+        .unwrap();
+    let response_due = drive(
+        &mut worker,
+        &mut listener,
+        start + 2_200_003,
+        0,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    assert_eq!(response_due.expired_deadlines, 1);
+    assert_eq!(expired[0].kind, ConnectionDeadlineKind::ResponseWrite);
+    worker.close(token).unwrap();
+}
+
+#[test]
+fn invalid_phase_transition_fails_closed_into_closing() {
+    let mut harness = Harness::<4, 8, 24>::new();
+    let (mut worker, mut listener, address) = open_worker(&mut harness, TurnConfig::DEFAULT);
+    let _client = connect(address);
+    let mut events = event_buffer();
+    let mut expired = [deadline_placeholder(); 4];
+    let mut admitted = [(); 4].map(|()| None);
+
+    let start = 60_000_000;
+    drive(
+        &mut worker,
+        &mut listener,
+        start,
+        200,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    let token = take_token(&mut admitted, 0);
+
+    assert!(matches!(
+        worker.transition_phase(token, ConnectionPhase::KeepAliveIdle, start + 100),
+        Err(WorkerError::Invalid)
+    ));
+    assert!(matches!(
+        worker.transition_phase(token, ConnectionPhase::ReadingRequestHead, start + 100),
+        Err(WorkerError::Invalid)
+    ));
+    assert!(matches!(
+        worker.note_progress(token, 10, start + 100),
+        Err(WorkerError::Invalid)
+    ));
+    worker.close(token).unwrap();
+}
+
+#[test]
+fn stale_tokens_fail_closed_for_all_deadline_hooks() {
+    let mut harness = Harness::<4, 8, 24>::new();
+    let (mut worker, mut listener, address) = open_worker(&mut harness, TurnConfig::DEFAULT);
+    let _client_a = connect(address);
+    let mut events = event_buffer();
+    let mut expired = [deadline_placeholder(); 4];
+    let mut admitted = [(); 4].map(|()| None);
+
+    let start = 70_000_000;
+    drive(
+        &mut worker,
+        &mut listener,
+        start,
+        200,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    let stale = take_token(&mut admitted, 0);
+    worker.close(stale).unwrap();
+
+    let _client_b = connect(address);
+    drive(
+        &mut worker,
+        &mut listener,
+        start + 100,
+        200,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    let live = take_token(&mut admitted, 0);
+    assert_ne!(live.generation, stale.generation);
+
+    assert!(!worker.note_progress(stale, 0, start + 200).unwrap());
+    assert!(matches!(
+        worker.note_progress(stale, 10, start + 200),
+        Err(WorkerError::StaleToken)
+    ));
+    assert!(matches!(
+        worker.transition_phase(stale, ConnectionPhase::ReadingRequestBody, start + 200),
+        Err(WorkerError::StaleToken)
+    ));
+    assert!(matches!(
+        worker.schedule_idle(stale, start + 200),
+        Err(WorkerError::StaleToken)
+    ));
+    assert!(matches!(
+        worker.cancel_idle(stale),
+        Err(WorkerError::StaleToken)
+    ));
+    assert!(matches!(
+        worker.cancel_deadline(stale),
+        Err(WorkerError::StaleToken)
+    ));
+    worker.close(live).unwrap();
+}
+
+#[test]
+fn idle_arm_cancel_resume_round_trip() {
+    let mut harness = Harness::<4, 8, 24>::new();
+    let (mut worker, mut listener, address) = open_worker(&mut harness, TurnConfig::DEFAULT);
+    let _client = connect(address);
+    let mut events = event_buffer();
+    let mut expired = [deadline_placeholder(); 4];
+    let mut admitted = [(); 4].map(|()| None);
+
+    let start = 80_000_000;
+    drive(
+        &mut worker,
+        &mut listener,
+        start,
+        200,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    let token = take_token(&mut admitted, 0);
+
+    worker
+        .transition_phase(token, ConnectionPhase::WritingResponse, start + 100)
+        .unwrap();
+    worker.cancel_deadline(token).unwrap();
+    worker.cancel_deadline(token).unwrap();
+    worker.schedule_idle(token, start + 200).unwrap();
+    assert!(matches!(
+        worker.schedule_idle(token, start + 200),
+        Err(WorkerError::Invalid)
+    ));
+
+    worker.cancel_idle(token).unwrap();
+    worker.cancel_idle(token).unwrap();
+    worker
+        .transition_phase(token, ConnectionPhase::ReadingRequestHead, start + 300)
+        .unwrap();
+    assert!(matches!(
+        worker.cancel_idle(token),
+        Err(WorkerError::Invalid)
+    ));
+
+    let due = drive(
+        &mut worker,
+        &mut listener,
+        start + 1_000_301,
+        0,
+        &mut events,
+        &mut expired,
+        &mut admitted,
+    )
+    .unwrap();
+    assert_eq!(due.expired_deadlines, 1);
+    assert_eq!(expired[0].kind, ConnectionDeadlineKind::RequestHead);
+    worker.close(token).unwrap();
 }

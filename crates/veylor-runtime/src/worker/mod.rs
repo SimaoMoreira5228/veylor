@@ -2,12 +2,12 @@ use std::io;
 use std::net::SocketAddr;
 
 use crate::{
-    AcceptBatchOutcome, AcceptStop, AcceptedConnection, ConnectionDeadline, ConnectionSlot,
-    ConnectionTable, ConnectionTimeouts, ConnectionToken, DeadlineError, Poller, Readiness,
-    ShutdownPhase, ShutdownResult, ShutdownState, TableError, TcpListener, TcpStream,
-    TimerExpiration, TimerQueue, TimerQueueError, accept_ready, close_connection,
-    deadline_timer_id, destroy, force_shutdown, process_deadline, register_connection,
-    request_shutdown, schedule_phase_deadline,
+    AcceptBatchOutcome, AcceptStop, AcceptedConnection, ConnectionDeadline, ConnectionPhase,
+    ConnectionSlot, ConnectionTable, ConnectionTimeouts, ConnectionToken, DeadlineError, Poller,
+    Readiness, ShutdownPhase, ShutdownResult, ShutdownState, TableError, TcpListener, TcpStream,
+    TimerExpiration, TimerQueue, TimerQueueError, accept_ready, cancel_phase_deadline,
+    close_connection, deadline_timer_id, destroy, force_shutdown, process_deadline,
+    register_connection, request_shutdown, schedule_phase_deadline, start_keep_alive_idle_deadline,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +317,96 @@ impl<'a> Worker<'a> {
         close_connection(&mut *self.shutdown, Some(&mut self.timers));
 
         Ok(())
+    }
+
+    // NOTE: refresh happens only on byte progress; a WouldBlock turn reports
+    // zero bytes and leaves the armed deadline alone so slow peers still time out.
+    pub fn note_progress(
+        &mut self,
+        token: ConnectionToken,
+        bytes: u64,
+        now_ns: u64,
+    ) -> Result<bool, WorkerError> {
+        if bytes == 0 {
+            return Ok(false);
+        }
+        cancel_phase_deadline(&mut self.table, &mut self.timers, token)?;
+        schedule_phase_deadline(
+            &mut self.table,
+            &mut self.timers,
+            token,
+            now_ns,
+            self.timeouts,
+        )?;
+        Ok(true)
+    }
+
+    // NOTE: the armed deadline is cancelled before the move because the table
+    // rejects kind changes while armed; any failure parks the slot in Closing
+    // so the server must close it instead of running it deadline-less.
+    pub fn transition_phase(
+        &mut self,
+        token: ConnectionToken,
+        next: ConnectionPhase,
+        now_ns: u64,
+    ) -> Result<(), WorkerError> {
+        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+            Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = self.table.transition(token, next) {
+            let _ = self.table.transition(token, ConnectionPhase::Closing);
+            return Err(error.into());
+        }
+        if next == ConnectionPhase::Closing {
+            return Ok(());
+        }
+        if let Err(error) = schedule_phase_deadline(
+            &mut self.table,
+            &mut self.timers,
+            token,
+            now_ns,
+            self.timeouts,
+        ) {
+            let _ = self.table.transition(token, ConnectionPhase::Closing);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub fn schedule_idle(
+        &mut self,
+        token: ConnectionToken,
+        now_ns: u64,
+    ) -> Result<(), WorkerError> {
+        start_keep_alive_idle_deadline(
+            &mut self.table,
+            &mut self.timers,
+            token,
+            now_ns,
+            self.timeouts,
+        )?;
+        Ok(())
+    }
+
+    // NOTE: resume needs transition_phase(ReadingRequestHead) next to re-arm
+    // the head deadline; this only drops the idle timer so a resumed request
+    // is not killed by idle expiry.
+    pub fn cancel_idle(&mut self, token: ConnectionToken) -> Result<(), WorkerError> {
+        if self.table.phase(token)? != ConnectionPhase::KeepAliveIdle {
+            return Err(WorkerError::Invalid);
+        }
+        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+            Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn cancel_deadline(&mut self, token: ConnectionToken) -> Result<(), WorkerError> {
+        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+            Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn begin_shutdown(&mut self, now_ns: u64, grace_ns: u64, timer_id: u64) -> ShutdownResult {

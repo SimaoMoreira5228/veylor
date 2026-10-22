@@ -628,7 +628,7 @@ fn work_pending(conns: &[Option<ConnState>]) -> bool {
     conns
         .iter()
         .flatten()
-        .any(|conn| conn.has_pending_output() || conn.has_unparsed_input())
+        .any(|conn| conn.has_pending_output() || conn.has_unparsed_input() || conn.read_armed())
 }
 
 fn close_idle_for_drain(
