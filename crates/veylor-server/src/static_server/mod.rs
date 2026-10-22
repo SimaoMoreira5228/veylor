@@ -15,6 +15,7 @@ use veylor_runtime::{
 };
 
 use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
+use crate::host::{HostHandle, HostShared};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::{MAX_ROUTES, RouteBuildError, StaticRoutes};
 
@@ -33,6 +34,9 @@ pub struct CloseCounts {
     pub peer_closed: u64,
     pub reset: u64,
     pub timeout: u64,
+    pub parked_timeout: u64,
+    pub queue_full: u64,
+    pub cancelled: u64,
     pub protocol_error: u64,
     pub response_overflow: u64,
     pub transport_error: u64,
@@ -46,6 +50,13 @@ impl CloseCounts {
             ConnClose::PeerClosed => &mut self.peer_closed,
             ConnClose::Reset => &mut self.reset,
             ConnClose::Timeout => &mut self.timeout,
+            // NOTE: genuinely distinct from Timeout/TransportError: an abandoned park
+            // means the host never responded (host health), and a full host queue means
+            // overload at the dispatch boundary (S4.2 quota recovery needs both split
+            // out). Cancelled is host-initiated, unlike drain Shutdown closes.
+            ConnClose::ParkedTimeout => &mut self.parked_timeout,
+            ConnClose::QueueFull => &mut self.queue_full,
+            ConnClose::Cancelled => &mut self.cancelled,
             ConnClose::ProtocolError => &mut self.protocol_error,
             ConnClose::ResponseOverflow => &mut self.response_overflow,
             ConnClose::TransportError => &mut self.transport_error,
@@ -111,6 +122,7 @@ pub struct Server {
     pub(crate) listener: TcpListener,
     pub(crate) config: ServerConfig,
     pub(crate) routes: StaticRoutes,
+    pub(crate) host: Arc<HostShared>,
 }
 
 impl Server {
@@ -125,6 +137,7 @@ impl Server {
             listener,
             config,
             routes: StaticRoutes::new(),
+            host: Arc::new(HostShared::new(config.worker_count)),
         })
     }
 
@@ -145,6 +158,12 @@ impl Server {
             .map_err(ServerError::from)
     }
 
+    pub fn register_managed(&mut self, method: &[u8], path: &[u8]) -> Result<(), ServerError> {
+        self.routes
+            .register_managed(method, path)
+            .map_err(ServerError::from)
+    }
+
     pub fn start(self) -> Result<RunningServer, ServerError> {
         freeze_check(&self.routes)?;
         if self.config.worker_count > 1 {
@@ -154,6 +173,7 @@ impl Server {
             mut listener,
             config,
             routes,
+            host,
         } = self;
         let mut worker_poller = Poller::new(MAX_EVENTS_PER_TURN).map_err(ServerError::Poll)?;
         worker_poller
@@ -168,6 +188,7 @@ impl Server {
             listener,
             config,
             routes: Arc::new(routes),
+            host: Arc::clone(&host),
             worker_poller,
             stop: Arc::clone(&stop),
             force: Arc::clone(&force),
@@ -183,6 +204,7 @@ impl Server {
             stop,
             force,
             addr,
+            host: HostHandle::new(host),
         })
     }
 }
@@ -193,11 +215,16 @@ pub struct RunningServer {
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) force: Arc<AtomicBool>,
     pub(crate) addr: SocketAddr,
+    pub(crate) host: HostHandle,
 }
 
 impl RunningServer {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    pub fn host(&self) -> HostHandle {
+        self.host.clone()
     }
 
     pub fn stop_accepting(&self) {
@@ -222,6 +249,9 @@ impl RunningServer {
             total.peer_closed += worker.peer_closed;
             total.reset += worker.reset;
             total.timeout += worker.timeout;
+            total.parked_timeout += worker.parked_timeout;
+            total.queue_full += worker.queue_full;
+            total.cancelled += worker.cancelled;
             total.protocol_error += worker.protocol_error;
             total.response_overflow += worker.response_overflow;
             total.transport_error += worker.transport_error;
@@ -288,6 +318,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         mut listener,
         config,
         routes,
+        host,
         mut worker_poller,
         stop,
         force,
@@ -299,6 +330,15 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     };
     let mut stream_poller = match Poller::new(MAX_CONNECTIONS * 2) {
         Ok(poller) => poller,
+        Err(error) => {
+            result.error = Some(error.to_string());
+            return result;
+        }
+    };
+    // NOTE: host respond/cancel stages a command and wakes this poller so a parked
+    // worker picks it up promptly instead of sleeping out the poll cadence.
+    match stream_poller.create_waker() {
+        Ok(waker) => host.register_waker(worker_id, waker),
         Err(error) => {
             result.error = Some(error.to_string());
             return result;
@@ -388,14 +428,61 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             }
         }
         expired.fill(sentinel_deadline());
-        // NOTE: the worker wait is skipped while connection work is pending;
-        // otherwise every pump turn pays the full poll cadence even though the
-        // next step is already known. Timer and accept paths stay nonblocking.
-        let worker_wait_ms = if work_pending(&conns) {
-            0
-        } else {
-            config.poll_wait_ms
-        };
+        // NOTE: the loop wait rides the stream poller while streams are registered, so
+        // stream readiness wakes the wait instead of every wave paying the worker-poller
+        // cadence; Worker::turn then runs at zero wait and still drains accepts/expires
+        // timers each iteration. With zero streams the stream poll is skipped and the
+        // worker poller carries the wait as before (no spin either way). Stop/force wake
+        // only worker-poller wakers, so a stop sleeping in the stream poll is observed at
+        // loop top within one stream cadence; new accepts likewise wait out one cadence.
+        let live_streams = worker.live_count();
+        let pending = work_pending(&conns);
+        let stream_wait_ms = if pending { 0 } else { config.poll_wait_ms };
+        let worker_wait_ms = if live_streams == 0 { stream_wait_ms } else { 0 };
+        if live_streams > 0 {
+            ready.clear();
+            let poll_error: Option<io::Error> =
+                match stream_poller.poll(Some(Duration::from_millis(stream_wait_ms as u64))) {
+                    Ok(readiness) => {
+                        ready.extend(readiness.take(MAX_CONNECTIONS * 2));
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+            for event in ready.drain(..) {
+                if event.token == LISTENER_TOKEN || event.token == WAKE_TOKEN {
+                    continue;
+                }
+                let Some(conn) = conns
+                    .get_mut(event.token.wrapping_sub(1))
+                    .and_then(|slot| slot.as_mut())
+                else {
+                    continue;
+                };
+                if event.readable || event.read_closed_hint {
+                    conn.mark_readable();
+                }
+                if event.writable {
+                    conn.mark_writable();
+                }
+                if event.error_hint {
+                    conn.mark_error();
+                }
+            }
+            if let Some(error) = poll_error {
+                result.error = Some(error.to_string());
+                cleanup_all(
+                    &host,
+                    &mut conns,
+                    &mut stream_poller,
+                    &mut worker,
+                    &mut result.counts,
+                );
+                worker.destroy();
+                host.push_shutdown(worker_id);
+                break;
+            }
+        }
         let input = TurnInput {
             listener_token: LISTENER_TOKEN,
             now_ns,
@@ -414,22 +501,34 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         );
         drain_expired(
             &expired,
+            &host,
             &mut conns,
             &mut stream_poller,
             &mut worker,
             &mut result.counts,
         );
         let draining = worker.shutdown_phase() != ShutdownPhase::Running;
+        drain_host_staged(
+            &host,
+            worker_id,
+            &mut conns,
+            &mut stream_poller,
+            &mut worker,
+            &mut result.counts,
+            now_ns,
+        );
         match turn_result {
             Ok(outcome) => {
                 if outcome.shutdown_complete {
                     cleanup_all(
+                        &host,
                         &mut conns,
                         &mut stream_poller,
                         &mut worker,
                         &mut result.counts,
                     );
                     worker.destroy();
+                    host.push_shutdown(worker_id);
                     break;
                 }
             }
@@ -437,60 +536,16 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             Err(error) => {
                 result.error = Some(format!("worker turn failed: {error:?}"));
                 cleanup_all(
+                    &host,
                     &mut conns,
                     &mut stream_poller,
                     &mut worker,
                     &mut result.counts,
                 );
                 worker.destroy();
+                host.push_shutdown(worker_id);
                 break;
             }
-        }
-
-        let poll_timeout = if work_pending(&conns) {
-            0
-        } else {
-            config.poll_wait_ms as u64
-        };
-        ready.clear();
-        let poll_error: Option<io::Error> =
-            match stream_poller.poll(Some(Duration::from_millis(poll_timeout))) {
-                Ok(readiness) => {
-                    ready.extend(readiness.take(MAX_CONNECTIONS * 2));
-                    None
-                }
-                Err(error) => Some(error),
-            };
-        for event in ready.drain(..) {
-            if event.token == LISTENER_TOKEN || event.token == WAKE_TOKEN {
-                continue;
-            }
-            let Some(conn) = conns
-                .get_mut(event.token.wrapping_sub(1))
-                .and_then(|slot| slot.as_mut())
-            else {
-                continue;
-            };
-            if event.readable || event.read_closed_hint {
-                conn.mark_readable();
-            }
-            if event.writable {
-                conn.mark_writable();
-            }
-            if event.error_hint {
-                conn.mark_error();
-            }
-        }
-        if let Some(error) = poll_error {
-            result.error = Some(error.to_string());
-            cleanup_all(
-                &mut conns,
-                &mut stream_poller,
-                &mut worker,
-                &mut result.counts,
-            );
-            worker.destroy();
-            break;
         }
 
         let live_count = worker.live_count().max(1) as u64;
@@ -503,7 +558,15 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             if draining {
                 conn.begin_drain();
             }
-            let hook_close = match pump_connection(conn, &routes, &table, per_conn_budget) {
+            let hook_close = match pump_connection(
+                conn,
+                &routes,
+                &table,
+                per_conn_budget,
+                worker_id,
+                &host,
+                draining,
+            ) {
                 PumpOutcome::Keep(progress) => {
                     let token = conn.token();
                     apply_pump_hooks(&mut worker, token, progress, now_ns)
@@ -514,6 +577,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 close_conn(
                     index,
                     reason,
+                    &host,
                     &mut conns,
                     &mut stream_poller,
                     &mut worker,
@@ -531,6 +595,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             && now_ns.saturating_sub(drain_start_ns) >= config.drain_idle_linger_ns
         {
             close_idle_for_drain(
+                &host,
                 &mut conns,
                 &mut stream_poller,
                 &mut worker,
@@ -591,6 +656,7 @@ fn drain_admitted(
 
 fn drain_expired(
     expired: &[ConnectionDeadline],
+    host: &HostShared,
     conns: &mut [Option<ConnState>],
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
@@ -606,14 +672,86 @@ fn drain_expired(
             .and_then(|entry| entry.as_ref())
             .is_some_and(|conn| conn.token() == deadline.token);
         if timed_out {
+            // NOTE: an abandoned park (host never responded) reports ParkedTimeout, not
+            // Timeout, so host health is distinguishable from slow networks.
+            let reason = if deadline.kind == ConnectionDeadlineKind::AwaitingHandler {
+                ConnClose::ParkedTimeout
+            } else {
+                ConnClose::Timeout
+            };
+            close_conn(slot, reason, host, conns, stream_poller, worker, counts);
+        }
+    }
+}
+
+// NOTE: a staged validation failure drops the work without touching the slot: the entry
+// is already tombed, and the host got its outcome at stage time. Single-threaded worker
+// order makes this unreachable except under table divergence, so fail closed silently.
+fn drain_host_staged(
+    host: &HostShared,
+    worker_id: u32,
+    conns: &mut [Option<ConnState>],
+    stream_poller: &mut Poller,
+    worker: &mut Worker<'_>,
+    counts: &mut CloseCounts,
+    now_ns: u64,
+) {
+    for work in host.take_staged(worker_id) {
+        let valid = conns
+            .get(work.slot)
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|conn| conn.token() == work.token && conn.is_parked())
+            && worker
+                .phase(work.token)
+                .is_ok_and(|phase| phase == ConnectionPhase::AwaitingHandler);
+        if !valid {
+            continue;
+        }
+        if work.cancel {
             close_conn(
-                slot,
-                ConnClose::Timeout,
+                work.slot,
+                ConnClose::Cancelled,
+                host,
                 conns,
                 stream_poller,
                 worker,
                 counts,
             );
+            continue;
+        }
+        let encoded = conns
+            .get_mut(work.slot)
+            .and_then(|entry| entry.as_mut())
+            .map(|conn| conn.complete_parked(work.status, &work.reason, &work.body));
+        match encoded {
+            Some(Ok(())) => {
+                if worker
+                    .transition_phase(work.token, ConnectionPhase::WritingResponse, now_ns)
+                    .is_err()
+                {
+                    close_conn(
+                        work.slot,
+                        ConnClose::TransportError,
+                        host,
+                        conns,
+                        stream_poller,
+                        worker,
+                        counts,
+                    );
+                }
+            }
+            Some(Err(reason)) => {
+                close_conn(
+                    work.slot,
+                    reason,
+                    host,
+                    conns,
+                    stream_poller,
+                    worker,
+                    counts,
+                );
+            }
+            None => {}
         }
     }
 }
@@ -658,6 +796,15 @@ fn apply_pump_hooks(
             return Some(ConnClose::TransportError);
         }
     }
+    // NOTE: the park enqueue already succeeded in the pump; this arms the parked
+    // (AwaitingHandler) deadline. On failure close_conn unparks the entry, so the host
+    // observes Gone rather than a wedged slot.
+    if progress.entered_park {
+        let entered = worker.transition_phase(token, ConnectionPhase::AwaitingHandler, now_ns);
+        if entered.is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
     if progress.response_flushed {
         if worker.cancel_deadline(token).is_err() {
             return Some(ConnClose::TransportError);
@@ -672,6 +819,7 @@ fn apply_pump_hooks(
 fn close_conn(
     index: usize,
     reason: ConnClose,
+    host: &HostShared,
     conns: &mut [Option<ConnState>],
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
@@ -681,13 +829,21 @@ fn close_conn(
         return;
     };
     let token = conn.token();
+    let parked = conn.is_parked();
     let mut stream = conn.into_stream();
     let _ = stream_poller.deregister(&mut stream);
     let _ = worker.close(token);
+    // NOTE: every parked close unparks exactly once (take_staged already removed staged
+    // entries, so this is a no-op for applied responds/cancels): the host tomb records
+    // Gone and a later respond can never report success for a dead connection.
+    if parked {
+        host.unpark_closed(token);
+    }
     counts.add(reason);
 }
 
 fn cleanup_all(
+    host: &HostShared,
     conns: &mut [Option<ConnState>],
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
@@ -698,6 +854,7 @@ fn cleanup_all(
             close_conn(
                 index,
                 ConnClose::Shutdown,
+                host,
                 conns,
                 stream_poller,
                 worker,
@@ -715,6 +872,7 @@ fn work_pending(conns: &[Option<ConnState>]) -> bool {
 }
 
 fn close_idle_for_drain(
+    host: &HostShared,
     conns: &mut [Option<ConnState>],
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
@@ -726,6 +884,7 @@ fn close_idle_for_drain(
             close_conn(
                 index,
                 ConnClose::Shutdown,
+                host,
                 conns,
                 stream_poller,
                 worker,

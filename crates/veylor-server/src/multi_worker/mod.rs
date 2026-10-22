@@ -5,6 +5,7 @@ use std::thread::{self, JoinHandle};
 
 use veylor_runtime::{PollInterest, Poller, TcpListener, WakeHandle, bind_reuse_port};
 
+use crate::host::HostShared;
 use crate::static_routes::StaticRoutes;
 use crate::static_server::{
     CloseCounts, LISTENER_TOKEN, MAX_EVENTS_PER_TURN, RunningServer, Server, ServerConfig,
@@ -16,6 +17,7 @@ pub(crate) struct ThreadCtx {
     pub(crate) listener: TcpListener,
     pub(crate) config: ServerConfig,
     pub(crate) routes: Arc<StaticRoutes>,
+    pub(crate) host: Arc<HostShared>,
     pub(crate) worker_poller: Poller,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) force: Arc<AtomicBool>,
@@ -73,6 +75,7 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
         listener: template,
         config,
         routes,
+        host,
     } = server;
     let count = config.worker_count;
     let addr = template.local_addr().map_err(ServerError::Bind)?;
@@ -89,7 +92,8 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
     let force = Arc::new(AtomicBool::new(false));
     let mut prepared = Vec::with_capacity(count);
     for (index, listener) in listeners.into_iter().enumerate() {
-        let prepared_worker = prepare_worker(index, listener, &config, &routes, &stop, &force)?;
+        let prepared_worker =
+            prepare_worker(index, listener, &config, &routes, &host, &stop, &force)?;
         prepared.push(prepared_worker);
     }
     let peers: Vec<WakeHandle> = prepared.iter().map(|(_, waker)| waker.clone()).collect();
@@ -117,6 +121,7 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
         stop,
         force,
         addr,
+        host: crate::host::HostHandle::new(host),
     })
 }
 
@@ -125,6 +130,7 @@ fn prepare_worker(
     mut listener: TcpListener,
     config: &ServerConfig,
     routes: &Arc<StaticRoutes>,
+    host: &Arc<HostShared>,
     stop: &Arc<AtomicBool>,
     force: &Arc<AtomicBool>,
 ) -> Result<(ThreadCtx, WakeHandle), ServerError> {
@@ -138,6 +144,7 @@ fn prepare_worker(
         listener,
         config: *config,
         routes: Arc::clone(routes),
+        host: Arc::clone(host),
         worker_poller,
         stop: Arc::clone(stop),
         force: Arc::clone(force),

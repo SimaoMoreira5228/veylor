@@ -43,13 +43,22 @@ pub struct StaticRoute {
     body: Vec<u8>,
 }
 
+pub struct ManagedRoute {
+    method: Vec<u8>,
+    path: Vec<u8>,
+}
+
 pub struct StaticRoutes {
     routes: Vec<StaticRoute>,
+    managed: Vec<ManagedRoute>,
 }
 
 impl StaticRoutes {
     pub fn new() -> Self {
-        Self { routes: Vec::new() }
+        Self {
+            routes: Vec::new(),
+            managed: Vec::new(),
+        }
     }
 
     pub fn register(
@@ -78,6 +87,10 @@ impl StaticRoutes {
             .routes
             .iter()
             .any(|route| route.method == method && route.path == path)
+            || self
+                .managed
+                .iter()
+                .any(|route| route.method == method && route.path == path)
         {
             return Err(RouteBuildError::Duplicate);
         }
@@ -91,6 +104,36 @@ impl StaticRoutes {
         Ok(())
     }
 
+    pub fn register_managed(&mut self, method: &[u8], path: &[u8]) -> Result<(), RouteBuildError> {
+        if method.is_empty()
+            || method.len() > crate::host::HOST_MAX_METHOD_BYTES
+            || !method.iter().copied().all(is_token)
+            || path.is_empty()
+            || path.len() > crate::host::HOST_MAX_PATH_BYTES
+        {
+            return Err(RouteBuildError::Invalid);
+        }
+        if self.routes.len() + self.managed.len() >= MAX_ROUTES {
+            return Err(RouteBuildError::Full);
+        }
+        if self
+            .routes
+            .iter()
+            .any(|route| route.method == method && route.path == path)
+            || self
+                .managed
+                .iter()
+                .any(|route| route.method == method && route.path == path)
+        {
+            return Err(RouteBuildError::Duplicate);
+        }
+        self.managed.push(ManagedRoute {
+            method: method.to_vec(),
+            path: path.to_vec(),
+        });
+        Ok(())
+    }
+
     pub fn build_table<'slots, 'data>(
         &'data self,
         slots: &'slots mut [RouteSlot<'data>],
@@ -99,6 +142,15 @@ impl StaticRoutes {
         for route in self.routes.iter() {
             let config = RouteConfig {
                 kind: RouteKind::Static,
+                body: RouteBodyPolicy::Reject,
+            };
+            table.register(route.method.as_slice(), route.path.as_slice(), config)?;
+        }
+        // NOTE: managed routes share the frozen exact table with a distinct kind so the
+        // connection layer can park on match; bodies stay rejected, same as static v1.
+        for route in self.managed.iter() {
+            let config = RouteConfig {
+                kind: RouteKind::Managed,
                 body: RouteBodyPolicy::Reject,
             };
             table.register(route.method.as_slice(), route.path.as_slice(), config)?;

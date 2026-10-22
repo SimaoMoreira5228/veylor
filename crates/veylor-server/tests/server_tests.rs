@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use veylor_runtime::ConnectionTimeouts;
 use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig};
@@ -606,5 +606,45 @@ fn generous_timeouts_full_exchange_without_false_timeout() {
     server.stop_accepting();
     let counts = server.join().expect("join server");
     assert_eq!(counts.timeout, 0, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn warm_keep_alive_round_trip_stays_responsive() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    let start = Instant::now();
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "round trip stalled"
+    );
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn stop_accepting_with_idle_keep_alive_returns_promptly() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    let start = Instant::now();
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "stop join stalled"
+    );
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
