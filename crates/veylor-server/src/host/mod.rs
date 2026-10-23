@@ -8,14 +8,16 @@ use crate::connection::parked::BodyPushOutcome;
 use crate::connection::{pull_staged_body, push_staged_body};
 use crate::static_routes::MAX_RESPONSE_BODY;
 
-// NOTE: park/poll/respond/cancel discipline mirrors src/runtime/host/queue.odin and the
-// S3.2/S3.6 direction: bounded per-worker event queues, whole-event dequeue with
-// required-capacity reporting, level-triggered wakeups, one Shutdown event per worker.
-// Fixed-length bodies stage per parked record up to the shared static cap: the worker
-// pushes wire bytes into staging, the host pulls with offsets, completion is pull-observed.
+// NOTE: park/poll/respond/cancel mirrors the Odin host queue: bounded per-worker event
+// queues, whole-event dequeue with required-capacity reporting, level-triggered wakeups,
+// one Shutdown event per worker. Fixed-length bodies stage per parked record up to the
+// shared static cap: the worker pushes wire bytes, the host pulls, completion is observed.
 
-// NOTE: depths mirror the Odin HOST_QUEUE_DEPTH so overload behavior stays comparable.
+// NOTE: depths mirror the Odin HOST_QUEUE_DEPTH for comparable overload behavior.
 pub const HOST_QUEUE_DEPTH: usize = 64;
+// NOTE: H2 stream-keyed park range appended to the parked table: 8 conns x 32 subslots,
+// indexed MAX_CONNECTIONS + conn * 32 + subslot; sized from the H2 turn constants.
+pub(crate) const H2_PARK_SLOTS: usize = crate::h2::turn::MAX_H2_CONNS * crate::h2::STREAM_SLOTS;
 pub const HOST_MAX_METHOD_BYTES: usize = 16;
 pub const HOST_MAX_PATH_BYTES: usize = 2048;
 pub const HOST_MAX_REASON_BYTES: usize = 64;
@@ -140,6 +142,7 @@ pub struct StagedWork {
     pub reason: Vec<u8>,
     pub body: Vec<u8>,
     pub cancel: bool,
+    pub grant_owed: u32,
 }
 
 pub(crate) struct HostInner {
@@ -166,9 +169,10 @@ impl HostShared {
         let mut wakers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             events.push(VecDeque::with_capacity(HOST_QUEUE_DEPTH));
-            parked.push((0..super::MAX_CONNECTIONS).map(|_| None).collect());
+            let park_cap = super::MAX_CONNECTIONS + H2_PARK_SLOTS;
+            parked.push((0..park_cap).map(|_| None).collect());
             tombs.push(VecDeque::with_capacity(HOST_TOMB_DEPTH));
-            seqs.push(vec![0u32; super::MAX_CONNECTIONS]);
+            seqs.push(vec![0u32; super::MAX_CONNECTIONS + H2_PARK_SLOTS]);
             wakers.push(None);
         }
         Self {
@@ -201,11 +205,9 @@ impl HostShared {
         }
     }
 
-    // NOTE: the parked deadline reuses the AwaitingHandler kind, whose timeout is the
-    // body-progress timeout: an abandoned park (host never responds) must time out like
-    // an abandoned body, and no new deadline kind is added for it. The owner-side
-    // snapshot (method, keep-open) lives in the worker's ConnState; only the event copy
-    // and the staged response cross this lock, never parser pointers or IO.
+    // NOTE: the parked deadline reuses the AwaitingHandler (body-progress) timeout so an
+    // abandoned park times out like an abandoned body. Only the event copy and the staged
+    // response cross this lock, never parser pointers or IO.
     pub fn try_park(
         &self,
         worker_id: u32,
@@ -230,15 +232,11 @@ impl HostShared {
                 .get(worker)
                 .and_then(|table| table.get(slot))
                 .is_some_and(|entry| entry.is_none());
-            if !vacant {
-                inner.counters.queue_full += 1;
-                return (Err(ParkError::Full), None);
-            }
             let room = inner
                 .events
                 .get(worker)
                 .is_some_and(|queue| queue.len() < HOST_QUEUE_DEPTH);
-            if !room {
+            if !vacant || !room {
                 inner.counters.queue_full += 1;
                 return (Err(ParkError::Full), None);
             }
@@ -266,31 +264,28 @@ impl HostShared {
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (Ok(event_token), waker)
         });
-        match outcome {
-            Some((result, waker)) => {
-                if result.is_ok() {
-                    if let Some(waker) = waker {
-                        let _ = waker.wake();
-                    }
-                    self.wake.notify_one();
-                }
-                result
+        let Some((result, waker)) = outcome else {
+            return Err(ParkError::Full);
+        };
+        if result.is_ok() {
+            if let Some(waker) = waker {
+                let _ = waker.wake();
             }
-            None => Err(ParkError::Full),
+            self.wake.notify_one();
         }
+        result
     }
 
-    pub fn unpark_closed(&self, token: ConnectionToken) -> bool {
+    pub fn unpark_closed(&self, worker_id: u32, slot: u32) -> bool {
         let done = self.with_inner(|inner| {
-            let worker = token.worker_id as usize;
-            let slot = token.slot as usize;
+            let worker = worker_id as usize;
             let entry = inner
                 .parked
                 .get_mut(worker)
-                .and_then(|table| table.get_mut(slot))
+                .and_then(|table| table.get_mut(slot as usize))
                 .and_then(|entry| entry.take());
-            // NOTE: the tomb records the entry's sequenced token, not the base token:
-            // only the exact parked exchange may observe Gone; anything else is Stale.
+            // NOTE: the tomb records the sequenced token: only the exact parked exchange
+            // observes Gone; anything else is Stale.
             match entry {
                 Some(entry) => {
                     push_tomb(inner, worker, entry.token, TombCause::Gone);
@@ -351,12 +346,11 @@ impl HostShared {
                 .and_then(|table| table.get_mut(slot))
                 .and_then(|entry| entry.as_mut())
             {
-                // NOTE: a token mismatch falls through to the tomb search instead of
-                // failing here: the slot may hold a newer exchange with a bumped park
-                // sequence while the tomb records what happened to this exact token.
+                // NOTE: a token mismatch falls through to the tomb search: the slot may hold
+                // a newer exchange while the tomb records this exact token.
                 if entry.token == token {
                     // NOTE: one-shot respond loses to an open or staged stream: the entry stays
-                    // parked for pump-pull, so a late fixed respond reports Duplicate, never hijack.
+                    // parked for pump-pull, so a late fixed respond reports Duplicate.
                     if entry.staged.is_some() || entry.stream.is_some() {
                         inner.counters.responds_duplicate += 1;
                         return (RespondOutcome::Duplicate, None);
@@ -372,32 +366,26 @@ impl HostShared {
                 }
             }
             let found = match find_tomb(inner, worker, token) {
-                Some(TombCause::Responded) => {
-                    inner.counters.responds_duplicate += 1;
-                    RespondOutcome::Duplicate
-                }
-                Some(TombCause::Gone) => {
-                    inner.counters.responds_gone += 1;
-                    RespondOutcome::Gone
-                }
-                Some(TombCause::Cancelled) | None => {
-                    inner.counters.responds_stale += 1;
-                    RespondOutcome::Stale
-                }
+                Some(TombCause::Responded) => RespondOutcome::Duplicate,
+                Some(TombCause::Gone) => RespondOutcome::Gone,
+                Some(TombCause::Cancelled) | None => RespondOutcome::Stale,
             };
+            match found {
+                RespondOutcome::Duplicate => inner.counters.responds_duplicate += 1,
+                RespondOutcome::Gone => inner.counters.responds_gone += 1,
+                _ => inner.counters.responds_stale += 1,
+            }
             (found, None)
         });
-        match outcome {
-            Some((result, waker)) => {
-                if result == RespondOutcome::Ok {
-                    if let Some(waker) = waker {
-                        let _ = waker.wake();
-                    }
-                }
-                result
+        let Some((result, waker)) = outcome else {
+            return RespondOutcome::Stale;
+        };
+        if result == RespondOutcome::Ok {
+            if let Some(waker) = waker {
+                let _ = waker.wake();
             }
-            None => RespondOutcome::Stale,
         }
+        result
     }
 
     pub fn stage_cancel(&self, token: ConnectionToken) -> CancelOutcome {
@@ -424,17 +412,15 @@ impl HostShared {
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (CancelOutcome::Ok, waker)
         });
-        match outcome {
-            Some((result, waker)) => {
-                if result == CancelOutcome::Ok {
-                    if let Some(waker) = waker {
-                        let _ = waker.wake();
-                    }
-                }
-                result
+        let Some((result, waker)) = outcome else {
+            return CancelOutcome::Stale;
+        };
+        if result == CancelOutcome::Ok {
+            if let Some(waker) = waker {
+                let _ = waker.wake();
             }
-            None => CancelOutcome::Stale,
         }
+        result
     }
 
     pub fn pull_body(&self, token: ConnectionToken, out: &mut [u8]) -> BodyPull {
@@ -476,6 +462,7 @@ impl HostShared {
                     request_seq: 0,
                     ..entry.token
                 };
+                let grant = entry.body_pulled.min(u64::from(u32::MAX)) as u32;
                 staged.push(StagedWork {
                     token: base,
                     slot,
@@ -483,6 +470,7 @@ impl HostShared {
                     reason,
                     body,
                     cancel,
+                    grant_owed: grant,
                 });
             }
             (staged, None)
@@ -490,11 +478,9 @@ impl HostShared {
         taken.map(|(staged, _)| staged).unwrap_or_default()
     }
 
-    // NOTE: whole-event dequeue: the first pending event that does not fit the caller
-    // buffers reports its required capacities and stays queued; a later unfitting event
-    // ends the batch silently with the preceding complete events returned. The wait is
-    // level-triggered: every enqueue notifies, and pending is re-checked after each wake,
-    // so no queued event is missed between the check and the wait.
+    // NOTE: whole-event dequeue: the first unfitting event reports required capacities
+    // and stays queued; a later one ends the batch silently. The wait is level-triggered:
+    // every enqueue notifies and pending is re-checked after each wake.
     pub fn poll(
         &self,
         timeout_ns: u64,
@@ -553,8 +539,8 @@ impl HostShared {
         }
     }
 
-    // NOTE: best-effort on a full queue; the host must keep draining. Bounded retries so
-    // a worker that outlives its host still exits instead of wedging the join.
+    // NOTE: best-effort on a full queue; the host must keep draining. Bounded retries
+    // so a worker that outlives its host still exits instead of wedging the join.
     pub fn push_shutdown(&self, worker_id: u32) {
         for _ in 0..SHUTDOWN_PUSH_RETRIES {
             let pushed = self.with_inner(|inner| {
@@ -613,8 +599,8 @@ impl HostShared {
             .unwrap_or(0)
     }
 
-    // NOTE: the closure runs under the queue lock and must only copy bytes, never do IO
-    // or parsing. The waker clone leaves under the guard; wake() runs after unlock.
+    // NOTE: the closure runs under the queue lock and must only copy bytes. The waker
+    // clone leaves under the guard; wake() runs after unlock.
     pub(crate) fn with_inner<T>(
         &self,
         op: impl FnOnce(&mut MutexGuard<'_, HostInner>) -> (T, Option<WakeHandle>),
@@ -715,20 +701,15 @@ fn drain_pending(
     let mut empty_workers = 0;
     let mut cursor = inner.next_poll % workers;
     while report.copied < events.len() && empty_workers < workers {
-        let front_kind = inner.events[cursor].front().map(|event| {
-            (
-                event.kind,
-                event.token,
-                event.route_id,
-                usize::from(event.method_len),
-                usize::from(event.path_len),
-            )
-        });
-        let Some((kind, token, route_id, method_len, path_len)) = front_kind else {
+        let front = inner.events[cursor].front();
+        let Some(event) = front else {
             empty_workers += 1;
             cursor = (cursor + 1) % workers;
             continue;
         };
+        let (kind, token, route_id) = (event.kind, event.token, event.route_id);
+        let method_len = usize::from(event.method_len);
+        let path_len = usize::from(event.path_len);
         empty_workers = 0;
         if method_used + method_len > methods.len() || path_used + path_len > paths.len() {
             if report.copied == 0 {

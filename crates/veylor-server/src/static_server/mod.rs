@@ -14,7 +14,7 @@ use crate::host::{HostHandle, HostShared};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::{MAX_ROUTES, RouteBuildError, StaticRoutes};
 
-mod turn;
+pub(crate) mod turn;
 
 pub(crate) use turn::worker_main;
 
@@ -38,6 +38,8 @@ pub struct CloseCounts {
     pub response_overflow: u64,
     pub transport_error: u64,
     pub shutdown: u64,
+    pub h2_served: u64,
+    pub h2_refused: u64,
 }
 
 impl CloseCounts {
@@ -71,6 +73,11 @@ pub struct ServerConfig {
     pub turn: TurnConfig,
     pub poll_wait_ms: i32,
     pub worker_count: usize,
+    // NOTE: paired-port h2c: None disables the cleartext HTTP/2 listener, Some(0)
+    // binds an ephemeral loopback port, Some(port) binds that port on the H1
+    // bind address IP. One extra port (not ALPN/upgrades) keeps the H1 path
+    // untouched; each worker binds its own reuse-port h2c listener like H1.
+    pub h2c_port: Option<u16>,
 }
 
 impl Default for ServerConfig {
@@ -87,6 +94,7 @@ impl Default for ServerConfig {
             turn: TurnConfig::DEFAULT,
             poll_wait_ms: 10,
             worker_count: 1,
+            h2c_port: None,
         }
     }
 }
@@ -117,9 +125,24 @@ impl From<RouteBuildError> for ServerError {
 
 pub struct Server {
     pub(crate) listener: TcpListener,
+    pub(crate) h2c_listener: Option<TcpListener>,
     pub(crate) config: ServerConfig,
     pub(crate) routes: StaticRoutes,
+    pub(crate) h2_routes: Vec<H2StaticRoute>,
     pub(crate) host: Arc<HostShared>,
+}
+
+// NOTE: owned route projection for the h2c turn: StaticRoutes stays read-only
+// (frozen), so register paths mirror validated entries here and the worker projects
+// borrows per turn. Managed routes mirror as park-only entries; file mounts stay
+// H1-only and h2c answers 404 for them.
+#[derive(Clone, Debug)]
+pub(crate) struct H2StaticRoute {
+    pub(crate) method: Vec<u8>,
+    pub(crate) path: Vec<u8>,
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) managed: bool,
 }
 
 impl Server {
@@ -130,16 +153,36 @@ impl Server {
         } else {
             bind_reuse_port(addr).map_err(ServerError::Bind)?
         };
+        let h2c_listener = match config.h2c_port {
+            None => None,
+            Some(port) => {
+                let h2c_addr = SocketAddr::new(addr.ip(), port);
+                let bound = if config.worker_count == 1 {
+                    TcpListener::bind(h2c_addr).map_err(ServerError::Bind)?
+                } else {
+                    bind_reuse_port(h2c_addr).map_err(ServerError::Bind)?
+                };
+                Some(bound)
+            }
+        };
         Ok(Self {
             listener,
+            h2c_listener,
             config,
             routes: StaticRoutes::new(),
+            h2_routes: Vec::new(),
             host: Arc::new(HostShared::new(config.worker_count)),
         })
     }
 
     pub fn addr(&self) -> Result<SocketAddr, ServerError> {
         self.listener.local_addr().map_err(ServerError::Bind)
+    }
+
+    pub fn h2c_addr(&self) -> Option<Result<SocketAddr, ServerError>> {
+        self.h2c_listener
+            .as_ref()
+            .map(|listener| listener.local_addr().map_err(ServerError::Bind))
     }
 
     pub fn register_route(
@@ -153,7 +196,18 @@ impl Server {
     ) -> Result<(), ServerError> {
         self.routes
             .register(method, path, status, reason, body, max_body_bytes)
-            .map_err(ServerError::from)
+            .map_err(ServerError::from)?;
+        // NOTE: register validated, so the mirror cannot fail: same bounds, same order.
+        if self.h2_routes.len() < MAX_ROUTES {
+            self.h2_routes.push(H2StaticRoute {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                status,
+                body: body.to_vec(),
+                managed: false,
+            });
+        }
+        Ok(())
     }
 
     pub fn register_managed(
@@ -164,7 +218,19 @@ impl Server {
     ) -> Result<(), ServerError> {
         self.routes
             .register_managed(method, path, max_body_bytes, &[])
-            .map_err(ServerError::from)
+            .map_err(ServerError::from)?;
+        // NOTE: park-only mirror (valid dummy status/body pass the projection filter);
+        // the turn parks these instead of serving them synchronously (H1 parity).
+        if self.h2_routes.len() < MAX_ROUTES {
+            self.h2_routes.push(H2StaticRoute {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                status: 200,
+                body: Vec::new(),
+                managed: true,
+            });
+        }
+        Ok(())
     }
 
     pub fn register_file_mount(
@@ -196,8 +262,10 @@ impl Server {
         }
         let Server {
             mut listener,
+            mut h2c_listener,
             config,
             routes,
+            h2_routes,
             host,
         } = self;
         let mut worker_poller = Poller::new(MAX_EVENTS_PER_TURN).map_err(ServerError::Poll)?;
@@ -206,13 +274,19 @@ impl Server {
             .map_err(ServerError::Poll)?;
         let waker = worker_poller.create_waker().map_err(ServerError::Poll)?;
         let addr = listener.local_addr().map_err(ServerError::Bind)?;
+        let h2c_addr = h2c_listener
+            .as_mut()
+            .map(|bound| bound.local_addr().map_err(ServerError::Bind))
+            .transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
         let force = Arc::new(AtomicBool::new(false));
         let ctx = ThreadCtx {
             worker_id: 0,
             listener,
+            h2c_listener,
             config,
             routes: Arc::new(routes),
+            h2_routes: Arc::new(h2_routes),
             host: Arc::clone(&host),
             worker_poller,
             stop: Arc::clone(&stop),
@@ -229,6 +303,7 @@ impl Server {
             stop,
             force,
             addr,
+            h2c_addr,
             host: HostHandle::new(host),
         })
     }
@@ -240,12 +315,17 @@ pub struct RunningServer {
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) force: Arc<AtomicBool>,
     pub(crate) addr: SocketAddr,
+    pub(crate) h2c_addr: Option<SocketAddr>,
     pub(crate) host: HostHandle,
 }
 
 impl RunningServer {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    pub fn h2c_addr(&self) -> Option<SocketAddr> {
+        self.h2c_addr
     }
 
     pub fn host(&self) -> HostHandle {
@@ -281,6 +361,8 @@ impl RunningServer {
             total.response_overflow += worker.response_overflow;
             total.transport_error += worker.transport_error;
             total.shutdown += worker.shutdown;
+            total.h2_served += worker.h2_served;
+            total.h2_refused += worker.h2_refused;
         }
         Ok(total)
     }

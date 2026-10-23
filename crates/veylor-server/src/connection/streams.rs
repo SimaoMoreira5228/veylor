@@ -367,7 +367,7 @@ pub(crate) fn apply_stream_cmd(
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
             if method[..usize::from(method_len)].eq_ignore_ascii_case(b"HEAD") {
-                host.unpark_closed(token);
+                host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             }
             let connection = if keep_open {
@@ -386,7 +386,7 @@ pub(crate) fn apply_stream_cmd(
                 connection,
             };
             let Ok(encoded) = encode_response_head(&response, &mut conn.output[..]) else {
-                host.unpark_closed(token);
+                host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
             progress.entered_response = true;
@@ -396,7 +396,7 @@ pub(crate) fn apply_stream_cmd(
             // NOTE: the stage probe guarantees fit, so BufferTooSmall here is unreachable and
             // permanent: close and tomb Gone instead of wedging the stream.
             let Ok(length) = encode_response_chunk(&chunk, &mut conn.output[..]) else {
-                host.unpark_closed(token);
+                host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
             length
@@ -421,14 +421,14 @@ pub(crate) fn apply_stream_cmd(
                 &mut conn.output[..],
                 &mut required,
             ) else {
-                host.unpark_closed(token);
+                host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
             conn.pending_len = 0;
             conn.closing = !keep_open;
             conn.close_reason = ConnClose::Completed;
             conn.phase = ConnPhase::SendingResponse;
-            host.unpark_closed(token);
+            host.unpark_closed(token.worker_id, token.slot);
             length
         }
         StreamCmd::Cancel => return PumpOutcome::Close(ConnClose::Cancelled),

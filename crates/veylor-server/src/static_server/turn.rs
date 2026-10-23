@@ -2,6 +2,7 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use veylor_http2::{HpackTable, StreamTable};
 use veylor_router::RouteSlot;
 use veylor_runtime::{
     AcceptedConnection, AdmittedConnection, ConnectionDeadline, ConnectionDeadlineKind,
@@ -11,7 +12,9 @@ use veylor_runtime::{
 };
 
 use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
-use crate::host::HostShared;
+use crate::h2::H2Conn;
+use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps};
+use crate::host::{HostShared, StagedWork};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::MAX_ROUTES;
 
@@ -28,8 +31,10 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let ThreadCtx {
         worker_id,
         mut listener,
+        mut h2c_listener,
         config,
         routes,
+        h2_routes,
         host,
         mut worker_poller,
         stop,
@@ -64,6 +69,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             return result;
         }
     };
+    if let Err(message) = h2_turn::register_listener(&mut worker_poller, &mut h2c_listener) {
+        result.error = Some(message.to_string());
+        return result;
+    }
+    let h2_flat = h2_turn::project_routes(&h2_routes);
+    let h2_view = crate::h2::FrozenRoutesView::new(&h2_flat).ok();
+    let h2_enabled = h2c_listener.is_some() && h2_view.is_some();
 
     let mut slots = vec![ConnectionSlot::EMPTY; MAX_CONNECTIONS];
     let mut free_stack = vec![0u32; MAX_CONNECTIONS];
@@ -114,10 +126,51 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         .collect();
     let mut admitted: Vec<Option<AdmittedConnection>> = (0..staging_cap).map(|_| None).collect();
     let mut ready: Vec<Readiness> = Vec::new();
+    let mut h2_meta = h2_turn::H2MetaSlots::default();
+    let mut h2_bufs = h2_turn::H2BufSlots::default();
+    let mut h2_staging = h2_turn::accept_staging();
+    // NOTE: pre-allocated before any borrow exists and never moved: Option-
+    // wrapped buffers would force as_mut bindings that the borrow checker
+    // rejects for spanning borrows. ~57 KiB per slot, ~456 KiB per worker.
+    // Direct locals (not struct fields): only same-site overwrites visibly end
+    // the old regions for the next accept.
+    let mut h2_ts0: Option<StreamTable<'_>>;
+    let mut h2_ts1: Option<StreamTable<'_>>;
+    let mut h2_ts2: Option<StreamTable<'_>>;
+    let mut h2_ts3: Option<StreamTable<'_>>;
+    let mut h2_ts4: Option<StreamTable<'_>>;
+    let mut h2_ts5: Option<StreamTable<'_>>;
+    let mut h2_ts6: Option<StreamTable<'_>>;
+    let mut h2_ts7: Option<StreamTable<'_>>;
+    let mut h2_dec0: Option<HpackTable<'_>>;
+    let mut h2_dec1: Option<HpackTable<'_>>;
+    let mut h2_dec2: Option<HpackTable<'_>>;
+    let mut h2_dec3: Option<HpackTable<'_>>;
+    let mut h2_dec4: Option<HpackTable<'_>>;
+    let mut h2_dec5: Option<HpackTable<'_>>;
+    let mut h2_dec6: Option<HpackTable<'_>>;
+    let mut h2_dec7: Option<HpackTable<'_>>;
+    let mut h2_enc0: Option<HpackTable<'_>>;
+    let mut h2_enc1: Option<HpackTable<'_>>;
+    let mut h2_enc2: Option<HpackTable<'_>>;
+    let mut h2_enc3: Option<HpackTable<'_>>;
+    let mut h2_enc4: Option<HpackTable<'_>>;
+    let mut h2_enc5: Option<HpackTable<'_>>;
+    let mut h2_enc6: Option<HpackTable<'_>>;
+    let mut h2_enc7: Option<HpackTable<'_>>;
+    let mut h2_c0: Option<H2Conn<'_>> = None;
+    let mut h2_c1: Option<H2Conn<'_>> = None;
+    let mut h2_c2: Option<H2Conn<'_>> = None;
+    let mut h2_c3: Option<H2Conn<'_>> = None;
+    let mut h2_c4: Option<H2Conn<'_>> = None;
+    let mut h2_c5: Option<H2Conn<'_>> = None;
+    let mut h2_c6: Option<H2Conn<'_>> = None;
+    let mut h2_c7: Option<H2Conn<'_>> = None;
     let base = Instant::now();
     let mut turn_offset = 0usize;
     let mut stop_seen = false;
     let mut drain_start_ns = 0u64;
+    let mut h2_force_ns = 0u64;
 
     loop {
         let now_ns = base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -136,6 +189,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     worker.begin_shutdown(now_ns, config.shutdown_grace_ns, SHUTDOWN_TIMER_ID);
                 if result == veylor_runtime::ShutdownResult::Draining {
                     drain_start_ns = now_ns;
+                } else if h2_turn::occupied(&h2_meta) > 0 {
+                    h2_turn::restart_h2_drain(
+                        &mut drain_start_ns,
+                        &mut h2_force_ns,
+                        now_ns,
+                        config.shutdown_grace_ns,
+                    );
                 }
             }
         }
@@ -147,8 +207,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // worker poller carries the wait as before (no spin either way). Stop/force wake
         // only worker-poller wakers, so a stop sleeping in the stream poll is observed at
         // loop top within one stream cadence; new accepts likewise wait out one cadence.
-        let live_streams = worker.live_count();
-        let pending = work_pending(&conns);
+        let live_streams = worker.live_count() + h2_turn::occupied(&h2_meta);
+        let pending = work_pending(&conns, h2_turn::wants_pump(&h2_meta));
         let stream_wait_ms = if pending { 0 } else { config.poll_wait_ms };
         let worker_wait_ms = if live_streams == 0 { stream_wait_ms } else { 0 };
         if live_streams > 0 {
@@ -163,6 +223,9 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 };
             for event in ready.drain(..) {
                 if event.token == LISTENER_TOKEN || event.token == WAKE_TOKEN {
+                    continue;
+                }
+                if h2_turn::note_readiness(&mut h2_meta, &event) {
                     continue;
                 }
                 let Some(conn) = conns
@@ -190,6 +253,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut worker,
                     &mut result.counts,
                 );
+                h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
                 worker.destroy();
                 host.push_shutdown(worker_id);
                 break;
@@ -220,18 +284,34 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             &mut result.counts,
         );
         let draining = worker.shutdown_phase() != ShutdownPhase::Running;
+        // NOTE: one take per turn: H1 slots drain below, H2 stream-keyed slots ride the H2
+        // pump dispatch; either side drops divergent work silently (already tombed).
+        let staged = host.take_staged(worker_id);
+        let (h1_staged, mut h2_staged): (Vec<_>, Vec<_>) = staged
+            .into_iter()
+            .partition(|work| work.slot < MAX_CONNECTIONS);
         drain_host_staged(
             &host,
-            worker_id,
+            h1_staged,
             &mut conns,
             &mut stream_poller,
             &mut worker,
             &mut result.counts,
             now_ns,
         );
+        let h2_accept_budget = match &turn_result {
+            Ok(outcome) => config
+                .turn
+                .max_accepts_per_turn
+                .saturating_sub(outcome.accepted),
+            Err(_) => 0,
+        };
         match turn_result {
             Ok(outcome) => {
-                if outcome.shutdown_complete {
+                // NOTE: the shutdown state only tracks H1 slots, so it can
+                // report complete while h2c conns are still draining; hold the
+                // worker until they finish (force still bounds the wait).
+                if outcome.shutdown_complete && h2_turn::occupied(&h2_meta) == 0 {
                     cleanup_all(
                         &host,
                         &mut conns,
@@ -239,6 +319,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         &mut worker,
                         &mut result.counts,
                     );
+                    h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
                     worker.destroy();
                     host.push_shutdown(worker_id);
                     break;
@@ -254,13 +335,61 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut worker,
                     &mut result.counts,
                 );
+                h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
                 worker.destroy();
                 host.push_shutdown(worker_id);
                 break;
             }
         }
+        drive_h2_accepts!(
+            h2c_listener,
+            h2_enabled,
+            draining,
+            h2_accept_budget,
+            now_ns,
+            h2_staging,
+            h2_meta,
+            h2_bufs,
+            stream_poller,
+            config,
+            result,
+            h2_ts0,
+            h2_ts1,
+            h2_ts2,
+            h2_ts3,
+            h2_ts4,
+            h2_ts5,
+            h2_ts6,
+            h2_ts7,
+            h2_dec0,
+            h2_dec1,
+            h2_dec2,
+            h2_dec3,
+            h2_dec4,
+            h2_dec5,
+            h2_dec6,
+            h2_dec7,
+            h2_enc0,
+            h2_enc1,
+            h2_enc2,
+            h2_enc3,
+            h2_enc4,
+            h2_enc5,
+            h2_enc6,
+            h2_enc7,
+            h2_c0,
+            h2_c1,
+            h2_c2,
+            h2_c3,
+            h2_c4,
+            h2_c5,
+            h2_c6,
+            h2_c7
+        );
 
-        let live_count = worker.live_count().max(1) as u64;
+        // NOTE: the per-conn byte budget divides across H1+H2 conns together:
+        // one turn's bytes split fairly instead of each family taking a full share.
+        let live_count = (worker.live_count() + h2_turn::occupied(&h2_meta)).max(1) as u64;
         let per_conn_budget = config.turn.byte_budget_per_turn.div_ceil(live_count).max(1);
         for step in 0..MAX_CONNECTIONS {
             let index = (turn_offset + step) % MAX_CONNECTIONS;
@@ -298,6 +427,56 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             }
         }
         turn_offset = (turn_offset + 1) % MAX_CONNECTIONS;
+        drive_h2_pumps!(
+            h2_enabled,
+            h2_view,
+            draining,
+            per_conn_budget,
+            now_ns,
+            h2_meta,
+            stream_poller,
+            config,
+            result,
+            worker,
+            force,
+            h2_force_ns,
+            drain_start_ns,
+            h2_ts0,
+            h2_ts1,
+            h2_ts2,
+            h2_ts3,
+            h2_ts4,
+            h2_ts5,
+            h2_ts6,
+            h2_ts7,
+            h2_dec0,
+            h2_dec1,
+            h2_dec2,
+            h2_dec3,
+            h2_dec4,
+            h2_dec5,
+            h2_dec6,
+            h2_dec7,
+            h2_enc0,
+            h2_enc1,
+            h2_enc2,
+            h2_enc3,
+            h2_enc4,
+            h2_enc5,
+            h2_enc6,
+            h2_enc7,
+            h2_c0,
+            h2_c1,
+            h2_c2,
+            h2_c3,
+            h2_c4,
+            h2_c5,
+            h2_c6,
+            h2_c7,
+            host,
+            worker_id,
+            h2_staged
+        );
 
         // NOTE: drain serves in-flight exchanges to completion (each conn closes
         // after its current response via begin_drain); conns still idle past the
@@ -401,14 +580,14 @@ fn drain_expired(
 // order makes this unreachable except under table divergence, so fail closed silently.
 fn drain_host_staged(
     host: &HostShared,
-    worker_id: u32,
+    staged: Vec<StagedWork>,
     conns: &mut [Option<ConnState>],
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
     now_ns: u64,
 ) {
-    for work in host.take_staged(worker_id) {
+    for work in staged {
         let valid = conns
             .get(work.slot)
             .and_then(|entry| entry.as_ref())
@@ -466,6 +645,54 @@ fn drain_host_staged(
             None => {}
         }
     }
+}
+
+// NOTE: H2 staged hook: validate-then-complete per stream-keyed work item, fail closed
+// silently on divergence (entries arrive tombed and the host already has its outcome).
+pub(crate) fn apply_h2_staged(
+    meta: &mut h2_turn::H2Meta,
+    conn: &mut Option<H2Conn<'_>>,
+    turn: &mut h2_turn::H2Turn<'_>,
+) -> bool {
+    if !meta.occupied {
+        return false;
+    }
+    let index = meta.token.saturating_sub(h2_turn::H2_STREAM_TOKEN_BASE);
+    let base = MAX_CONNECTIONS + index * crate::h2::STREAM_SLOTS;
+    let mut slot = 0;
+    let mut applied = false;
+    while slot < turn.staged.len() {
+        if turn.staged[slot].slot < base || turn.staged[slot].slot >= base + crate::h2::STREAM_SLOTS
+        {
+            slot += 1;
+            continue;
+        }
+        let work = turn.staged.remove(slot);
+        let sub = work.slot - base;
+        let stream = work.token.stream_id;
+        let expect = ConnectionToken {
+            worker_id: turn.worker_id,
+            slot: work.slot as u32,
+            request_seq: 0,
+            stream_id: stream,
+            worker_generation: 1,
+            generation: 1,
+        };
+        if work.token != expect || (stream >> 1) as usize % crate::h2::STREAM_SLOTS != sub {
+            continue;
+        }
+        let Some(live) = conn.as_mut().filter(|active| !active.is_closed()) else {
+            continue;
+        };
+        let outcome = live.apply_staged(h2_turn::pending_spare(meta), &work);
+        meta.pending_len += outcome.written;
+        turn.counts.h2_served += u64::from(outcome.served);
+        if work.cancel {
+            turn.counts.h2_refused += 1;
+        }
+        applied = true;
+    }
+    applied
 }
 
 // NOTE: hook failures mean the worker table diverged from connection state; a
@@ -549,7 +776,7 @@ fn close_conn(
     // entries, so this is a no-op for applied responds/cancels): the host tomb records
     // Gone and a later respond can never report success for a dead connection.
     if parked {
-        host.unpark_closed(token);
+        host.unpark_closed(token.worker_id, token.slot);
     }
     counts.add(reason);
 }
@@ -576,11 +803,12 @@ fn cleanup_all(
     }
 }
 
-fn work_pending(conns: &[Option<ConnState>]) -> bool {
+fn work_pending(conns: &[Option<ConnState>], h2_pending: bool) -> bool {
     conns
         .iter()
         .flatten()
         .any(|conn| conn.has_pending_output() || conn.has_unparsed_input() || conn.read_armed())
+        || h2_pending
 }
 
 fn close_idle_for_drain(

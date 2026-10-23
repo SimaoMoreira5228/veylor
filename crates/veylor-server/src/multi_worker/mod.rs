@@ -8,15 +8,17 @@ use veylor_runtime::{PollInterest, Poller, TcpListener, WakeHandle, bind_reuse_p
 use crate::host::HostShared;
 use crate::static_routes::StaticRoutes;
 use crate::static_server::{
-    CloseCounts, LISTENER_TOKEN, MAX_EVENTS_PER_TURN, RunningServer, Server, ServerConfig,
-    ServerError, worker_main,
+    CloseCounts, H2StaticRoute, LISTENER_TOKEN, MAX_EVENTS_PER_TURN, RunningServer, Server,
+    ServerConfig, ServerError, worker_main,
 };
 
 pub(crate) struct ThreadCtx {
     pub(crate) worker_id: u32,
     pub(crate) listener: TcpListener,
+    pub(crate) h2c_listener: Option<TcpListener>,
     pub(crate) config: ServerConfig,
     pub(crate) routes: Arc<StaticRoutes>,
+    pub(crate) h2_routes: Arc<Vec<H2StaticRoute>>,
     pub(crate) host: Arc<HostShared>,
     pub(crate) worker_poller: Poller,
     pub(crate) stop: Arc<AtomicBool>,
@@ -73,12 +75,18 @@ pub(crate) fn run_worker(ctx: ThreadCtx) -> ThreadResult {
 pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> {
     let Server {
         listener: template,
+        h2c_listener: h2c_template,
         config,
         routes,
+        h2_routes,
         host,
     } = server;
     let count = config.worker_count;
     let addr = template.local_addr().map_err(ServerError::Bind)?;
+    let h2c_addr = h2c_template
+        .as_ref()
+        .map(|bound| bound.local_addr().map_err(ServerError::Bind))
+        .transpose()?;
     let mut listeners = Vec::with_capacity(count);
     listeners.push(template);
     for _ in 1..count {
@@ -87,13 +95,41 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
             Err(error) => return Err(ServerError::Bind(error)),
         }
     }
+    let mut h2c_listeners = Vec::with_capacity(count);
+    if h2c_template.is_some() {
+        h2c_listeners.push(h2c_template);
+        let bound = h2c_addr.expect("h2c template addr");
+        for _ in 1..count {
+            match bind_reuse_port(bound) {
+                Ok(listener) => h2c_listeners.push(Some(listener)),
+                Err(error) => return Err(ServerError::Bind(error)),
+            }
+        }
+    }
     let routes = Arc::new(routes);
+    let h2_routes = Arc::new(h2_routes);
     let stop = Arc::new(AtomicBool::new(false));
     let force = Arc::new(AtomicBool::new(false));
     let mut prepared = Vec::with_capacity(count);
     for (index, listener) in listeners.into_iter().enumerate() {
-        let prepared_worker =
-            prepare_worker(index, listener, &config, &routes, &host, &stop, &force)?;
+        let h2c_listener = if h2c_listeners.is_empty() {
+            None
+        } else {
+            h2c_listeners[index].take()
+        };
+        let prepared_worker = prepare_worker(
+            index,
+            PreparedInputs {
+                listener,
+                h2c_listener,
+                config,
+                routes: &routes,
+                h2_routes: &h2_routes,
+                host: &host,
+                stop: &stop,
+                force: &force,
+            },
+        )?;
         prepared.push(prepared_worker);
     }
     let peers: Vec<WakeHandle> = prepared.iter().map(|(_, waker)| waker.clone()).collect();
@@ -121,19 +157,25 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
         stop,
         force,
         addr,
+        h2c_addr,
         host: crate::host::HostHandle::new(host),
     })
 }
 
 fn prepare_worker(
     index: usize,
-    mut listener: TcpListener,
-    config: &ServerConfig,
-    routes: &Arc<StaticRoutes>,
-    host: &Arc<HostShared>,
-    stop: &Arc<AtomicBool>,
-    force: &Arc<AtomicBool>,
+    inputs: PreparedInputs<'_>,
 ) -> Result<(ThreadCtx, WakeHandle), ServerError> {
+    let PreparedInputs {
+        mut listener,
+        h2c_listener,
+        config,
+        routes,
+        h2_routes,
+        host,
+        stop,
+        force,
+    } = inputs;
     let mut worker_poller = Poller::new(MAX_EVENTS_PER_TURN).map_err(ServerError::Poll)?;
     worker_poller
         .register(&mut listener, LISTENER_TOKEN, PollInterest::Readable)
@@ -142,8 +184,10 @@ fn prepare_worker(
     let ctx = ThreadCtx {
         worker_id: index as u32,
         listener,
-        config: *config,
+        h2c_listener,
+        config,
         routes: Arc::clone(routes),
+        h2_routes: Arc::clone(h2_routes),
         host: Arc::clone(host),
         worker_poller,
         stop: Arc::clone(stop),
@@ -151,6 +195,17 @@ fn prepare_worker(
         peers: Vec::new(),
     };
     Ok((ctx, waker))
+}
+
+struct PreparedInputs<'a> {
+    listener: TcpListener,
+    h2c_listener: Option<TcpListener>,
+    config: ServerConfig,
+    routes: &'a Arc<StaticRoutes>,
+    h2_routes: &'a Arc<Vec<H2StaticRoute>>,
+    host: &'a Arc<HostShared>,
+    stop: &'a Arc<AtomicBool>,
+    force: &'a Arc<AtomicBool>,
 }
 
 fn abort_started(

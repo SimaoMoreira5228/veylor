@@ -329,7 +329,7 @@ pub(crate) fn park_request(
                 conn.out_sent = 0;
             }
             Err(_) => {
-                host.unpark_closed(token);
+                host.unpark_closed(token.worker_id, token.slot);
                 return ExchangeOutcome::Close(ConnClose::ResponseOverflow);
             }
         }
@@ -360,7 +360,7 @@ pub(crate) fn park_request(
             &conn.input[conn.head_len..conn.head_len + take],
         ) {
             BodyPushOutcome::Refused => {
-                host.unpark_closed(token);
+                host.unpark_closed(token.worker_id, token.slot);
                 return ExchangeOutcome::Close(ConnClose::TransportError);
             }
             BodyPushOutcome::Pushed | BodyPushOutcome::Answered => {

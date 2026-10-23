@@ -25,6 +25,7 @@ build:
 integration-linux: test-linux integration-rust-ffi-linux
 
 integration-rust-ffi-linux:
+    mkdir -p build
     cargo build -p veylor-ffi
     clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_http1.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \

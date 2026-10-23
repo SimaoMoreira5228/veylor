@@ -1,7 +1,7 @@
 const MAX_CONNECTION_SLOT_COUNT: u64 = u32::MAX as u64 + 1;
 const MAX_CONNECTION_GENERATION: u64 = 0x7fff_ffff;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionToken {
     pub worker_id: u32,
     pub slot: u32,

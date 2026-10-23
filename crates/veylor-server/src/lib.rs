@@ -13,13 +13,13 @@ pub use connection::{HEADER_SLOTS, INPUT_CAP, OUTPUT_CAP};
 pub use connection::{TrailerOutcome, TrailerReport};
 pub use h2::{
     ACK_SLOTS, DECIMAL_CAP, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES,
-    FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HPACK_BLOCK_CAP, INPUT_STAGING_CAP,
-    MAX_STREAMS_PER_STEP, PushError, STREAM_SLOTS, StepOutcome,
+    FrozenRoute, FrozenRoutesView, H2_BODY_CAP, H2Conn, H2HostCtx, HEADER_BLOCK_CAP,
+    HPACK_BLOCK_CAP, INPUT_STAGING_CAP, MAX_STREAMS_PER_STEP, PushError, STREAM_SLOTS, StepOutcome,
 };
 pub use host::{
     BodyPull, CancelOutcome, EventSlot, HOST_MAX_METHOD_BYTES, HOST_MAX_PATH_BYTES,
-    HOST_MAX_REASON_BYTES, HOST_QUEUE_DEPTH, HostCounters, HostEventKind, HostHandle, PollReport,
-    RespondOutcome,
+    HOST_MAX_REASON_BYTES, HOST_QUEUE_DEPTH, HostCounters, HostEventKind, HostHandle, HostShared,
+    PollReport, RespondOutcome,
 };
 pub use static_files::{
     FileMounts, FilePlan, FileReject, MountError, RangeApply, content_type_for_name, read_chunk,
