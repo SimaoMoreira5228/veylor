@@ -1,4 +1,5 @@
 mod connection;
+pub mod h2;
 pub mod host;
 mod multi_worker;
 mod static_files;
@@ -10,6 +11,11 @@ pub use connection::{ConnClose, PumpOutcome, PumpProgress};
 pub use connection::{FD_CACHE_ENTRIES, FdCache};
 pub use connection::{HEADER_SLOTS, INPUT_CAP, OUTPUT_CAP};
 pub use connection::{TrailerOutcome, TrailerReport};
+pub use h2::{
+    ACK_SLOTS, DECIMAL_CAP, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES,
+    FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HPACK_BLOCK_CAP, INPUT_STAGING_CAP,
+    MAX_STREAMS_PER_STEP, PushError, STREAM_SLOTS, StepOutcome,
+};
 pub use host::{
     BodyPull, CancelOutcome, EventSlot, HOST_MAX_METHOD_BYTES, HOST_MAX_PATH_BYTES,
     HOST_MAX_REASON_BYTES, HOST_QUEUE_DEPTH, HostCounters, HostEventKind, HostHandle, PollReport,

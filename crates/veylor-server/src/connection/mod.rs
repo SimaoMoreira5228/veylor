@@ -11,7 +11,6 @@ use veylor_runtime::{
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_files::FilePlan;
-#[cfg(not(target_os = "linux"))]
 use crate::static_files::read_chunk;
 use crate::static_routes::{
     EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_expectation_failed,
@@ -593,7 +592,6 @@ fn encode_static(
 // (no fd cache yet); EPIPE and backpressure stay in the dispatch mapping, and Rust
 // ignores SIGPIPE process-wide, so a closed receiver closes as PeerClosed, never a
 // signal. Partial short reads advance the offset and resume on the next turn.
-#[cfg(not(target_os = "linux"))]
 fn stage_file_chunk(conn: &mut ConnState) -> Result<(), ConnClose> {
     let Some(transfer) = conn.file.as_mut() else {
         return Err(ConnClose::TransportError);
@@ -627,9 +625,11 @@ fn sendfile_file_chunk(conn: &mut ConnState, byte_budget: u64) -> Result<u64, Co
     if transfer.offset >= transfer.plan.size {
         return Ok(0);
     }
-    let width = (transfer.plan.size - transfer.offset)
-        .min(OUTPUT_CAP as u64)
-        .min(byte_budget) as usize;
+    if transfer.plan.multipart {
+        return stage_file_chunk(conn).map(|_| 0); // NOTE: framing interleaves file bytes
+    }
+    let rest = transfer.plan.size - transfer.offset;
+    let width = std::cmp::min(std::cmp::min(rest, OUTPUT_CAP as u64), byte_budget) as usize;
     if width == 0 || conn.write_blocked {
         return Ok(0);
     }

@@ -23,6 +23,9 @@ pub const MAX_STATIC_BODY_BYTES: u64 = 64 * 1024;
 const CAPTURE_SLOTS: usize = 8;
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
 const CONTENT_RANGE_BYTES: usize = 80;
+// NOTE: "multipart/byteranges; boundary=" plus the fixed token and three hex fields tops out near 91 bytes;
+// 128 leaves margin, and the same buffer doubles as the Content-Range scratch since the two never coexist.
+const MULTIPART_CTYPE_BYTES: usize = 128;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
@@ -424,7 +427,8 @@ fn respond_file(
     let range = (method == b"GET")
         .then(|| range_header_value(headers, head, input))
         .flatten();
-    if plan.apply_range(range) == RangeApply::Unsatisfiable {
+    let outcome = plan.apply_range(range);
+    if outcome == RangeApply::Unsatisfiable {
         return Ok(Some(respond_range_unsatisfiable(
             head,
             input,
@@ -435,6 +439,9 @@ fn respond_file(
             output,
         )?));
     }
+    // NOTE: two or more satisfiable ranges frame as one multipart body: the virtual length rides plan.size and the pump pages it
+    // through read_chunk, so this path only swaps the Content-Type.
+    let multipart = outcome == RangeApply::Multipart;
     let status = if plan.partial { 206 } else { 200 };
     let reason = if plan.partial {
         b"Partial Content".as_slice()
@@ -449,28 +456,38 @@ fn respond_file(
         true,
         false,
     );
-    let mut content_range = [0u8; CONTENT_RANGE_BYTES];
-    let range_len = if plan.partial {
+    let mut value = [0u8; MULTIPART_CTYPE_BYTES];
+    let range_len = if plan.partial && !multipart {
         write_content_range(
-            &mut content_range,
+            &mut value,
             Some((plan.start, plan.start + plan.size - 1)),
             plan.total,
         )
     } else {
         0
     };
+    let ctype_len = if multipart {
+        plan.multipart_content_type(&mut value)
+    } else {
+        0
+    };
+    let ctype_value = if multipart {
+        &value[..ctype_len]
+    } else {
+        plan.content_type.as_bytes()
+    };
     let mut fields = [Field {
         name: b"Content-Type",
-        value: plan.content_type.as_bytes(),
+        value: ctype_value,
     }; 3];
     fields[1] = Field {
         name: b"Accept-Ranges",
         value: b"bytes",
     };
-    let field_len = if plan.partial {
+    let field_len = if plan.partial && !multipart {
         fields[2] = Field {
             name: b"Content-Range",
-            value: &content_range[..range_len],
+            value: &value[..range_len],
         };
         3
     } else {
@@ -564,43 +581,18 @@ fn respond_range_unsatisfiable(
 }
 
 fn write_content_range(out: &mut [u8], range: Option<(u64, u64)>, total: u64) -> usize {
-    let mut len = push_field_bytes(out, 0, b"bytes ");
+    use crate::static_files::{push_bytes, push_decimal};
+    let mut len = push_bytes(out, 0, b"bytes ");
     match range {
         Some((start, last)) => {
             len = push_decimal(out, len, start);
-            len = push_field_bytes(out, len, b"-");
+            len = push_bytes(out, len, b"-");
             len = push_decimal(out, len, last);
-            len = push_field_bytes(out, len, b"/");
+            len = push_bytes(out, len, b"/");
         }
-        None => len = push_field_bytes(out, len, b"*/"),
+        None => len = push_bytes(out, len, b"*/"),
     }
     push_decimal(out, len, total)
-}
-
-fn push_field_bytes(out: &mut [u8], len: usize, bytes: &[u8]) -> usize {
-    let end = len + bytes.len();
-    out[len..end].copy_from_slice(bytes);
-    end
-}
-
-fn push_decimal(out: &mut [u8], mut len: usize, value: u64) -> usize {
-    let mut digits = [0u8; 20];
-    let mut count = 0;
-    let mut rest = value;
-    loop {
-        digits[count] = b'0' + (rest % 10) as u8;
-        count += 1;
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
-    }
-    while count > 0 {
-        count -= 1;
-        out[len] = digits[count];
-        len += 1;
-    }
-    len
 }
 
 // NOTE: query strings strip like the router so /assets/a.css?x=1 names the file;

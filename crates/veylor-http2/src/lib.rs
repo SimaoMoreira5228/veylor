@@ -1,6 +1,7 @@
 mod connection;
 mod flow_control;
 mod frame;
+mod h2c;
 mod hpack;
 mod service;
 mod stream;
@@ -40,6 +41,10 @@ pub use frame::{
 pub use frame::{
     DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, FrameHeader, FrameHeaderError, FrameType,
     MAX_FRAME_SIZE, MAX_STREAM_ID, MIN_MAX_FRAME_SIZE, decode_frame_header, encode_frame_header,
+};
+pub use h2c::{
+    H2C_GOAWAY_LEN, H2C_HEADER_TABLE_SIZE, H2C_MAX_CONCURRENT_STREAMS, H2C_MAX_FRAME_SIZE,
+    H2C_SERVER_SETTINGS_LEN, H2cError, H2cFeedResult, H2cServerHandshake,
 };
 pub use hpack::{
     DecodedHpackString, HPACK_STATIC_TABLE_LEN, HpackBytes, HpackEntrySlot, HpackError, HpackField,
