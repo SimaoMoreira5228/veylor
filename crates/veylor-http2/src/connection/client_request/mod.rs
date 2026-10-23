@@ -31,6 +31,8 @@ pub enum RequestFieldSectionError {
     Hpack(HpackError),
 }
 
+
+
 pub fn encode_request_field_section(
     driver: &mut H2FrameDriver<'_, '_, '_, '_>,
     fields: &[HpackFieldToEncode<'_>],

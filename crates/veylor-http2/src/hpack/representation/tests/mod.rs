@@ -1,4 +1,5 @@
 mod encode_block;
+mod policy;
 
 use super::{
     HpackError, HpackHeader, HpackRepresentation, decode_header_block, decode_header_field,

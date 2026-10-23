@@ -431,6 +431,76 @@ fn second_stream_reuses_connection() {
     assert_eq!(counts.shutdown, 1);
 }
 
+// NOTE: policy-adoption golden: :status resolves to the static-table indexed form while
+// content-length stays a 5-byte literal, so the repeat response costs the same 5 bytes.
+#[test]
+fn h2_policy_indexed_status_wire_golden() {
+    let server = h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"GET", b"/hello", true);
+    let (header, first) = read_frame(&mut client);
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(first, vec![0x88, 0x0f, 0x0d, 0x01, b'5']);
+    let response = decode_response(&first);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.content_length, 5);
+    let (header, body) = read_frame(&mut client);
+    assert_eq!(header.frame_type, FrameType::Data);
+    assert_eq!(body, b"hello");
+    send_headers(&mut client, 3, b"GET", b"/empty", true);
+    let (header, second) = read_frame(&mut client);
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(second, vec![0x88, 0x0f, 0x0d, 0x01, b'0']);
+    let response = decode_response(&second);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.content_length, 0);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 2);
+    assert_eq!(counts.shutdown, 1);
+}
+
+// NOTE: explicit kinds bypass the policy: the same :status value encodes indexed under
+// Default but stays a 5-byte literal under WithoutIndexing (the pre-adoption wire form).
+#[test]
+fn h2_explicit_literal_bypasses_policy() {
+    let legacy = [field(b":status", b"200"), field(b"content-length", b"5")];
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 512];
+    let len = encode_header_block(&legacy, &mut encoder, &mut block).expect("encode legacy");
+    assert_eq!(len, 9);
+    assert_eq!(
+        &block[..len],
+        &[0x08, 0x03, b'2', b'0', b'0', 0x0f, 0x0d, 0x01, b'5']
+    );
+    let policy = [
+        HpackFieldToEncode {
+            name: b":status",
+            value: b"200",
+            representation: HpackRepresentation::Default,
+            huffman_name: false,
+            huffman_value: false,
+        },
+        HpackFieldToEncode {
+            name: b"content-length",
+            value: b"5",
+            representation: HpackRepresentation::Default,
+            huffman_name: false,
+            huffman_value: false,
+        },
+    ];
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 512];
+    let len = encode_header_block(&policy, &mut encoder, &mut block).expect("encode policy");
+    assert_eq!(len, 5);
+    assert_eq!(&block[..len], &[0x88, 0x0f, 0x0d, 0x01, b'5']);
+}
+
 #[test]
 fn graceful_drain_sends_goaway() {
     let server = h2_server();

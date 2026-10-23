@@ -51,9 +51,9 @@ pub use hpack::{
     HpackFieldToEncode, HpackHeader, HpackIntegerError, HpackRepresentation, HpackSpan,
     HpackStringError, HpackTable, HpackTableError, HuffmanError, TableInsert, decode_header_block,
     decode_header_field, decode_hpack_integer, decode_hpack_string, decode_huffman,
-    encode_header_block, encode_hpack_integer, encode_hpack_string, encode_huffman,
-    encode_indexed_header, encode_literal_header, encode_pending_table_size_updates,
-    encode_table_size_update,
+    default_literal_representation, encode_header_block, encode_hpack_integer, encode_hpack_string,
+    encode_huffman, encode_indexed_header, encode_literal_header,
+    encode_pending_table_size_updates, encode_table_size_update,
 };
 pub use service::{
     MAX_STREAM_WRITE, MAX_TRAILERS, METHOD_CAP, RecordRef, RequestTrailer, ResponsePhase,

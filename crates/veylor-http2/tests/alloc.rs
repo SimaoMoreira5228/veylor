@@ -74,6 +74,37 @@ const FIELDS: [HpackFieldToEncode<'static>; 3] = [
     },
 ];
 
+const POLICY_FIELDS: [HpackFieldToEncode<'static>; 3] = [
+    HpackFieldToEncode {
+        name: b":status",
+        value: b"200",
+        representation: HpackRepresentation::Default,
+        huffman_name: false,
+        huffman_value: false,
+    },
+    HpackFieldToEncode {
+        name: b"content-type",
+        value: b"text/plain",
+        representation: HpackRepresentation::Default,
+        huffman_name: false,
+        huffman_value: false,
+    },
+    HpackFieldToEncode {
+        name: b"x-test",
+        value: b"alloc",
+        representation: HpackRepresentation::Default,
+        huffman_name: false,
+        huffman_value: false,
+    },
+];
+
+fn run_policy_once(block_table: &mut HpackTable<'_>) -> usize {
+    let mut block = [0; 256];
+    let block_length = encode_header_block(&POLICY_FIELDS, block_table, &mut block).unwrap();
+    assert!(block_length > 0);
+    block_length
+}
+
 fn establish(streams: &mut StreamTable<'_>) {
     let settings = FrameHeader {
         payload_length: 0,
@@ -233,6 +264,7 @@ fn http2_hot_path_performs_no_heap_allocation() {
         decode_block_len
     );
     assert!(run_data_once(&mut driver, 1) > 0);
+    assert!(run_policy_once(&mut block_table) > 0);
 
     reset_counts();
 
@@ -260,6 +292,14 @@ fn http2_hot_path_performs_no_heap_allocation() {
     }
     let (data_allocs, data_allocated, data_deallocs) = load_counts();
 
+    reset_counts();
+
+    let mut policy_bytes = 0;
+    for _ in 0..ITERATIONS {
+        policy_bytes += run_policy_once(&mut block_table);
+    }
+    let (policy_allocs, policy_allocated, policy_deallocs) = load_counts();
+
     assert_eq!(headers_allocs, 0);
     assert_eq!(headers_bytes, 0);
     assert_eq!(headers_deallocs, 0);
@@ -269,6 +309,9 @@ fn http2_hot_path_performs_no_heap_allocation() {
     assert_eq!(data_allocs, 0);
     assert_eq!(data_allocated, 0);
     assert_eq!(data_deallocs, 0);
+    assert_eq!(policy_allocs, 0);
+    assert_eq!(policy_allocated, 0);
+    assert_eq!(policy_deallocs, 0);
 
     println!("http2: {ITERATIONS} iterations, {total_bytes} queued bytes, {headers_allocs} allocs");
     println!(
@@ -276,5 +319,8 @@ fn http2_hot_path_performs_no_heap_allocation() {
     );
     println!(
         "http2 data: {ITERATIONS} iterations, {data_bytes} queued bytes, {data_allocs} allocs"
+    );
+    println!(
+        "http2 policy: {ITERATIONS} iterations, {policy_bytes} encoded bytes, {policy_allocs} allocs"
     );
 }

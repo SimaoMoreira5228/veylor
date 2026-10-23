@@ -826,8 +826,8 @@ fn send_full(
     let mut length_buf = [0; DECIMAL_CAP];
     let length_len = push_decimal(&mut length_buf, body.len() as u64);
     let response_fields = [
-        literal(b":status", &status_buf[..status_len]),
-        literal(b"content-length", &length_buf[..length_len]),
+        field(b":status", &status_buf[..status_len]),
+        field(b"content-length", &length_buf[..length_len]),
     ];
     let mut block = [0; HPACK_BLOCK_CAP];
     let sent = server
@@ -949,11 +949,11 @@ fn fail_goaway(
     *terminal = true;
 }
 
-fn literal<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
+fn field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
     HpackFieldToEncode {
         name,
         value,
-        representation: HpackRepresentation::WithoutIndexing,
+        representation: HpackRepresentation::Default,
         huffman_name: false,
         huffman_value: false,
     }

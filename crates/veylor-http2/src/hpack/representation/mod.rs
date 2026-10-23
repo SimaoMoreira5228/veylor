@@ -16,6 +16,9 @@ pub enum HpackRepresentation {
     Incremental,
     WithoutIndexing,
     NeverIndexed,
+    
+    
+    Default,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +71,55 @@ impl HpackHeader {
         },
         representation: HpackRepresentation::Indexed,
     };
+}
+
+// NOTE (privacy boundary): the dynamic table is connection-shared state observable across streams.
+// Indexing a secret lets a peer that injects headers run CRIME-style compression oracles: an
+// indexed-versus-literal length difference reveals whether a guessed value already sits in the
+// table. Sensitive names therefore resolve to never-indexed even on an exact table match, so
+// secrets never enter the table in either direction.
+// Policy lives beside the representation enum it maps onto: one match site, one precedence rule.
+const NEVER_INDEXED_NAMES: [&[u8]; 4] = [
+    b"authorization",       
+    b"proxy-authorization", 
+    b"cookie", 
+    b"set-cookie", 
+];
+const INCREMENTAL_NAMES: [&[u8]; 8] = [
+    b":method",          
+    b":scheme",          
+    b":authority",       
+    b":status",          
+    b"content-type",     
+    b"content-encoding", 
+    b"cache-control",    
+    b"server",           
+];
+
+fn is_sensitive_name(name: &[u8]) -> bool {
+    NEVER_INDEXED_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
+fn is_stable_name(name: &[u8]) -> bool {
+    INCREMENTAL_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
+
+
+
+
+pub fn default_literal_representation(name: &[u8]) -> HpackRepresentation {
+    if is_sensitive_name(name) {
+        return HpackRepresentation::NeverIndexed;
+    }
+    if is_stable_name(name) {
+        return HpackRepresentation::Incremental;
+    }
+    HpackRepresentation::WithoutIndexing
 }
 
 pub fn decode_header_field(
@@ -181,7 +233,9 @@ pub fn encode_literal_header(
         HpackRepresentation::Incremental => (6, 0x40),
         HpackRepresentation::WithoutIndexing => (4, 0),
         HpackRepresentation::NeverIndexed => (4, 0x10),
-        HpackRepresentation::Indexed => return Err(HpackError::InvalidRepresentation),
+        HpackRepresentation::Indexed | HpackRepresentation::Default => {
+            return Err(HpackError::InvalidRepresentation);
+        }
     };
 
     let mut index_prefix = [0; 11];
@@ -252,6 +306,10 @@ pub fn encode_pending_table_size_updates(
     Ok(total_length)
 }
 
+
+
+
+
 pub fn encode_header_block(
     fields: &[HpackFieldToEncode<'_>],
     table: &mut HpackTable<'_>,
@@ -259,38 +317,63 @@ pub fn encode_header_block(
 ) -> Result<usize, HpackError> {
     let size_update_length = pending_table_size_update_length(table)?;
     let mut table_state = EncoderTableState::new(table);
+    // NOTE: per-field resolutions live in this stack buffer for ordinary blocks; only blocks
+    // past MAX_INLINE_RESOLVED fields spill to the heap. The two encoder loops need random
+    // access to earlier decisions (preflight scans, loop-2 replay), which a streaming resolve
+    // cannot provide without flapping under eviction — hence the buffer, not a recompute.
+    const MAX_INLINE_RESOLVED: usize = 64;
+    let mut inline = [HpackRepresentation::WithoutIndexing; MAX_INLINE_RESOLVED];
+    let mut spilled: Option<Vec<HpackRepresentation>> = None;
+    let mut inline_len = 0usize;
+    let has_default = fields
+        .iter()
+        .any(|field| field.representation == HpackRepresentation::Default);
     let mut required_length = size_update_length;
     for (field_index, field) in fields.iter().enumerate() {
-        let (name_index, indexed_field) = match field.representation {
-            HpackRepresentation::Indexed => (
-                0,
-                Some(
-                    block_table_index(
-                        fields,
-                        table,
-                        &table_state,
-                        field_index,
-                        field.name,
-                        Some(field.value),
-                    )
-                    .ok_or(HpackError::InvalidIndex)?,
-                ),
-            ),
-            _ => (
-                block_table_index(fields, table, &table_state, field_index, field.name, None)
-                    .unwrap_or(0),
-                None,
-            ),
+        let recorded: &[HpackRepresentation] = if has_default {
+            spilled.as_deref().unwrap_or(&inline[..inline_len])
+        } else {
+            &[]
         };
-        let field_length = field_encoding_length(*field, name_index, indexed_field)?;
+        let (name_index, indexed_field, effective) = resolve_field(
+            fields,
+            table,
+            &table_state,
+            if has_default { Some(recorded) } else { None },
+            field_index,
+        )?;
+        if has_default {
+            if let Some(spill) = spilled.as_mut() {
+                spill.push(effective);
+            } else if inline_len < MAX_INLINE_RESOLVED {
+                inline[inline_len] = effective;
+                inline_len += 1;
+            } else {
+                let mut spill = inline.to_vec();
+                spill.push(effective);
+                spilled = Some(spill);
+            }
+        }
+        let field_length = field_encoding_length(*field, effective, name_index, indexed_field)?;
         required_length =
             required_length
                 .checked_add(field_length)
                 .ok_or(HpackError::BufferTooSmall {
                     required: usize::MAX,
                 })?;
-        if field.representation == HpackRepresentation::Incremental {
-            preflight_insertion(fields, table, &mut table_state, field_index)?;
+        if effective == HpackRepresentation::Incremental {
+            let recorded: &[HpackRepresentation] = if has_default {
+                spilled.as_deref().unwrap_or(&inline[..inline_len])
+            } else {
+                &[]
+            };
+            preflight_insertion(
+                fields,
+                table,
+                &mut table_state,
+                if has_default { Some(recorded) } else { None },
+                field_index,
+            )?;
         }
     }
     if output.len() < required_length {
@@ -299,9 +382,19 @@ pub fn encode_header_block(
         });
     }
 
+    let recorded: &[HpackRepresentation] = if has_default {
+        spilled.as_deref().unwrap_or(&inline[..inline_len])
+    } else {
+        &[]
+    };
     let mut offset = size_update_length;
-    for field in fields {
-        if field.representation == HpackRepresentation::Indexed {
+    for (field_index, field) in fields.iter().enumerate() {
+        let effective = if has_default {
+            recorded[field_index]
+        } else {
+            field.representation
+        };
+        if effective == HpackRepresentation::Indexed {
             let index = table
                 .find_exact_index(field.name, field.value)
                 .ok_or(HpackError::InvalidIndex)?;
@@ -309,7 +402,7 @@ pub fn encode_header_block(
         } else {
             let name_index = table.find_name_index(field.name).unwrap_or(0);
             offset += encode_literal_header(
-                field.representation,
+                effective,
                 name_index,
                 field.name,
                 field.value,
@@ -318,7 +411,7 @@ pub fn encode_header_block(
                 &mut output[offset..],
             )?;
         }
-        if field.representation == HpackRepresentation::Incremental {
+        if effective == HpackRepresentation::Incremental {
             match table
                 .insert_bytes(field.name, field.value)
                 .map_err(HpackError::Table)?
@@ -357,23 +450,25 @@ fn pending_table_size_update_length(table: &HpackTable<'_>) -> Result<usize, Hpa
 
 fn field_encoding_length(
     field: HpackFieldToEncode<'_>,
+    effective: HpackRepresentation,
     name_index: u64,
     indexed_field: Option<u64>,
 ) -> Result<usize, HpackError> {
-    let (prefix_bits, _) = match field.representation {
+    let (prefix_bits, _) = match effective {
         HpackRepresentation::WithoutIndexing | HpackRepresentation::NeverIndexed => (4, 0),
         HpackRepresentation::Incremental => (6, 0x40),
         HpackRepresentation::Indexed => (7, 0x80),
+        HpackRepresentation::Default => return Err(HpackError::InvalidRepresentation),
     };
     let mut prefix = [0; 11];
-    let index = if field.representation == HpackRepresentation::Indexed {
+    let index = if effective == HpackRepresentation::Indexed {
         indexed_field.ok_or(HpackError::InvalidIndex)?
     } else {
         name_index
     };
     let index_length =
         encode_hpack_integer(index, prefix_bits, &mut prefix).map_err(map_integer_error)?;
-    if field.representation == HpackRepresentation::Indexed {
+    if effective == HpackRepresentation::Indexed {
         return Ok(index_length);
     }
     let name_length = if name_index == 0 {
@@ -395,10 +490,61 @@ fn field_encoding_length(
         })
 }
 
+fn resolve_field(
+    fields: &[HpackFieldToEncode<'_>],
+    table: &HpackTable<'_>,
+    state: &EncoderTableState,
+    resolved: Option<&[HpackRepresentation]>,
+    field_index: usize,
+) -> Result<(u64, Option<u64>, HpackRepresentation), HpackError> {
+    let field = fields[field_index];
+    let lookup = |value| {
+        block_table_index(
+            fields,
+            table,
+            state,
+            resolved,
+            field_index,
+            field.name,
+            value,
+        )
+    };
+    match field.representation {
+        HpackRepresentation::Indexed => {
+            let index = lookup(Some(field.value)).ok_or(HpackError::InvalidIndex)?;
+            Ok((0, Some(index), HpackRepresentation::Indexed))
+        }
+        HpackRepresentation::Default => {
+            if !is_sensitive_name(field.name) {
+                if let Some(index) = lookup(Some(field.value)) {
+                    return Ok((0, Some(index), HpackRepresentation::Indexed));
+                }
+            }
+            let representation = default_literal_representation(field.name);
+            Ok((lookup(None).unwrap_or(0), None, representation))
+        }
+        representation => Ok((lookup(None).unwrap_or(0), None, representation)),
+    }
+}
+
+fn is_inserted(
+    fields: &[HpackFieldToEncode<'_>],
+    resolved: Option<&[HpackRepresentation]>,
+    index: usize,
+) -> bool {
+    if let Some(resolved) = resolved {
+        return resolved
+            .get(index)
+            .is_some_and(|representation| *representation == HpackRepresentation::Incremental);
+    }
+    fields[index].representation == HpackRepresentation::Incremental
+}
+
 fn block_table_index(
     fields: &[HpackFieldToEncode<'_>],
     table: &HpackTable<'_>,
     state: &EncoderTableState,
+    resolved: Option<&[HpackRepresentation]>,
     field_index: usize,
     name: &[u8],
     value: Option<&[u8]>,
@@ -414,10 +560,10 @@ fn block_table_index(
 
     let mut newer_insertions = 0_u64;
     for previous_index in (state.first_inserted_field..field_index).rev() {
-        let previous = fields[previous_index];
-        if previous.representation != HpackRepresentation::Incremental {
+        if !is_inserted(fields, resolved, previous_index) {
             continue;
         }
+        let previous = fields[previous_index];
         if previous.name == name && value.is_none_or(|expected| previous.value == expected) {
             return u64::try_from(HPACK_STATIC_TABLE_LEN)
                 .ok()?
@@ -453,6 +599,7 @@ fn preflight_insertion(
     fields: &[HpackFieldToEncode<'_>],
     table: &HpackTable<'_>,
     state: &mut EncoderTableState,
+    resolved: Option<&[HpackRepresentation]>,
     field_index: usize,
 ) -> Result<(), HpackError> {
     let field = fields[field_index];
@@ -463,7 +610,7 @@ fn preflight_insertion(
     }
 
     while state.size > table.max_size() - size {
-        evict_oldest(fields, table, state, field_index)?;
+        evict_oldest(fields, table, state, resolved, field_index)?;
     }
     let entry_count = state
         .retained_original_entries
@@ -508,6 +655,7 @@ fn evict_oldest(
     fields: &[HpackFieldToEncode<'_>],
     table: &HpackTable<'_>,
     state: &mut EncoderTableState,
+    resolved: Option<&[HpackRepresentation]>,
     next_field: usize,
 ) -> Result<(), HpackError> {
     if state.retained_original_entries > 0 {
@@ -539,7 +687,7 @@ fn evict_oldest(
         return Err(HpackError::Table(HpackTableError::DescriptorCapacity));
     }
     let oldest = (state.first_inserted_field..next_field)
-        .find(|index| fields[*index].representation == HpackRepresentation::Incremental)
+        .find(|index| is_inserted(fields, resolved, *index))
         .ok_or(HpackError::Table(HpackTableError::DescriptorCapacity))?;
     let field = fields[oldest];
     let size = entry_size(field.name.len(), field.value.len()).map_err(HpackError::Table)?;
@@ -552,7 +700,7 @@ fn evict_oldest(
         next_field
     } else {
         (oldest + 1..next_field)
-            .find(|index| fields[*index].representation == HpackRepresentation::Incremental)
+            .find(|index| is_inserted(fields, resolved, *index))
             .ok_or(HpackError::Table(HpackTableError::DescriptorCapacity))?
     };
     Ok(())
