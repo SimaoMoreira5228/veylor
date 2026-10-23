@@ -10,6 +10,7 @@ use veylor_runtime::{
 };
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
+use crate::static_files::{FilePlan, read_chunk};
 use crate::static_routes::{
     EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_expectation_failed,
     respond_to_head,
@@ -53,6 +54,9 @@ pub(crate) enum ConnPhase {
         responded: bool,
     },
     SendingResponse,
+    // NOTE: in-flight file body after its head flushed; offsets ride conn.file and every
+    // body byte stages through the output buffer, so this variant stays fieldless + Copy.
+    SendingFile,
     // NOTE: the owner-side parked snapshot: method copy for HEAD semantics at respond time,
     // keep-open from the request line alone, fixed-length body admission with the event token
     // so worker turns can stage wire bytes for host pulls; unread bytes drain within the cap.
@@ -84,6 +88,12 @@ pub enum ConnClose {
     Completed,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FileTransfer {
+    plan: FilePlan,
+    offset: u64,
+}
+
 pub struct ConnState {
     pub(crate) token: ConnectionToken,
     pub(crate) stream: TcpStream,
@@ -102,6 +112,7 @@ pub struct ConnState {
     pub(crate) out_sent: usize,
     pub(crate) pending_len: usize,
     pub(crate) phase: ConnPhase,
+    pub(crate) file: Option<FileTransfer>,
     pub(crate) read_ready: bool,
     pub(crate) write_blocked: bool,
     pub(crate) closing: bool,
@@ -129,6 +140,7 @@ impl ConnState {
             out_sent: 0,
             pending_len: 0,
             phase: ConnPhase::ReadingHead,
+            file: None,
             read_ready: true,
             write_blocked: false,
             closing: false,
@@ -177,6 +189,12 @@ impl ConnState {
         self.closing = true;
     }
 
+    pub(crate) fn file_complete(&self) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|transfer| transfer.offset >= transfer.plan.size)
+    }
+
     pub fn into_stream(self) -> TcpStream {
         self.stream
     }
@@ -213,6 +231,14 @@ pub fn pump_connection(
     if conn.is_parked() {
         return parked::pump_parked(conn, host);
     }
+    // NOTE: bounded per-turn file staging: one read_chunk slice at most and only with a
+    // fully flushed head/chunk, so slow readers backpressure through write_blocked and a
+    // large file never sits resident; the shared dispatch below flushes the staged slice.
+    if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
+        if let Err(reason) = stage_file_chunk(conn) {
+            return PumpOutcome::Close(reason);
+        }
+    }
     let draining_body = matches!(conn.phase, ConnPhase::DrainingBody { .. });
     let reading = (conn.phase == ConnPhase::ReadingHead || draining_body) && conn.len < INPUT_CAP;
     let token = conn.token;
@@ -225,7 +251,7 @@ pub fn pump_connection(
     // order. An admitted 100-continue interim is staged ahead of the final and stays writable
     // during the drain; dispatch serves the write first and pauses reads while it is pending, so
     // the interim always flushes before further drain bytes are consumed from the wire.
-    let sending = conn.phase == ConnPhase::SendingResponse;
+    let sending = conn.phase == ConnPhase::SendingResponse || conn.phase == ConnPhase::SendingFile;
     let flushing_interim =
         matches!(conn.phase, ConnPhase::DrainingBody { .. }) && out_sent < out_len;
     let write_ready = (sending || flushing_interim) && out_sent < out_len && !conn.write_blocked;
@@ -314,7 +340,11 @@ pub fn pump_connection(
         if left == 0 {
             conn.out_len = conn.pending_len;
             conn.pending_len = 0;
-            conn.phase = ConnPhase::SendingResponse;
+            conn.phase = if conn.file.is_some() {
+                ConnPhase::SendingFile
+            } else {
+                ConnPhase::SendingResponse
+            };
             conn.write_blocked = false;
             // NOTE: a parked respond already moved the worker to WritingResponse, so the
             // drain-complete hook must not transition twice; static drains still report it.
@@ -342,19 +372,29 @@ pub fn pump_connection(
             }
             ExchangeOutcome::Close(reason) => return PumpOutcome::Close(reason),
         }
-        if conn.phase == ConnPhase::SendingResponse {
+        if conn.phase == ConnPhase::SendingResponse || conn.phase == ConnPhase::SendingFile {
             progress.entered_response = true;
         } else if matches!(conn.phase, ConnPhase::DrainingBody { .. }) {
             progress.entered_body = true;
         }
     }
 
-    if conn.phase == ConnPhase::SendingResponse && !conn.has_pending_output() {
+    // NOTE: a file transfer completes only when its staged offset reaches plan size, so
+    // partial flushes keep their WritingResponse deadline via byte progress; the re-arm
+    // keeps the poll wait at zero between chunks instead of paying a cadence per slice.
+    // Shutdown mid-transfer drains the same way: begin_drain set closing, so completion
+    // closes while the force deadline still force-closes through the normal cleanup.
+    let response_done = conn.phase == ConnPhase::SendingResponse
+        || (conn.phase == ConnPhase::SendingFile && conn.file_complete());
+    if response_done && !conn.has_pending_output() {
         if conn.closing {
             return PumpOutcome::Close(conn.close_reason);
         }
+        conn.file = None;
         reuse_keep_alive(conn);
         progress.response_flushed = true;
+    } else if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
+        conn.read_ready = true;
     }
     PumpOutcome::Keep(progress)
 }
@@ -459,6 +499,7 @@ fn encode_static(
             keep_open,
             drain_total,
             interim_len,
+            file,
         }) => {
             conn.out_sent = 0;
             conn.write_blocked = false;
@@ -475,9 +516,19 @@ fn encode_static(
             conn.len -= conn.head_len + skip;
             conn.head_len = 0;
             let remaining = drain_total - skip as u64;
+            // NOTE: HEAD and empty files complete with the head alone; only GET bodies
+            // with bytes stage, so the pump never opens a file it will not read from.
+            conn.file = file
+                .filter(|plan| !plan.head_only && plan.size > 0)
+                .map(|plan| FileTransfer { plan, offset: 0 });
+            let sending_file = conn.file.is_some();
             if remaining == 0 {
                 conn.out_len = length;
-                conn.phase = ConnPhase::SendingResponse;
+                conn.phase = if sending_file {
+                    ConnPhase::SendingFile
+                } else {
+                    ConnPhase::SendingResponse
+                };
             } else {
                 conn.out_len = interim_len;
                 conn.pending_len = length;
@@ -490,6 +541,34 @@ fn encode_static(
             ExchangeOutcome::Responded
         }
         Err(_) => ExchangeOutcome::Close(ConnClose::ResponseOverflow),
+    }
+}
+
+// NOTE: truncation rule: read_chunk clamps to the plan remainder, so over-long reads
+// cannot happen; a zero-byte read before plan size means the file shrank underfoot and
+// fails the transfer closed, never as a short success. Each stage re-opens the file
+// (no fd cache yet); EPIPE and backpressure stay in the dispatch mapping, and Rust
+// ignores SIGPIPE process-wide, so a closed receiver closes as PeerClosed, never a
+// signal. Partial short reads advance the offset and resume on the next turn.
+fn stage_file_chunk(conn: &mut ConnState) -> Result<(), ConnClose> {
+    let Some(transfer) = conn.file.as_mut() else {
+        return Err(ConnClose::TransportError);
+    };
+    if transfer.offset >= transfer.plan.size {
+        return Ok(());
+    }
+    let width = (transfer.plan.size - transfer.offset).min(OUTPUT_CAP as u64) as usize;
+    match read_chunk(&transfer.plan, transfer.offset, &mut conn.output[..width]) {
+        Ok(0) => Err(ConnClose::TransportError),
+        Ok(staged) => {
+            transfer.offset += staged as u64;
+            conn.out_len = staged;
+            conn.out_sent = 0;
+            conn.write_blocked = false;
+            conn.read_ready = true;
+            Ok(())
+        }
+        Err(_) => Err(ConnClose::TransportError),
     }
 }
 

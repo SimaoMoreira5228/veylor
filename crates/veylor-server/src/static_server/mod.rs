@@ -167,6 +167,16 @@ impl Server {
             .map_err(ServerError::from)
     }
 
+    pub fn register_file_mount(
+        &mut self,
+        prefix: &[u8],
+        root: &std::path::Path,
+    ) -> Result<(), ServerError> {
+        self.routes
+            .register_file_mount(prefix, root)
+            .map_err(ServerError::from)
+    }
+
     pub fn register_managed_with_trailers(
         &mut self,
         method: &[u8],

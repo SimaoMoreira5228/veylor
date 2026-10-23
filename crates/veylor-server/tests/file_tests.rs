@@ -381,3 +381,36 @@ fn invalid_mounts_reject() {
         Some(MountError::Invalid)
     );
 }
+
+#[test]
+fn read_chunk_truncation_surfaces_zero_before_plan_size() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let plan = mounts
+        .resolve(b"GET", b"/assets/blob.bin")
+        .expect("blob plan");
+    fs::write(fixture.root.join("blob.bin"), b"short").expect("truncate");
+    let mut out = [0u8; 8192];
+    // NOTE: the pump treats a zero read before plan size as truncation, never success.
+    assert_eq!(read_chunk(&plan, 0, &mut out).expect("short read"), 5);
+    assert_eq!(read_chunk(&plan, 5, &mut out).expect("truncated read"), 0);
+    fs::remove_file(fixture.root.join("blob.bin")).expect("delete");
+    assert!(read_chunk(&plan, 0, &mut out).is_err());
+}
+
+#[test]
+fn read_chunk_clamps_overgrown_file_to_plan_size() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let plan = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    let mut grown = b"<html>hello</html>".to_vec();
+    grown.extend_from_slice(&[b'g'; 100]);
+    fs::write(fixture.root.join("index.html"), &grown).expect("grow");
+    let mut out = vec![0u8; 65536];
+    // NOTE: over-long reads clamp to the plan remainder; bytes past plan.size never serve.
+    let got = read_chunk(&plan, 0, &mut out).expect("clamped read");
+    assert_eq!(got, plan.size as usize);
+    assert_eq!(&out[..got], b"<html>hello</html>");
+}

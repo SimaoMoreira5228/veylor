@@ -900,6 +900,41 @@ vyl_http1_result vyl_managed_static_host_pull_trailers(
     size_t values_capacity,
     vyl_managed_static_trailer_report* out_report
 );
+/* NOTE: Opens a chunked response stream for a parked token: a repeat reports DUPLICATE, a token
+   whose connection closed GONE. 204/205/304 and bad reasons report INVALID_ARGUMENT without
+   staging, so a later one-shot respond still works. Begin arms nothing: poll is-writable until
+   the head flushes before writing. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_begin_stream(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint16_t status,
+    vyl_http1_bytes reason
+);
+/* NOTE: Stages one bounded chunk on an open stream. Each admitted write consumes the writable
+   arm: a write with no arm reports BAD_STATE, a write racing a staged command WOULD_BLOCK.
+   Empty chunks report INVALID_ARGUMENT; lengths pass through with no separate C cap — the
+   server rejects past 16 KiB (or past the output frame fit) with BODY_TOO_LONG. Valid only
+   while running. */
+vyl_http1_result vyl_managed_static_host_write_stream(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    vyl_http1_bytes chunk
+);
+/* NOTE: Ends an open stream with the terminal chunk; the connection unparks for keep-alive
+   reuse. A repeat end while the first is still queued reports DUPLICATE, after apply GONE.
+   Ending a token with no open stream reports INVALID_ARGUMENT. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_end_stream(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token
+);
+/* NOTE: Queries whether a stream token currently admits a write: OK with 1 when a write would
+   stage, OK with 0 for any other live-or-unknown token. Only a bad handle, a non-running
+   server, or a zero-generation token reports BAD_STATE. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_is_writable(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint32_t* out_writable
+);
 
 #ifdef __cplusplus
 }

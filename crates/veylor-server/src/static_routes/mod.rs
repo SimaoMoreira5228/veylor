@@ -1,10 +1,14 @@
+use std::path::Path;
+
 use veylor_http1::{
-    ConnectionHeader, RequestHead, ResponseFraming, ResponseToWrite,
+    ConnectionHeader, Field, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
     connection_header_for_response, encode_response_head, is_token,
 };
 use veylor_router::{
     RouteBodyPolicy, RouteCapture, RouteConfig, RouteError, RouteKind, RouteSlot, RouteTable,
 };
+
+use crate::static_files::{FileMounts, FilePlan, FileReject, MountError};
 
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_RESPONSE_BODY: usize = 4096;
@@ -58,6 +62,7 @@ pub struct ManagedRoute {
 pub struct StaticRoutes {
     routes: Vec<StaticRoute>,
     managed: Vec<ManagedRoute>,
+    files: FileMounts,
 }
 
 impl StaticRoutes {
@@ -65,6 +70,7 @@ impl StaticRoutes {
         Self {
             routes: Vec::new(),
             managed: Vec::new(),
+            files: FileMounts::new(),
         }
     }
 
@@ -163,6 +169,23 @@ impl StaticRoutes {
         Ok(())
     }
 
+    // NOTE: file mounts register alongside static routes and freeze structurally at
+    // start: Server is consumed by start, so no &mut handle survives to register late.
+    // Frozen therefore maps to Invalid; duplicates and capacity keep their own errors.
+    pub fn register_file_mount(
+        &mut self,
+        prefix: &[u8],
+        root: &Path,
+    ) -> Result<(), RouteBuildError> {
+        self.files
+            .register(prefix, root)
+            .map_err(|error| match error {
+                MountError::Duplicate => RouteBuildError::Duplicate,
+                MountError::Full => RouteBuildError::Full,
+                MountError::Invalid | MountError::Frozen => RouteBuildError::Invalid,
+            })
+    }
+
     pub fn build_table<'slots, 'data>(
         &'data self,
         slots: &'slots mut [RouteSlot<'data>],
@@ -251,6 +274,7 @@ pub struct EncodedStaticResponse {
     pub keep_open: bool,
     pub drain_total: u64,
     pub interim_len: usize,
+    pub file: Option<FilePlan>,
 }
 
 pub fn respond_to_head(
@@ -262,6 +286,13 @@ pub fn respond_to_head(
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
     let mut captures = [RouteCapture::default(); CAPTURE_SLOTS];
     let found = table.find_request(head, input, &mut captures);
+    // NOTE: exact static routes win; file mounts serve only table misses, so existing
+    // routes never change behavior when mounts are added.
+    if matches!(found, Err(RouteError::NotFound)) {
+        if let Some(file) = respond_file(routes, head, input, output)? {
+            return Ok(file);
+        }
+    }
     // NOTE: unmatched requests have no route cap of their own, so 404s keep the default.
     let (status, reason, body, cap) = match found {
         Ok(found) => {
@@ -341,7 +372,119 @@ pub fn respond_to_head(
         keep_open: connection != ConnectionHeader::Close,
         drain_total,
         interim_len,
+        file: None,
     })
+}
+
+// NOTE: rejection mapping stays inside the static path's 404/400+close and 413+close
+// families: NotFound/Forbidden/NotAFile all read as 404+close (traversal gets no
+// existence oracle), TooLarge reads as 413+close like any over-cap body. No new status.
+// Bodies drain within the same default cap as unmatched static paths; chunked rejects.
+fn respond_file(
+    routes: &StaticRoutes,
+    head: RequestHead,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<Option<EncodedStaticResponse>, RouteBuildError> {
+    let Some((method, path)) = file_target(head, input) else {
+        return Ok(None);
+    };
+    if head.is_chunked {
+        return Ok(Some(reject_payload(output, method)?));
+    }
+    let drain_total = match head.content_length {
+        Some(length) if length > MAX_STATIC_BODY_BYTES => {
+            return Ok(Some(reject_payload(output, method)?));
+        }
+        Some(length) => length,
+        None => 0,
+    };
+    let interim_len = if head.expect_continue {
+        encode_continue(output)?
+    } else {
+        0
+    };
+    let plan = match routes.files.resolve(method, path) {
+        Ok(plan) => plan,
+        Err(FileReject::TooLarge) => return Ok(Some(reject_payload(output, method)?)),
+        Err(FileReject::NotFound | FileReject::Forbidden | FileReject::NotAFile) => {
+            return Ok(None);
+        }
+    };
+    let connection =
+        connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
+    let content_type = [Field {
+        name: b"Content-Type",
+        value: plan.content_type.as_bytes(),
+    }];
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade: b"",
+        status: 200,
+        reason: b"OK",
+        fields: &content_type,
+        framing: ResponseFraming::FixedLength,
+        content_length: plan.size,
+        connection,
+    };
+    let final_buf = output
+        .get_mut(interim_len..)
+        .ok_or(RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+    let length = interim_len + encoded.length;
+    // NOTE: HEAD and empty files complete with the head alone; only GET with bytes
+    // streams, so the pump never stages zero-length transfers.
+    let file = if plan.head_only || plan.size == 0 {
+        None
+    } else {
+        Some(plan)
+    };
+    Ok(Some(EncodedStaticResponse {
+        length,
+        keep_open: connection != ConnectionHeader::Close,
+        drain_total,
+        interim_len,
+        file,
+    }))
+}
+
+// NOTE: query strings strip like the router so /assets/a.css?x=1 names the file;
+// fragments never arrive on the wire and anything else rejects inside resolve.
+fn file_target(head: RequestHead, input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let method = head.method(input)?;
+    let target = head.target(input)?;
+    let path = match head.target_form {
+        TargetForm::Origin => strip_query(target),
+        TargetForm::Absolute => absolute_path(target)?,
+        TargetForm::Authority | TargetForm::Asterisk => return None,
+    };
+    if path.is_empty() || path[0] != b'/' {
+        return None;
+    }
+    Some((method, path))
+}
+
+fn strip_query(target: &[u8]) -> &[u8] {
+    let end = target
+        .iter()
+        .position(|byte| *byte == b'?')
+        .unwrap_or(target.len());
+    &target[..end]
+}
+
+fn absolute_path(target: &[u8]) -> Option<&[u8]> {
+    let colon = target.iter().position(|byte| *byte == b':')?;
+    let after = target.get(colon + 1..)?;
+    let authority = after.strip_prefix(b"//")?;
+    let end = authority
+        .iter()
+        .position(|byte| matches!(byte, b'/' | b'?'))
+        .unwrap_or(authority.len());
+    if end == authority.len() || authority[end] == b'?' {
+        return Some(b"/");
+    }
+    Some(strip_query(&authority[end..]))
 }
 
 fn reject_payload(
@@ -354,6 +497,7 @@ fn reject_payload(
         keep_open: false,
         drain_total: 0,
         interim_len: 0,
+        file: None,
     })
 }
 

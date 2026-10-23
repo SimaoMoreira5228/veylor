@@ -47,11 +47,25 @@ static size_t read_to_end(int fd, char* out, size_t capacity) {
     return total;
 }
 
+static void wait_stream_writable(vyl_managed_static_server* server, vyl_managed_static_token token) {
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
+    for (int i = 0; i < 500; i++) {
+        uint32_t writable = 0;
+        assert(vyl_managed_static_host_is_writable(server, token, &writable) == VYL_HTTP1_OK);
+        if (writable == 1) {
+            return;
+        }
+        nanosleep(&pause, NULL);
+    }
+    assert(0 && "stream never armed writable");
+}
+
 int main(void) {
     static const uint8_t get_method[] = "GET";
     static const uint8_t post_method[] = "POST";
     static const uint8_t m_path[] = "/m";
     static const uint8_t c_path[] = "/c";
+    static const uint8_t s_path[] = "/s";
     static const uint8_t t_path[] = "/t";
     static const uint8_t tag_name[] = "x-tag";
     static const char chunked_request[] = "POST /t HTTP/1.1\r\nHost: test\r\n"
@@ -60,7 +74,10 @@ int main(void) {
                                           "5\r\nhello\r\n0\r\nX-Tag: v1\r\n\r\n";
     static const uint8_t reason[] = "OK";
     static const uint8_t reply[] = "managed-hi";
+    static const uint8_t first_chunk[] = "hi";
+    static const uint8_t second_chunk[] = "yo";
     static const char request[] = "GET /m HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    static const char stream_request[] = "GET /s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
     static const char cancel_request[] = "GET /c HTTP/1.1\r\nHost: test\r\n\r\n";
     vyl_managed_static_config config = {0};
     vyl_managed_static_server* server = NULL;
@@ -103,6 +120,14 @@ int main(void) {
             server,
             (vyl_http1_bytes){.data = get_method, .length = sizeof(get_method) - 1},
             (vyl_http1_bytes){.data = c_path, .length = sizeof(c_path) - 1},
+            (uint64_t)-1
+        ) == VYL_HTTP1_OK
+    );
+    assert(
+        vyl_managed_static_register_managed_route(
+            server,
+            (vyl_http1_bytes){.data = get_method, .length = sizeof(get_method) - 1},
+            (vyl_http1_bytes){.data = s_path, .length = sizeof(s_path) - 1},
             (uint64_t)-1
         ) == VYL_HTTP1_OK
     );
@@ -246,13 +271,67 @@ int main(void) {
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "managed-hi") != NULL);
 
+    fd = connect_loopback(port);
+    assert(
+        send(fd, stream_request, sizeof(stream_request) - 1, 0) ==
+        (ssize_t)(sizeof(stream_request) - 1)
+    );
+    assert(
+        vyl_managed_static_poll_events(
+            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+        ) == VYL_HTTP1_OK
+    );
+    assert(report.copied == 1);
+    token = events[0].token;
+    assert(
+        vyl_managed_static_host_write_stream(
+            server,
+            token,
+            (vyl_http1_bytes){.data = first_chunk, .length = sizeof(first_chunk) - 1}
+        ) == VYL_HTTP1_BAD_STATE
+    );
+    assert(
+        vyl_managed_static_host_begin_stream(
+            server,
+            token,
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    assert(
+        vyl_managed_static_host_write_stream(
+            server,
+            token,
+            (vyl_http1_bytes){.data = first_chunk, .length = sizeof(first_chunk) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    assert(
+        vyl_managed_static_host_write_stream(
+            server,
+            token,
+            (vyl_http1_bytes){.data = second_chunk, .length = sizeof(second_chunk) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    assert(vyl_managed_static_host_end_stream(server, token) == VYL_HTTP1_OK);
+    read_to_end(fd, response, sizeof(response));
+    assert(close(fd) == 0);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Transfer-Encoding: chunked") != NULL);
+    assert(strstr(response, "2\r\nhi\r\n") != NULL);
+    assert(strstr(response, "2\r\nyo\r\n") != NULL);
+    assert(strstr(response, "0\r\n\r\n") != NULL);
+    assert(vyl_managed_static_host_end_stream(server, token) == VYL_HTTP1_GONE);
+
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 2);
+    assert(counts.completed == 3);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 2
+            counts.shutdown == 3
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

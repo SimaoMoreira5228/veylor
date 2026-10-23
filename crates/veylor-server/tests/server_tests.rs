@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use veylor_runtime::{ConnectionTimeouts, ConnectionToken};
@@ -888,4 +890,277 @@ fn managed_fixed_body_echo_round_trip_reuses_keep_alive() {
     server.stop_accepting();
     let counts = server.join().expect("join server");
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
+const FILE_BLOB_LEN: usize = 1 << 20;
+
+struct FileFixture {
+    dir: PathBuf,
+    root: PathBuf,
+    blob: Vec<u8>,
+}
+
+impl FileFixture {
+    fn build() -> Self {
+        let id = NEXT_FILE_ID.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("veylor-srv-file-{}-{id}", std::process::id()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("fixture root");
+        std::fs::write(root.join("hello.txt"), b"hello file").expect("hello file");
+        std::fs::write(root.join("empty.txt"), b"").expect("empty file");
+        std::fs::write(dir.join("outside.txt"), b"outside secret").expect("outside file");
+        let mut blob = Vec::with_capacity(FILE_BLOB_LEN);
+        for i in 0..FILE_BLOB_LEN {
+            blob.push((i % 251) as u8);
+        }
+        std::fs::write(root.join("blob.bin"), &blob).expect("blob file");
+        Self { dir, root, blob }
+    }
+}
+
+impl Drop for FileFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn file_server() -> (RunningServer, FileFixture) {
+    let fixture = FileFixture::build();
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    server
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register hello");
+    server
+        .register_file_mount(b"/assets/", &fixture.root)
+        .expect("register assets");
+    (server.start().expect("start server"), fixture)
+}
+
+fn header<'a>(response: &'a ClientResponse, name: &str) -> &'a str {
+    response
+        .headers
+        .iter()
+        .find(|(field, _)| field.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .expect("header present")
+}
+
+#[test]
+fn file_get_serves_exact_bytes_type_length() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/hello.txt");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello file");
+    assert_eq!(header(&response, "content-length"), "10");
+    assert_eq!(header(&response, "content-type"), "text/plain");
+    get(&mut stream, "/assets/hello.txt?v=1");
+    let queried = read_response(&mut stream);
+    assert_eq!(queried.status, 200);
+    assert_eq!(queried.body, b"hello file");
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(fixture.blob.len(), FILE_BLOB_LEN);
+}
+
+#[test]
+fn file_head_returns_headers_only() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    let request =
+        b"HEAD /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    stream.write_all(request).expect("write HEAD");
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+    }
+    let text = String::from_utf8(head).expect("head utf8");
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status: {text}");
+    assert!(text.contains("Content-Length: 10"), "length: {text}");
+    assert!(text.contains("Content-Type: text/plain"), "type: {text}");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn file_missing_returns_404_then_closes() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/nope.txt");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 404);
+    assert_eq!(response.body, b"Not Found");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_traversal_rejected_without_fs_escape() {
+    let (server, _fixture) = file_server();
+    for path in ["/assets/../outside.txt", "/assets/%2e%2e/outside.txt"] {
+        let mut stream = connect(&server);
+        get(&mut stream, path);
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 404, "path {path}");
+        assert_eq!(response.body, b"Not Found", "path {path}");
+        read_eof(&mut stream);
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 2, "counts: {counts:?}");
+}
+
+#[test]
+fn file_blob_streams_exact_1mib() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/blob.bin");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        header(&response, "content-length"),
+        FILE_BLOB_LEN.to_string()
+    );
+    assert_eq!(
+        header(&response, "content-type"),
+        "application/octet-stream"
+    );
+    assert_eq!(response.body, fixture.blob);
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_slow_reader_tiny_reads_completes() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/blob.bin");
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+    }
+    let text = String::from_utf8(head).expect("head utf8");
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status: {text}");
+    let mut body = Vec::with_capacity(FILE_BLOB_LEN);
+    while body.len() < FILE_BLOB_LEN {
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).expect("read body byte");
+        body.push(byte[0]);
+    }
+    assert_eq!(body, fixture.blob);
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_disconnect_mid_transfer_server_healthy() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/blob.bin");
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+    }
+    let mut partial = [0; 4096];
+    stream.read_exact(&mut partial).expect("read partial body");
+    drop(stream);
+    let mut again = connect(&server);
+    get(&mut again, "/hello");
+    let response = read_response(&mut again);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert!(
+        counts.peer_closed + counts.reset + counts.transport_error >= 1,
+        "counts: {counts:?}"
+    );
+}
+
+#[test]
+fn file_shutdown_mid_transfer_drains_clean() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/blob.bin");
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+    }
+    server.stop_accepting();
+    let mut body = Vec::with_capacity(FILE_BLOB_LEN);
+    stream.read_to_end(&mut body).expect("read drained body");
+    assert_eq!(body, fixture.blob);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_duplicate_and_invalid_mounts_reject() {
+    let fixture = FileFixture::build();
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    server
+        .register_file_mount(b"/assets/", &fixture.root)
+        .expect("first mount");
+    assert!(
+        server
+            .register_file_mount(b"/assets/", &fixture.root)
+            .is_err()
+    );
+    assert!(
+        server
+            .register_file_mount(b"/bad/", &fixture.root.join("hello.txt"))
+            .is_err()
+    );
+    let running = server.start().expect("start server");
+    running.stop_accepting();
+    let _ = running.join().expect("join server");
 }

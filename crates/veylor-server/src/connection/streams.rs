@@ -1,6 +1,7 @@
 use veylor_http1::{
-    BodyEvent, ConnectionHeader, Limits, ResponseFraming, ResponseToWrite, encode_response_chunk,
-    encode_response_chunk_with_required_length, encode_response_final_chunk, encode_response_head,
+    BodyEvent, ConnectionHeader, Field, Limits, ResponseFraming, ResponseToWrite,
+    encode_response_chunk, encode_response_chunk_with_required_length,
+    encode_response_final_chunk_with_required_length, encode_response_head,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -57,6 +58,7 @@ pub(crate) enum StreamCmd {
     Begin { status: u16, reason: Vec<u8> },
     Write { chunk: Vec<u8> },
     End,
+    EndWithTrailers { trailers: Vec<StagedTrailer> },
     Cancel,
 }
 
@@ -143,6 +145,59 @@ impl HostShared {
         self.stage_stream(token, StreamCmd::End, RespondOutcome::Stale)
     }
 
+    // NOTE: response-trailer stage validation is two layers: the request-trailer prohibited
+    // set below (RFC 9112 trailers carry no framing/routing/auth metadata; the http1 terminal
+    // encoder's own response set omits content-length, so the stage gate must name it), then the
+    // http1 terminal encoder as an empty-output probe for name/value syntax, pseudo-headers (`:`
+    // is no token char), and its wider response set. A nonzero required length proves the staged
+    // set always encodes. Staged caps mirror the request-trailer bounds (TRAILER_SLOTS fields, 1
+    // KiB name/value bytes); anything past either cap, or any invalid field, rejects the whole
+    // set with nothing staged.
+    pub fn end_stream_with_trailers(
+        &self,
+        token: ConnectionToken,
+        fields: &[(&[u8], &[u8])],
+    ) -> RespondOutcome {
+        if fields.len() > TRAILER_SLOTS {
+            return RespondOutcome::Invalid;
+        }
+        let mut total = 0usize;
+        for (name, value) in fields {
+            if request_trailer_prohibited(name) {
+                return RespondOutcome::Invalid;
+            }
+            total += name.len() + value.len();
+        }
+        if total > MAX_STAGED_TRAILER_BYTES {
+            return RespondOutcome::Invalid;
+        }
+        let borrowed: Vec<Field> = fields
+            .iter()
+            .copied()
+            .map(|(name, value)| Field { name, value })
+            .collect();
+        let mut required = 0usize;
+        let _ = encode_response_final_chunk_with_required_length(&borrowed, &mut [], &mut required);
+        if required == 0 {
+            return RespondOutcome::Invalid;
+        }
+        if required > OUTPUT_CAP {
+            return RespondOutcome::BodyTooLarge;
+        }
+        let staged = borrowed
+            .iter()
+            .map(|field| StagedTrailer {
+                name: field.name.to_vec(),
+                value: field.value.to_vec(),
+            })
+            .collect();
+        self.stage_stream(
+            token,
+            StreamCmd::EndWithTrailers { trailers: staged },
+            RespondOutcome::Stale,
+        )
+    }
+
     pub fn is_writable(&self, token: ConnectionToken) -> bool {
         let done = self.with_inner(|inner| {
             let live = inner
@@ -223,7 +278,7 @@ impl HostShared {
                         stream.writable = false;
                     }
                 }
-                StreamCmd::End => {
+                StreamCmd::End | StreamCmd::EndWithTrailers { .. } => {
                     let open = entry.stream.as_ref().is_some_and(|stream| stream.head_sent);
                     if !open {
                         return (RespondOutcome::Invalid, None);
@@ -320,8 +375,26 @@ pub(crate) fn apply_stream_cmd(
             };
             length
         }
-        StreamCmd::End => {
-            let Ok(length) = encode_response_final_chunk(&[], &mut conn.output[..]) else {
+        StreamCmd::End | StreamCmd::EndWithTrailers { .. } => {
+            // NOTE: stage validation plus the staged caps prove the trailer block fits, so the
+            // required-length probe here is the no-truncation guarantee, never a fit check: any
+            // encode failure is permanent and fails the connection closed like the chunk path.
+            let trailers: Vec<Field> = match &cmd {
+                StreamCmd::EndWithTrailers { trailers } => trailers
+                    .iter()
+                    .map(|field| Field {
+                        name: &field.name,
+                        value: &field.value,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut required = 0usize;
+            let Ok(length) = encode_response_final_chunk_with_required_length(
+                &trailers,
+                &mut conn.output[..],
+                &mut required,
+            ) else {
                 host.unpark_closed(token);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
@@ -352,6 +425,33 @@ pub(crate) struct ChunkedFeed {
     pub(crate) decoded: u64,
     pub(crate) done: bool,
     pub(crate) failed: bool,
+}
+
+// NOTE: the request-trailer prohibited set, mirrored from the http1 chunked decoder policy so
+// the response terminal refuses the same framing/routing/auth metadata. Kept local (not read
+// from the decoder) because the decoder type carries no query for it and the response encoder's
+// own set omits content-length.
+fn request_trailer_prohibited(name: &[u8]) -> bool {
+    const PROHIBITED: [&[u8]; 15] = [
+        b"authorization",
+        b"connection",
+        b"content-encoding",
+        b"content-length",
+        b"content-range",
+        b"content-type",
+        b"expect",
+        b"host",
+        b"keep-alive",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    PROHIBITED
+        .iter()
+        .any(|prohibited| name.eq_ignore_ascii_case(prohibited))
 }
 
 impl HostShared {
@@ -436,6 +536,14 @@ impl crate::host::HostHandle {
 
     pub fn end_stream(&self, token: ConnectionToken) -> RespondOutcome {
         self.shared.end_stream(token)
+    }
+
+    pub fn end_stream_with_trailers(
+        &self,
+        token: ConnectionToken,
+        fields: &[(&[u8], &[u8])],
+    ) -> RespondOutcome {
+        self.shared.end_stream_with_trailers(token, fields)
     }
 
     pub fn is_writable(&self, token: ConnectionToken) -> bool {

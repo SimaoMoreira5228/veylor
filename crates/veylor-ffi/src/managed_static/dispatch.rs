@@ -334,6 +334,154 @@ fn trailer_outcome_to_result(outcome: TrailerOutcome) -> VylResult {
     }
 }
 
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_begin_stream(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    status: u16,
+    reason: VylBytes,
+) -> VylResult {
+    catch_ffi(|| unsafe { host_begin_stream(server, token, status, reason) })
+}
+
+unsafe fn host_begin_stream(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    status: u16,
+    reason: VylBytes,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let reason = match unsafe { read_bytes(reason) } {
+        Ok(reason) => reason,
+        Err(error) => return error,
+    };
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    respond_outcome_to_result(
+        running
+            .host()
+            .begin_stream(token_to_server(token), status, reason),
+    )
+}
+
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_write_stream(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    chunk: VylBytes,
+) -> VylResult {
+    catch_ffi(|| unsafe { host_write_stream(server, token, chunk) })
+}
+
+unsafe fn host_write_stream(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    chunk: VylBytes,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let chunk = match unsafe { read_bytes(chunk) } {
+        Ok(chunk) => chunk,
+        Err(error) => return error,
+    };
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    respond_outcome_to_result(running.host().write_stream(token_to_server(token), chunk))
+}
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_end_stream(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+) -> VylResult {
+    catch_ffi(|| unsafe { host_end_stream(server, token) })
+}
+
+unsafe fn host_end_stream(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    respond_outcome_to_result(running.host().end_stream(token_to_server(token)))
+}
+
+// NOTE: the Rust query returns a bare bool with no invalid signal, so the shape check lives here:
+// a zero-generation token reports bad-state, while an unknown-but-well-formed token answers Ok
+// with false — absence of a live writable stream is a negative answer, never an error.
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_is_writable(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    out_writable: *mut u32,
+) -> VylResult {
+    catch_ffi(|| unsafe { host_is_writable(server, token, out_writable) })
+}
+
+unsafe fn host_is_writable(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    out_writable: *mut u32,
+) -> VylResult {
+    if server.is_null() || out_writable.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    unsafe {
+        out_writable.write(0);
+    }
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    let token = token_to_server(token);
+    if token.generation == 0 {
+        return VylResult::BadState;
+    }
+    unsafe {
+        out_writable.write(u32::from(running.host().is_writable(token)));
+    }
+    VylResult::Ok
+}
+
 fn token_to_server(token: VylManagedStaticToken) -> ConnectionToken {
     ConnectionToken {
         worker_id: token.worker_id,
