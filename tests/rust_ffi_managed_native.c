@@ -8,8 +8,12 @@
 #include <unistd.h>
 
 _Static_assert(
-    sizeof(vyl_managed_static_native_request) == 48,
+    sizeof(vyl_managed_static_native_request) == 56,
     "native request twin must match Rust NativeRequestView"
+);
+_Static_assert(
+    offsetof(vyl_managed_static_native_request, body) == 48,
+    "native request body offset must match Rust"
 );
 _Static_assert(
     sizeof(vyl_managed_static_native_response) == 40,
@@ -32,11 +36,35 @@ static int32_t native_handler(
     assert(memcmp(request->path, "/native", 7) == 0);
     assert(request->has_body == 0);
     assert(request->body_len == 0);
+    assert(request->body == NULL);
     response->status = 200;
     response->reason = reason;
     response->reason_len = sizeof(reason) - 1;
     response->body = body;
     response->body_len = sizeof(body) - 1;
+    return 0;
+}
+
+static int32_t native_echo(
+    void* user_data,
+    const vyl_managed_static_native_request* request,
+    vyl_managed_static_native_response* response
+) {
+    static const uint8_t reason[] = "OK";
+    assert(user_data == &native_tag);
+    assert(request->method_len == 4);
+    assert(memcmp(request->method, "POST", 4) == 0);
+    assert(request->path_len == 5);
+    assert(memcmp(request->path, "/echo", 5) == 0);
+    assert(request->has_body == 1);
+    assert(request->body_len == 8);
+    assert(request->body != NULL);
+    assert(memcmp(request->body, "echo-me!", 8) == 0);
+    response->status = 200;
+    response->reason = reason;
+    response->reason_len = sizeof(reason) - 1;
+    response->body = request->body;
+    response->body_len = (size_t)request->body_len;
     return 0;
 }
 
@@ -69,7 +97,10 @@ static size_t read_closed(int fd, char* out, size_t cap) {
 int main(void) {
     static const uint8_t method[] = "GET";
     static const uint8_t path[] = "/native";
+    static const uint8_t post_method[] = "POST";
+    static const uint8_t echo_path[] = "/echo";
     static const char request[] = "GET /native HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    static const char echo_request[] = "POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 8\r\nConnection: close\r\n\r\necho-me!";
     vyl_managed_static_config config = {0};
     vyl_managed_static_server* server = NULL;
     vyl_managed_static_close_counts counts = {0};
@@ -124,6 +155,15 @@ int main(void) {
             &native_tag
         ) == VYL_HTTP1_INVALID_ARGUMENT
     );
+    assert(
+        vyl_managed_static_register_native_route(
+            server,
+            (vyl_http1_bytes){.data = post_method, .length = sizeof(post_method) - 1},
+            (vyl_http1_bytes){.data = echo_path, .length = sizeof(echo_path) - 1},
+            native_echo,
+            &native_tag
+        ) == VYL_HTTP1_OK
+    );
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_local_addr(server, &port) == VYL_HTTP1_OK);
     assert(port != 0);
@@ -135,13 +175,20 @@ int main(void) {
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "native-hello") != NULL);
 
+    fd = connect_loopback(port);
+    assert(send(fd, echo_request, sizeof(echo_request) - 1, 0) == (ssize_t)(sizeof(echo_request) - 1));
+    read_closed(fd, response, sizeof(response));
+    assert(close(fd) == 0);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "echo-me!") != NULL);
+
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 1);
+    assert(counts.completed == 2);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 1
+            counts.shutdown == 2
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

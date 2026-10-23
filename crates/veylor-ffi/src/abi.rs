@@ -119,6 +119,7 @@ pub enum VylResult {
     StaleToken = 12,
     Duplicate = 13,
     Gone = 14,
+    Busy = 15,
 }
 
 pub fn catch_ffi(call: impl FnOnce() -> VylResult) -> VylResult {

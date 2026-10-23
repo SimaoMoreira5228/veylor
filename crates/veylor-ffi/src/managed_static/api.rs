@@ -3,9 +3,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::slice;
 
-use veylor_server::{MAX_STATIC_BODY_BYTES, Server};
+use veylor_server::{MAX_STATIC_BODY_BYTES, MAX_WORKERS, Server, in_native_handler};
 
-use super::{ManagedStaticState, VylManagedStaticCloseCounts, VylManagedStaticConfig};
+use super::{
+    ManagedStaticState, ReadyRouteOp, ReadyServer, VylManagedStaticCloseCounts,
+    VylManagedStaticConfig,
+};
 use super::{VylManagedStaticServer, server_error_to_result};
 use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
 
@@ -48,7 +51,14 @@ unsafe fn create_server(
         Err(error) => return server_error_to_result(error),
     };
     let handle = Box::new(VylManagedStaticServer {
-        state: ManagedStaticState::Ready(server),
+        state: ManagedStaticState::Ready(Box::new(ReadyServer {
+            server,
+            config: server_config,
+            addr,
+            h2c_port: None,
+            worker_count: 1,
+            ops: Vec::new(),
+        })),
     });
     unsafe {
         out_server.write(Box::into_raw(handle));
@@ -162,7 +172,7 @@ unsafe fn register_static_route(
         return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *server };
-    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
         return VylResult::BadState;
     };
     let method = match unsafe { read_bytes(method) } {
@@ -181,8 +191,21 @@ unsafe fn register_static_route(
         Ok(body) => body,
         Err(error) => return error,
     };
-    match routes.register_route(method, path, status, reason, body, max_body_bytes) {
-        Ok(()) => VylResult::Ok,
+    match ready
+        .server
+        .register_route(method, path, status, reason, body, max_body_bytes)
+    {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::Static {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                status,
+                reason: reason.to_vec(),
+                body: body.to_vec(),
+                max_body_bytes,
+            });
+            VylResult::Ok
+        }
         Err(error) => server_error_to_result(error),
     }
 }
@@ -197,7 +220,7 @@ unsafe fn register_managed_route(
         return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *server };
-    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
         return VylResult::BadState;
     };
     let method = match unsafe { read_bytes(method) } {
@@ -208,8 +231,15 @@ unsafe fn register_managed_route(
         Ok(path) => path,
         Err(error) => return error,
     };
-    match routes.register_managed(method, path, max_body_bytes) {
-        Ok(()) => VylResult::Ok,
+    match ready.server.register_managed(method, path, max_body_bytes) {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::Managed {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                max_body_bytes,
+            });
+            VylResult::Ok
+        }
         Err(error) => server_error_to_result(error),
     }
 }
@@ -255,7 +285,7 @@ unsafe fn register_managed_with_trailers(
         return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *server };
-    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
         return VylResult::BadState;
     };
     let method = match unsafe { read_bytes(method) } {
@@ -286,8 +316,19 @@ unsafe fn register_managed_with_trailers(
         }
         trailers.push(name);
     }
-    match routes.register_managed_with_trailers(method, path, max_body_bytes, &trailers) {
-        Ok(()) => VylResult::Ok,
+    match ready
+        .server
+        .register_managed_with_trailers(method, path, max_body_bytes, &trailers)
+    {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::ManagedWithTrailers {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                max_body_bytes,
+                trailers: trailers.iter().map(|name| name.to_vec()).collect(),
+            });
+            VylResult::Ok
+        }
         Err(error) => server_error_to_result(error),
     }
 }
@@ -318,7 +359,7 @@ unsafe fn register_file_mount(
         return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *server };
-    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
         return VylResult::BadState;
     };
     let prefix = match unsafe { read_bytes(prefix) } {
@@ -333,8 +374,14 @@ unsafe fn register_file_mount(
         Ok(root) => root,
         Err(error) => return error,
     };
-    match routes.register_file_mount(prefix, root) {
-        Ok(()) => VylResult::Ok,
+    match ready.server.register_file_mount(prefix, root) {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::FileMount {
+                prefix: prefix.to_vec(),
+                root: root.to_path_buf(),
+            });
+            VylResult::Ok
+        }
         Err(error) => server_error_to_result(error),
     }
 }
@@ -358,6 +405,63 @@ fn bytes_to_path(root: &[u8]) -> Result<&std::path::Path, VylResult> {
 
 
 
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_enable_h2c(
+    server: *mut VylManagedStaticServer,
+    port: u16,
+) -> VylResult {
+    catch_ffi(|| unsafe { enable_h2c(server, port) })
+}
+
+unsafe fn enable_h2c(server: *mut VylManagedStaticServer, port: u16) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    ready.h2c_port = Some(port);
+    VylResult::Ok
+}
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_set_worker_count(
+    server: *mut VylManagedStaticServer,
+    count: usize,
+) -> VylResult {
+    catch_ffi(|| unsafe { set_worker_count(server, count) })
+}
+
+unsafe fn set_worker_count(server: *mut VylManagedStaticServer, count: usize) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    if count == 0 || count > MAX_WORKERS {
+        return VylResult::InvalidArgument;
+    }
+    ready.worker_count = count;
+    VylResult::Ok
+}
+
+
+
+
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_start(
     server: *mut VylManagedStaticServer,
@@ -371,11 +475,42 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
     }
     let handle = unsafe { &mut *server };
     let state = std::mem::replace(&mut handle.state, ManagedStaticState::Joined);
-    let ManagedStaticState::Ready(routes) = state else {
+    let ManagedStaticState::Ready(ready) = state else {
         handle.state = state;
         return VylResult::BadState;
     };
-    match routes.start() {
+    let ReadyServer {
+        server,
+        config,
+        addr,
+        h2c_port,
+        worker_count,
+        ops,
+    } = *ready;
+    if h2c_port.is_none() && worker_count == 1 {
+        return match server.start() {
+            Ok(running) => {
+                handle.state = ManagedStaticState::Running(running);
+                VylResult::Ok
+            }
+            Err(error) => server_error_to_result(error),
+        };
+    }
+    let mut staged = config;
+    staged.worker_count = worker_count;
+    staged.h2c_port = h2c_port;
+    let bind_addr = server.addr().unwrap_or(addr);
+    drop(server);
+    let mut rebound = match Server::bind(bind_addr, staged) {
+        Ok(rebound) => rebound,
+        Err(error) => return server_error_to_result(error),
+    };
+    for op in &ops {
+        if let Err(error) = op.apply(&mut rebound) {
+            return error;
+        }
+    }
+    match rebound.start() {
         Ok(running) => {
             handle.state = ManagedStaticState::Running(running);
             VylResult::Ok
@@ -427,6 +562,8 @@ unsafe fn stop_server(server: *mut VylManagedStaticServer, force: bool) -> VylRe
 
 
 
+
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_join(
     server: *mut VylManagedStaticServer,
@@ -439,6 +576,9 @@ unsafe fn join_server(
     server: *mut VylManagedStaticServer,
     out_counts: *mut VylManagedStaticCloseCounts,
 ) -> VylResult {
+    if in_native_handler() {
+        return VylResult::Busy;
+    }
     if server.is_null() || out_counts.is_null() {
         return VylResult::InvalidArgument;
     }
@@ -484,7 +624,7 @@ unsafe fn local_addr(server: *mut VylManagedStaticServer, out_port: *mut u16) ->
     }
     let handle = unsafe { &*server };
     let port = match &handle.state {
-        ManagedStaticState::Ready(routes) => match routes.addr() {
+        ManagedStaticState::Ready(ready) => match ready.server.addr() {
             Ok(addr) => addr.port(),
             Err(error) => return server_error_to_result(error),
         },

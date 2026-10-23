@@ -22,12 +22,13 @@ pub use host::{
     PollReport, RespondOutcome,
 };
 pub use static_files::{
-    FileMounts, FilePlan, FileReject, MountError, RangeApply, content_type_for_name, read_chunk,
+    FileMounts, FilePlan, FileReject, MountError, RangeApply, content_type_for_name,
+    parse_http_date, read_chunk, write_http_date,
 };
 pub use static_files::{MAX_FILE_SIZE, MAX_MOUNTS};
 pub use static_routes::{
     MAX_RESPONSE_BODY, MAX_ROUTES, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
-    NativeResponseOut, RouteBuildError,
+    NativeResponseOut, RouteBuildError, in_native_handler,
 };
 pub use static_server::{
     CloseCounts, MAX_WORKERS, RunningServer, Server, ServerConfig, ServerError,

@@ -28,7 +28,8 @@ typedef enum {
     VYL_HTTP1_CANCELLED = 11,
     VYL_HTTP1_STALE_TOKEN = 12,
     VYL_HTTP1_DUPLICATE = 13,
-    VYL_HTTP1_GONE = 14
+    VYL_HTTP1_GONE = 14,
+    VYL_HTTP1_BUSY = 15
 } vyl_http1_result;
 
 typedef enum {
@@ -807,9 +808,25 @@ vyl_http1_result vyl_managed_static_register_managed_route_with_trailers(
     const vyl_http1_bytes* trailer_names,
     size_t trailer_count
 );
+/* NOTE: Stages the cleartext HTTP/2 listener port for start; the port binds at start beside
+   the H1 listener. Zero binds an ephemeral loopback port, any other port binds fixed; the
+   last call wins. Valid only before start; post-start reports BAD_STATE. */
+vyl_http1_result vyl_managed_static_enable_h2c(
+    vyl_managed_static_server* server,
+    uint16_t port
+);
+/* NOTE: Stages the worker count for start against the server cap of 16 workers: zero and
+   counts past 16 report INVALID_ARGUMENT. One keeps the single-worker path; more workers
+   bind reuse-port listeners at start. The last call wins. Valid only before start;
+   post-start reports BAD_STATE. */
+vyl_http1_result vyl_managed_static_set_worker_count(
+    vyl_managed_static_server* server,
+    size_t count
+);
 vyl_http1_result vyl_managed_static_start(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_accepting(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_force(vyl_managed_static_server* server);
+/* NOTE: Joining from inside a native handler reports BUSY without touching either pointer. */
 vyl_http1_result vyl_managed_static_join(
     vyl_managed_static_server* server,
     vyl_managed_static_close_counts* out_counts
@@ -965,18 +982,21 @@ vyl_http1_result vyl_managed_static_host_is_writable(
 
 /* NOTE: Native (worker-executed) routes. The handler runs on the connection owner worker and
    must return promptly without calling back into server APIs; registry and dispatch entries
-   fail while a handler runs. Joining from inside a handler deadlocks (the worker waits on
-   itself): a busy report needs a later slice exposing the server reentrancy guard. Request
+   fail while a handler runs. Joining from inside a handler reports BUSY (the worker would
+   wait on itself): pass the handle through user_data to observe it. Request
    bytes are borrowed for the call; the engine copies reason/body into bounded scratch before
    returning, so handler memory only needs to outlive the call. Native routes win over static
    and file routes for the same method and path (any overlap rejects as a duplicate). The
-   request carries framing only (has_body/body_len); staged body bytes stay host-routed in
-   this slice. A nonzero return fails the request closed without a partial write. Handlers
-   are nounwind: unwinding (C++ exceptions, Rust panics) aborts the process, so handlers must
-   catch their own failures and return nonzero instead. user_data stores opaque and comes back
-   verbatim on every call, never dereferenced; it must outlive the handle and its
-   thread-safety is the host's contract. Register before start; method/path copy before
-   return, null handlers reject, post-start rejects. */
+   request carries framing (has_body/body_len) plus the body bytes when the full
+   fixed-length body is buffered at invoke time: body is NULL with has_body set when the
+   tail has not arrived yet, and NULL with has_body clear when there is no body. Check
+   body before reading body_len bytes; the pump still drains declared bytes. Retaining
+   method/path/body past return is UB. A nonzero return fails the request closed without
+   a partial write. Handlers are nounwind: unwinding (C++ exceptions, Rust panics) aborts
+   the process, so handlers must catch their own failures and return nonzero instead.
+   user_data stores opaque and comes back verbatim on every call, never dereferenced; it
+   must outlive the handle and its thread-safety is the host's contract. Register before
+   start; method/path copy before return, null handlers reject, post-start rejects. */
 typedef struct {
     const uint8_t* method;
     size_t method_len;
@@ -984,6 +1004,7 @@ typedef struct {
     size_t path_len;
     uint8_t has_body;
     uint64_t body_len;
+    const uint8_t* body;
 } vyl_managed_static_native_request;
 
 typedef struct {
@@ -1001,7 +1022,7 @@ typedef int32_t (*vyl_managed_static_native_handler)(
 );
 
 _Static_assert(
-    sizeof(vyl_managed_static_native_request) == 48,
+    sizeof(vyl_managed_static_native_request) == 56,
     "native request twin must match Rust NativeRequestView"
 );
 _Static_assert(
@@ -1011,6 +1032,10 @@ _Static_assert(
 _Static_assert(
     offsetof(vyl_managed_static_native_request, body_len) == 40,
     "native request body_len offset must match Rust"
+);
+_Static_assert(
+    offsetof(vyl_managed_static_native_request, body) == 48,
+    "native request body offset must match Rust"
 );
 _Static_assert(
     sizeof(vyl_managed_static_native_response) == 40,

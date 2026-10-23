@@ -10,13 +10,13 @@ mod native;
 mod tests;
 
 pub use api::{
-    vyl_managed_static_destroy, vyl_managed_static_join, vyl_managed_static_local_addr,
-    vyl_managed_static_new, vyl_managed_static_register_file_mount,
+    vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_join,
+    vyl_managed_static_local_addr, vyl_managed_static_new, vyl_managed_static_register_file_mount,
     vyl_managed_static_register_managed_route,
     vyl_managed_static_register_managed_route_with_trailers,
     vyl_managed_static_register_static_route,
-    vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_start,
-    vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
+    vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_set_worker_count,
+    vyl_managed_static_start, vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
     vyl_managed_static_host_begin_stream, vyl_managed_static_host_cancel,
@@ -29,7 +29,7 @@ pub use native::{
     VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn, VylManagedStaticNativeRequest,
     VylManagedStaticNativeResponse, vyl_managed_static_register_native_route,
 };
-use veylor_server::{CloseCounts, RunningServer, Server, ServerConfig};
+use veylor_server::{CloseCounts, NativeHandler, RunningServer, Server, ServerConfig};
 
 use crate::abi::VylResult;
 
@@ -89,9 +89,95 @@ pub struct VylManagedStaticServer {
 }
 
 pub(super) enum ManagedStaticState {
-    Ready(Server),
+    Ready(Box<ReadyServer>),
     Running(RunningServer),
     Joined,
+}
+
+// NOTE: pre-start server. The bound handle serves eager registration validation and the
+// pre-start local-addr query; `config`/`addr` plus the staged `h2c_port`/`worker_count`
+// and the recorded `ops` replay a fresh bind at start when non-default settings apply.
+// The default path starts the bound handle untouched, so stock behavior never rebinds.
+pub(super) struct ReadyServer {
+    pub(super) server: Server,
+    pub(super) config: ServerConfig,
+    pub(super) addr: std::net::SocketAddr,
+    pub(super) h2c_port: Option<u16>,
+    pub(super) worker_count: usize,
+    pub(super) ops: Vec<ReadyRouteOp>,
+}
+
+// NOTE: validated registration replay for the start-time rebind. Every entry already
+// passed eager validation, so replay with identical bytes must succeed; failures still
+// map fail-closed. `u64::MAX` stays the uncapped body sentinel on static and managed
+// entries alike: no new variant, the standing cap-less answer.
+pub(super) enum ReadyRouteOp {
+    Static {
+        method: Vec<u8>,
+        path: Vec<u8>,
+        status: u16,
+        reason: Vec<u8>,
+        body: Vec<u8>,
+        max_body_bytes: u64,
+    },
+    Managed {
+        method: Vec<u8>,
+        path: Vec<u8>,
+        max_body_bytes: u64,
+    },
+    ManagedWithTrailers {
+        method: Vec<u8>,
+        path: Vec<u8>,
+        max_body_bytes: u64,
+        trailers: Vec<Vec<u8>>,
+    },
+    FileMount {
+        prefix: Vec<u8>,
+        root: std::path::PathBuf,
+    },
+    Native {
+        method: Vec<u8>,
+        path: Vec<u8>,
+        handler: NativeHandler,
+        user_data: usize,
+    },
+}
+
+impl ReadyRouteOp {
+    pub(super) fn apply(&self, server: &mut Server) -> Result<(), VylResult> {
+        let result = match self {
+            Self::Static {
+                method,
+                path,
+                status,
+                reason,
+                body,
+                max_body_bytes,
+            } => server.register_route(method, path, *status, reason, body, *max_body_bytes),
+            Self::Managed {
+                method,
+                path,
+                max_body_bytes,
+            } => server.register_managed(method, path, *max_body_bytes),
+            Self::ManagedWithTrailers {
+                method,
+                path,
+                max_body_bytes,
+                trailers,
+            } => {
+                let names: Vec<&[u8]> = trailers.iter().map(Vec::as_slice).collect();
+                server.register_managed_with_trailers(method, path, *max_body_bytes, &names)
+            }
+            Self::FileMount { prefix, root } => server.register_file_mount(prefix, root),
+            Self::Native {
+                method,
+                path,
+                handler,
+                user_data,
+            } => server.register_native(method, path, Some(*handler), *user_data),
+        };
+        result.map_err(server_error_to_result)
+    }
 }
 
 impl VylManagedStaticConfig {

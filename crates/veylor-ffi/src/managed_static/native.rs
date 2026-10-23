@@ -4,8 +4,14 @@ use std::mem::{offset_of, size_of};
 use veylor_server::{NativeHandler, NativeRequestView, NativeResponseOut};
 
 use super::api::read_bytes;
-use super::{ManagedStaticState, VylManagedStaticServer, server_error_to_result};
+use super::{ManagedStaticState, ReadyRouteOp, VylManagedStaticServer, server_error_to_result};
 use crate::abi::{VylBytes, VylResult, catch_ffi};
+
+
+
+
+
+
 
 
 
@@ -20,6 +26,7 @@ pub struct VylManagedStaticNativeRequest {
     pub path_len: usize,
     pub has_body: u8,
     pub body_len: u64,
+    pub body: *const u8,
 }
 
 
@@ -46,12 +53,14 @@ pub type VylManagedStaticNativeHandler = Option<VylManagedStaticNativeHandlerFn>
 const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == size_of::<NativeRequestView>());
 const _: () =
     assert!(size_of::<VylManagedStaticNativeResponse>() == size_of::<NativeResponseOut>());
-const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == 48);
+const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == 56);
 const _: () = assert!(size_of::<VylManagedStaticNativeResponse>() == 40);
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeRequest, has_body) == 4 * size_of::<*const u8>());
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeRequest, body_len) == 5 * size_of::<*const u8>());
+const _: () =
+    assert!(offset_of!(VylManagedStaticNativeRequest, body) == 6 * size_of::<*const u8>());
 const _: () = assert!(offset_of!(VylManagedStaticNativeResponse, reason) == size_of::<*const u8>());
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeResponse, body_len) == 4 * size_of::<*const u8>());
@@ -59,6 +68,8 @@ const _: () =
 // NOTE: the server registry carries the handler address plus an opaque user_data word, so
 // no slot pool, trampoline table, or process-global state is needed: the C handler converts
 // once here and user_data round-trips through the server untouched.
+
+
 
 
 
@@ -104,7 +115,7 @@ unsafe fn register_native_route(
         return VylResult::InvalidArgument;
     };
     let handle = unsafe { &mut *server };
-    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
         return VylResult::BadState;
     };
     let method = match unsafe { read_bytes(method) } {
@@ -121,8 +132,19 @@ unsafe fn register_native_route(
 
     let handler =
         unsafe { std::mem::transmute::<VylManagedStaticNativeHandlerFn, NativeHandler>(handler) };
-    match routes.register_native(method, path, Some(handler), user_data as usize) {
-        Ok(()) => VylResult::Ok,
+    match ready
+        .server
+        .register_native(method, path, Some(handler), user_data as usize)
+    {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::Native {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                handler,
+                user_data: user_data as usize,
+            });
+            VylResult::Ok
+        }
         Err(error) => server_error_to_result(error),
     }
 }

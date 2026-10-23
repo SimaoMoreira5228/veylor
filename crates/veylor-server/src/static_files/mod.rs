@@ -4,6 +4,11 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+mod http_date;
+
+pub(crate) use http_date::system_time_secs;
+pub use http_date::{HTTP_DATE_BYTES, parse_http_date, write_http_date};
+
 pub const MAX_MOUNTS: usize = 16;
 // NOTE: files stream through the pump in bounded turns, so this cap only bounds metadata sanity, never resident memory; it mirrors the Odin STATIC_FILE_MAX_SIZE so every file the old engine planned still plans here.
 pub const MAX_FILE_SIZE: u64 = i64::MAX as u64;
@@ -36,6 +41,7 @@ pub enum FileReject {
 pub struct FilePlan {
     pub fs_path: PathBuf,
     pub size: u64,
+    pub mtime: u64,
     pub total: u64,
     pub start: u64,
     pub content_type: &'static str,
@@ -523,6 +529,7 @@ impl FileMounts {
         let last = segments.len() - 1;
         let mut fs_path = mount.root.clone();
         let mut size = 0;
+        let mut mtime = 0;
         for (index, segment) in segments.iter().enumerate() {
             push_segment(&mut fs_path, segment)?;
             let meta = match std::fs::symlink_metadata(&fs_path) {
@@ -545,6 +552,7 @@ impl FileMounts {
                     return Err(FileReject::NotAFile);
                 }
                 size = meta.len();
+                mtime = system_time_secs(meta.modified().ok());
             }
         }
         if size > MAX_FILE_SIZE {
@@ -553,6 +561,7 @@ impl FileMounts {
         Ok(FilePlan {
             fs_path,
             size,
+            mtime,
             total: size,
             start: 0,
             content_type: content_type_for_name(segments[last].as_slice()),

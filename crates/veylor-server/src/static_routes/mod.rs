@@ -57,9 +57,11 @@ pub struct ManagedRoute {
 // NOTE: C-ABI native handlers run on the owner worker inside the pump (never on a host
 // thread) with borrowed request views; the engine copies reason/body into caller buffers
 // before returning and never retains handler memory. No headers in v1: method+path plus
-// framing presence/length keeps the call FFI-trivial while staged bytes stay host-routed.
-// No user_data in v1 either: the registry stores the bare pointer and the FFI slice adds
-// the context field alongside the C struct twins.
+// framing presence/length keeps the call FFI-trivial, with fixed-length bodies borrowed
+// when fully buffered (see body). user_data crosses as an address-sized value next to the
+// handler pointer (see below).
+// WARNING: every pointer below borrows worker input bytes for the call only; a handler
+// retaining method/path/body past return is UB, same as the out-param scratch rule.
 #[repr(C)]
 pub struct NativeRequestView {
     pub method: *const u8,
@@ -68,6 +70,7 @@ pub struct NativeRequestView {
     pub path_len: usize,
     pub has_body: u8,
     pub body_len: u64,
+    pub body: *const u8,
 }
 
 #[repr(C)]
@@ -103,7 +106,7 @@ thread_local! {
     pub(crate) static IN_NATIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) fn in_native_handler() -> bool {
+pub fn in_native_handler() -> bool {
     IN_NATIVE.get()
 }
 
@@ -399,9 +402,11 @@ pub(crate) fn valid_reason(reason: &[u8]) -> bool {
         })
 }
 
+mod native;
 mod respond;
 
 pub(crate) use respond::encode_continue;
+pub(crate) use respond::reject_payload;
 pub use respond::{
     EncodedStaticResponse, respond_bad_request, respond_expectation_failed,
     respond_payload_too_large, respond_to_head,

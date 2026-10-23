@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use veylor_server::{FD_CACHE_ENTRIES, FdCache};
-use veylor_server::{FileMounts, FileReject, MountError, RangeApply, read_chunk};
+use veylor_server::{
+    FileMounts, FileReject, MountError, RangeApply, parse_http_date, read_chunk, write_http_date,
+};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const BLOB_LEN: usize = 1 << 20;
@@ -823,4 +825,111 @@ fn multipart_large_body_pages_in_bounded_turns_without_buffering() {
     assert_eq!(assembled, expected);
     assert!(turns > 700, "streams across turns: {turns}");
     assert_eq!(high, out.len(), "fills the staging buffer");
+}
+
+fn emit(secs: u64) -> String {
+    let mut out = [0u8; 64];
+    let len = write_http_date(secs, &mut out);
+    String::from_utf8(out[..len].to_vec()).expect("date ascii")
+}
+
+#[test]
+fn http_date_known_vectors_emit_exact_imf() {
+    for (secs, expected) in [
+        (0, "Thu, 01 Jan 1970 00:00:00 GMT"),
+        (784_111_777, "Sun, 06 Nov 1994 08:49:37 GMT"),
+        (946_684_800, "Sat, 01 Jan 2000 00:00:00 GMT"),
+        (951_782_400, "Tue, 29 Feb 2000 00:00:00 GMT"),
+        (4_102_444_800, "Fri, 01 Jan 2100 00:00:00 GMT"),
+    ] {
+        assert_eq!(emit(secs), expected, "emit for {secs}");
+        assert_eq!(
+            parse_http_date(expected.as_bytes()),
+            Some(secs),
+            "parse {expected}"
+        );
+    }
+}
+
+#[test]
+fn http_date_obsolete_formats_parse_to_same_instant() {
+    assert_eq!(
+        parse_http_date(b"Sunday, 06-Nov-94 08:49:37 GMT"),
+        Some(784_111_777)
+    );
+    assert_eq!(
+        parse_http_date(b"Sun Nov  6 08:49:37 1994"),
+        Some(784_111_777)
+    );
+    assert_eq!(
+        parse_http_date(b"Sun Nov 16 08:49:37 1994"),
+        parse_http_date(b"Sun, 16 Nov 1994 08:49:37 GMT")
+    );
+}
+
+#[test]
+fn http_date_emit_parse_round_trips_every_magnitude() {
+    for secs in [
+        0,
+        1,
+        86_399,
+        784_111_777,
+        951_782_400,
+        4_102_444_800,
+        u64::from(u32::MAX),
+    ] {
+        let text = emit(secs);
+        assert_eq!(
+            parse_http_date(text.as_bytes()),
+            Some(secs),
+            "round trip {secs}"
+        );
+    }
+}
+
+#[test]
+fn http_date_malformed_values_reject_to_none() {
+    for value in [
+        "",
+        "yesterday",
+        "Sun, 06 Nov 1994 08:49:37",
+        "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Sun, 32 Nov 1994 08:49:37 GMT",
+        "Sun, 00 Nov 1994 08:49:37 GMT",
+        "Sun, 06 Xyz 1994 08:49:37 GMT",
+        "Sun, 06 Nov 1994 25:49:37 GMT",
+        "Sun, 06 Nov 1994 08:61:37 GMT",
+        "Sun, 29 Feb 1999 00:00:00 GMT",
+        "Sun, 29 Feb 1900 00:00:00 GMT",
+        "Sun, 06 Nov 1994 08:49:37 GMT ",
+        "Funday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 94",
+    ] {
+        assert_eq!(parse_http_date(value.as_bytes()), None, "reject {value:?}");
+    }
+    assert!(
+        parse_http_date(b"Sun, 06 Nov 1994 08:49:60 GMT").is_some(),
+        "leap second folds"
+    );
+}
+
+#[test]
+fn plan_carries_truncated_mtime_from_same_stat() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let plan = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    let meta = fs::metadata(fixture.root.join("index.html")).expect("stat");
+    let expected = meta
+        .modified()
+        .expect("mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch")
+        .as_secs();
+    assert_eq!(plan.mtime, expected);
+    let head = mounts
+        .resolve(b"HEAD", b"/assets/index.html")
+        .expect("head plan");
+    assert_eq!(head.mtime, plan.mtime);
 }

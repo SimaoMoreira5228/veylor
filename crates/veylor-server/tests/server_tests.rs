@@ -1679,6 +1679,207 @@ fn file_range_large_multipart_streams_across_turns() {
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
 
+fn get_conditional(stream: &mut TcpStream, path: &str, field: &str, value: &str) {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n{field}: {value}\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write conditional request");
+}
+
+fn last_modified(response: &ClientResponse) -> String {
+    header(response, "last-modified").to_string()
+}
+
+#[test]
+fn file_last_modified_present_and_imf_shaped() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/hello.txt");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    let seen = last_modified(&response);
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    get_range(&mut stream, "/assets/hello.txt", "bytes=0-3");
+    let partial = read_response(&mut stream);
+    assert_eq!(partial.status, 206);
+    assert_eq!(
+        last_modified(&partial),
+        seen,
+        "206 carries the same validator"
+    );
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_conditional_round_trip_304_keeps_alive() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/hello.txt");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    let seen = last_modified(&first);
+    get_conditional(&mut stream, "/assets/hello.txt", "If-Modified-Since", &seen);
+    let not_modified = read_response(&mut stream);
+    assert_eq!(not_modified.status, 304);
+    assert!(not_modified.body.is_empty());
+    assert_eq!(header(&not_modified, "content-length"), "0");
+    assert_eq!(
+        last_modified(&not_modified),
+        seen,
+        "304 repeats the validator"
+    );
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_conditional_older_and_garbage_dates_serve_200_full() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get_conditional(
+        &mut stream,
+        "/assets/hello.txt",
+        "If-Modified-Since",
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+    );
+    let older = read_response(&mut stream);
+    assert_eq!(older.status, 200);
+    assert_eq!(older.body, b"hello file");
+    for garbage in ["not-a-date", "Sun, 06 Nov 1994 08:49:37 UTC", ""] {
+        let request = format!(
+            "GET /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nIf-Modified-Since: {garbage}\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("write garbage date");
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 200, "garbage {garbage:?}");
+        assert_eq!(response.body, b"hello file", "garbage {garbage:?}");
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_conditional_future_date_answers_304() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get_conditional(
+        &mut stream,
+        "/assets/hello.txt",
+        "If-Modified-Since",
+        "Tue, 06 Nov 2035 08:49:37 GMT",
+    );
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 304);
+    assert!(response.body.is_empty());
+    get(&mut stream, "/assets/hello.txt");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello file");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_conditional_head_matches_get_logic() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/hello.txt");
+    let first = read_response(&mut stream);
+    let seen = last_modified(&first);
+    let fresh = format!(
+        "HEAD /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nIf-Modified-Since: {seen}\r\n\r\n"
+    );
+    stream
+        .write_all(fresh.as_bytes())
+        .expect("write HEAD fresh");
+    let not_modified = read_head(&mut stream);
+    assert!(
+        not_modified.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "status: {not_modified}"
+    );
+    assert!(
+        not_modified.contains("Last-Modified: "),
+        "validator: {not_modified}"
+    );
+    let stale = "HEAD /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n";
+    stream
+        .write_all(stale.as_bytes())
+        .expect("write HEAD stale");
+    let full = read_head(&mut stream);
+    assert!(full.starts_with("HTTP/1.1 200 OK\r\n"), "status: {full}");
+    assert!(full.contains("Content-Length: 10"), "length: {full}");
+    assert!(full.contains("Last-Modified: "), "validator: {full}");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_if_none_match_ignored_serves_200() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    for etag in ["*", "\"abc\"", "W/\"abc\""] {
+        get_conditional(&mut stream, "/assets/hello.txt", "If-None-Match", etag);
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 200, "etag {etag}");
+        assert_eq!(response.body, b"hello file", "etag {etag}");
+    }
+    get(&mut stream, "/assets/hello.txt");
+    let first = read_response(&mut stream);
+    let seen = last_modified(&first);
+    let both = format!(
+        "GET /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nIf-None-Match: *\r\nIf-Modified-Since: {seen}\r\n\r\n"
+    );
+    stream
+        .write_all(both.as_bytes())
+        .expect("write both validators");
+    let not_modified = read_response(&mut stream);
+    assert_eq!(
+        not_modified.status, 304,
+        "If-Modified-Since still drives 304"
+    );
+    assert!(not_modified.body.is_empty());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_conditional_with_range_still_304() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/hello.txt");
+    let first = read_response(&mut stream);
+    let seen = last_modified(&first);
+    let request = format!(
+        "GET /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nRange: bytes=0-3\r\nIf-Modified-Since: {seen}\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write ranged conditional");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 304, "precondition precedes Range");
+    assert!(response.body.is_empty());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
 // NOTE: native-handler suite: handlers below are extern "C" to prove the C-ABI boundary.
 // A panicking handler aborts the process (nounwind frame, uncatchable engine-side), so
 // native_boom contains its own panic and reports failure — the contractual handler pattern
@@ -1747,6 +1948,64 @@ unsafe extern "C" fn native_reenter(
 
 static NATIVE_LARGE_BODY: [u8; MAX_RESPONSE_BODY] = [b'N'; MAX_RESPONSE_BODY];
 
+// NOTE: echo/record statics below are per-handler (never shared across handlers), so parallel
+// tests recording through different routes never observe each other. The echo buffer is static
+// storage the engine copies before return; the default single-worker pump invokes handlers
+// sequentially, so no concurrent invoke can realloc it mid-copy.
+static NATIVE_ECHO_BODY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static NATIVE_RECORD_BODY_NULL: AtomicBool = AtomicBool::new(false);
+static NATIVE_RECORD_HAS_BODY: AtomicBool = AtomicBool::new(false);
+static NATIVE_RECORD_BODY_LEN: AtomicU64 = AtomicU64::new(0);
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn native_echo(
+    _user_data: *mut std::ffi::c_void,
+    request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    if request.is_null() || response.is_null() {
+        return 1;
+    }
+    
+    let view = unsafe { &*request };
+    let out = unsafe { &mut *response };
+    let mut staged = NATIVE_ECHO_BODY.lock().expect("echo lock");
+    staged.clear();
+    if !view.body.is_null() && view.body_len > 0 {
+        
+        let bytes = unsafe { std::slice::from_raw_parts(view.body, view.body_len as usize) };
+        staged.extend_from_slice(bytes);
+    }
+    out.status = 200;
+    out.reason = b"OK".as_ptr();
+    out.reason_len = 2;
+    out.body = staged.as_ptr();
+    out.body_len = staged.len();
+    0
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn native_record(
+    _user_data: *mut std::ffi::c_void,
+    request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    if request.is_null() || response.is_null() {
+        return 1;
+    }
+    
+    let view = unsafe { &*request };
+    let out = unsafe { &mut *response };
+    NATIVE_RECORD_BODY_NULL.store(view.body.is_null(), Ordering::SeqCst);
+    NATIVE_RECORD_HAS_BODY.store(view.has_body != 0, Ordering::SeqCst);
+    NATIVE_RECORD_BODY_LEN.store(view.body_len, Ordering::SeqCst);
+    out.status = 200;
+    out.reason = b"OK".as_ptr();
+    out.reason_len = 2;
+    out.body = b"recorded".as_ptr();
+    out.body_len = 8;
+    0
+}
 #[allow(unsafe_code)]
 unsafe extern "C" fn native_large(
     _user_data: *mut std::ffi::c_void,
@@ -1781,6 +2040,12 @@ fn native_server() -> RunningServer {
     server
         .register_native(b"POST", b"/large", Some(native_large), 0)
         .expect("register large");
+    server
+        .register_native(b"POST", b"/echo", Some(native_echo), 0)
+        .expect("register echo");
+    server
+        .register_native(b"POST", b"/record", Some(native_record), 0)
+        .expect("register record");
     server.start().expect("start server")
 }
 
@@ -1860,6 +2125,69 @@ fn native_large_body_within_caps_drains_then_reusable() {
     assert_eq!(response.status, 200);
     assert_eq!(response.body.len(), MAX_RESPONSE_BODY);
     assert!(response.body.iter().all(|byte| *byte == b'N'));
+    get(&mut stream, "/fixed");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"native-hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn native_echo_returns_staged_body_then_reusable() {
+    let server = native_server();
+    let mut stream = connect(&server);
+    let request = "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\nhello world";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello world");
+    get(&mut stream, "/fixed");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"native-hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn native_zero_length_body_echoes_empty() {
+    let server = native_server();
+    let mut stream = connect(&server);
+    let request = "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn native_partial_tail_invokes_framing_only_then_drains() {
+    NATIVE_RECORD_BODY_NULL.store(false, Ordering::SeqCst);
+    NATIVE_RECORD_HAS_BODY.store(false, Ordering::SeqCst);
+    NATIVE_RECORD_BODY_LEN.store(0, Ordering::SeqCst);
+    let server = native_server();
+    let mut stream = connect(&server);
+    let head = "POST /record HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n";
+    stream.write_all(head.as_bytes()).expect("write head");
+    // NOTE: the pump invokes at head-parse time, so a withheld tail guarantees the handler runs
+    // framing-only; the sleep only lets that turn happen before the body arrives.
+    std::thread::sleep(Duration::from_millis(300));
+    stream.write_all(b"hello").expect("write body");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"recorded");
+    assert!(
+        NATIVE_RECORD_BODY_NULL.load(Ordering::SeqCst),
+        "withheld tail must invoke with null body"
+    );
+    assert!(NATIVE_RECORD_HAS_BODY.load(Ordering::SeqCst));
+    assert_eq!(NATIVE_RECORD_BODY_LEN.load(Ordering::SeqCst), 5);
     get(&mut stream, "/fixed");
     let second = read_response(&mut stream);
     assert_eq!(second.status, 200);

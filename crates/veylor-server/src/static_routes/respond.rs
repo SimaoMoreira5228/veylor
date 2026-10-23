@@ -1,7 +1,5 @@
 // NOTE: response-assembly half of the static_routes seam: registry owns route storage and
 // validation (super), this module owns response encoding over already-matched routes.
-use std::panic::{AssertUnwindSafe, catch_unwind};
-
 use veylor_http1::{
     ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
     connection_header_for_response, encode_response_head,
@@ -9,13 +7,12 @@ use veylor_http1::{
 use veylor_router::{RouteCapture, RouteError, RouteKind, RouteTable};
 
 use crate::connection::field;
-use crate::host::HOST_MAX_REASON_BYTES;
-use crate::static_files::{FilePlan, FileReject, RangeApply};
-
-use super::{
-    IN_NATIVE, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
-    NativeResponseOut, RouteBuildError, StaticRoutes, in_native_handler, route_cap, valid_reason,
+use crate::static_files::{
+    FilePlan, FileReject, HTTP_DATE_BYTES, RangeApply, parse_http_date, write_http_date,
 };
+
+use super::native::respond_native;
+use super::{MAX_STATIC_BODY_BYTES, RouteBuildError, StaticRoutes, in_native_handler, route_cap};
 
 const CAPTURE_SLOTS: usize = 8;
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
@@ -159,162 +156,6 @@ pub fn respond_to_head(
     })
 }
 
-// NOTE: native dispatch: framing mirrors the static path (chunked and over-cap bodies
-// reject, expect-continue interims, drain-before-respond) while status/reason/body come
-// from the handler's out-params instead of the registry. Reason/body copy into bounded
-// stack scratch (the host reason bound and the static body cap); bad return codes, invalid
-// status/reason, or oversize output fail closed as overflow, a panicking handler as a
-// protocol close, never as a partial write. Bodies are framing-only in v1: the handler
-// sees presence/length and the pump drains declared bytes exactly like a static route.
-fn respond_native(
-    handler: NativeHandler,
-    user_data: usize,
-    head: RequestHead,
-    method: &[u8],
-    path: &[u8],
-    input: &[u8],
-    output: &mut [u8],
-) -> Result<EncodedStaticResponse, RouteBuildError> {
-    if head.is_chunked {
-        return reject_payload(output, method);
-    }
-    let declared = head.content_length.unwrap_or(0);
-    let drain_total = match head.content_length {
-        Some(length) if length > MAX_STATIC_BODY_BYTES => {
-            return reject_payload(output, method);
-        }
-        Some(length) => length,
-        None => 0,
-    };
-    let interim_len = if head.expect_continue {
-        encode_continue(output)?
-    } else {
-        0
-    };
-    let request = NativeRequestView {
-        method: method.as_ptr(),
-        method_len: method.len(),
-        path: path.as_ptr(),
-        path_len: path.len(),
-        has_body: u8::from(declared > 0),
-        body_len: declared,
-    };
-    let mut response = NativeResponseOut {
-        status: 0,
-        reason: std::ptr::null(),
-        reason_len: 0,
-        body: std::ptr::null(),
-        body_len: 0,
-    };
-    let mut reason_buf = [0u8; HOST_MAX_REASON_BYTES];
-    let mut body_buf = [0u8; MAX_RESPONSE_BODY];
-    // NOTE: the flag trips nested registry/dispatch entries on this worker. Unwinding through
-    // an extern "C" frame aborts the process (nounwind: verified SIGABRT, uncatchable from
-    // here), so containment is the handler's contract — a Rust handler must catch its own
-    // panics and return nonzero; catch_unwind below covers only the boundary closure itself.
-    // The flag clears on every path below since a returning handler cannot skip it.
-    IN_NATIVE.set(true);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        invoke_native(handler, user_data, &request, &mut response)
-    }));
-    IN_NATIVE.set(false);
-    let code = match outcome {
-        Ok(code) => code,
-        Err(_) => return Err(RouteBuildError::NativePanic),
-    };
-    if code != 0 {
-        return Err(RouteBuildError::Invalid);
-    }
-    if !(200..=599).contains(&response.status) {
-        return Err(RouteBuildError::Invalid);
-    }
-    if !copy_handler_bytes(response.reason, response.reason_len, &mut reason_buf) {
-        return Err(RouteBuildError::Invalid);
-    }
-    if !copy_handler_bytes(response.body, response.body_len, &mut body_buf) {
-        return Err(RouteBuildError::Invalid);
-    }
-    let reason = &reason_buf[..response.reason_len];
-    let body = &body_buf[..response.body_len];
-    if !valid_reason(reason) {
-        return Err(RouteBuildError::Invalid);
-    }
-    let status = response.status as u16;
-    let response_close = status == 404;
-    let connection = connection_header_for_response(
-        head,
-        input,
-        status,
-        ResponseFraming::FixedLength,
-        true,
-        response_close,
-    );
-    let response = ResponseToWrite {
-        request_method: method,
-        requested_upgrade: b"",
-        status,
-        reason,
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: body.len() as u64,
-        connection,
-    };
-    let final_buf = output
-        .get_mut(interim_len..)
-        .ok_or(RouteBuildError::Invalid)?;
-    let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
-    let mut length = interim_len + encoded.length;
-    if encoded.body_allowed && !body.is_empty() {
-        let end = length + body.len();
-        output
-            .get_mut(length..end)
-            .ok_or(RouteBuildError::Invalid)?
-            .copy_from_slice(body);
-        length = end;
-    }
-    Ok(EncodedStaticResponse {
-        length,
-        keep_open: connection != ConnectionHeader::Close,
-        drain_total,
-        interim_len,
-        file: None,
-    })
-}
-
-// NOTE: single unsafe funnel for the boundary call: the engine holds the request views and
-// the out-param alive across it, and registration already rejected null pointers.
-#[allow(unsafe_code)]
-fn invoke_native(
-    handler: NativeHandler,
-    user_data: usize,
-    request: &NativeRequestView,
-    response: &mut NativeResponseOut,
-) -> i32 {
-    
-
-
-    unsafe { handler(user_data as *mut std::ffi::c_void, request, response) }
-}
-
-// NOTE: single unsafe funnel for handler-owned out bytes: empty outputs skip the slice so
-// null+0 never forms one, and bounded lengths copy before the handler's memory can lapse.
-#[allow(unsafe_code)]
-fn copy_handler_bytes(src: *const u8, len: usize, dst: &mut [u8]) -> bool {
-    if len == 0 {
-        return true;
-    }
-    if len > dst.len() || src.is_null() {
-        return false;
-    }
-    
-
-    unsafe {
-        dst[..len].copy_from_slice(std::slice::from_raw_parts(src, len));
-    }
-    true
-}
-
 // NOTE: rejection mapping stays inside the static path's 404/400+close and 413+close
 // families: NotFound/Forbidden/NotAFile all read as 404+close (traversal gets no
 // existence oracle), TooLarge reads as 413+close like any over-cap body. No new status.
@@ -356,6 +197,24 @@ fn respond_file(
     // windows answer 416 with bytes */size and no body, closed like a 404.
     // NOTE (RFC 9110 section 14.2): range handling is defined only for GET; HEAD (the only
     // other file method here) ignores Range and answers 200 full headers.
+    // NOTE: If-None-Match ignores unconditionally in v1: no ETags emit anywhere, so comparison is
+    // impossible and If-Modified-Since alone drives 304. Preconditions evaluate before Range, for GET
+    // and HEAD alike; malformed dates ignore to 200 full while future dates 304 by the same mtime <=
+    // date rule, both sides already whole seconds so the comparison is per-second per RFC 9110 13.1.
+    let fresh = header_value(headers, head, input, b"if-modified-since")
+        .and_then(parse_http_date)
+        .is_some_and(|since| plan.mtime <= since);
+    if fresh {
+        return Ok(Some(respond_not_modified(
+            head,
+            input,
+            method,
+            &plan,
+            drain_total,
+            interim_len,
+            output,
+        )?));
+    }
     let range = (method == b"GET")
         .then(|| range_header_value(headers, head, input))
         .flatten();
@@ -389,6 +248,8 @@ fn respond_file(
         false,
     );
     let mut value = [0u8; MULTIPART_CTYPE_BYTES];
+    let mut date = [0u8; HTTP_DATE_BYTES];
+    let date_len = write_http_date(plan.mtime, &mut date);
     let range_len = if plan.partial && !multipart {
         write_content_range(
             &mut value,
@@ -411,19 +272,23 @@ fn respond_file(
     let mut fields = [Field {
         name: b"Content-Type",
         value: ctype_value,
-    }; 3];
+    }; 4];
     fields[1] = Field {
         name: b"Accept-Ranges",
         value: b"bytes",
     };
+    fields[2] = Field {
+        name: b"Last-Modified",
+        value: &date[..date_len],
+    };
     let field_len = if plan.partial && !multipart {
-        fields[2] = Field {
+        fields[3] = Field {
             name: b"Content-Range",
             value: &value[..range_len],
         };
-        3
+        4
     } else {
-        2
+        3
     };
     let response = ResponseToWrite {
         request_method: method,
@@ -462,12 +327,65 @@ fn range_header_value<'a>(
     head: RequestHead,
     input: &'a [u8],
 ) -> Option<&'a [u8]> {
+    header_value(headers, head, input, b"range")
+}
+
+fn header_value<'a>(
+    headers: &'a [Header],
+    head: RequestHead,
+    input: &'a [u8],
+    name: &[u8],
+) -> Option<&'a [u8]> {
     headers.iter().take(head.header_count).find_map(|header| {
-        let name = field(input, header.name)?;
-        if !name.eq_ignore_ascii_case(b"range") {
+        let found = field(input, header.name)?;
+        if !found.eq_ignore_ascii_case(name) {
             return None;
         }
         field(input, header.value)
+    })
+}
+
+// NOTE: 304 mirrors the 416 small-fixed-response shape (no body, no file staging) but keeps alive:
+// a cache revalidation is a normal response, not an error, so only the Last-Modified validator that
+// the 200 would have carried rides along per RFC 9110 13.1, and the connection reuses as usual.
+fn respond_not_modified(
+    head: RequestHead,
+    input: &[u8],
+    method: &[u8],
+    plan: &FilePlan,
+    drain_total: u64,
+    interim_len: usize,
+    output: &mut [u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let mut date = [0u8; HTTP_DATE_BYTES];
+    let date_len = write_http_date(plan.mtime, &mut date);
+    let fields = [Field {
+        name: b"Last-Modified",
+        value: &date[..date_len],
+    }];
+    let connection =
+        connection_header_for_response(head, input, 304, ResponseFraming::FixedLength, true, false);
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade: b"",
+        status: 304,
+        reason: b"Not Modified",
+        fields: &fields,
+        framing: ResponseFraming::FixedLength,
+        content_length: 0,
+        connection,
+    };
+    let final_buf = output
+        .get_mut(interim_len..)
+        .ok_or(RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+    Ok(EncodedStaticResponse {
+        length: interim_len + encoded.length,
+        keep_open: connection != ConnectionHeader::Close,
+        drain_total,
+        interim_len,
+        file: None,
     })
 }
 
@@ -565,7 +483,7 @@ fn absolute_path(target: &[u8]) -> Option<&[u8]> {
     Some(strip_query(&authority[end..]))
 }
 
-fn reject_payload(
+pub(crate) fn reject_payload(
     output: &mut [u8],
     method: &[u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {

@@ -13,6 +13,7 @@ _Static_assert(
     sizeof(vyl_managed_static_close_counts) == 8 * 8,
     "close counts layout must match Rust"
 );
+_Static_assert(VYL_HTTP1_BUSY == 15, "busy code must match Rust VylResult::Busy");
 
 static int connect_loopback(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -75,6 +76,12 @@ int main(void) {
 
     assert(vyl_managed_static_new(&config, &server) == VYL_HTTP1_OK);
     assert(server != NULL);
+    assert(vyl_managed_static_set_worker_count(NULL, 2) == VYL_HTTP1_INVALID_ARGUMENT);
+    assert(vyl_managed_static_set_worker_count(server, 0) == VYL_HTTP1_INVALID_ARGUMENT);
+    assert(vyl_managed_static_set_worker_count(server, 17) == VYL_HTTP1_INVALID_ARGUMENT);
+    assert(vyl_managed_static_set_worker_count(server, 2) == VYL_HTTP1_OK);
+    assert(vyl_managed_static_enable_h2c(NULL, 0) == VYL_HTTP1_INVALID_ARGUMENT);
+    assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_OK);
     assert(
         vyl_managed_static_register_static_route(
             server,
@@ -104,6 +111,8 @@ int main(void) {
         ) == VYL_HTTP1_OK
     );
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
+    assert(vyl_managed_static_set_worker_count(server, 1) == VYL_HTTP1_BAD_STATE);
+    assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_BAD_STATE);
     assert(vyl_managed_static_local_addr(server, &port) == VYL_HTTP1_OK);
     assert(port != 0);
 
