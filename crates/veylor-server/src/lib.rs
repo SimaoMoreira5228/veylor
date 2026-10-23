@@ -1,6 +1,7 @@
 mod connection;
 pub mod host;
 mod multi_worker;
+mod static_files;
 mod static_routes;
 mod static_server;
 
@@ -12,6 +13,10 @@ pub use host::{
     HOST_MAX_REASON_BYTES, HOST_QUEUE_DEPTH, HostCounters, HostEventKind, HostHandle, PollReport,
     RespondOutcome,
 };
+pub use static_files::{
+    FileMounts, FilePlan, FileReject, MountError, content_type_for_name, read_chunk,
+};
+pub use static_files::{MAX_FILE_SIZE, MAX_MOUNTS};
 pub use static_routes::{MAX_RESPONSE_BODY, MAX_ROUTES, MAX_STATIC_BODY_BYTES, RouteBuildError};
 pub use static_server::{
     CloseCounts, MAX_WORKERS, RunningServer, Server, ServerConfig, ServerError,

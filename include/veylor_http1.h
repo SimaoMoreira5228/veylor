@@ -780,6 +780,20 @@ vyl_http1_result vyl_managed_static_register_managed_route(
     vyl_http1_bytes path,
     uint64_t max_body_bytes
 );
+/* NOTE: Same park and copy rules as above, plus a per-route trailer allowlist copied before
+   return: at most 32 names, each 1-128 bytes. Over-count, empty, or over-long names reject;
+   duplicates (including against other managed or static routes) fail. An empty allowlist
+   admits no trailer fields. */
+#define VYL_MANAGED_STATIC_MAX_TRAILER_NAMES 32u
+#define VYL_MANAGED_STATIC_MAX_TRAILER_NAME_BYTES 128u
+vyl_http1_result vyl_managed_static_register_managed_route_with_trailers(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    uint64_t max_body_bytes,
+    const vyl_http1_bytes* trailer_names,
+    size_t trailer_count
+);
 vyl_http1_result vyl_managed_static_start(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_accepting(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_force(vyl_managed_static_server* server);
@@ -862,6 +876,29 @@ vyl_http1_result vyl_managed_static_host_pull_body(
     size_t out_capacity,
     size_t* out_pulled,
     uint32_t* out_end
+);
+
+typedef struct {
+    size_t fields;
+    size_t names_copied;
+    size_t values_copied;
+    size_t names_required;
+    size_t values_required;
+} vyl_managed_static_trailer_report;
+
+/* NOTE: Whole-set trailer copy with NUL-joined names and values, ready only after end-of-body;
+   an earlier pull reports WOULD_BLOCK without touching the buffers. Copies happen only when
+   both caller buffers fit; otherwise nothing copies and the report carries the required
+   capacities for a retry. A repeat after respond reports DUPLICATE, a closed connection GONE,
+   unknown or superseded tokens STALE_TOKEN. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_pull_trailers(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint8_t* names,
+    size_t names_capacity,
+    uint8_t* values,
+    size_t values_capacity,
+    vyl_managed_static_trailer_report* out_report
 );
 
 #ifdef __cplusplus

@@ -10,13 +10,15 @@ mod tests;
 pub use api::{
     vyl_managed_static_destroy, vyl_managed_static_join, vyl_managed_static_local_addr,
     vyl_managed_static_new, vyl_managed_static_register_managed_route,
+    vyl_managed_static_register_managed_route_with_trailers,
     vyl_managed_static_register_static_route,
     vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_start,
     vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
     vyl_managed_static_host_cancel, vyl_managed_static_host_pull_body,
-    vyl_managed_static_host_respond, vyl_managed_static_poll_events,
+    vyl_managed_static_host_pull_trailers, vyl_managed_static_host_respond,
+    vyl_managed_static_poll_events,
 };
 use veylor_server::{CloseCounts, RunningServer, Server, ServerConfig};
 
@@ -150,6 +152,7 @@ const _: () = assert!(std::mem::size_of::<VylManagedStaticConfig>() > 0);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticCloseCounts>() == 8 * 8);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticToken>() == 4 * 4 + 8 * 2);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticPollReport>() == 8 * 4);
+const _: () = assert!(std::mem::size_of::<VylManagedStaticTrailerReport>() == 8 * 5);
 
 
 
@@ -186,4 +189,15 @@ pub struct VylManagedStaticPollReport {
     pub events_required: usize,
     pub method_required: usize,
     pub path_required: usize,
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VylManagedStaticTrailerReport {
+    pub fields: usize,
+    pub names_copied: usize,
+    pub values_copied: usize,
+    pub names_required: usize,
+    pub values_required: usize,
 }

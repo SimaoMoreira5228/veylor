@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "veylor_http1.h"
 
 #include <arpa/inet.h>
@@ -6,11 +8,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 _Static_assert(sizeof(vyl_managed_static_token) == 32, "token layout must match Rust");
 _Static_assert(sizeof(vyl_managed_static_event) == 80, "event layout must match Rust");
 _Static_assert(sizeof(vyl_managed_static_poll_report) == 32, "report layout must match Rust");
+_Static_assert(sizeof(vyl_managed_static_trailer_report) == 40, "trailer report layout must match Rust");
+_Static_assert(VYL_HTTP1_WOULD_BLOCK == 7, "would-block code must match Rust");
 _Static_assert(VYL_HTTP1_STALE_TOKEN == 12, "stale code must match Rust");
 _Static_assert(VYL_HTTP1_DUPLICATE == 13, "duplicate code must match Rust");
 _Static_assert(VYL_HTTP1_GONE == 14, "gone code must match Rust");
@@ -44,8 +49,15 @@ static size_t read_to_end(int fd, char* out, size_t capacity) {
 
 int main(void) {
     static const uint8_t get_method[] = "GET";
+    static const uint8_t post_method[] = "POST";
     static const uint8_t m_path[] = "/m";
     static const uint8_t c_path[] = "/c";
+    static const uint8_t t_path[] = "/t";
+    static const uint8_t tag_name[] = "x-tag";
+    static const char chunked_request[] = "POST /t HTTP/1.1\r\nHost: test\r\n"
+                                          "Transfer-Encoding: chunked\r\n"
+                                          "Connection: close\r\n\r\n"
+                                          "5\r\nhello\r\n0\r\nX-Tag: v1\r\n\r\n";
     static const uint8_t reason[] = "OK";
     static const uint8_t reply[] = "managed-hi";
     static const char request[] = "GET /m HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
@@ -92,6 +104,16 @@ int main(void) {
             (vyl_http1_bytes){.data = get_method, .length = sizeof(get_method) - 1},
             (vyl_http1_bytes){.data = c_path, .length = sizeof(c_path) - 1},
             (uint64_t)-1
+        ) == VYL_HTTP1_OK
+    );
+    assert(
+        vyl_managed_static_register_managed_route_with_trailers(
+            server,
+            (vyl_http1_bytes){.data = post_method, .length = sizeof(post_method) - 1},
+            (vyl_http1_bytes){.data = t_path, .length = sizeof(t_path) - 1},
+            (uint64_t)-1,
+            (const vyl_http1_bytes[]){{.data = tag_name, .length = sizeof(tag_name) - 1}},
+            1
         ) == VYL_HTTP1_OK
     );
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
@@ -151,13 +173,86 @@ int main(void) {
     assert(close(fd) == 0);
     assert(vyl_managed_static_host_cancel(server, token) == VYL_HTTP1_STALE_TOKEN);
 
+    fd = connect_loopback(port);
+    assert(
+        send(fd, chunked_request, sizeof(chunked_request) - 1, 0) ==
+        (ssize_t)(sizeof(chunked_request) - 1)
+    );
+    assert(
+        vyl_managed_static_poll_events(
+            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+        ) == VYL_HTTP1_OK
+    );
+    assert(report.copied == 1);
+    token = events[0].token;
+    uint8_t staged[16] = {0};
+    size_t staged_total = 0;
+    uint32_t body_end = 0;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    for (int i = 0; i < 5000 && body_end == 0; i++) {
+        uint8_t chunk[16] = {0};
+        size_t pulled = 0;
+        uint32_t end = 0;
+        assert(
+            vyl_managed_static_host_pull_body(server, token, chunk, sizeof(chunk), &pulled, &end) ==
+            VYL_HTTP1_OK
+        );
+        assert(staged_total + pulled <= sizeof(staged));
+        memcpy(staged + staged_total, chunk, pulled);
+        staged_total += pulled;
+        body_end = end;
+        if (body_end == 0) {
+            nanosleep(&pause, NULL);
+        }
+    }
+    assert(body_end == 1);
+    assert(staged_total == 5);
+    assert(memcmp(staged, "hello", 5) == 0);
+    uint8_t short_names[2] = {0};
+    uint8_t short_values[2] = {0};
+    vyl_managed_static_trailer_report trailer_report = {0};
+    assert(
+        vyl_managed_static_host_pull_trailers(
+            server, token, short_names, sizeof(short_names), short_values, sizeof(short_values),
+            &trailer_report
+        ) == VYL_HTTP1_OK
+    );
+    assert(trailer_report.fields == 1);
+    assert(trailer_report.names_copied == 0 && trailer_report.values_copied == 0);
+    assert(trailer_report.names_required == 5 && trailer_report.values_required == 2);
+    uint8_t names[5] = {0};
+    uint8_t values[2] = {0};
+    assert(
+        vyl_managed_static_host_pull_trailers(
+            server, token, names, sizeof(names), values, sizeof(values), &trailer_report
+        ) == VYL_HTTP1_OK
+    );
+    assert(trailer_report.fields == 1);
+    assert(trailer_report.names_copied == 5 && trailer_report.values_copied == 2);
+    assert(trailer_report.names_required == 0 && trailer_report.values_required == 0);
+    assert(memcmp(names, "X-Tag", 5) == 0);
+    assert(memcmp(values, "v1", 2) == 0);
+    assert(
+        vyl_managed_static_host_respond(
+            server,
+            token,
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    read_to_end(fd, response, sizeof(response));
+    assert(close(fd) == 0);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "managed-hi") != NULL);
+
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 1);
+    assert(counts.completed == 2);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 1
+            counts.shutdown == 2
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

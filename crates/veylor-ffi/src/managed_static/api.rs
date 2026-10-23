@@ -9,6 +9,10 @@ use super::{ManagedStaticState, VylManagedStaticCloseCounts, VylManagedStaticCon
 use super::{VylManagedStaticServer, server_error_to_result};
 use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
 
+// NOTE: mirrors the `veylor-server` static-route allowlist bounds; enforced here before any copy.
+const MAX_TRAILER_NAMES: usize = 32;
+const MAX_TRAILER_NAME_BYTES: usize = 128;
+
 
 
 
@@ -205,6 +209,84 @@ unsafe fn register_managed_route(
         Err(error) => return error,
     };
     match routes.register_managed(method, path, max_body_bytes) {
+        Ok(()) => VylResult::Ok,
+        Err(error) => server_error_to_result(error),
+    }
+}
+
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_register_managed_route_with_trailers(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    max_body_bytes: u64,
+    trailer_names: *const VylBytes,
+    trailer_count: usize,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        register_managed_with_trailers(
+            server,
+            method,
+            path,
+            max_body_bytes,
+            trailer_names,
+            trailer_count,
+        )
+    })
+}
+
+unsafe fn register_managed_with_trailers(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    max_body_bytes: u64,
+    trailer_names: *const VylBytes,
+    trailer_count: usize,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    let method = match unsafe { read_bytes(method) } {
+        Ok(method) => method,
+        Err(error) => return error,
+    };
+    let path = match unsafe { read_bytes(path) } {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if (trailer_names.is_null() && trailer_count != 0)
+        || !slice_length_valid::<VylBytes>(trailer_count)
+    {
+        return VylResult::InvalidArgument;
+    }
+    if trailer_count > MAX_TRAILER_NAMES {
+        return VylResult::InvalidArgument;
+    }
+    let mut trailers = Vec::with_capacity(trailer_count);
+    for index in 0..trailer_count {
+        let raw = unsafe { *trailer_names.add(index) };
+        let name = match unsafe { read_bytes(raw) } {
+            Ok(name) => name,
+            Err(error) => return error,
+        };
+        if name.is_empty() || name.len() > MAX_TRAILER_NAME_BYTES {
+            return VylResult::InvalidArgument;
+        }
+        trailers.push(name);
+    }
+    match routes.register_managed_with_trailers(method, path, max_body_bytes, &trailers) {
         Ok(()) => VylResult::Ok,
         Err(error) => server_error_to_result(error),
     }

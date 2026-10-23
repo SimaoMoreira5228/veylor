@@ -1,12 +1,16 @@
 use std::slice;
 
 use veylor_runtime::ConnectionToken;
-use veylor_server::{CancelOutcome, EventSlot, HostEventKind, PollReport, RespondOutcome};
+use veylor_server::{
+    CancelOutcome, EventSlot, HostEventKind, PollReport, RespondOutcome, TrailerOutcome,
+    TrailerReport,
+};
 
 use super::VylManagedStaticServer;
 use super::{
     ManagedStaticState, VYL_MANAGED_STATIC_EVENT_REQUEST, VYL_MANAGED_STATIC_EVENT_SHUTDOWN,
     VylManagedStaticEvent, VylManagedStaticPollReport, VylManagedStaticToken,
+    VylManagedStaticTrailerReport,
 };
 use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
 
@@ -247,6 +251,87 @@ fn respond_outcome_to_result(outcome: RespondOutcome) -> VylResult {
     }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_pull_trailers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    names: *mut u8,
+    names_capacity: usize,
+    values: *mut u8,
+    values_capacity: usize,
+    out_report: *mut VylManagedStaticTrailerReport,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        host_pull_trailers(
+            server,
+            token,
+            names,
+            names_capacity,
+            values,
+            values_capacity,
+            out_report,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn host_pull_trailers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    names: *mut u8,
+    names_capacity: usize,
+    values: *mut u8,
+    values_capacity: usize,
+    out_report: *mut VylManagedStaticTrailerReport,
+) -> VylResult {
+    if server.is_null() || out_report.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    unsafe {
+        out_report.write(VylManagedStaticTrailerReport::default());
+    }
+    if (names.is_null() && names_capacity != 0) || !slice_length_valid::<u8>(names_capacity) {
+        return VylResult::InvalidArgument;
+    }
+    if (values.is_null() && values_capacity != 0) || !slice_length_valid::<u8>(values_capacity) {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    let names = unsafe { mutable_bytes(names, names_capacity) };
+    let values = unsafe { mutable_bytes(values, values_capacity) };
+    let report = running
+        .host()
+        .pull_trailers(token_to_server(token), names, values);
+    unsafe {
+        out_report.write(report_from_trailers(report));
+    }
+    trailer_outcome_to_result(report.outcome)
+}
+
+fn trailer_outcome_to_result(outcome: TrailerOutcome) -> VylResult {
+    match outcome {
+        TrailerOutcome::Ok => VylResult::Ok,
+        TrailerOutcome::NotReady => VylResult::WouldBlock,
+        TrailerOutcome::Stale => VylResult::StaleToken,
+        TrailerOutcome::Duplicate => VylResult::Duplicate,
+        TrailerOutcome::Gone => VylResult::Gone,
+    }
+}
+
 fn token_to_server(token: VylManagedStaticToken) -> ConnectionToken {
     ConnectionToken {
         worker_id: token.worker_id,
@@ -291,6 +376,16 @@ fn report_from_poll(report: PollReport) -> VylManagedStaticPollReport {
         events_required: report.events_required,
         method_required: report.method_required,
         path_required: report.path_required,
+    }
+}
+
+fn report_from_trailers(report: TrailerReport) -> VylManagedStaticTrailerReport {
+    VylManagedStaticTrailerReport {
+        fields: report.fields,
+        names_copied: report.names_copied,
+        values_copied: report.values_copied,
+        names_required: report.names_required,
+        values_required: report.values_required,
     }
 }
 

@@ -817,3 +817,75 @@ fn managed_cap_rejects_over_cap_and_parks_under_cap() {
     let counts = server.join().expect("join server");
     assert_eq!(counts.completed, 1, "counts: {counts:?}");
 }
+
+#[test]
+fn managed_fixed_body_echo_round_trip_reuses_keep_alive() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut builder = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    builder
+        .register_managed(b"POST", b"/echo", MAX_STATIC_BODY_BYTES)
+        .expect("register echo");
+    let server = builder.start().expect("start server");
+    let host = server.host();
+    let mut stream = connect(&server);
+
+    for body in [b"hello echo".as_slice(), b"second pass".as_slice()] {
+        let head = format!(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("write head");
+        stream.write_all(body).expect("write body");
+        let token = ConnectionToken {
+            worker_id: 0,
+            slot: 0,
+            request_seq: 0,
+            stream_id: 0,
+            worker_generation: 0,
+            generation: 0,
+        };
+        let mut events = [EventSlot {
+            kind: HostEventKind::Shutdown,
+            token,
+            route_id: 0,
+            method_len: 0,
+            path_len: 0,
+            method_offset: 0,
+            path_offset: 0,
+        }];
+        let mut methods = [0; 64];
+        let mut paths = [0; 4096];
+        let report = host.poll(5_000_000_000, &mut events, &mut methods, &mut paths);
+        assert_eq!(report.copied, 1);
+        assert_eq!(events[0].kind, HostEventKind::Request);
+        // NOTE: the head and body travel in separate segments, so the park event can win
+        // the race against the body pump; retry the pull until the staged bytes complete
+        // or the test times out.
+        let mut collected = Vec::new();
+        let start = Instant::now();
+        loop {
+            let mut staged = [0; 16];
+            let (outcome, n, complete) = host.pull_body(events[0].token, &mut staged);
+            assert_eq!(outcome, RespondOutcome::Ok);
+            collected.extend_from_slice(&staged[..n]);
+            if complete {
+                break;
+            }
+            assert!(start.elapsed() < DEADLINE, "echo body stalls");
+            if n == 0 {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(collected, body);
+        assert_eq!(
+            host.respond(events[0].token, 200, b"OK", &collected),
+            RespondOutcome::Ok
+        );
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, body);
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
