@@ -1026,3 +1026,340 @@ fn managed_trailers_registration_rejects_bad_allowlist() {
         .register_managed_with_trailers(b"POST", b"/t", MAX_STATIC_BODY_BYTES, &[b"x-a"])
         .expect("valid allowlist registers");
 }
+
+fn wait_writable(host: &HostHandle, token: ConnectionToken) {
+    assert!(
+        spin_until(|| host.is_writable(token)),
+        "stream never armed writable"
+    );
+}
+
+fn read_raw_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+        assert!(head.len() < 65536, "head overflow");
+    }
+    head
+}
+
+fn read_chunk_frame(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0; 1];
+    while !line.ends_with(b"\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => panic!("eof mid-chunk-size"),
+            Ok(_) => line.push(byte[0]),
+            Err(error) => panic!("read chunk size: {error:?}"),
+        }
+    }
+    let size = usize::from_str_radix(
+        std::str::from_utf8(&line[..line.len() - 2])
+            .expect("size utf8")
+            .trim(),
+        16,
+    )
+    .expect("size hex");
+    if size == 0 {
+        let mut crlf = [0; 2];
+        stream.read_exact(&mut crlf).expect("final crlf");
+        assert_eq!(&crlf, b"\r\n");
+        return None;
+    }
+    let mut chunk = vec![0; size];
+    stream.read_exact(&mut chunk).expect("chunk bytes");
+    let mut crlf = [0; 2];
+    stream.read_exact(&mut crlf).expect("chunk crlf");
+    assert_eq!(&crlf, b"\r\n");
+    Some(chunk)
+}
+
+fn read_chunked(stream: &mut TcpStream) -> (u16, Vec<u8>, Vec<u8>) {
+    let head = read_raw_head(stream);
+    let text = String::from_utf8(head.clone()).expect("head utf8");
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("status int");
+    assert!(
+        text.contains("Transfer-Encoding: chunked"),
+        "stream head must be chunked"
+    );
+    let mut raw = head;
+    let mut body = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let mut byte = [0; 1];
+        while !line.ends_with(b"\r\n") {
+            match stream.read(&mut byte) {
+                Ok(0) => panic!("eof mid-chunk-size"),
+                Ok(_) => line.push(byte[0]),
+                Err(error) => panic!("read chunk size: {error:?}"),
+            }
+        }
+        raw.extend_from_slice(&line);
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&line[..line.len() - 2]).expect("size utf8"),
+            16,
+        )
+        .expect("size hex");
+        if size == 0 {
+            let mut crlf = [0; 2];
+            stream.read_exact(&mut crlf).expect("final crlf");
+            raw.extend_from_slice(&crlf);
+            break;
+        }
+        let mut chunk = vec![0; size];
+        stream.read_exact(&mut chunk).expect("chunk bytes");
+        raw.extend_from_slice(&chunk);
+        let mut crlf = [0; 2];
+        stream.read_exact(&mut crlf).expect("chunk crlf");
+        raw.extend_from_slice(&crlf);
+        body.extend_from_slice(&chunk);
+    }
+    (status, raw, body)
+}
+
+#[test]
+fn managed_stream_begin_writes_end_exact_and_reuses() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(
+        host.write_stream(event.token, b"hello "),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(host.write_stream(event.token, b"world"), RespondOutcome::Ok);
+    wait_writable(&host, event.token);
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (status, raw, body) = read_chunked(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello world");
+    assert_eq!(
+        raw,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"
+    );
+    assert_eq!(
+        host.end_stream(event.token),
+        RespondOutcome::Gone,
+        "post-end ops observe Gone after unpark"
+    );
+    get(&mut stream, "/work");
+    let (second, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(second.token, 200, b"OK", b"again"),
+        RespondOutcome::Ok
+    );
+    let reused = read_response(&mut stream);
+    assert_eq!(reused.status, 200);
+    assert_eq!(reused.body, b"again");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_stream_write_without_writable_rejected_then_admitted() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.write_stream(event.token, &[]),
+        RespondOutcome::Invalid,
+        "empty chunk rejects"
+    );
+    assert_eq!(
+        host.write_stream(event.token, &[b'x'; 16_384 + 1]),
+        RespondOutcome::BodyTooLarge,
+        "chunk past MAX_STREAM_WRITE rejects"
+    );
+    assert_eq!(
+        host.write_stream(event.token, &[b'x'; 9000]),
+        RespondOutcome::BodyTooLarge,
+        "chunk whose frame cannot fit the output rejects at stage"
+    );
+    assert_eq!(
+        host.write_stream(event.token, b"early"),
+        RespondOutcome::NotWritable,
+        "write with no stream rejects"
+    );
+    let unknown = ConnectionToken {
+        request_seq: 9999,
+        ..event.token
+    };
+    assert!(!host.is_writable(unknown), "unknown token never writable");
+    assert_eq!(
+        host.write_stream(unknown, b"early"),
+        RespondOutcome::NotWritable,
+        "write with no token rejects"
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(host.write_stream(event.token, b"late"), RespondOutcome::Ok);
+    // NOTE: the queued window is transient by design (the worker applies within microseconds),
+    // so the test loops until the queue is observed: every iteration is either an admission
+    // (a full worker cycle completed first) or the expected rejection, and the admitted bytes
+    // are tracked so the wire body stays exact. A wedged worker breaks the loop immediately
+    // instead of hanging the suite.
+    let mut agains = 0u32;
+    loop {
+        match host.write_stream(event.token, b"again") {
+            RespondOutcome::Ok => agains += 1,
+            RespondOutcome::WouldBlock | RespondOutcome::NotWritable => break,
+            other => panic!("unexpected write outcome: {other:?}"),
+        }
+        assert!(agains < 1000, "worker outran the stage loop");
+    }
+    wait_writable(&host, event.token);
+    assert_eq!(host.write_stream(event.token, b"!"), RespondOutcome::Ok);
+    wait_writable(&host, event.token);
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (_, _, body) = read_chunked(&mut stream);
+    let mut expected = b"late".to_vec();
+    for _ in 0..agains {
+        expected.extend_from_slice(b"again");
+    }
+    expected.extend_from_slice(b"!");
+    assert_eq!(body, expected);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_stream_end_twice_fails_closed() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    // NOTE: the queued end applies within microseconds, so a single second end races between
+    // Duplicate (queued) and Gone (applied): loop until the apply is observed. Every iteration
+    // is one of the two legal outcomes, so the test cannot flake either way.
+    let mut spins = 0u32;
+    loop {
+        match host.end_stream(event.token) {
+            RespondOutcome::Duplicate => spins += 1,
+            RespondOutcome::Gone => break,
+            other => panic!("unexpected end outcome: {other:?}"),
+        }
+        assert!(spins < 1_000_000, "staged end never applied");
+    }
+    let (status, raw, body) = read_chunked(&mut stream);
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert!(
+        raw.ends_with(b"0\r\n\r\n"),
+        "stream ends with terminal chunk"
+    );
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Gone);
+    assert_eq!(
+        host.write_stream(event.token, b"late"),
+        RespondOutcome::Gone
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Gone
+    );
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_stream_cancel_mid_stream_closes() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(
+        host.write_stream(event.token, b"partial"),
+        RespondOutcome::Ok
+    );
+    let head = read_raw_head(&mut stream);
+    let text = String::from_utf8(head).expect("head utf8");
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK"),
+        "stream head sent: {text}"
+    );
+    assert_eq!(
+        read_chunk_frame(&mut stream),
+        Some(b"partial".to_vec()),
+        "first chunk flushes before cancel"
+    );
+    assert_eq!(host.cancel(event.token), CancelOutcome::Ok);
+    expect_eof(&mut stream);
+    assert_eq!(
+        host.write_stream(event.token, b"late"),
+        RespondOutcome::Gone,
+        "cancelled stream tombs Gone"
+    );
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Gone);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.cancelled, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn managed_stream_begin_no_body_status_rejected() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 204, b"No Content"),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 304, b"Not Modified"),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 100, b"Continue"),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"bad\r\nreason"),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"fallback"),
+        RespondOutcome::Ok,
+        "rejected begins stage nothing"
+    );
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"fallback");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}

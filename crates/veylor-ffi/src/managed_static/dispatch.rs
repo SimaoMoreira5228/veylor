@@ -248,6 +248,8 @@ fn respond_outcome_to_result(outcome: RespondOutcome) -> VylResult {
         RespondOutcome::Gone => VylResult::Gone,
         RespondOutcome::Invalid => VylResult::InvalidArgument,
         RespondOutcome::BodyTooLarge => VylResult::BodyTooLong,
+        RespondOutcome::NotWritable => VylResult::BadState,
+        RespondOutcome::WouldBlock => VylResult::WouldBlock,
     }
 }
 

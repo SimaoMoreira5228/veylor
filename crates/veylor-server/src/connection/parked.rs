@@ -1,6 +1,6 @@
 use veylor_http1::{
-    BodyDecoder, BodyEvent, BodyLimits, ConnectionHeader, Header, Limits, ResponseBody,
-    ResponseFraming, ResponseToWrite, connection_header_for_response, encode_response_head,
+    BodyDecoder, BodyLimits, ConnectionHeader, Header, ResponseBody, ResponseFraming,
+    ResponseToWrite, connection_header_for_response, encode_response_head,
 };
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
 
@@ -10,10 +10,13 @@ use crate::host::{
 };
 use crate::static_routes::{encode_continue, respond_payload_too_large};
 
+use super::streams::{apply_stream_cmd, decode_chunked, take_stream_cmd};
 use super::{
     ConnClose, ConnPhase, ConnState, ExchangeOutcome, INPUT_CAP, PumpOutcome, PumpProgress,
-    StagedTrailer, TrailerOutcome, TrailerReport, connection_value, field, trailer_allowed,
+    TrailerOutcome, TrailerReport, connection_value,
 };
+
+pub(crate) use super::streams::{StreamCmd, StreamState, push_staged_body};
 
 // NOTE: request-trailer staging bounds: at most TRAILER_SLOTS fields and MAX_STAGED_TRAILER_BYTES
 // of staged name/value bytes per park; the first field past either cap fails the connection closed.
@@ -156,6 +159,12 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
         conn.out_sent += accepted;
         progress.bytes_written = accepted as u64;
         return PumpOutcome::Keep(progress);
+    }
+    let staged = host
+        .with_inner(|inner| (take_stream_cmd(inner, event_token), None))
+        .and_then(|(cmd, _)| cmd);
+    if let Some(cmd) = staged {
+        return apply_stream_cmd(conn, host, event_token, cmd, progress);
     }
     let read_ready = conn.read_ready;
     let read_scratch = if conn.len < INPUT_CAP {
@@ -400,6 +409,8 @@ impl ParkedEntry {
         Self {
             token,
             staged: None,
+            stream_cmd: None,
+            stream: None,
             body_total,
             body: Vec::new(),
             body_pulled: 0,
@@ -408,40 +419,21 @@ impl ParkedEntry {
     }
 }
 
-pub(crate) fn push_staged_body(
-    inner: &mut HostInner,
-    token: ConnectionToken,
-    bytes: &[u8],
-) -> bool {
-    let Some(entry) = inner
-        .parked
-        .get_mut(token.worker_id as usize)
-        .and_then(|table| table.get_mut(token.slot as usize))
-        .and_then(|entry| entry.as_mut())
-    else {
-        return false;
-    };
-    if entry.token != token || entry.staged.is_some() {
-        return false;
-    }
-    if entry.body_pulled + entry.body.len() as u64 + bytes.len() as u64 > entry.body_total {
-        return false;
-    }
-    entry.body.extend_from_slice(bytes);
-    true
-}
-
 pub(crate) fn pull_staged_body(
     inner: &mut HostInner,
     token: ConnectionToken,
     out: &mut [u8],
 ) -> (RespondOutcome, usize, bool) {
+    // NOTE: a staged-but-unapplied stream command fails body pulls closed with Stale; the
+    // cause is known-wrong (the entry is live) but serving body mid-response risks order.
     let live = inner
         .parked
         .get(token.worker_id as usize)
         .and_then(|table| table.get(token.slot as usize))
         .and_then(|entry| entry.as_ref())
-        .is_some_and(|entry| entry.token == token && entry.staged.is_none());
+        .is_some_and(|entry| {
+            entry.token == token && entry.staged.is_none() && entry.stream_cmd.is_none()
+        });
     if !live {
         let outcome = match find_tomb(inner, token.worker_id as usize, token) {
             Some(TombCause::Gone) => RespondOutcome::Gone,
@@ -464,86 +456,6 @@ pub(crate) fn pull_staged_body(
     entry.body_pulled += take as u64;
     let complete = entry.body_pulled == entry.body_total;
     (RespondOutcome::Ok, take, complete)
-}
-
-// NOTE: chunked completion reuses the declared-total observation with no new pull flag: a
-// chunked park starts unknown (body_total u64::MAX, so pulls never report complete early)
-// and the terminal 0-chunk collapses the total onto the exact staged byte count, making
-// pulled == total true exactly when the host drains the last decoded byte. A separate
-// chunked_done triple flag would fork every BodyPull consumer for zero new information,
-// since "no more bytes will arrive" already is the predicate; the phase-side chunked_done
-// flag exists only because complete_parked cannot query the entry.
-pub(crate) struct ChunkedFeed {
-    pub(crate) consumed: usize,
-    pub(crate) decoded: u64,
-    pub(crate) done: bool,
-    pub(crate) failed: bool,
-}
-
-impl HostShared {
-    pub(crate) fn mark_chunked_done(&self, token: ConnectionToken) -> bool {
-        let marked = self.with_inner(|inner| {
-            let done = inner
-                .parked
-                .get_mut(token.worker_id as usize)
-                .and_then(|table| table.get_mut(token.slot as usize))
-                .and_then(|entry| entry.as_mut())
-                .is_some_and(|entry| {
-                    if entry.token != token {
-                        return false;
-                    }
-                    entry.body_total = entry.body_pulled + entry.body.len() as u64;
-                    entry.trailers.get_or_insert_with(Vec::new);
-                    true
-                });
-            (done, None)
-        });
-        marked.is_some_and(|(done, _)| done)
-    }
-
-    pub(crate) fn stage_trailer_field(
-        &self,
-        token: ConnectionToken,
-        name: &[u8],
-        value: &[u8],
-    ) -> bool {
-        let staged = self.with_inner(|inner| {
-            let entry = inner
-                .parked
-                .get_mut(token.worker_id as usize)
-                .and_then(|table| table.get_mut(token.slot as usize))
-                .and_then(|entry| entry.as_mut());
-            let Some(entry) = entry else {
-                return (false, None);
-            };
-            if entry.token != token || entry.staged.is_some() {
-                return (false, None);
-            }
-            if entry
-                .trailers
-                .as_ref()
-                .is_some_and(|fields| fields.len() >= TRAILER_SLOTS)
-            {
-                return (false, None);
-            }
-            let mut total = 0usize;
-            for field in entry.trailers.iter().flatten() {
-                total += field.name.len() + field.value.len();
-            }
-            if total + name.len() + value.len() > MAX_STAGED_TRAILER_BYTES {
-                return (false, None);
-            }
-            entry
-                .trailers
-                .get_or_insert_with(Vec::new)
-                .push(StagedTrailer {
-                    name: name.to_vec(),
-                    value: value.to_vec(),
-                });
-            (true, None)
-        });
-        staged.is_some_and(|(done, _)| done)
-    }
 }
 
 impl crate::host::HostHandle {
@@ -629,105 +541,4 @@ fn pull_parked_trailers(
         values_copied: values_used,
         ..TrailerReport::default()
     }
-}
-
-fn stage_new_trailers(
-    conn: &mut ConnState,
-    host: &HostShared,
-    event_token: ConnectionToken,
-    base: usize,
-    end: usize,
-) -> bool {
-    while conn.trailer_staged < TRAILER_SLOTS {
-        let staged = conn.trailer_staged;
-        let header = conn.trailer_slots[staged];
-        if header.name.length == 0 {
-            break;
-        }
-        let input = &conn.input[base..end];
-        let (Some(name), Some(value)) = (field(input, header.name), field(input, header.value))
-        else {
-            return false;
-        };
-        if !trailer_allowed(&conn.trailer_allow, &conn.trailer_conn, name) {
-            return false;
-        }
-        if !host.stage_trailer_field(event_token, name, value) {
-            return false;
-        }
-        conn.trailer_staged = staged + 1;
-    }
-    true
-}
-
-// NOTE: the decoder is driven directly, not via the request wrapper: the route allowlist copied at
-// park gates each stored field alongside Connection-nominated and request-prohibited names, while
-// staged bytes copy into the host entry for whole-set pulls after end-of-body. Unlisted or refused
-// fields fail closed here; prohibited names and quota breaches also fail inside the decoder verdicts,
-// and chunk extensions are consumed and ignored within the extension quota by the same verdicts. No
-// framing syntax is re-implemented: size lines, CRLF strictness, and overflow checks are the http1
-// layer's.
-// NOTE: the decoder lives worker-side because BodyDecoder is !Send on this toolchain (raw
-// trailer-base pointer) while HostInner crosses threads; ConnState never leaves its worker,
-// matching the existing parser/headers placement. The slots buffer lives in ConnState so the base
-// pointer stays stable across turns; spans never escape the turn that stored them because each new
-// field copies out to host staging before any compaction runs.
-fn decode_chunked(
-    conn: &mut ConnState,
-    host: &HostShared,
-    event_token: ConnectionToken,
-) -> ChunkedFeed {
-    let mut feed = ChunkedFeed {
-        consumed: 0,
-        decoded: 0,
-        done: false,
-        failed: false,
-    };
-    loop {
-        let Some(decoder) = conn.chunked_decoder.as_mut() else {
-            feed.failed = true;
-            break;
-        };
-        let base = feed.consumed;
-        let end = conn.len;
-        let next = match decoder.next(
-            &conn.input[base..end],
-            false,
-            &mut conn.trailer_slots,
-            Limits::default(),
-        ) {
-            Ok(next) => next,
-            Err(_) => {
-                feed.failed = true;
-                break;
-            }
-        };
-        if !stage_new_trailers(conn, host, event_token, base, end) {
-            feed.failed = true;
-            break;
-        }
-        match next.event {
-            Some(BodyEvent::Data(span)) => {
-                let start = base + span.offset;
-                if !host.push_body(event_token, &conn.input[start..start + span.length]) {
-                    break;
-                }
-                feed.decoded += span.length as u64;
-            }
-            Some(BodyEvent::Trailers { count }) => {
-                if count != conn.trailer_staged || !host.mark_chunked_done(event_token) {
-                    feed.failed = true;
-                    break;
-                }
-                feed.done = true;
-            }
-            Some(BodyEvent::Complete) => {}
-            None => {}
-        }
-        feed.consumed += next.consumed;
-        if feed.done || next.event.is_none() && next.consumed == 0 {
-            break;
-        }
-    }
-    feed
 }

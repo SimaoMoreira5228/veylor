@@ -1,4 +1,5 @@
 pub(crate) mod parked;
+pub(crate) mod streams;
 
 pub(crate) use parked::{pull_staged_body, push_staged_body};
 

@@ -6,9 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-veylor-runtime = { path = "../veylor-runtime" }
-veylor-router = { path = "../veylor-router" }
-veylor-http1 = { path = "../veylor-http1" }
+veylor-runtime = { version = "0.1.0", path = "../veylor-runtime" }
+veylor-router = { version = "0.1.0", path = "../veylor-router" }
+veylor-http1 = { version = "0.1.0", path = "../veylor-http1" }
 
 [lints]
 workspace = true

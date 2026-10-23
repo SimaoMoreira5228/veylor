@@ -41,6 +41,8 @@ pub(crate) enum StagedAction {
 pub(crate) struct ParkedEntry {
     pub(crate) token: ConnectionToken,
     pub(crate) staged: Option<StagedAction>,
+    pub(crate) stream_cmd: Option<crate::connection::parked::StreamCmd>,
+    pub(crate) stream: Option<crate::connection::parked::StreamState>,
     pub(crate) body_total: u64,
     pub(crate) body: Vec<u8>,
     pub(crate) body_pulled: u64,
@@ -60,7 +62,7 @@ pub(crate) struct Tomb {
     cause: TombCause,
 }
 
-struct HostEvent {
+pub(crate) struct HostEvent {
     kind: HostEventKind,
     token: ConnectionToken,
     route_id: u64,
@@ -103,6 +105,8 @@ pub enum RespondOutcome {
     Gone,
     Invalid,
     BodyTooLarge,
+    NotWritable,
+    WouldBlock,
 }
 
 // NOTE: pull triple (outcome, bytes copied, end-of-body); Duplicate means already answered.
@@ -138,13 +142,13 @@ pub struct StagedWork {
 }
 
 pub(crate) struct HostInner {
-    events: Vec<VecDeque<HostEvent>>,
+    pub(crate) events: Vec<VecDeque<HostEvent>>,
     pub(crate) parked: Vec<Vec<Option<ParkedEntry>>>,
     pub(crate) tombs: Vec<VecDeque<Tomb>>,
     seqs: Vec<Vec<u32>>,
-    wakers: Vec<Option<WakeHandle>>,
+    pub(crate) wakers: Vec<Option<WakeHandle>>,
     next_poll: usize,
-    counters: HostCounters,
+    pub(crate) counters: HostCounters,
 }
 
 pub struct HostShared {
@@ -335,7 +339,9 @@ impl HostShared {
                 // failing here: the slot may hold a newer exchange with a bumped park
                 // sequence while the tomb records what happened to this exact token.
                 if entry.token == token {
-                    if entry.staged.is_some() {
+                    // NOTE: one-shot respond loses to an open or staged stream: the entry stays
+                    // parked for pump-pull, so a late fixed respond reports Duplicate, never hijack.
+                    if entry.staged.is_some() || entry.stream.is_some() {
                         inner.counters.responds_duplicate += 1;
                         return (RespondOutcome::Duplicate, None);
                     }
@@ -431,6 +437,8 @@ impl HostShared {
             for slot in 0..inner.parked[worker].len() {
                 let action = inner.parked[worker][slot]
                     .as_mut()
+                    // NOTE: stream entries stay parked for pump-pull; take_staged never consumes them.
+                    .filter(|entry| entry.stream.is_none())
                     .and_then(|entry| entry.staged.take());
                 let Some(action) = action else { continue };
                 let entry = inner.parked[worker][slot].take();
@@ -741,7 +749,7 @@ fn drain_pending(
     report
 }
 
-fn valid_reason(reason: &[u8]) -> bool {
+pub(crate) fn valid_reason(reason: &[u8]) -> bool {
     !reason.is_empty()
         && !reason.iter().any(|byte| {
             *byte == b'\r' || *byte == b'\n' || (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f
