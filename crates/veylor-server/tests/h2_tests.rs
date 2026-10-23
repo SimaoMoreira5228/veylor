@@ -11,6 +11,8 @@ use veylor_http2::{
     encode_frame_header, encode_header_block,
 };
 use veylor_runtime::ConnectionToken;
+
+type TrailerFields = Vec<(Vec<u8>, Vec<u8>)>;
 use veylor_server::{
     ACK_SLOTS, CancelOutcome, CloseCounts, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES,
     ENCODE_ENTRIES, EventSlot, FrozenRoute, FrozenRoutesView, H2_BODY_CAP, H2Conn, H2HostCtx,
@@ -1592,5 +1594,267 @@ fn h2_managed_short_body_reset_stream_survives() {
     assert_eq!(sibling.body, b"hello");
     let counts = stop_join(server);
     assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+fn spin_until(mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + DEADLINE;
+    while !ready() {
+        assert!(Instant::now() < deadline, "spun waiting for host state");
+        std::thread::yield_now();
+    }
+}
+
+fn post_upload_open(stream: &mut TcpStream, id: u32, body: &[u8]) {
+    send_headers_len(
+        stream,
+        id,
+        b"POST",
+        b"/upload",
+        Some(body.len() as u64),
+        false,
+    );
+    write_frame(stream, FrameType::Data, 0, id, body);
+}
+
+fn pull_trailers_ready(host: &HostHandle, token: ConnectionToken) -> (Vec<u8>, Vec<u8>) {
+    let deadline = Instant::now() + DEADLINE;
+    let mut names = vec![0; 256];
+    let mut values = vec![0; 1024];
+    loop {
+        let report = host.pull_trailers(token, &mut names, &mut values);
+        match report.outcome {
+            veylor_server::TrailerOutcome::Ok => {
+                names.truncate(report.names_copied);
+                values.truncate(report.values_copied);
+                return (names, values);
+            }
+            veylor_server::TrailerOutcome::NotReady | veylor_server::TrailerOutcome::Stale => {}
+            outcome => panic!("unexpected trailer outcome: {outcome:?}"),
+        }
+        assert!(Instant::now() < deadline, "trailers never staged");
+        std::thread::yield_now();
+    }
+}
+
+fn read_block(stream: &mut TcpStream, id: u32, first: (FrameHeader, Vec<u8>)) -> (Vec<u8>, bool) {
+    let (header, mut block) = first;
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(header.stream_id, id);
+    let mut ended = header.flags & HEADERS_FLAG_END_STREAM != 0;
+    let mut flags = header.flags;
+    while flags & HEADERS_FLAG_END_HEADERS == 0 {
+        let (next, payload) = read_frame(stream);
+        assert_eq!(next.frame_type, FrameType::Continuation);
+        assert_eq!(next.stream_id, id);
+        flags = next.flags;
+        block.extend_from_slice(&payload);
+        ended = ended || flags & HEADERS_FLAG_END_STREAM != 0;
+        if flags & CONTINUATION_FLAG_END_HEADERS != 0 {
+            break;
+        }
+    }
+    (block, ended)
+}
+
+fn decode_fields(block: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    let (count, _) = decode_header_block(block, &mut decoder, &mut decoded).expect("decode block");
+    decoded
+        .iter()
+        .take(count)
+        .map(|header| {
+            let name = decoder.resolve(header.field.name).expect("name").to_vec();
+            let value = decoder.resolve(header.field.value).expect("value").to_vec();
+            (name, value)
+        })
+        .collect()
+}
+
+fn read_response_with_trailers(stream: &mut TcpStream, id: u32) -> (Response, TrailerFields) {
+    let (block, mut ended) = loop {
+        let frame = read_frame(stream);
+        if frame.0.frame_type == FrameType::WindowUpdate {
+            continue;
+        }
+        break read_block(stream, id, frame);
+    };
+    let mut response = decode_response(&block);
+    let mut body = Vec::new();
+    let mut trailers = Vec::new();
+    while !ended {
+        let (header, payload) = read_frame(stream);
+        assert_eq!(header.stream_id, id);
+        match header.frame_type {
+            FrameType::Data => {
+                body.extend_from_slice(&payload);
+                ended = header.flags & DATA_FLAG_END_STREAM != 0;
+            }
+            FrameType::Headers => {
+                let (block, end) = read_block(stream, id, (header, payload));
+                ended = end;
+                trailers.extend(decode_fields(&block));
+            }
+            FrameType::WindowUpdate => {}
+            found => panic!("unexpected frame: {found:?}"),
+        }
+    }
+    response.body = body;
+    (response, trailers)
+}
+
+#[test]
+fn h2_managed_request_trailers_stage_and_pull() {
+    let server = managed_h2_body_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    post_upload_open(&mut stream, 1, b"data");
+    let (event, method, path) = poll_h2_request(&host);
+    assert_eq!(method, b"POST");
+    assert_eq!(path, b"/upload");
+    send_trailers(
+        &mut stream,
+        1,
+        &[(b"x-checksum", b"abc"), (b"x-count", b"2")],
+    );
+    assert_eq!(pull_all(&host, event.token), b"data");
+    let (names, values) = pull_trailers_ready(&host, event.token);
+    assert_eq!(names, b"x-checksum\x00x-count");
+    assert_eq!(values, b"abc\x002");
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let (grants, response) = read_response_with_grants(&mut stream, 1);
+    assert_eq!(grants, vec![(0, 4), (1, 4)]);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"done");
+    post_upload(&mut stream, 3, b"again");
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(pull_all(&host, event.token), b"again");
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"second"),
+        RespondOutcome::Ok
+    );
+    let (_, response) = read_response_with_grants(&mut stream, 3);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"second");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_prohibited_trailer_rsts_stream_sibling_fine() {
+    // NOTE: stream ids ascend here: a lower id opened after a higher one is implicitly
+    // closed per RFC 9113 section 5.1.1, which would RST the sibling for protocol reasons.
+    let server = managed_h2_body_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    post_upload_open(&mut stream, 1, b"data");
+    poll_h2_request(&host);
+    send_trailers(&mut stream, 1, &[(b"connection", b"close")]);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    post_upload_open(&mut stream, 3, b"data");
+    poll_h2_request(&host);
+    send_trailers(&mut stream, 3, &[(b":method", b"GET")]);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 3);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    send_headers(&mut stream, 5, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 5);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_refused, 2, "counts: {counts:?}");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_stream_end_with_trailers_exact_bytes() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.write_stream(event.token, b"chunk-one"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.write_stream(event.token, b"chunk-two"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.end_stream_with_trailers(
+            event.token,
+            &[(b"x-resp-trailer", b"trailer-value"), (b"x-count", b"2")]
+        ),
+        RespondOutcome::Ok
+    );
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"chunk-onechunk-two");
+    assert_eq!(
+        trailers,
+        vec![
+            (b"x-resp-trailer".to_vec(), b"trailer-value".to_vec()),
+            (b"x-count".to_vec(), b"2".to_vec()),
+        ]
+    );
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_write_after_trailers_fail_closed() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-end", b"1")]),
+        RespondOutcome::Ok
+    );
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    assert_eq!(trailers, vec![(b"x-end".to_vec(), b"1".to_vec())]);
+    assert_eq!(
+        host.write_stream(event.token, b"late"),
+        RespondOutcome::Gone
+    );
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Gone);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Gone
+    );
+    let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }

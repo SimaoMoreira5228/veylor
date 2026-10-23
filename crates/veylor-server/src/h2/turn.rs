@@ -501,6 +501,7 @@ pub(crate) fn pump_slot(
     let mut close_reason: Option<ConnClose> = None;
     let mut eof = false;
     let mut progressed = apply_h2_staged(meta, conn, turn);
+    progressed |= super::apply_h2_streams(meta, conn, turn);
     if let H2Flush::Closed(reason) = flush_pending(meta, stream_poller, &mut turn.budget) {
         close_reason = Some(reason);
     }

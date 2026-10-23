@@ -1763,6 +1763,49 @@ fn dispatch_pull_body_partial_copies_and_completion_query() {
 }
 
 #[test]
+fn dispatch_body_round_trip_then_reuses_connection() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    unsafe { register_managed(server, b"GET", b"/m", u64::MAX) };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nhello")
+        .expect("write post");
+    let token = unsafe { poll_one(server) };
+    assert_eq!(unsafe { drain_body(server, token) }, b"hello");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"stored"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"stored");
+    stream
+        .write_all(b"GET /m HTTP/1.1\r\nHost: test\r\n\r\n")
+        .expect("write reuse");
+    let token = unsafe { poll_one(server) };
+    assert_ne!(token.request_seq, 0, "reused slot parks a fresh sequence");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"again"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"again");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 0, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
 fn dispatch_shutdown_event_arrives_after_stop() {
     let config = test_config(0);
     let server = unsafe { create(&config) };

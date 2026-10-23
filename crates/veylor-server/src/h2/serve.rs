@@ -1,0 +1,584 @@
+use veylor_http1::is_token;
+use veylor_http2::{
+    ErrorCode, H2ServerDriver, HeaderRange, HeadersFrameWriter, HpackHeader, ServerError,
+    StreamState, ValidatedServerRequest, encode_header_block,
+};
+use veylor_runtime::ConnectionToken;
+
+use crate::connection::StagedTrailer;
+use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
+use crate::connection::streams::{StreamCmd, take_stream_cmd};
+use crate::host::HostShared;
+
+use super::routes::{FrozenRoutesView, NOT_FOUND_BODY, field, send_full};
+use super::turn;
+use super::{
+    H2_BODY_CAP, H2Conn, H2HostCtx, Phase, STREAM_SLOTS, StepOutcome, StreamEvent, fail_goaway,
+};
+
+pub(crate) struct Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
+    pub(crate) server: &'s mut H2ServerDriver<'b, 't, 'd, 'e>,
+    pub(crate) headers: &'s [HpackHeader],
+    pub(crate) data: &'u [u8],
+    pub(crate) terminal: &'s mut bool,
+    pub(crate) routes: &'o FrozenRoutesView<'o>,
+    pub(crate) host: Option<H2HostCtx<'h>>,
+    pub(crate) output: &'o mut [u8],
+    pub(crate) used: &'o mut usize,
+    pub(crate) outcome: &'o mut StepOutcome,
+}
+
+impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
+    fn fail(&mut self, code: ErrorCode) {
+        let last = self.server.driver().streams().highest_remote();
+        let max = self
+            .server
+            .driver()
+            .streams()
+            .remote_settings()
+            .max_frame_size;
+        fail_goaway(
+            last,
+            max,
+            self.terminal,
+            self.output,
+            self.used,
+            self.outcome,
+            code,
+        );
+    }
+
+    fn deny(&mut self, stream: u32, code: ErrorCode, close: bool) {
+        let staged = if code == ErrorCode::RefusedStream {
+            self.server.refuse(stream, &mut self.output[*self.used..])
+        } else {
+            self.server
+                .rst_stream(stream, code, &mut self.output[*self.used..])
+        };
+        match staged {
+            Ok(writer) => {
+                *self.used += writer.pending_bytes().len();
+                self.outcome.refused += 1;
+            }
+            Err(ServerError::StreamClosed | ServerError::UnknownStream) => {}
+            Err(_) => self.fail(ErrorCode::InternalError),
+        }
+        if close {
+            self.outcome.closed = true;
+        }
+    }
+
+    fn stage_request_trailers(&mut self, stream: u32, range: HeaderRange, end: bool) -> H2Trailer {
+        let Some(ctx) = self.host else {
+            return H2Trailer::Conn;
+        };
+        let Some(fields) = self.headers.get(range.start..range.start + range.count) else {
+            return H2Trailer::Conn;
+        };
+        let mut staged = Vec::new();
+        for header in fields {
+            let Some((name, value)) = self.server.driver().resolve_header(*header) else {
+                return H2Trailer::Stream(ErrorCode::ProtocolError);
+            };
+            if staged.len() >= TRAILER_SLOTS || !valid_trailer_field(name, value) {
+                return H2Trailer::Stream(ErrorCode::ProtocolError);
+            }
+            staged.push((name, value));
+        }
+        let sub = (stream >> 1) as usize % STREAM_SLOTS;
+        let slot = ctx.base.slot + sub as u32;
+        let worker = ctx.base.worker_id;
+        let verdict = ctx.host.with_inner(|inner| {
+            let entry = inner
+                .parked
+                .get_mut(worker as usize)
+                .and_then(|table| table.get_mut(slot as usize))
+                .and_then(|entry| entry.as_mut());
+            let Some(entry) = entry else {
+                return (H2Trailer::Conn, None);
+            };
+            if entry.token.stream_id != stream || entry.token.slot != slot {
+                return (H2Trailer::Conn, None);
+            }
+            if entry.staged.is_some() {
+                return (H2Trailer::Stream(ErrorCode::RefusedStream), None);
+            }
+            let have = entry.trailers.as_ref().map_or(0, Vec::len);
+            if have + staged.len() > TRAILER_SLOTS {
+                return (H2Trailer::Stream(ErrorCode::ProtocolError), None);
+            }
+            let mut total = 0usize;
+            for field in entry.trailers.iter().flatten() {
+                total += field.name.len() + field.value.len();
+            }
+            for (name, value) in &staged {
+                total += name.len() + value.len();
+                if total > MAX_STAGED_TRAILER_BYTES {
+                    return (H2Trailer::Stream(ErrorCode::ProtocolError), None);
+                }
+            }
+            let fields = entry.trailers.get_or_insert_with(Vec::new);
+            for (name, value) in &staged {
+                fields.push(StagedTrailer {
+                    name: name.to_vec(),
+                    value: value.to_vec(),
+                });
+            }
+            if end && entry.body_pulled + entry.body.len() as u64 != entry.body_total {
+                return (H2Trailer::Stream(ErrorCode::ProtocolError), None);
+            }
+            (H2Trailer::Staged, None)
+        });
+        verdict
+            .map(|(verdict, _)| verdict)
+            .unwrap_or(H2Trailer::Conn)
+    }
+
+    pub(crate) fn serve_one(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Headers { stream, range, end } => {
+                let fields = match self.headers.get(range.start..range.start + range.count) {
+                    Some(fields) => fields,
+                    None => return self.fail(ErrorCode::ProtocolError),
+                };
+                let request = match self.server.accept_request(stream, fields) {
+                    Ok(request) => request,
+                    Err(ServerError::RefusedStream) => {
+                        return self.deny(stream, ErrorCode::RefusedStream, false);
+                    }
+                    Err(
+                        ServerError::StreamClosed
+                        | ServerError::UnknownStream
+                        | ServerError::NewStreamsClosed,
+                    ) => return,
+                    Err(ServerError::Request(_)) => {
+                        match self.stage_request_trailers(stream, range, end) {
+                            H2Trailer::Staged => return,
+                            H2Trailer::Stream(code) => return self.deny(stream, code, false),
+                            H2Trailer::Conn => return self.fail(ErrorCode::ProtocolError),
+                        }
+                    }
+                    Err(_) => return self.fail(ErrorCode::InternalError),
+                };
+                let path = match request.path {
+                    Some(path) if path.first() == Some(&b'/') => path,
+                    _ => return self.deny(stream, ErrorCode::RefusedStream, false),
+                };
+                let is_head = request.method == b"HEAD";
+                if self.routes.is_managed(request.method, path) {
+                    if let Some(ctx) = self.host {
+                        let declared = request.content_length;
+                        if end && declared.unwrap_or(0) > 0 {
+                            return self.deny(stream, ErrorCode::ProtocolError, false);
+                        }
+                        if end || declared.is_some() {
+                            let capped = declared.unwrap_or(0) <= H2_BODY_CAP;
+                            if capped
+                                && park_stream(ctx, self.routes, stream, request, self.outcome)
+                            {
+                                return;
+                            }
+                            return self.deny(stream, ErrorCode::RefusedStream, false);
+                        }
+                    }
+                }
+                let (status, body) = self
+                    .routes
+                    .lookup(request.method, path)
+                    .unwrap_or((404, NOT_FOUND_BODY));
+                if !end {
+                    if send_full(
+                        self.server,
+                        stream,
+                        status,
+                        body,
+                        false,
+                        false,
+                        self.output,
+                        self.used,
+                    )
+                    .is_err()
+                    {
+                        return self.fail(ErrorCode::InternalError);
+                    }
+                    return self.deny(stream, ErrorCode::RefusedStream, true);
+                }
+                match send_full(
+                    self.server,
+                    stream,
+                    status,
+                    body,
+                    is_head || body.is_empty(),
+                    true,
+                    self.output,
+                    self.used,
+                ) {
+                    Ok(()) => self.outcome.served += 1,
+                    Err(code) => self.fail(code),
+                }
+            }
+            StreamEvent::Data(stream, start, len, end) => {
+                let Some(bytes) = self.data.get(start..start + len) else {
+                    return self.fail(ErrorCode::InternalError);
+                };
+                let Some(ctx) = self.host else {
+                    return self.deny(stream, ErrorCode::RefusedStream, true);
+                };
+                match push_h2_data(ctx, stream, bytes, end) {
+                    H2DataOutcome::Stored => {}
+                    H2DataOutcome::Short => self.deny(stream, ErrorCode::ProtocolError, false),
+                    H2DataOutcome::Over => self.deny(stream, ErrorCode::FlowControlError, false),
+                    H2DataOutcome::Gone => self.deny(stream, ErrorCode::RefusedStream, false),
+                }
+            }
+            StreamEvent::PeerReset => {}
+            StreamEvent::PeerGoAway => self.outcome.closed = true,
+        }
+    }
+}
+
+// NOTE: queue-full split: H1 closes the conn when the host queue is full, but one H2 conn
+// carries siblings, so a refused park RSTs only its stream and multiplexing continues.
+fn park_stream(
+    ctx: H2HostCtx<'_>,
+    routes: &FrozenRoutesView<'_>,
+    stream: u32,
+    request: ValidatedServerRequest<'_>,
+    outcome: &mut StepOutcome,
+) -> bool {
+    let total = request.content_length.unwrap_or(0);
+    let path = request.path.unwrap_or(b"/");
+    let route_id = routes.find(request.method, path).map(|index| index as u64);
+    let route_id = route_id.unwrap_or(u64::MAX);
+    let sub = (stream >> 1) as usize % STREAM_SLOTS;
+    let base = ConnectionToken {
+        stream_id: stream,
+        request_seq: 0,
+        slot: ctx.base.slot + sub as u32,
+        ..ctx.base
+    };
+    match ctx.host.try_park(
+        ctx.base.worker_id,
+        base,
+        route_id,
+        request.method,
+        path,
+        total,
+    ) {
+        Ok(_) => {
+            outcome.parked += 1;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum H2Trailer {
+    Staged,
+    Stream(ErrorCode),
+    Conn,
+}
+
+fn valid_trailer_field(name: &[u8], value: &[u8]) -> bool {
+    if name.is_empty() || name.first() == Some(&b':') || trailer_prohibited(name) {
+        return false;
+    }
+    if !name
+        .iter()
+        .copied()
+        .all(|byte| is_token(byte) && !byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let ows = |byte: &u8| *byte == b' ' || *byte == b'\t';
+    if value.first().is_some_and(ows) || value.last().is_some_and(ows) {
+        return false;
+    }
+    !value.iter().any(|byte| {
+        *byte == 0
+            || *byte == b'\r'
+            || *byte == b'\n'
+            || *byte == 0x7f
+            || (*byte < 0x20 && *byte != b'\t')
+    })
+}
+
+fn trailer_prohibited(name: &[u8]) -> bool {
+    const PROHIBITED: [&[u8]; 15] = [
+        b"authorization",
+        b"connection",
+        b"content-encoding",
+        b"content-length",
+        b"content-range",
+        b"content-type",
+        b"expect",
+        b"host",
+        b"keep-alive",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    PROHIBITED
+        .iter()
+        .any(|prohibited| name.eq_ignore_ascii_case(prohibited))
+}
+
+enum H2DataOutcome {
+    Stored,
+    Short,
+    Over,
+    Gone,
+}
+
+fn push_h2_data(ctx: H2HostCtx<'_>, stream: u32, bytes: &[u8], end: bool) -> H2DataOutcome {
+    let slot = ctx.base.slot + ((stream >> 1) as usize % STREAM_SLOTS) as u32;
+    let outcome = ctx.host.with_inner(|inner| {
+        let live = inner
+            .parked
+            .get_mut(ctx.base.worker_id as usize)
+            .and_then(|table| table.get_mut(slot as usize))
+            .and_then(|entry| entry.as_mut())
+            .filter(|live| live.token.stream_id == stream);
+        let Some(live) = live else {
+            return (H2DataOutcome::Gone, None);
+        };
+        let room = live
+            .body_total
+            .saturating_sub(live.body_pulled + live.body.len() as u64);
+        let fit = room.min(bytes.len() as u64) as usize;
+        live.body.extend_from_slice(&bytes[..fit]);
+        if fit < bytes.len() {
+            return (H2DataOutcome::Over, None);
+        }
+        if end && live.body_pulled + live.body.len() as u64 != live.body_total {
+            return (H2DataOutcome::Short, None);
+        }
+        (H2DataOutcome::Stored, None)
+    });
+    let Some((result, _)) = outcome else {
+        return H2DataOutcome::Gone;
+    };
+    result
+}
+
+#[derive(Clone, Copy)]
+enum StreamStep {
+    Done {
+        used: usize,
+        served: bool,
+        refused: bool,
+    },
+    Dead {
+        used: usize,
+    },
+}
+
+fn abort_stream(
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    host: &HostShared,
+    token: ConnectionToken,
+    code: ErrorCode,
+    out: &mut [u8],
+) -> StreamStep {
+    let used = match server.rst_stream(token.stream_id, code, out) {
+        Ok(writer) => writer.pending_bytes().len(),
+        Err(_) => 0,
+    };
+    host.unpark_closed(token.worker_id, token.slot);
+    StreamStep::Dead { used }
+}
+
+pub(crate) fn apply_h2_streams(
+    meta: &mut turn::H2Meta,
+    conn: &mut Option<H2Conn<'_>>,
+    turn: &mut turn::H2Turn<'_>,
+) -> bool {
+    if turn::pending_spare(meta).len() < 2048 {
+        return false;
+    }
+    let Some(live) = conn.as_mut().filter(|active| !active.is_closed()) else {
+        return false;
+    };
+    let index = meta.token.saturating_sub(turn::H2_STREAM_TOKEN_BASE);
+    let base = (crate::static_server::MAX_CONNECTIONS + index * STREAM_SLOTS) as u32;
+    let host = turn.host;
+    let fail = ErrorCode::InternalError;
+    let peek = host.with_inner(|inner| {
+        let mut found = None;
+        for sub in 0..STREAM_SLOTS {
+            let slot = base + sub as u32;
+            let entry = inner
+                .parked
+                .get_mut(turn.worker_id as usize)
+                .and_then(|table| table.get_mut(slot as usize))
+                .and_then(|entry| entry.as_mut())
+                .filter(|entry| entry.stream.is_some());
+            let Some(entry) = entry else {
+                continue;
+            };
+            if entry.stream_cmd.is_some() || entry.staged.is_some() {
+                if found.is_none() {
+                    let token = entry.token;
+                    let write = match &entry.stream_cmd {
+                        Some(StreamCmd::Write { chunk }) => Some(chunk.len()),
+                        _ => None,
+                    };
+                    if let Some(cmd) = take_stream_cmd(inner, token) {
+                        found = Some((token, write, cmd));
+                    }
+                }
+                continue;
+            }
+            if entry.staged.is_none() {
+                if let Some(stream) = entry.stream.as_mut() {
+                    if stream.head_sent {
+                        stream.writable = true;
+                    }
+                }
+            }
+        }
+        (found, None)
+    });
+    let Some((found, _)) = peek else {
+        return false;
+    };
+    let Some((token, write, cmd)) = found else {
+        return false;
+    };
+    let stream = token.stream_id;
+    let Phase::Serving(server) = &mut live.phase else {
+        host.unpark_closed(token.worker_id, token.slot);
+        return true;
+    };
+    let spare = turn::pending_spare(meta).len();
+    let found = server.driver().streams().find(stream);
+    let credit = found
+        .filter(|found| found.state != StreamState::Closed)
+        .map(|found| found.send_window.value());
+    if let Some(len) = write {
+        let room = len + 64 <= spare;
+        let send = server.driver().connection_send_window().value() >= len as i64;
+        let flow = credit.is_some_and(|window| window >= len as i64);
+        if !room || !send || (!flow && credit.is_some()) {
+            return false;
+        }
+    }
+    let spare = turn::pending_spare(meta);
+    let step = match cmd {
+        StreamCmd::Begin { status, .. } => {
+            let mut used = 0;
+            match send_full(server, stream, status, b"", false, false, spare, &mut used) {
+                Ok(()) => StreamStep::Done {
+                    used,
+                    served: false,
+                    refused: false,
+                },
+                Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+            }
+        }
+        StreamCmd::Write { chunk } => {
+            let mut used = 0;
+            let mut off = 0;
+            while off < chunk.len() {
+                match server.send_data(stream, &chunk[off..], false, &mut spare[used..]) {
+                    Ok(sent) => {
+                        used += sent.writer.pending_bytes().len();
+                        off += sent.frame.payload_length;
+                        if sent.frame.payload_length == 0 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if off == chunk.len() {
+                StreamStep::Done {
+                    used,
+                    served: false,
+                    refused: false,
+                }
+            } else {
+                abort_stream(server, host, token, fail, turn::pending_spare(meta))
+            }
+        }
+        StreamCmd::End => match server.send_data(stream, b"", true, spare) {
+            Ok(sent) => {
+                let used = sent.writer.pending_bytes().len();
+                host.unpark_closed(token.worker_id, token.slot);
+                StreamStep::Done {
+                    used,
+                    served: true,
+                    refused: false,
+                }
+            }
+            Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+        },
+        StreamCmd::EndWithTrailers { trailers } => {
+            let mut fields = [field(b"", b""); TRAILER_SLOTS];
+            let mut valid = trailers.len() <= TRAILER_SLOTS;
+            for (slot, staged) in trailers.iter().enumerate().take(TRAILER_SLOTS) {
+                valid = valid && valid_trailer_field(&staged.name, &staged.value);
+                fields[slot] = field(&staged.name, &staged.value);
+            }
+            let mut block = [0; 1152];
+            let encoded = valid.then(|| {
+                encode_header_block(
+                    &fields[..trailers.len()],
+                    server.driver_mut().hpack_encoder_mut(),
+                    &mut block,
+                )
+            });
+            match encoded {
+                Some(Ok(len)) => {
+                    let mut writer = HeadersFrameWriter::new(spare);
+                    let queued =
+                        writer.queue_headers(server.driver_mut(), stream, &block[..len], true);
+                    match queued {
+                        Ok(queued) => {
+                            let used = queued.output_length;
+                            host.unpark_closed(token.worker_id, token.slot);
+                            StreamStep::Done {
+                                used,
+                                served: true,
+                                refused: false,
+                            }
+                        }
+                        Err(_) => {
+                            abort_stream(server, host, token, fail, turn::pending_spare(meta))
+                        }
+                    }
+                }
+                _ => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+            }
+        }
+        StreamCmd::Cancel => {
+            let used = match server.rst_stream(stream, ErrorCode::Cancel, turn::pending_spare(meta))
+            {
+                Ok(writer) => writer.pending_bytes().len(),
+                Err(_) => 0,
+            };
+            host.unpark_closed(token.worker_id, token.slot);
+            StreamStep::Done {
+                used,
+                served: false,
+                refused: true,
+            }
+        }
+    };
+    let (used, served, refused, progress) = match step {
+        StreamStep::Done {
+            used,
+            served,
+            refused,
+        } => (used, served, refused, true),
+        StreamStep::Dead { used } => (used, false, false, true),
+    };
+    meta.pending_len += used;
+    turn.counts.h2_served += u64::from(served);
+    turn.counts.h2_refused += u64::from(refused);
+    progress
+}
