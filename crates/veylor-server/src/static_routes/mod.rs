@@ -1,14 +1,15 @@
 use std::path::Path;
 
 use veylor_http1::{
-    ConnectionHeader, Field, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
+    ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
     connection_header_for_response, encode_response_head, is_token,
 };
 use veylor_router::{
     RouteBodyPolicy, RouteCapture, RouteConfig, RouteError, RouteKind, RouteSlot, RouteTable,
 };
 
-use crate::static_files::{FileMounts, FilePlan, FileReject, MountError};
+use crate::connection::field;
+use crate::static_files::{FileMounts, FilePlan, FileReject, MountError, RangeApply};
 
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_RESPONSE_BODY: usize = 4096;
@@ -20,6 +21,8 @@ pub(crate) const MAX_TRAILER_NAME_BYTES: usize = 128;
 // body bytes at all; u64::MAX leaves the route uncapped except for input-buffer/deadline stops.
 pub const MAX_STATIC_BODY_BYTES: u64 = 64 * 1024;
 const CAPTURE_SLOTS: usize = 8;
+// NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
+const CONTENT_RANGE_BYTES: usize = 80;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
@@ -281,6 +284,7 @@ pub fn respond_to_head(
     routes: &StaticRoutes,
     table: &RouteTable<'_, '_>,
     head: RequestHead,
+    headers: &[Header],
     input: &[u8],
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
@@ -289,7 +293,7 @@ pub fn respond_to_head(
     // NOTE: exact static routes win; file mounts serve only table misses, so existing
     // routes never change behavior when mounts are added.
     if matches!(found, Err(RouteError::NotFound)) {
-        if let Some(file) = respond_file(routes, head, input, output)? {
+        if let Some(file) = respond_file(routes, head, headers, input, output)? {
             return Ok(file);
         }
     }
@@ -383,6 +387,7 @@ pub fn respond_to_head(
 fn respond_file(
     routes: &StaticRoutes,
     head: RequestHead,
+    headers: &[Header],
     input: &[u8],
     output: &mut [u8],
 ) -> Result<Option<EncodedStaticResponse>, RouteBuildError> {
@@ -404,25 +409,79 @@ fn respond_file(
     } else {
         0
     };
-    let plan = match routes.files.resolve(method, path) {
+    let mut plan = match routes.files.resolve(method, path) {
         Ok(plan) => plan,
         Err(FileReject::TooLarge) => return Ok(Some(reject_payload(output, method)?)),
         Err(FileReject::NotFound | FileReject::Forbidden | FileReject::NotAFile) => {
             return Ok(None);
         }
     };
-    let connection =
-        connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
-    let content_type = [Field {
+    // NOTE: a satisfiable single range narrows the plan window for a 206 while the pump
+    // keeps 0-based offsets; ignored headers fall back to 200 full and unsatisfiable
+    // windows answer 416 with bytes */size and no body, closed like a 404.
+    // NOTE (RFC 9110 section 14.2): range handling is defined only for GET; HEAD (the only
+    // other file method here) ignores Range and answers 200 full headers.
+    let range = (method == b"GET")
+        .then(|| range_header_value(headers, head, input))
+        .flatten();
+    if plan.apply_range(range) == RangeApply::Unsatisfiable {
+        return Ok(Some(respond_range_unsatisfiable(
+            head,
+            input,
+            method,
+            &plan,
+            drain_total,
+            interim_len,
+            output,
+        )?));
+    }
+    let status = if plan.partial { 206 } else { 200 };
+    let reason = if plan.partial {
+        b"Partial Content".as_slice()
+    } else {
+        b"OK".as_slice()
+    };
+    let connection = connection_header_for_response(
+        head,
+        input,
+        status,
+        ResponseFraming::FixedLength,
+        true,
+        false,
+    );
+    let mut content_range = [0u8; CONTENT_RANGE_BYTES];
+    let range_len = if plan.partial {
+        write_content_range(
+            &mut content_range,
+            Some((plan.start, plan.start + plan.size - 1)),
+            plan.total,
+        )
+    } else {
+        0
+    };
+    let mut fields = [Field {
         name: b"Content-Type",
         value: plan.content_type.as_bytes(),
-    }];
+    }; 3];
+    fields[1] = Field {
+        name: b"Accept-Ranges",
+        value: b"bytes",
+    };
+    let field_len = if plan.partial {
+        fields[2] = Field {
+            name: b"Content-Range",
+            value: &content_range[..range_len],
+        };
+        3
+    } else {
+        2
+    };
     let response = ResponseToWrite {
         request_method: method,
         requested_upgrade: b"",
-        status: 200,
-        reason: b"OK",
-        fields: &content_type,
+        status,
+        reason,
+        fields: &fields[..field_len],
         framing: ResponseFraming::FixedLength,
         content_length: plan.size,
         connection,
@@ -447,6 +506,101 @@ fn respond_file(
         interim_len,
         file,
     }))
+}
+
+fn range_header_value<'a>(
+    headers: &'a [Header],
+    head: RequestHead,
+    input: &'a [u8],
+) -> Option<&'a [u8]> {
+    headers.iter().take(head.header_count).find_map(|header| {
+        let name = field(input, header.name)?;
+        if !name.eq_ignore_ascii_case(b"range") {
+            return None;
+        }
+        field(input, header.value)
+    })
+}
+
+fn respond_range_unsatisfiable(
+    head: RequestHead,
+    input: &[u8],
+    method: &[u8],
+    plan: &FilePlan,
+    drain_total: u64,
+    interim_len: usize,
+    output: &mut [u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let mut value = [0u8; CONTENT_RANGE_BYTES];
+    let value_len = write_content_range(&mut value, None, plan.total);
+    let fields = [Field {
+        name: b"Content-Range",
+        value: &value[..value_len],
+    }];
+    let connection =
+        connection_header_for_response(head, input, 416, ResponseFraming::FixedLength, true, true);
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade: b"",
+        status: 416,
+        reason: b"Range Not Satisfiable",
+        fields: &fields,
+        framing: ResponseFraming::FixedLength,
+        content_length: 0,
+        connection,
+    };
+    let final_buf = output
+        .get_mut(interim_len..)
+        .ok_or(RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+    Ok(EncodedStaticResponse {
+        length: interim_len + encoded.length,
+        keep_open: connection != ConnectionHeader::Close,
+        drain_total,
+        interim_len,
+        file: None,
+    })
+}
+
+fn write_content_range(out: &mut [u8], range: Option<(u64, u64)>, total: u64) -> usize {
+    let mut len = push_field_bytes(out, 0, b"bytes ");
+    match range {
+        Some((start, last)) => {
+            len = push_decimal(out, len, start);
+            len = push_field_bytes(out, len, b"-");
+            len = push_decimal(out, len, last);
+            len = push_field_bytes(out, len, b"/");
+        }
+        None => len = push_field_bytes(out, len, b"*/"),
+    }
+    push_decimal(out, len, total)
+}
+
+fn push_field_bytes(out: &mut [u8], len: usize, bytes: &[u8]) -> usize {
+    let end = len + bytes.len();
+    out[len..end].copy_from_slice(bytes);
+    end
+}
+
+fn push_decimal(out: &mut [u8], mut len: usize, value: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    let mut rest = value;
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        out[len] = digits[count];
+        len += 1;
+    }
+    len
 }
 
 // NOTE: query strings strip like the router so /assets/a.css?x=1 names the file;

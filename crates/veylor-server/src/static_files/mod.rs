@@ -30,8 +30,141 @@ pub enum FileReject {
 pub struct FilePlan {
     pub fs_path: PathBuf,
     pub size: u64,
+    pub total: u64,
+    pub start: u64,
     pub content_type: &'static str,
     pub head_only: bool,
+    pub partial: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RangeApply {
+    Ignored,
+    Ranged,
+    Unsatisfiable,
+}
+
+impl FilePlan {
+    // NOTE: single-range resolution rides the plan so the pump keeps 0-based offsets:
+    // size narrows to the window length and start anchors it, so a 206 streams [start,
+    // start + size) through the unchanged completion rule. Malformed values, unknown
+    // units, and multi-range sets ignore back to 200 full (RFC 9110 servers MAY ignore
+    // Range), and unsatisfiable windows report for a 416. If-Range is not read here.
+    pub fn apply_range(&mut self, header: Option<&[u8]>) -> RangeApply {
+        let Some(value) = header else {
+            return RangeApply::Ignored;
+        };
+        match range_window(self.total, value) {
+            Window::Full => RangeApply::Ignored,
+            Window::Unsatisfiable => RangeApply::Unsatisfiable,
+            Window::Slice { start, end } => {
+                self.start = start;
+                self.size = end - start;
+                self.partial = true;
+                RangeApply::Ranged
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Window {
+    Full,
+    Slice { start: u64, end: u64 },
+    Unsatisfiable,
+}
+
+fn range_window(size: u64, value: &[u8]) -> Window {
+    let trimmed = trim_range_ows(value);
+    if trimmed.len() < 6 || !trimmed[..5].eq_ignore_ascii_case(b"bytes") || trimmed[5] != b'=' {
+        return Window::Full;
+    }
+    let set = trim_range_ows(&trimmed[6..]);
+    if set.is_empty() || set.contains(&b',') {
+        return Window::Full;
+    }
+    let dash = match set.iter().position(|byte| *byte == b'-') {
+        Some(dash) => dash,
+        None => return Window::Full,
+    };
+    let (first, last) = (&set[..dash], &set[dash + 1..]);
+    if first.is_empty() {
+        let suffix = match parse_range_digits(last) {
+            Some(suffix) => suffix,
+            None => return Window::Full,
+        };
+        // NOTE: a zero suffix selects no bytes, so it ignores to 200 full; an empty file
+        // satisfies no suffix, so any range on it reports 416 with bytes */0 downstream.
+        if suffix == 0 {
+            return Window::Full;
+        }
+        if size == 0 {
+            return Window::Unsatisfiable;
+        }
+        if suffix >= size {
+            return Window::Slice {
+                start: 0,
+                end: size,
+            };
+        }
+        return Window::Slice {
+            start: size - suffix,
+            end: size,
+        };
+    }
+    let start = match parse_range_digits(first) {
+        Some(start) => start,
+        None => return Window::Full,
+    };
+    if last.is_empty() {
+        if start >= size {
+            return Window::Unsatisfiable;
+        }
+        return Window::Slice { start, end: size };
+    }
+    let last = match parse_range_digits(last) {
+        Some(last) => last,
+        None => return Window::Full,
+    };
+    if last < start {
+        return Window::Full;
+    }
+    if start >= size {
+        return Window::Unsatisfiable;
+    }
+    Window::Slice {
+        start,
+        end: last.saturating_add(1).min(size),
+    }
+}
+
+// NOTE: digit runs saturate at u64::MAX instead of wrapping, so huge positions fail
+// deterministically downstream: a saturated start reads as past end (416), a saturated
+// last clamps to size - 1, and a saturated suffix covers the whole file.
+fn parse_range_digits(digits: &[u8]) -> Option<u64> {
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for byte in digits.iter() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u64);
+    }
+    Some(value)
+}
+
+fn trim_range_ows(mut value: &[u8]) -> &[u8] {
+    while matches!(value.first(), Some(b' ') | Some(b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ') | Some(b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 struct FileMount {
@@ -153,8 +286,11 @@ impl FileMounts {
         Ok(FilePlan {
             fs_path,
             size,
+            total: size,
+            start: 0,
             content_type: content_type_for_name(segments[last].as_slice()),
             head_only: method == b"HEAD",
+            partial: false,
         })
     }
 }
@@ -211,7 +347,9 @@ pub fn read_chunk(plan: &FilePlan, offset: u64, out: &mut [u8]) -> std::io::Resu
         return Ok(0);
     }
     let mut file = File::open(&plan.fs_path)?;
-    file.seek(SeekFrom::Start(offset))?;
+    // NOTE: pump offsets stay window-relative, so the seek anchors at plan start; the
+    // window always sits inside total, hence start + offset cannot overflow u64 here.
+    file.seek(SeekFrom::Start(plan.start + offset))?;
     let end = remaining.min(out.len() as u64) as usize;
     file.read(&mut out[..end])
 }

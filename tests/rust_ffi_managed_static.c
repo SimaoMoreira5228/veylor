@@ -2,9 +2,11 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 _Static_assert(
@@ -33,6 +35,9 @@ int main(void) {
     static const uint8_t tiny_path[] = "/tiny";
     static const uint8_t tiny_body[] = "tiny";
     static const char over_request[] = "POST /tiny HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
+    static const uint8_t mount_prefix[] = "/assets/";
+    static const uint8_t mount_file_body[] = "mount-bytes";
+    static const char mount_request[] = "GET /assets/hello.txt HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
     vyl_managed_static_config config = {0};
     vyl_managed_static_server* server = NULL;
     vyl_managed_static_close_counts counts = {0};
@@ -56,6 +61,18 @@ int main(void) {
     config.poll_wait_ms = 10;
     config.port = 0;
 
+    char mount_dir[64] = {0};
+    assert(snprintf(mount_dir, sizeof(mount_dir), "/tmp/veylor-mount-%d", (int)getpid()) > 0);
+    if (mkdir(mount_dir, 0700) != 0) {
+        assert(errno == EEXIST);
+    }
+    char mount_path[96] = {0};
+    assert(snprintf(mount_path, sizeof(mount_path), "%s/hello.txt", mount_dir) > 0);
+    FILE* mount_file = fopen(mount_path, "w");
+    assert(mount_file != NULL);
+    assert(fwrite(mount_file_body, 1, sizeof(mount_file_body) - 1, mount_file) == sizeof(mount_file_body) - 1);
+    assert(fclose(mount_file) == 0);
+
     assert(vyl_managed_static_new(&config, &server) == VYL_HTTP1_OK);
     assert(server != NULL);
     assert(
@@ -77,6 +94,13 @@ int main(void) {
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
             (vyl_http1_bytes){.data = tiny_body, .length = sizeof(tiny_body) - 1},
             4
+        ) == VYL_HTTP1_OK
+    );
+    assert(
+        vyl_managed_static_register_file_mount(
+            server,
+            (vyl_http1_bytes){.data = mount_prefix, .length = sizeof(mount_prefix) - 1},
+            (vyl_http1_bytes){.data = (const uint8_t*)mount_dir, .length = strlen(mount_dir)}
         ) == VYL_HTTP1_OK
     );
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
@@ -116,14 +140,34 @@ int main(void) {
     assert(strstr(response, "HTTP/1.1 413") != NULL);
     assert(strstr(response, "Payload Too Large") != NULL);
 
+    fd = connect_loopback(port);
+    assert(send(fd, mount_request, sizeof(mount_request) - 1, 0) == (ssize_t)(sizeof(mount_request) - 1));
+    total = 0;
+    for (;;) {
+        received = recv(fd, response + total, sizeof(response) - 1 - total, 0);
+        assert(received >= 0);
+        if (received == 0) {
+            break;
+        }
+        total += (size_t)received;
+        assert(total < sizeof(response) - 1);
+    }
+    assert(close(fd) == 0);
+    response[total] = '\0';
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "mount-bytes") != NULL);
+    assert(strstr(response, "text/plain") != NULL);
+
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 2);
+    assert(counts.completed == 3);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 2
+            counts.shutdown == 3
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
+    assert(remove(mount_path) == 0);
+    assert(rmdir(mount_dir) == 0);
     return 0;
 }

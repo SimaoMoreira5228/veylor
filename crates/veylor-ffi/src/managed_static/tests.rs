@@ -2391,3 +2391,219 @@ fn stream_end_with_trailers_rejects_bad_state_and_null_inputs() {
     );
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
+
+struct FixtureDir {
+    path: std::path::PathBuf,
+}
+
+impl FixtureDir {
+    fn new(name: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "veylor-ffi-mount-{}-{}-{name}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&path).expect("create fixture dir");
+        Self { path }
+    }
+    fn write(&self, name: &str, contents: &[u8]) {
+        std::fs::write(self.path.join(name), contents).expect("write fixture file");
+    }
+}
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+unsafe fn mount_raw(server: *mut VylManagedStaticServer, prefix: &[u8], root: &[u8]) -> VylResult {
+    unsafe { super::vyl_managed_static_register_file_mount(server, bytes(prefix), bytes(root)) }
+}
+
+fn mount_root_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_str().expect("utf8 temp path").as_bytes().to_vec()
+    }
+}
+
+fn get_file(port: u16, path: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = connect_loopback(port);
+    let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).expect("read head byte");
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n".as_slice()) {
+            break;
+        }
+    }
+    let head = String::from_utf8(raw).expect("utf8 head");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .expect("status")
+        .parse()
+        .expect("status int");
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .expect("content length");
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).expect("read body");
+    (status, head, body)
+}
+
+#[test]
+fn file_mount_serves_exact_bytes_and_content_type() {
+    let fixture = FixtureDir::new("serve");
+    fixture.write("hello.txt", b"file-bytes-123");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let (status, head, body) = get_file(port, "/assets/hello.txt");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"file-bytes-123");
+    assert!(head.contains("Content-Type: text/plain"), "head: {head:?}");
+    let (missing, _, _) = get_file(port, "/assets/missing.txt");
+    assert_eq!(missing, 404);
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 2);
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn file_mount_rejects_traversal_as_404() {
+    let fixture = FixtureDir::new("traversal");
+    fixture.write("hello.txt", b"hello");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    for probe in [
+        "/assets/../hello.txt",
+        "/assets/%2e%2e/hello.txt",
+        "/assets/%2Fhello.txt",
+        "/assets//hello.txt",
+    ] {
+        let (status, _, _) = get_file(port, probe);
+        assert_eq!(status, 404, "probe {probe:?} must not escape");
+    }
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 4);
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn file_mount_rejects_duplicate_and_bad_roots() {
+    let fixture = FixtureDir::new("dupe");
+    fixture.write("hello.txt", b"hello");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets", &root) },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { mount_raw(server, b"/other/", b"relative/path") },
+        VylResult::InvalidArgument
+    );
+    let missing = mount_root_bytes(&fixture.path.join("absent"));
+    assert_eq!(
+        unsafe { mount_raw(server, b"/other/", &missing) },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe {
+            super::vyl_managed_static_register_file_mount(
+                std::ptr::null_mut(),
+                bytes(b"/x/"),
+                bytes(&root),
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe {
+            super::vyl_managed_static_register_file_mount(
+                server,
+                VylBytes {
+                    data: std::ptr::null(),
+                    length: 3,
+                },
+                bytes(&root),
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn file_mount_rejects_registration_after_start() {
+    let fixture = FixtureDir::new("late");
+    fixture.write("hello.txt", b"hello");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::BadState
+    );
+    assert_eq!(
+        unsafe { mount_raw(server, b"/late/", &root) },
+        VylResult::BadState
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_stop_force(server) },
+        VylResult::Ok
+    );
+    let mut counts = VylManagedStaticCloseCounts::default();
+    assert_eq!(
+        unsafe { vyl_managed_static_join(server, &mut counts) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}

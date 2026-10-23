@@ -45,7 +45,7 @@ pub use managed_static::{
     vyl_managed_static_host_is_writable, vyl_managed_static_host_pull_body,
     vyl_managed_static_host_pull_trailers, vyl_managed_static_host_respond,
     vyl_managed_static_host_write_stream, vyl_managed_static_join, vyl_managed_static_local_addr,
-    vyl_managed_static_new, vyl_managed_static_poll_events,
+    vyl_managed_static_new, vyl_managed_static_poll_events, vyl_managed_static_register_file_mount,
     vyl_managed_static_register_managed_route,
     vyl_managed_static_register_managed_route_with_trailers,
     vyl_managed_static_register_static_route,

@@ -3,7 +3,11 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use veylor_server::{FileMounts, FileReject, MountError, read_chunk};
+#[cfg(target_os = "linux")]
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use veylor_server::{FD_CACHE_ENTRIES, FdCache};
+use veylor_server::{FileMounts, FileReject, MountError, RangeApply, read_chunk};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const BLOB_LEN: usize = 1 << 20;
@@ -413,4 +417,229 @@ fn read_chunk_clamps_overgrown_file_to_plan_size() {
     let got = read_chunk(&plan, 0, &mut out).expect("clamped read");
     assert_eq!(got, plan.size as usize);
     assert_eq!(&out[..got], b"<html>hello</html>");
+}
+
+#[cfg(target_os = "linux")]
+fn cache_read_all(cache: &mut FdCache, plan: &veylor_server::FilePlan) -> Vec<u8> {
+    let mut assembled = Vec::new();
+    let mut offset = 0u64;
+    while offset < plan.size {
+        let file = cache.cached(plan).expect("cached open");
+        let mut cursor: &std::fs::File = file;
+        cursor.seek(SeekFrom::Start(offset)).expect("cache seek");
+        let width = veylor_server::OUTPUT_CAP.min((plan.size - offset) as usize);
+        let mut out = vec![0u8; width];
+        let got = cursor.read(&mut out).expect("cache read");
+        assert!(got > 0, "cache served no bytes before plan size");
+        assembled.extend_from_slice(&out[..got]);
+        offset += got as u64;
+    }
+    assembled
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fd_cache_opens_once_for_all_slices_and_reuses_across_transfers() {
+    assert_eq!(FD_CACHE_ENTRIES, 1, "single-entry bound");
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let plan = mounts
+        .resolve(b"GET", b"/assets/blob.bin")
+        .expect("blob plan");
+    let mut cache = FdCache::default();
+    let first = cache_read_all(&mut cache, &plan);
+    assert_eq!(first, fixture.blob);
+    assert_eq!(
+        cache.opens(),
+        1,
+        "one open for {} slices",
+        plan.size / veylor_server::OUTPUT_CAP as u64
+    );
+    let second = cache_read_all(&mut cache, &plan);
+    assert_eq!(second, fixture.blob);
+    assert_eq!(cache.opens(), 1, "second transfer reuses the handle");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fd_cache_revalidates_replaced_file_between_transfers() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let plan = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    let mut cache = FdCache::default();
+    assert_eq!(cache_read_all(&mut cache, &plan), b"<html>hello</html>");
+    assert_eq!(cache.opens(), 1);
+    let grown = b"<html>hello, replaced world</html>".to_vec();
+    fs::write(fixture.root.join("index.html"), &grown).expect("replace");
+    let fresh = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("fresh plan");
+    assert_eq!(fresh.size, grown.len() as u64);
+    assert_eq!(cache_read_all(&mut cache, &fresh), grown);
+    assert_eq!(cache.opens(), 2, "size change reopens, no stale prefix");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fd_cache_churn_across_more_files_than_entries_stays_exact() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let names = ["index.html", "sub/file.css", "app.js"];
+    let bodies: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| fs::read(fixture.root.join(name)).expect("read body"))
+        .collect();
+    let mut cache = FdCache::default();
+    for _ in 0..2 {
+        for (name, body) in names.iter().zip(bodies.iter()) {
+            let path = format!("/assets/{name}").into_bytes();
+            let plan = mounts.resolve(b"GET", &path).expect("churn plan");
+            assert_eq!(cache_read_all(&mut cache, &plan), *body);
+        }
+    }
+    assert_eq!(
+        cache.opens(),
+        (names.len() * 2) as u64,
+        "single entry misses on every switch"
+    );
+}
+
+#[test]
+fn range_exact_open_suffix_and_clamp_set_partial_windows() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let mut exact = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(exact.apply_range(Some(b"bytes=0-3")), RangeApply::Ranged);
+    assert!(exact.partial);
+    assert_eq!((exact.start, exact.size, exact.total), (0, 4, 18));
+    let mut open = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(open.apply_range(Some(b"bytes=4-")), RangeApply::Ranged);
+    assert_eq!((open.start, open.size, open.total), (4, 14, 18));
+    let mut suffix = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(suffix.apply_range(Some(b"bytes=-4")), RangeApply::Ranged);
+    assert_eq!((suffix.start, suffix.size, suffix.total), (14, 4, 18));
+    let mut clamp = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(clamp.apply_range(Some(b"bytes=10-100")), RangeApply::Ranged);
+    assert_eq!((clamp.start, clamp.size, clamp.total), (10, 8, 18));
+    let mut oversuffix = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(
+        oversuffix.apply_range(Some(b"bytes=-100")),
+        RangeApply::Ranged
+    );
+    assert_eq!(
+        (oversuffix.start, oversuffix.size, oversuffix.total),
+        (0, 18, 18)
+    );
+    let mut upper = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(upper.apply_range(Some(b"BYTES=0-3")), RangeApply::Ranged);
+    assert_eq!((upper.start, upper.size), (0, 4));
+}
+
+#[test]
+fn range_unsatisfiable_reports_without_mutating_plan() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    for header in [b"bytes=18-".as_slice(), b"bytes=20-30", b"bytes=18-18"] {
+        let mut plan = mounts
+            .resolve(b"GET", b"/assets/index.html")
+            .expect("index plan");
+        assert_eq!(plan.apply_range(Some(header)), RangeApply::Unsatisfiable);
+        assert!(!plan.partial);
+        assert_eq!((plan.start, plan.size, plan.total), (0, 18, 18));
+    }
+    let mut empty = mounts
+        .resolve(b"GET", b"/assets/empty.txt")
+        .expect("empty plan");
+    assert_eq!(
+        empty.apply_range(Some(b"bytes=0-")),
+        RangeApply::Unsatisfiable
+    );
+}
+
+#[test]
+fn range_ignored_headers_leave_full_plan() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let ignored: Vec<Option<&[u8]>> = vec![
+        None,
+        Some(b"bytes=0-1,3-4"),
+        Some(b"items=0-1"),
+        Some(b"bytes=abc"),
+        Some(b"bytes=5-3"),
+        Some(b"bytes=-0"),
+        Some(b"bytes="),
+        Some(b"bytes"),
+        Some(b"bytes=0 - 3"),
+    ];
+    for header in ignored {
+        let mut plan = mounts
+            .resolve(b"GET", b"/assets/index.html")
+            .expect("index plan");
+        assert_eq!(plan.apply_range(header), RangeApply::Ignored);
+        assert!(!plan.partial);
+        assert_eq!((plan.start, plan.size, plan.total), (0, 18, 18));
+    }
+}
+
+#[test]
+fn range_overflow_saturates_to_deterministic_outcomes() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let mut past = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(
+        past.apply_range(Some(b"bytes=18446744073709551615-")),
+        RangeApply::Unsatisfiable
+    );
+    let mut clamped = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(
+        clamped.apply_range(Some(b"bytes=0-18446744073709551615")),
+        RangeApply::Ranged
+    );
+    assert_eq!((clamped.start, clamped.size), (0, 18));
+    let mut suffix = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(
+        suffix.apply_range(Some(b"bytes=-18446744073709551615")),
+        RangeApply::Ranged
+    );
+    assert_eq!((suffix.start, suffix.size), (0, 18));
+}
+
+#[test]
+fn range_window_reads_exact_slice_bytes() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let mut plan = mounts
+        .resolve(b"GET", b"/assets/index.html")
+        .expect("index plan");
+    assert_eq!(plan.apply_range(Some(b"bytes=2-5")), RangeApply::Ranged);
+    let mut assembled = Vec::new();
+    let mut offset = 0u64;
+    let mut out = [0u8; 2];
+    while offset < plan.size {
+        let got = read_chunk(&plan, offset, &mut out).expect("window read");
+        assert!(got > 0, "window stalls before its length");
+        assembled.extend_from_slice(&out[..got]);
+        offset += got as u64;
+    }
+    assert_eq!(assembled, b"tml>");
 }

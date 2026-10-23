@@ -1265,3 +1265,220 @@ fn file_duplicate_and_invalid_mounts_reject() {
     running.stop_accepting();
     let _ = running.join().expect("join server");
 }
+
+#[test]
+fn file_keepalive_replace_between_transfers_serves_new_bytes() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/hello.txt");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello file");
+    let replacement = b"hello file, replaced and longer";
+    std::fs::write(fixture.root.join("hello.txt"), replacement).expect("replace hello");
+    get(&mut stream, "/assets/hello.txt");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, replacement);
+    assert_eq!(
+        header(&second, "content-length"),
+        replacement.len().to_string()
+    );
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_eviction_round_robin_across_many_files_stays_exact() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    for _ in 0..2 {
+        get(&mut stream, "/assets/hello.txt");
+        let hello = read_response(&mut stream);
+        assert_eq!(hello.status, 200);
+        assert_eq!(hello.body, b"hello file");
+        get(&mut stream, "/assets/blob.bin");
+        let blob = read_response(&mut stream);
+        assert_eq!(blob.status, 200);
+        assert_eq!(blob.body, fixture.blob);
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+fn get_range(stream: &mut TcpStream, path: &str, range: &str) {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nRange: {range}\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write ranged request");
+}
+
+fn read_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+        assert!(head.len() < 65536, "head overflow");
+    }
+    String::from_utf8(head).expect("head utf8")
+}
+
+#[test]
+fn file_range_exact_slice_then_keepalive_full() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get_range(&mut stream, "/assets/hello.txt", "bytes=0-3");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 206);
+    assert_eq!(first.body, b"hell");
+    assert_eq!(header(&first, "content-length"), "4");
+    assert_eq!(header(&first, "content-range"), "bytes 0-3/10");
+    assert_eq!(header(&first, "accept-ranges"), "bytes");
+    assert_eq!(header(&first, "content-type"), "text/plain");
+    get(&mut stream, "/assets/hello.txt");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello file");
+    assert_eq!(header(&second, "content-length"), "10");
+    assert_eq!(header(&second, "accept-ranges"), "bytes");
+    assert!(
+        second
+            .headers
+            .iter()
+            .all(|(field, _)| !field.eq_ignore_ascii_case("content-range")),
+        "200 carries no content-range"
+    );
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_range_open_suffix_and_clamp_serve_exact_windows() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get_range(&mut stream, "/assets/hello.txt", "bytes=6-");
+    let open = read_response(&mut stream);
+    assert_eq!(open.status, 206);
+    assert_eq!(open.body, b"file");
+    assert_eq!(header(&open, "content-range"), "bytes 6-9/10");
+    get_range(&mut stream, "/assets/hello.txt", "bytes=-4");
+    let suffix = read_response(&mut stream);
+    assert_eq!(suffix.status, 206);
+    assert_eq!(suffix.body, b"file");
+    assert_eq!(header(&suffix, "content-range"), "bytes 6-9/10");
+    get_range(&mut stream, "/assets/hello.txt", "bytes=4-100");
+    let clamped = read_response(&mut stream);
+    assert_eq!(clamped.status, 206);
+    assert_eq!(clamped.body, b"o file");
+    assert_eq!(header(&clamped, "content-range"), "bytes 4-9/10");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_range_unsatisfiable_answers_416_then_closes() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get_range(&mut stream, "/assets/hello.txt", "bytes=10-");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 416);
+    assert!(response.body.is_empty());
+    assert_eq!(header(&response, "content-range"), "bytes */10");
+    assert_eq!(header(&response, "content-length"), "0");
+    read_eof(&mut stream);
+    let mut empty = connect(&server);
+    get_range(&mut empty, "/assets/empty.txt", "bytes=0-");
+    let starved = read_response(&mut empty);
+    assert_eq!(starved.status, 416);
+    assert_eq!(header(&starved, "content-range"), "bytes */0");
+    read_eof(&mut empty);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 2, "counts: {counts:?}");
+}
+
+#[test]
+fn file_range_ignored_headers_serve_200_full() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    for range in ["bytes=0-1,3-4", "items=0-1", "bytes=nope", "bytes=5-3"] {
+        get_range(&mut stream, "/assets/hello.txt", range);
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 200, "range {range}");
+        assert_eq!(response.body, b"hello file", "range {range}");
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_range_head_ignores_range_with_full_headers() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    let request = "HEAD /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nRange: bytes=0-3\r\n\r\n";
+    stream
+        .write_all(request.as_bytes())
+        .expect("write HEAD range");
+    let text = read_head(&mut stream);
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status: {text}");
+    assert!(text.contains("Content-Length: 10"), "length: {text}");
+    assert!(!text.contains("Content-Range:"), "no range: {text}");
+    assert!(text.contains("Accept-Ranges: bytes"), "accept: {text}");
+    get(&mut stream, "/assets/hello.txt");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello file");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_range_overflow_start_is_unsatisfiable() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    get_range(
+        &mut stream,
+        "/assets/hello.txt",
+        "bytes=18446744073709551615-",
+    );
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 416);
+    assert_eq!(header(&response, "content-range"), "bytes */10");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_range_blob_slice_streams_exact_window() {
+    let (server, fixture) = file_server();
+    let mut stream = connect(&server);
+    get_range(&mut stream, "/assets/blob.bin", "bytes=1000-1999");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 206);
+    assert_eq!(
+        header(&response, "content-range"),
+        format!("bytes 1000-1999/{}", FILE_BLOB_LEN)
+    );
+    assert_eq!(response.body, &fixture.blob[1000..2000]);
+    get_range(&mut stream, "/assets/blob.bin", "bytes=-16");
+    let tail = read_response(&mut stream);
+    assert_eq!(tail.status, 206);
+    assert_eq!(tail.body, &fixture.blob[FILE_BLOB_LEN - 16..]);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}

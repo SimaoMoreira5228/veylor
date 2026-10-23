@@ -771,6 +771,17 @@ vyl_http1_result vyl_managed_static_register_static_route_with_body_cap(
     vyl_http1_bytes body,
     uint64_t max_body_bytes
 );
+/* NOTE: File mounts serve regular files beneath an absolute root at a slash-bounded prefix
+   (e.g. "/assets/"); GET/HEAD only, exact static routes win on overlap. Prefix bytes are
+   copied and the root path is converted to owned storage before return; the root crosses
+   as explicit-length bytes with no NUL assumption (byte-faithful on Unix, UTF-8 elsewhere).
+   Register before start; bad prefixes, non-absolute/missing/non-directory roots, and
+   duplicates fail with INVALID_ARGUMENT, full tables with CAPACITY, post-start with BAD_STATE. */
+vyl_http1_result vyl_managed_static_register_file_mount(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes prefix,
+    vyl_http1_bytes root
+);
 /* NOTE: Managed routes park matched requests for a host dispatch call; over-cap declarations
    reject with 413 like static routes. Same copy and cap rules as above; register before start,
    duplicates fail. */

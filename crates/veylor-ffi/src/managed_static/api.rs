@@ -296,6 +296,68 @@ unsafe fn register_managed_with_trailers(
 
 
 
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_register_file_mount(
+    server: *mut VylManagedStaticServer,
+    prefix: VylBytes,
+    root: VylBytes,
+) -> VylResult {
+    catch_ffi(|| unsafe { register_file_mount(server, prefix, root) })
+}
+
+unsafe fn register_file_mount(
+    server: *mut VylManagedStaticServer,
+    prefix: VylBytes,
+    root: VylBytes,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(routes) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    let prefix = match unsafe { read_bytes(prefix) } {
+        Ok(prefix) => prefix,
+        Err(error) => return error,
+    };
+    let root = match unsafe { read_bytes(root) } {
+        Ok(root) => root,
+        Err(error) => return error,
+    };
+    let root = match bytes_to_path(root) {
+        Ok(root) => root,
+        Err(error) => return error,
+    };
+    match routes.register_file_mount(prefix, root) {
+        Ok(()) => VylResult::Ok,
+        Err(error) => server_error_to_result(error),
+    }
+}
+
+fn bytes_to_path(root: &[u8]) -> Result<&std::path::Path, VylResult> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::path::Path::new(std::ffi::OsStr::from_bytes(root)))
+    }
+    #[cfg(not(unix))]
+    {
+        match std::str::from_utf8(root) {
+            Ok(valid) => Ok(std::path::Path::new(valid)),
+            Err(_) => Err(VylResult::InvalidArgument),
+        }
+    }
+}
+
+
+
+
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_start(
     server: *mut VylManagedStaticServer,
