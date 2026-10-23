@@ -18,7 +18,7 @@ pub(crate) mod turn;
 mod routes;
 mod serve;
 
-pub use routes::{FrozenRoute, FrozenRoutesView};
+pub use routes::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
 pub(crate) use serve::apply_h2_streams;
 
 pub const INPUT_STAGING_CAP: usize = 16_384 + 64;

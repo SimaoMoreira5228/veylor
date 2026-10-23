@@ -73,8 +73,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         result.error = Some(message.to_string());
         return result;
     }
-    let h2_flat = h2_turn::project_routes(&h2_routes);
-    let h2_view = crate::h2::FrozenRoutesView::new(&h2_flat).ok();
+    let (h2_flat, h2_natives) = h2_turn::project_routes(&h2_routes);
+    // NOTE: natives attach after the static table keeps its shape; the registry already
+    // rejects cross-kind overlap, so a with_natives failure only disables h2c, same as
+    // a static-table failure above.
+    let h2_view = crate::h2::FrozenRoutesView::new(&h2_flat)
+        .ok()
+        .and_then(|view| view.with_natives(&h2_natives).ok());
     let h2_enabled = h2c_listener.is_some() && h2_view.is_some();
 
     let mut slots = vec![ConnectionSlot::EMPTY; MAX_CONNECTIONS];

@@ -1,5 +1,7 @@
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use veylor_http2::{
@@ -17,8 +19,9 @@ use veylor_server::{
     ACK_SLOTS, CancelOutcome, CloseCounts, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES,
     ENCODE_ENTRIES, EventSlot, FrozenRoute, FrozenRoutesView, H2_BODY_CAP, H2Conn, H2HostCtx,
     HostEventKind, HostHandle, HostShared, INPUT_STAGING_CAP, MAX_ROUTES, MAX_STATIC_BODY_BYTES,
-    RespondOutcome, RouteBuildError, RunningServer, Server, ServerConfig,
-    h2::{HEADER_BLOCK_CAP, HEADER_SLOTS, STREAM_SLOTS},
+    NativeRequestView, NativeResponseOut, RespondOutcome, RouteBuildError, RunningServer, Server,
+    ServerConfig,
+    h2::{FrozenNativeRoute, HEADER_BLOCK_CAP, HEADER_SLOTS, STREAM_SLOTS},
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -1167,6 +1170,35 @@ fn h2_managed_park_respond_serves_host_body() {
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
 
+// NOTE: HEAD-park mapping lock: HEAD /work parks through the GET fallback with its method
+// intact, and an empty host respond serves HEADERS-only. Streaming Begin/EndWithTrailers on
+// this park stays unenforced until the ParkedEntry method seam lands (see serve.rs Begin arm).
+#[test]
+fn h2_managed_head_park_responds_without_body() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"HEAD", b"/work", true);
+    let (event, method, path) = poll_h2_request(&host);
+    assert_eq!(method, b"HEAD");
+    assert_eq!(path, b"/work");
+    assert_eq!(event.token.stream_id, 1);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b""),
+        RespondOutcome::Ok
+    );
+    let response = read_response(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+}
+
 #[test]
 fn h2_managed_concurrent_parks_share_conn() {
     let server = managed_h2_server();
@@ -1857,4 +1889,746 @@ fn h2_managed_write_after_trailers_fail_closed() {
     );
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+// NOTE: paired trailer reader: concurrent trailered streams interleave DATA/HEADERS frame by
+// frame (one stream command applies per turn), so sequential per-stream readers would misroute
+// siblings. This demuxes both streams in one loop until each sees its terminal HEADERS.
+fn read_trailer_pair(stream: &mut TcpStream, ids: [u32; 2]) -> [(Response, TrailerFields); 2] {
+    let mut heads: [Option<Response>; 2] = [None, None];
+    let mut bodies: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut trailers: [TrailerFields; 2] = [Vec::new(), Vec::new()];
+    let mut blocks: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut ended = [false, false];
+    let deadline = Instant::now() + DEADLINE;
+    while ended != [true, true] {
+        assert!(Instant::now() < deadline, "trailer pair never completed");
+        let (header, payload) = read_frame(stream);
+        if header.frame_type == FrameType::WindowUpdate {
+            continue;
+        }
+        let index = ids
+            .iter()
+            .position(|id| *id == header.stream_id)
+            .expect("pair stream");
+        match header.frame_type {
+            FrameType::Headers | FrameType::Continuation => {
+                blocks[index].extend_from_slice(&payload);
+                let complete = if header.frame_type == FrameType::Headers {
+                    header.flags & HEADERS_FLAG_END_HEADERS != 0
+                } else {
+                    header.flags & CONTINUATION_FLAG_END_HEADERS != 0
+                };
+                if !complete {
+                    continue;
+                }
+                let end = header.flags & HEADERS_FLAG_END_STREAM != 0;
+                let block = std::mem::take(&mut blocks[index]);
+                if heads[index].is_none() {
+                    assert!(!end, "response HEADERS must not end a trailered stream");
+                    heads[index] = Some(decode_response(&block));
+                } else {
+                    trailers[index].extend(decode_fields(&block));
+                    ended[index] = end;
+                }
+            }
+            FrameType::Data => {
+                bodies[index].extend_from_slice(&payload);
+                ended[index] = header.flags & DATA_FLAG_END_STREAM != 0;
+            }
+            found => panic!("unexpected frame: {found:?}"),
+        }
+    }
+    let [first, second] = heads;
+    let mut first = first.expect("first head");
+    first.body = std::mem::take(&mut bodies[0]);
+    let mut second = second.expect("second head");
+    second.body = std::mem::take(&mut bodies[1]);
+    [
+        (first, std::mem::take(&mut trailers[0])),
+        (second, std::mem::take(&mut trailers[1])),
+    ]
+}
+
+#[test]
+fn h2_managed_stream_trailers_isolated_per_stream() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    send_headers(&mut stream, 3, b"GET", b"/work", true);
+    let requests = poll_h2_requests(&host, 2);
+    assert_eq!(requests[0].0.token.stream_id, 1);
+    assert_eq!(requests[1].0.token.stream_id, 3);
+    let first = requests[0].0.token;
+    let second = requests[1].0.token;
+    assert_eq!(host.begin_stream(first, 200, b"OK"), RespondOutcome::Ok);
+    assert_eq!(host.begin_stream(second, 200, b"OK"), RespondOutcome::Ok);
+    spin_until(|| host.is_writable(first));
+    assert_eq!(host.write_stream(first, b"body-one"), RespondOutcome::Ok);
+    spin_until(|| host.is_writable(second));
+    assert_eq!(host.write_stream(second, b"body-three"), RespondOutcome::Ok);
+    spin_until(|| host.is_writable(first));
+    assert_eq!(
+        host.end_stream_with_trailers(first, &[(b"x-one", b"1")]),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(second));
+    assert_eq!(
+        host.end_stream_with_trailers(second, &[(b"x-three", b"3")]),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.parked_count() == 0);
+    let [(one, one_trailers), (three, three_trailers)] = read_trailer_pair(&mut stream, [1, 3]);
+    assert_eq!(one.status, 200);
+    assert_eq!(one.body, b"body-one");
+    assert_eq!(one_trailers, vec![(b"x-one".to_vec(), b"1".to_vec())]);
+    assert_eq!(three.status, 200);
+    assert_eq!(three.body, b"body-three");
+    assert_eq!(three_trailers, vec![(b"x-three".to_vec(), b"3".to_vec())]);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_stream_trailer_without_begin_rejected() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-early", b"1")]),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.write_stream(event.token, b"late-body"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"late-body");
+    assert!(trailers.is_empty());
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_stream_trailer_after_terminal_gone() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-end", b"1")]),
+        RespondOutcome::Ok
+    );
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    assert_eq!(trailers, vec![(b"x-end".to_vec(), b"1".to_vec())]);
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-late", b"2")]),
+        RespondOutcome::Gone
+    );
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_stream_trailer_after_cancel_stale() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(host.cancel(event.token), CancelOutcome::Ok);
+    spin_until(|| host.parked_count() == 0);
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-late", b"2")]),
+        RespondOutcome::Stale
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Stale
+    );
+    let (header, payload) = read_frame(&mut stream);
+    assert_eq!(header.frame_type, FrameType::RstStream);
+    assert_eq!(header.stream_id, 1);
+    assert_eq!(
+        decode_rst_stream_payload(header, &payload).expect("decode rst"),
+        ErrorCode::Cancel
+    );
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
+}
+// NOTE: H2 native-handler tests: FrozenNativeRoute entries ride the frozen view beside
+// static/managed kinds, and HEADERS-time dispatch invokes them through the shared
+// transport-neutral invoke (same guard/panic/validation contract as H1). The rig pumps
+// the transport-neutral driver directly, so no worker thread or host is involved.
+
+static H2N_OK: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/native",
+    handler: h2n_ok,
+    user_data: 0,
+}];
+
+static H2N_ECHO: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"POST",
+    path: b"/echo",
+    handler: h2n_record,
+    user_data: 0,
+}];
+
+static H2N_END_PROBE: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"POST",
+    path: b"/echo",
+    handler: h2n_probe_end,
+    user_data: 0,
+}];
+
+static H2N_CAP_PROBE: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"POST",
+    path: b"/echo",
+    handler: h2n_probe_cap,
+    user_data: 0,
+}];
+
+static H2N_FAIL: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_fail,
+    user_data: 0,
+}];
+
+static H2N_BAD_STATUS: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_bad_status,
+    user_data: 0,
+}];
+
+static H2N_BIG_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_big_body,
+    user_data: 0,
+}];
+
+static H2N_BAD_REASON: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_bad_reason,
+    user_data: 0,
+}];
+
+static H2N_204: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_204,
+    user_data: 0,
+}];
+
+static H2N_SELECT: [FrozenNativeRoute<'static>; 2] = [
+    FrozenNativeRoute {
+        method: b"GET",
+        path: b"/u1",
+        handler: h2n_select,
+        user_data: 1,
+    },
+    FrozenNativeRoute {
+        method: b"GET",
+        path: b"/u2",
+        handler: h2n_select,
+        user_data: 2,
+    },
+];
+
+static H2N_PRE_ROUTES: [FrozenRoute<'static>; 1] = [FrozenRoute {
+    method: b"HEAD",
+    path: b"/x",
+    status: 200,
+    body: b"static-head",
+    managed: false,
+}];
+
+static H2N_PRE_NATIVES: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/x",
+    handler: h2n_ok,
+    user_data: 0,
+}];
+
+static H2N_BIG: [u8; 4097] = [b'x'; 4097];
+static H2N_BAD_REASON_BYTES: [u8; 3] = *b"B\nd";
+static H2N_END_HIT: Mutex<bool> = Mutex::new(false);
+static H2N_CAP_HIT: Mutex<bool> = Mutex::new(false);
+
+struct H2nObserved {
+    method: Vec<u8>,
+    path: Vec<u8>,
+    has_body: u8,
+    body_len: u64,
+    null_body: bool,
+}
+
+static H2N_OBSERVED: Mutex<Option<H2nObserved>> = Mutex::new(None);
+
+fn h2n_view(natives: &'static [FrozenNativeRoute<'static>]) -> FrozenRoutesView<'static> {
+    FrozenRoutesView::new(&ROUTES)
+        .expect("frozen routes")
+        .with_natives(natives)
+        .expect("natives")
+}
+
+#[allow(unsafe_code)]
+fn h2n_respond(
+    response: *mut NativeResponseOut,
+    status: i32,
+    reason: &'static [u8],
+    body: &'static [u8],
+) -> i32 {
+    if response.is_null() {
+        return 1;
+    }
+    
+    let out = unsafe { &mut *response };
+    out.status = status;
+    out.reason = reason.as_ptr();
+    out.reason_len = reason.len();
+    out.body = body.as_ptr();
+    out.body_len = body.len();
+    0
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_ok(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 200, b"OK", b"native-hello")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_record(
+    _user_data: *mut c_void,
+    request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    if request.is_null() {
+        return 1;
+    }
+    
+    let view = unsafe { &*request };
+    let method = unsafe { std::slice::from_raw_parts(view.method, view.method_len) }.to_vec();
+    let path = unsafe { std::slice::from_raw_parts(view.path, view.path_len) }.to_vec();
+    *H2N_OBSERVED.lock().expect("observed lock") = Some(H2nObserved {
+        method,
+        path,
+        has_body: view.has_body,
+        body_len: view.body_len,
+        null_body: view.body.is_null(),
+    });
+    h2n_respond(response, 200, b"OK", b"")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_probe_end(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    *H2N_END_HIT.lock().expect("probe lock") = true;
+    h2n_respond(response, 200, b"OK", b"")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_probe_cap(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    *H2N_CAP_HIT.lock().expect("probe lock") = true;
+    h2n_respond(response, 200, b"OK", b"")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_fail(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    _response: *mut NativeResponseOut,
+) -> i32 {
+    1
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_bad_status(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 199, b"OK", b"")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_big_body(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 200, b"OK", &H2N_BIG)
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_bad_reason(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 200, &H2N_BAD_REASON_BYTES, b"")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_204(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 204, b"No Content", b"")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_select(
+    user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    if user_data as usize == 1 {
+        h2n_respond(response, 200, b"OK", b"one")
+    } else {
+        h2n_respond(response, 200, b"OK", b"two")
+    }
+}
+
+#[test]
+fn h2_native_get_serves_handler_body() {
+    let view = h2n_view(&H2N_OK);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"GET", b"/native", true);
+        let outcome = pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        assert_eq!(outcome.served, 1);
+        assert_eq!(outcome.refused, 0);
+        let response = read_response(client, 1);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_length, 12);
+        assert_eq!(response.body, b"native-hello");
+    });
+}
+
+#[test]
+fn h2_native_head_falls_back_to_get_without_body() {
+    let view = h2n_view(&H2N_OK);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"HEAD", b"/native", true);
+        let outcome = pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        assert_eq!(outcome.served, 1);
+        let response = read_response(client, 1);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_length, 12);
+        assert!(response.body.is_empty());
+    });
+}
+
+#[test]
+fn h2_native_user_data_selects_body() {
+    let view = h2n_view(&H2N_SELECT);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"GET", b"/u1", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        let first = read_response(client, 1);
+        assert_eq!(first.status, 200);
+        assert_eq!(first.body, b"one");
+        send_headers(client, 3, b"GET", b"/u2", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        let second = read_response(client, 3);
+        assert_eq!(second.status, 200);
+        assert_eq!(second.body, b"two");
+    });
+}
+
+#[test]
+fn h2_native_open_tail_invokes_framing_only_then_refuses() {
+    let view = h2n_view(&H2N_ECHO);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        *H2N_OBSERVED.lock().expect("observed lock") = None;
+        send_headers_len(client, 1, b"POST", b"/echo", Some(5), false);
+        let outcome = pump_until(conn, server, &view, None, |outcome| outcome.closed);
+        assert_eq!(outcome.refused, 1);
+        let seen = H2N_OBSERVED
+            .lock()
+            .expect("observed lock")
+            .take()
+            .expect("handler invoked");
+        assert_eq!(seen.method, b"POST");
+        assert_eq!(seen.path, b"/echo");
+        assert_eq!(seen.has_body, 1);
+        assert_eq!(seen.body_len, 5);
+        assert!(seen.null_body);
+        let (header, payload) = read_frame(client);
+        assert_eq!(header.frame_type, FrameType::Headers);
+        assert_eq!(header.stream_id, 1);
+        assert_eq!(header.flags & HEADERS_FLAG_END_STREAM, 0);
+        assert_eq!(decode_response(&payload).status, 200);
+        let (header, payload) = read_frame(client);
+        assert_eq!(header.frame_type, FrameType::RstStream);
+        assert_eq!(
+            decode_rst_stream_payload(header, &payload).expect("decode rst"),
+            ErrorCode::RefusedStream
+        );
+        read_eof(client);
+    });
+}
+
+#[test]
+fn h2_native_end_with_declared_body_is_protocol_error() {
+    let view = h2n_view(&H2N_END_PROBE);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        *H2N_END_HIT.lock().expect("probe lock") = false;
+        send_headers_len(client, 1, b"POST", b"/echo", Some(5), true);
+        pump_until(conn, server, &view, None, |outcome| outcome.refused > 0);
+        assert!(!*H2N_END_HIT.lock().expect("probe lock"));
+        let (id, code) = read_rst(client);
+        assert_eq!(id, 1);
+        assert_eq!(code, ErrorCode::ProtocolError);
+    });
+}
+
+#[test]
+fn h2_native_over_cap_refuses_before_invoke() {
+    let view = h2n_view(&H2N_CAP_PROBE);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        *H2N_CAP_HIT.lock().expect("probe lock") = false;
+        send_headers_len(
+            client,
+            1,
+            b"POST",
+            b"/echo",
+            Some(MAX_STATIC_BODY_BYTES + 1),
+            false,
+        );
+        pump_until(conn, server, &view, None, |outcome| outcome.refused > 0);
+        assert!(!*H2N_CAP_HIT.lock().expect("probe lock"));
+        let (id, code) = read_rst(client);
+        assert_eq!(id, 1);
+        assert_eq!(code, ErrorCode::RefusedStream);
+        send_headers(client, 3, b"GET", b"/empty", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        let sibling = read_response(client, 3);
+        assert_eq!(sibling.status, 200);
+        assert!(sibling.body.is_empty());
+    });
+}
+
+fn h2n_failure_rsts(natives: &'static [FrozenNativeRoute<'static>]) {
+    let view = h2n_view(natives);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"GET", b"/fail", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.refused > 0);
+        let (header, payload) = read_frame(client);
+        assert_eq!(header.frame_type, FrameType::RstStream);
+        assert_eq!(header.stream_id, 1);
+        assert_eq!(
+            decode_rst_stream_payload(header, &payload).expect("decode rst"),
+            ErrorCode::InternalError
+        );
+    });
+}
+
+#[test]
+fn h2_native_handler_failures_rst_without_headers() {
+    h2n_failure_rsts(&H2N_FAIL);
+    h2n_failure_rsts(&H2N_BAD_STATUS);
+    h2n_failure_rsts(&H2N_BIG_BODY);
+    h2n_failure_rsts(&H2N_BAD_REASON);
+    h2n_failure_rsts(&H2N_204);
+}
+
+#[test]
+fn h2_native_wins_over_head_static_on_fallback() {
+    let view = FrozenRoutesView::new(&H2N_PRE_ROUTES)
+        .expect("frozen routes")
+        .with_natives(&H2N_PRE_NATIVES)
+        .expect("natives");
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"HEAD", b"/x", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        let response = read_response(client, 1);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_length, 12);
+        assert!(response.body.is_empty());
+    });
+}
+
+#[test]
+fn h2_native_view_rejects_overlaps_and_bad_input() {
+    static OVER_STATIC: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+        method: b"GET",
+        path: b"/empty",
+        handler: h2n_ok,
+        user_data: 0,
+    }];
+    assert_eq!(
+        FrozenRoutesView::new(&ROUTES)
+            .expect("routes")
+            .with_natives(&OVER_STATIC)
+            .unwrap_err(),
+        RouteBuildError::Duplicate
+    );
+    static OVER_MANAGED: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+        method: b"GET",
+        path: b"/hello",
+        handler: h2n_ok,
+        user_data: 0,
+    }];
+    assert_eq!(
+        FrozenRoutesView::new(&ROUTES)
+            .expect("routes")
+            .with_natives(&OVER_MANAGED)
+            .unwrap_err(),
+        RouteBuildError::Duplicate
+    );
+    static INTERNAL_DUPE: [FrozenNativeRoute<'static>; 2] = [
+        FrozenNativeRoute {
+            method: b"GET",
+            path: b"/a",
+            handler: h2n_ok,
+            user_data: 0,
+        },
+        FrozenNativeRoute {
+            method: b"GET",
+            path: b"/a",
+            handler: h2n_ok,
+            user_data: 1,
+        },
+    ];
+    assert_eq!(
+        FrozenRoutesView::new(&ROUTES)
+            .expect("routes")
+            .with_natives(&INTERNAL_DUPE)
+            .unwrap_err(),
+        RouteBuildError::Duplicate
+    );
+    static BAD_METHOD: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+        method: b"GE T",
+        path: b"/a",
+        handler: h2n_ok,
+        user_data: 0,
+    }];
+    assert_eq!(
+        FrozenRoutesView::new(&ROUTES)
+            .expect("routes")
+            .with_natives(&BAD_METHOD)
+            .unwrap_err(),
+        RouteBuildError::Invalid
+    );
+    static EMPTY_PATH: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+        method: b"GET",
+        path: b"",
+        handler: h2n_ok,
+        user_data: 0,
+    }];
+    assert_eq!(
+        FrozenRoutesView::new(&ROUTES)
+            .expect("routes")
+            .with_natives(&EMPTY_PATH)
+            .unwrap_err(),
+        RouteBuildError::Invalid
+    );
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn live_native_hello(
+    _user_data: *mut c_void,
+    request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    if request.is_null() || response.is_null() {
+        return 1;
+    }
+    
+    let out = unsafe { &mut *response };
+    out.status = 200;
+    out.reason = b"OK".as_ptr();
+    out.reason_len = 2;
+    out.body = b"h2-native".as_ptr();
+    out.body_len = 9;
+    0
+}
+
+#[test]
+fn h2c_serves_native_routes_live() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_native(b"GET", b"/native", Some(live_native_hello), 0)
+        .expect("register native");
+    server
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register hello");
+    let server = server.start().expect("start server");
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"GET", b"/native", true);
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"h2-native");
+    send_headers(&mut client, 3, b"GET", b"/hello", true);
+    let static_response = read_response(&mut client, 3);
+    assert_eq!(static_response.status, 200);
+    assert_eq!(static_response.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2);
 }

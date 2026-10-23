@@ -7,8 +7,9 @@ use veylor_runtime::{
 };
 
 use super::{
-    ACK_SLOTS, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES, FrozenRoute,
-    FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP, STREAM_SLOTS,
+    ACK_SLOTS, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES, FrozenNativeRoute,
+    FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP,
+    STREAM_SLOTS,
 };
 use crate::connection::ConnClose;
 use crate::host::{HostShared, StagedWork};
@@ -672,13 +673,17 @@ pub(crate) fn register_listener(
     Ok(())
 }
 
-pub(crate) fn project_routes<'a>(h2_routes: &'a [H2StaticRoute]) -> Vec<FrozenRoute<'a>> {
+pub(crate) fn project_routes<'a>(
+    h2_routes: &'a [H2StaticRoute],
+) -> (Vec<FrozenRoute<'a>>, Vec<FrozenNativeRoute<'a>>) {
     // NOTE: the h2c route projection is built once per worker from the owned mirror;
-    // only status eligibility (200..=599 except 204) filters here.
-    h2_routes
+    // only status eligibility (200..=599 except 204) filters here. Natives skip the
+    // status/body filter (no stored response) and project alongside, never inside.
+    let flat = h2_routes
         .iter()
         .filter(|route| {
-            route.status != 204
+            route.native.is_none()
+                && route.status != 204
                 && (200..=599).contains(&route.status)
                 && route.body.len() <= MAX_RESPONSE_BODY
         })
@@ -689,7 +694,19 @@ pub(crate) fn project_routes<'a>(h2_routes: &'a [H2StaticRoute]) -> Vec<FrozenRo
             body: &route.body,
             managed: route.managed,
         })
-        .collect()
+        .collect();
+    let natives = h2_routes
+        .iter()
+        .filter_map(|route| {
+            route.native.map(|(handler, user_data)| FrozenNativeRoute {
+                method: &route.method,
+                path: &route.path,
+                handler,
+                user_data,
+            })
+        })
+        .collect();
+    (flat, natives)
 }
 // NOTE: single accept-arm definition, invoked once per slot index below.
 macro_rules! accept_h2_slot {

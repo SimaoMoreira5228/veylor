@@ -144,6 +144,7 @@ pub(crate) struct H2StaticRoute {
     pub(crate) status: u16,
     pub(crate) body: Vec<u8>,
     pub(crate) managed: bool,
+    pub(crate) native: Option<(NativeHandler, usize)>,
 }
 
 impl Server {
@@ -206,6 +207,7 @@ impl Server {
                 status,
                 body: body.to_vec(),
                 managed: false,
+                native: None,
             });
         }
         Ok(())
@@ -229,6 +231,7 @@ impl Server {
                 status: 200,
                 body: Vec::new(),
                 managed: true,
+                native: None,
             });
         }
         Ok(())
@@ -256,9 +259,9 @@ impl Server {
             .map_err(ServerError::from)
     }
 
-    // NOTE: native handlers run on the owner worker only; h2c serves no native routes yet
-    // (404 there) since the h2 projection has no native kind. user_data crosses as an
-    // address-sized value with the handler. Frozen at start like every other register path.
+    // NOTE: native handlers run on the owner worker only, over H1 and H2 alike; user_data
+    // crosses as an address-sized value with the handler. Frozen at start like every other
+    // register path.
     pub fn register_native(
         &mut self,
         method: &[u8],
@@ -268,7 +271,22 @@ impl Server {
     ) -> Result<(), ServerError> {
         self.routes
             .register_native(method, path, handler, user_data)
-            .map_err(ServerError::from)
+            .map_err(ServerError::from)?;
+        // NOTE: register validated, so the mirror cannot fail: same bounds, same order.
+        // Handler and user_data copy (both Copy); the H2 projection reads them straight.
+        if self.h2_routes.len() < MAX_ROUTES {
+            if let Some(handler) = handler {
+                self.h2_routes.push(H2StaticRoute {
+                    method: method.to_vec(),
+                    path: path.to_vec(),
+                    status: 200,
+                    body: Vec::new(),
+                    managed: false,
+                    native: Some((handler, user_data)),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn start(self) -> Result<RunningServer, ServerError> {

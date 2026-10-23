@@ -1,7 +1,7 @@
 use veylor_http1::is_token;
 use veylor_http2::{ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackRepresentation};
 
-use crate::static_routes::{MAX_RESPONSE_BODY, MAX_ROUTES, RouteBuildError};
+use crate::static_routes::{MAX_RESPONSE_BODY, MAX_ROUTES, NativeHandler, RouteBuildError};
 
 use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 
@@ -16,9 +16,22 @@ pub struct FrozenRoute<'a> {
     pub managed: bool,
 }
 
+// NOTE: native projection for the h2c turn: same method+path match shape as FrozenRoute,
+// but dispatch invokes the handler synchronously instead of serving a stored body. Status
+// and body dummies stay in FrozenRoute (natives never project there); validation and the
+// HEAD-to-GET fallback mirror the static view so H1 precedence carries over.
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenNativeRoute<'a> {
+    pub method: &'a [u8],
+    pub path: &'a [u8],
+    pub handler: NativeHandler,
+    pub user_data: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FrozenRoutesView<'a> {
     routes: &'a [FrozenRoute<'a>],
+    natives: &'a [FrozenNativeRoute<'a>],
 }
 
 impl<'a> FrozenRoutesView<'a> {
@@ -46,7 +59,43 @@ impl<'a> FrozenRoutesView<'a> {
         }) {
             return Err(RouteBuildError::Duplicate);
         }
-        Ok(Self { routes })
+        Ok(Self {
+            routes,
+            natives: &[],
+        })
+    }
+
+    // NOTE: native attach runs after new so the frozen static table keeps its shape: same
+    // method+path rules as the registry (bad method/path Invalid, any overlap Duplicate),
+    // and natives overlap nothing since the registry already rejects cross-kind dupes.
+    pub fn with_natives(
+        mut self,
+        natives: &'a [FrozenNativeRoute<'a>],
+    ) -> Result<Self, RouteBuildError> {
+        for native in natives {
+            let bad = native.method.is_empty() || native.path.is_empty();
+            let token = !native.method.iter().copied().all(is_token);
+            if bad || token {
+                return Err(RouteBuildError::Invalid);
+            }
+        }
+        if (1..natives.len()).any(|index| {
+            natives[..index].iter().any(|prev| {
+                prev.method == natives[index].method && prev.path == natives[index].path
+            })
+        }) {
+            return Err(RouteBuildError::Duplicate);
+        }
+        let overlap = natives.iter().any(|native| {
+            self.routes
+                .iter()
+                .any(|route| route.method == native.method && route.path == native.path)
+        });
+        if overlap {
+            return Err(RouteBuildError::Duplicate);
+        }
+        self.natives = natives;
+        Ok(self)
     }
 
     pub(crate) fn find(&self, method: &[u8], path: &[u8]) -> Option<usize> {
@@ -68,6 +117,28 @@ impl<'a> FrozenRoutesView<'a> {
     pub(crate) fn lookup(&self, method: &[u8], path: &[u8]) -> Option<(u16, &[u8])> {
         self.find(method, path)
             .map(|index| (self.routes[index].status, self.routes[index].body))
+    }
+
+    // NOTE: native-first dispatch like H1 (respond_to_head checks natives before statics):
+    // same HEAD-to-GET fallback as find, so a HEAD static never shadows a GET native.
+    pub(crate) fn lookup_native(
+        &self,
+        method: &[u8],
+        path: &[u8],
+    ) -> Option<(NativeHandler, usize)> {
+        let direct = self
+            .natives
+            .iter()
+            .find(|native| native.method == method && native.path == path);
+        let fallback = direct.is_none() && method == b"HEAD";
+        let found = if fallback {
+            self.natives
+                .iter()
+                .find(|native| native.method == b"GET" && native.path == path)
+        } else {
+            direct
+        };
+        found.map(|native| (native.handler, native.user_data))
     }
 
     pub(crate) fn is_managed(&self, method: &[u8], path: &[u8]) -> bool {

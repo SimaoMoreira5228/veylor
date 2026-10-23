@@ -68,47 +68,12 @@ pub(super) fn respond_native(
         body_len: declared,
         body,
     };
-    let mut response = NativeResponseOut {
-        status: 0,
-        reason: std::ptr::null(),
-        reason_len: 0,
-        body: std::ptr::null(),
-        body_len: 0,
-    };
     let mut reason_buf = [0u8; HOST_MAX_REASON_BYTES];
     let mut body_buf = [0u8; MAX_RESPONSE_BODY];
-    // NOTE: the flag trips nested registry/dispatch entries on this worker. Unwinding through
-    // an extern "C" frame aborts the process (nounwind: verified SIGABRT, uncatchable from
-    // here), so containment is the handler's contract — a Rust handler must catch its own
-    // panics and return nonzero; catch_unwind below covers only the boundary closure itself.
-    // The flag clears on every path below since a returning handler cannot skip it.
-    IN_NATIVE.set(true);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        invoke_native(handler, user_data, &request, &mut response)
-    }));
-    IN_NATIVE.set(false);
-    let code = match outcome {
-        Ok(code) => code,
-        Err(_) => return Err(RouteBuildError::NativePanic),
-    };
-    if code != 0 {
-        return Err(RouteBuildError::Invalid);
-    }
-    if !(200..=599).contains(&response.status) {
-        return Err(RouteBuildError::Invalid);
-    }
-    if !copy_handler_bytes(response.reason, response.reason_len, &mut reason_buf) {
-        return Err(RouteBuildError::Invalid);
-    }
-    if !copy_handler_bytes(response.body, response.body_len, &mut body_buf) {
-        return Err(RouteBuildError::Invalid);
-    }
-    let reason = &reason_buf[..response.reason_len];
-    let body = &body_buf[..response.body_len];
-    if !valid_reason(reason) {
-        return Err(RouteBuildError::Invalid);
-    }
-    let status = response.status as u16;
+    let invoked = request.invoke(handler, user_data, &mut reason_buf, &mut body_buf)?;
+    let reason = invoked.reason;
+    let body = invoked.body;
+    let status = invoked.status;
     let response_close = status == 404;
     let connection = connection_header_for_response(
         head,
@@ -149,6 +114,75 @@ pub(super) fn respond_native(
         interim_len,
         file: None,
     })
+}
+
+// NOTE: transport-neutral native invocation shared by H1 (respond_native above) and H2
+// (serve): reentrancy guard, unwind boundary, code/status validation, bounded out-param
+// copies. Framing and response encoding stay per protocol at the call sites. An inherent
+// method rather than a re-export so both seams reach it while the module stays private.
+pub(crate) struct InvokedNative<'r, 'b> {
+    pub(crate) status: u16,
+    pub(crate) reason: &'r [u8],
+    pub(crate) body: &'b [u8],
+}
+
+impl NativeRequestView {
+    pub(crate) fn invoke<'r, 'b>(
+        &self,
+        handler: NativeHandler,
+        user_data: usize,
+        reason_scratch: &'r mut [u8; HOST_MAX_REASON_BYTES],
+        body_scratch: &'b mut [u8; MAX_RESPONSE_BODY],
+    ) -> Result<InvokedNative<'r, 'b>, RouteBuildError> {
+        let mut response = NativeResponseOut {
+            status: 0,
+            reason: std::ptr::null(),
+            reason_len: 0,
+            body: std::ptr::null(),
+            body_len: 0,
+        };
+        // NOTE: the flag trips nested registry/dispatch entries on this worker. Unwinding
+        // through an extern "C" frame aborts the process (nounwind: verified SIGABRT,
+        // uncatchable from here), so containment is the handler's contract — a Rust handler
+        // must catch its own panics and return nonzero; catch_unwind below covers only the
+        // boundary closure itself. The flag clears on every path below since a returning
+        // handler cannot skip it.
+        IN_NATIVE.set(true);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            invoke_native(handler, user_data, self, &mut response)
+        }));
+        IN_NATIVE.set(false);
+        let code = match outcome {
+            Ok(code) => code,
+            Err(_) => return Err(RouteBuildError::NativePanic),
+        };
+        if code != 0 {
+            return Err(RouteBuildError::Invalid);
+        }
+        if !(200..=599).contains(&response.status) {
+            return Err(RouteBuildError::Invalid);
+        }
+        if !copy_handler_bytes(
+            response.reason,
+            response.reason_len,
+            &mut reason_scratch[..],
+        ) {
+            return Err(RouteBuildError::Invalid);
+        }
+        if !copy_handler_bytes(response.body, response.body_len, &mut body_scratch[..]) {
+            return Err(RouteBuildError::Invalid);
+        }
+        let reason = &reason_scratch[..response.reason_len];
+        let body = &body_scratch[..response.body_len];
+        if !valid_reason(reason) {
+            return Err(RouteBuildError::Invalid);
+        }
+        Ok(InvokedNative {
+            status: response.status as u16,
+            reason,
+            body,
+        })
+    }
 }
 
 // NOTE: single unsafe funnel for the boundary call: the engine holds the request views and

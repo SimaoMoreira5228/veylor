@@ -8,7 +8,10 @@ use veylor_runtime::ConnectionToken;
 use crate::connection::StagedTrailer;
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::streams::{StreamCmd, take_stream_cmd};
-use crate::host::HostShared;
+use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
+use crate::static_routes::{
+    MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
+};
 
 use super::routes::{FrozenRoutesView, NOT_FOUND_BODY, field, send_full};
 use super::turn;
@@ -65,6 +68,76 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         }
         if close {
             self.outcome.closed = true;
+        }
+    }
+
+    // NOTE: H2 native dispatch with the H1 invocation contract: same match, same
+    // native-first precedence, same guard/panic/fail-closed semantics via the shared
+    // invoke. H1 mappings translate per stream (the conn multiplexes on): overflow and
+    // handler failure RST InternalError where H1 closes response-overflow, panic RSTs
+    // where H1 closes protocol-error, never partial DATA since HEADERS emit only after
+    // a successful invoke. Every reason validates but never encodes: H2 has no reason
+    // phrase. A 204 always fails closed: the driver forbids content-length on 204 while
+    // the shared HEADERS path always carries it, and the static projection rejects 204
+    // outright, so there is no servable 204 shape here.
+    // NOTE: request bytes live in HPACK-decoded buffers and DATA has not arrived at
+    // HEADERS time, so every invoke is framing-only (null body, has_body/body_len
+    // intact). Tails RST rather than drain: sync routes hold no streaming state, so an
+    // open stream answers HEADERS-open then refuses exactly like a static body refusal.
+    fn serve_native(
+        &mut self,
+        stream: u32,
+        view: NativeRequestView,
+        end: bool,
+        is_head: bool,
+        handler: NativeHandler,
+        user_data: usize,
+    ) {
+        let declared = view.body_len;
+        if declared > MAX_STATIC_BODY_BYTES {
+            return self.deny(stream, ErrorCode::RefusedStream, false);
+        }
+        if end && declared > 0 {
+            return self.deny(stream, ErrorCode::ProtocolError, false);
+        }
+        let mut reason_scratch = [0u8; HOST_MAX_REASON_BYTES];
+        let mut body_scratch = [0u8; MAX_RESPONSE_BODY];
+        let invoked = match view.invoke(handler, user_data, &mut reason_scratch, &mut body_scratch)
+        {
+            Ok(invoked) => invoked,
+            Err(_) => return self.deny(stream, ErrorCode::InternalError, false),
+        };
+        if invoked.status == 204 {
+            return self.deny(stream, ErrorCode::InternalError, false);
+        }
+        if !end {
+            let refused = send_full(
+                self.server,
+                stream,
+                invoked.status,
+                invoked.body,
+                false,
+                false,
+                self.output,
+                self.used,
+            );
+            if refused.is_err() {
+                return self.fail(ErrorCode::InternalError);
+            }
+            return self.deny(stream, ErrorCode::RefusedStream, true);
+        }
+        match send_full(
+            self.server,
+            stream,
+            invoked.status,
+            invoked.body,
+            is_head || invoked.body.is_empty(),
+            true,
+            self.output,
+            self.used,
+        ) {
+            Ok(()) => self.outcome.served += 1,
+            Err(code) => self.fail(code),
         }
     }
 
@@ -181,6 +254,20 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                             return self.deny(stream, ErrorCode::RefusedStream, false);
                         }
                     }
+                }
+                if let Some((handler, user_data)) = self.routes.lookup_native(request.method, path)
+                {
+                    let declared = request.content_length.unwrap_or(0);
+                    let view = NativeRequestView {
+                        method: request.method.as_ptr(),
+                        method_len: request.method.len(),
+                        path: path.as_ptr(),
+                        path_len: path.len(),
+                        has_body: u8::from(declared > 0),
+                        body_len: declared,
+                        body: std::ptr::null(),
+                    };
+                    return self.serve_native(stream, view, end, is_head, handler, user_data);
                 }
                 let (status, body) = self
                     .routes
@@ -470,6 +557,12 @@ pub(crate) fn apply_h2_streams(
     let spare = turn::pending_spare(meta);
     let step = match cmd {
         StreamCmd::Begin { status, .. } => {
+            // NOTE: HEAD-park parity gap, documented-unenforced: H1 fails a host-staged streaming
+            // Begin on a HEAD park closed via the ConnPhase::Parked method snapshot, but ParkedEntry
+            // stores no method and the H2 driver retains none, so apply time cannot see it. Seam in
+            // host/*: snapshot method_len+method onto ParkedEntry in try_park, then token-gate that
+            // snapshot here like push_h2_data and abort_stream on HEAD (RST only its stream, conn
+            // stays up, siblings unaffected); the EndWithTrailers arm needs the same check.
             let mut used = 0;
             match send_full(server, stream, status, b"", false, false, spare, &mut used) {
                 Ok(()) => StreamStep::Done {
@@ -518,6 +611,11 @@ pub(crate) fn apply_h2_streams(
             Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
         },
         StreamCmd::EndWithTrailers { trailers } => {
+            // NOTE: terminal HEADERS stay per stream: the token-gated take plus the slot-derived
+            // unpark bind the set to its stream only, zero-DATA trailers are legal, never-begun
+            // sets reject at stage, late sets follow the tomb discipline, and assembly is
+            // all-or-nothing through the shared serve validator. HEAD EndWithTrailers stays
+            // unenforced with the Begin arm until the ParkedEntry method seam lands.
             let mut fields = [field(b"", b""); TRAILER_SLOTS];
             let mut valid = trailers.len() <= TRAILER_SLOTS;
             for (slot, staged) in trailers.iter().enumerate().take(TRAILER_SLOTS) {
