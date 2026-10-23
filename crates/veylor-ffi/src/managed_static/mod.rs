@@ -17,10 +17,10 @@ pub use api::{
 };
 pub use dispatch::{
     vyl_managed_static_host_begin_stream, vyl_managed_static_host_cancel,
-    vyl_managed_static_host_end_stream, vyl_managed_static_host_is_writable,
-    vyl_managed_static_host_pull_body, vyl_managed_static_host_pull_trailers,
-    vyl_managed_static_host_respond, vyl_managed_static_host_write_stream,
-    vyl_managed_static_poll_events,
+    vyl_managed_static_host_end_stream, vyl_managed_static_host_end_stream_with_trailers,
+    vyl_managed_static_host_is_writable, vyl_managed_static_host_pull_body,
+    vyl_managed_static_host_pull_trailers, vyl_managed_static_host_respond,
+    vyl_managed_static_host_write_stream, vyl_managed_static_poll_events,
 };
 use veylor_server::{CloseCounts, RunningServer, Server, ServerConfig};
 

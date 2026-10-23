@@ -1609,3 +1609,31 @@ fn managed_stream_end_then_trailers_fails_closed() {
     server.stop_accepting();
     let _ = server.join().expect("join server");
 }
+
+#[test]
+fn managed_body_unread_respond_repeated_sequential() {
+    // NOTE: regression test for the park-time race where a host respond staged between
+    // try_park and the buffered-body push killed the connection with TransportError instead
+    // of draining (~3% per exchange, ~60% per 50-exchange run pre-fix). Repeating the
+    // respond-then-write exchange exercises both orders across runs; every order must reuse.
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    for _ in 0..25 {
+        stream
+            .write_all(b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nabc")
+            .expect("write head and partial body");
+        let (event, _, _) = poll_request(&host);
+        assert_eq!(
+            host.respond(event.token, 200, b"OK", b"ok"),
+            RespondOutcome::Ok
+        );
+        stream.write_all(b"defghij").expect("write rest of body");
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+}

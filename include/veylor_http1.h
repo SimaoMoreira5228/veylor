@@ -786,6 +786,8 @@ vyl_http1_result vyl_managed_static_register_managed_route(
    admits no trailer fields. */
 #define VYL_MANAGED_STATIC_MAX_TRAILER_NAMES 32u
 #define VYL_MANAGED_STATIC_MAX_TRAILER_NAME_BYTES 128u
+#define VYL_MANAGED_STATIC_MAX_RESPONSE_TRAILERS 8u
+#define VYL_MANAGED_STATIC_MAX_RESPONSE_TRAILER_BYTES 1024u
 vyl_http1_result vyl_managed_static_register_managed_route_with_trailers(
     vyl_managed_static_server* server,
     vyl_http1_bytes method,
@@ -926,6 +928,20 @@ vyl_http1_result vyl_managed_static_host_write_stream(
 vyl_http1_result vyl_managed_static_host_end_stream(
     vyl_managed_static_server* server,
     vyl_managed_static_token token
+);
+/* NOTE: Ends an open stream with a validated trailer block; the connection unparks for
+   keep-alive reuse. Whole-set discipline: every field validates before anything stages, so a
+   bad name, bad value, prohibited name, over-count (>8), or over-byte (>1 KiB total) set
+   reports INVALID_ARGUMENT with the stream still open. A repeat end while the first is still
+   queued reports DUPLICATE, after apply GONE; ending a token with no open stream reports
+   INVALID_ARGUMENT. An encoded terminal past the output fit reports BODY_TOO_LONG. The field
+   array and every nonempty trailer byte range must be valid; zero count accepts NULL. Valid
+   only while running. */
+vyl_http1_result vyl_managed_static_host_end_stream_with_trailers(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    const vyl_http1_field* trailers,
+    size_t trailer_count
 );
 /* NOTE: Queries whether a stream token currently admits a write: OK with 1 when a write would
    stage, OK with 0 for any other live-or-unknown token. Only a bad handle, a non-running

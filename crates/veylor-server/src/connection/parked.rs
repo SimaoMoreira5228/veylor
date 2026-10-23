@@ -16,7 +16,7 @@ use super::{
     TrailerOutcome, TrailerReport, connection_value,
 };
 
-pub(crate) use super::streams::{StreamCmd, StreamState, push_staged_body};
+pub(crate) use super::streams::{BodyPushOutcome, StreamCmd, StreamState, push_staged_body};
 
 // NOTE: request-trailer staging bounds: at most TRAILER_SLOTS fields and MAX_STAGED_TRAILER_BYTES
 // of staged name/value bytes per park; the first field past either cap fails the connection closed.
@@ -351,14 +351,22 @@ pub(crate) fn park_request(
     };
     let mut body_received = 0u64;
     if take > 0 {
-        if !host.push_body(
+        // NOTE: the host may stage its respond between try_park above and this push (same
+        // reason the flake hunt chased): Answered means the bytes were never staged, so count
+        // them as drain-skipped here and let the normal drain publish the held response.
+        // Only a genuinely unusable entry still fails closed.
+        match host.push_body_or_answered(
             event_token,
             &conn.input[conn.head_len..conn.head_len + take],
         ) {
-            host.unpark_closed(token);
-            return ExchangeOutcome::Close(ConnClose::TransportError);
+            BodyPushOutcome::Refused => {
+                host.unpark_closed(token);
+                return ExchangeOutcome::Close(ConnClose::TransportError);
+            }
+            BodyPushOutcome::Pushed | BodyPushOutcome::Answered => {
+                body_received = take as u64;
+            }
         }
-        body_received = take as u64;
     }
     conn.input.copy_within(conn.head_len + take..conn.len, 0);
     conn.len -= conn.head_len + take;

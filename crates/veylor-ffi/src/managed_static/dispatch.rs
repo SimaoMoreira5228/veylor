@@ -12,7 +12,11 @@ use super::{
     VylManagedStaticEvent, VylManagedStaticPollReport, VylManagedStaticToken,
     VylManagedStaticTrailerReport,
 };
-use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
+use crate::abi::{VylBytes, VylField, VylResult, catch_ffi, slice_length_valid};
+
+// NOTE: mirrors the `veylor-server` staged response-trailer bounds; enforced here before any copy.
+const MAX_RESPONSE_TRAILER_FIELDS: usize = 8;
+const MAX_RESPONSE_TRAILER_BYTES: usize = 1024;
 
 
 
@@ -439,6 +443,72 @@ unsafe fn host_end_stream(
     respond_outcome_to_result(running.host().end_stream(token_to_server(token)))
 }
 
+
+
+
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_end_stream_with_trailers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    trailers: *const VylField,
+    trailer_count: usize,
+) -> VylResult {
+    catch_ffi(|| unsafe { host_end_stream_with_trailers(server, token, trailers, trailer_count) })
+}
+
+unsafe fn host_end_stream_with_trailers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    trailers: *const VylField,
+    trailer_count: usize,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if (trailers.is_null() && trailer_count != 0) || !slice_length_valid::<VylField>(trailer_count)
+    {
+        return VylResult::InvalidArgument;
+    }
+    if trailer_count > MAX_RESPONSE_TRAILER_FIELDS {
+        return VylResult::InvalidArgument;
+    }
+    let raw = unsafe { raw_trailer_fields(trailers, trailer_count) };
+    let mut total = 0usize;
+    let mut fields = Vec::with_capacity(trailer_count);
+    for field in raw {
+        let name = match unsafe { read_bytes(field.name) } {
+            Ok(name) => name,
+            Err(error) => return error,
+        };
+        let value = match unsafe { read_bytes(field.value) } {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        fields.push((name, value));
+    }
+    if total > MAX_RESPONSE_TRAILER_BYTES {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    respond_outcome_to_result(
+        running
+            .host()
+            .end_stream_with_trailers(token_to_server(token), &fields),
+    )
+}
+
 // NOTE: the Rust query returns a bare bool with no invalid signal, so the shape check lives here:
 // a zero-generation token reports bad-state, while an unknown-but-well-formed token answers Ok
 // with false — absence of a live writable stream is a negative answer, never an error.
@@ -564,6 +634,16 @@ unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
         return Ok(&[]);
     }
     Ok(unsafe { slice::from_raw_parts(bytes.data, bytes.length) })
+}
+
+unsafe fn raw_trailer_fields<'a>(
+    trailers: *const VylField,
+    trailer_count: usize,
+) -> &'a [VylField] {
+    if trailer_count == 0 {
+        return &[];
+    }
+    unsafe { slice::from_raw_parts(trailers, trailer_count) }
 }
 
 const _: () = assert!(std::mem::size_of::<VylManagedStaticEvent>() == 4 + 4 + 32 + 8 + 8 * 4);

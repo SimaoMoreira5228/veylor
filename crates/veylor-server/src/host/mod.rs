@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use veylor_runtime::{ConnectionToken, WakeHandle};
 
+use crate::connection::parked::BodyPushOutcome;
 use crate::connection::{pull_staged_body, push_staged_body};
 use crate::static_routes::MAX_RESPONSE_BODY;
 
@@ -304,6 +305,21 @@ impl HostShared {
     pub fn push_body(&self, token: ConnectionToken, bytes: &[u8]) -> bool {
         let done = self.with_inner(|inner| (push_staged_body(inner, token, bytes), None));
         done.is_some_and(|(ok, _)| ok)
+    }
+
+    pub(crate) fn push_body_or_answered(
+        &self,
+        token: ConnectionToken,
+        bytes: &[u8],
+    ) -> BodyPushOutcome {
+        let done = self.with_inner(|inner| {
+            (
+                crate::connection::streams::push_body_or_answered(inner, token, bytes),
+                None,
+            )
+        });
+        done.map(|(outcome, _)| outcome)
+            .unwrap_or(BodyPushOutcome::Refused)
     }
 
     pub fn stage_respond(

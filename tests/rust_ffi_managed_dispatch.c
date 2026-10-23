@@ -325,13 +325,72 @@ int main(void) {
     assert(strstr(response, "0\r\n\r\n") != NULL);
     assert(vyl_managed_static_host_end_stream(server, token) == VYL_HTTP1_GONE);
 
+    static const uint8_t checksum_name[] = "x-checksum";
+    static const uint8_t checksum_value[] = "abc";
+    static const uint8_t tag_value[] = "v1";
+    fd = connect_loopback(port);
+    assert(
+        send(fd, stream_request, sizeof(stream_request) - 1, 0) ==
+        (ssize_t)(sizeof(stream_request) - 1)
+    );
+    assert(
+        vyl_managed_static_poll_events(
+            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+        ) == VYL_HTTP1_OK
+    );
+    assert(report.copied == 1);
+    token = events[0].token;
+    assert(
+        vyl_managed_static_host_begin_stream(
+            server,
+            token,
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    assert(
+        vyl_managed_static_host_write_stream(
+            server,
+            token,
+            (vyl_http1_bytes){.data = first_chunk, .length = sizeof(first_chunk) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    static const vyl_http1_field resp_trailers[] = {
+        {
+            .name = {.data = checksum_name, .length = sizeof(checksum_name) - 1},
+            .value = {.data = checksum_value, .length = sizeof(checksum_value) - 1},
+        },
+        {
+            .name = {.data = tag_name, .length = sizeof(tag_name) - 1},
+            .value = {.data = tag_value, .length = sizeof(tag_value) - 1},
+        },
+    };
+    assert(
+        vyl_managed_static_host_end_stream_with_trailers(
+            server, token, resp_trailers, sizeof(resp_trailers) / sizeof(resp_trailers[0])
+        ) == VYL_HTTP1_OK
+    );
+    read_to_end(fd, response, sizeof(response));
+    assert(close(fd) == 0);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Transfer-Encoding: chunked") != NULL);
+    assert(strstr(response, "2\r\nhi\r\n") != NULL);
+    assert(strstr(response, "0\r\nx-checksum: abc\r\nx-tag: v1\r\n\r\n") != NULL);
+    assert(
+        vyl_managed_static_host_end_stream_with_trailers(
+            server, token, resp_trailers, sizeof(resp_trailers) / sizeof(resp_trailers[0])
+        ) == VYL_HTTP1_GONE
+    );
+
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 3);
+    assert(counts.completed == 4);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 3
+            counts.shutdown == 4
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

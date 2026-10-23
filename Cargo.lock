@@ -102,6 +102,7 @@ dependencies = [
 name = "veylor-server"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "veylor-http1",
  "veylor-router",
  "veylor-runtime",

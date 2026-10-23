@@ -16,27 +16,53 @@ use super::{
     trailer_allowed,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyPushOutcome {
+    Pushed,
+    Answered,
+    Refused,
+}
+
 pub(crate) fn push_staged_body(
     inner: &mut HostInner,
     token: ConnectionToken,
     bytes: &[u8],
 ) -> bool {
+    matches!(
+        push_body_or_answered(inner, token, bytes),
+        BodyPushOutcome::Pushed
+    )
+}
+
+// NOTE: park-time body bytes race the host's staged respond: try_park queues the event, the
+// host can answer before the worker pushes the already-read bytes, and killing the connection
+// for that ordering loses a healthy exchange. Answering first is legitimate, so an entry that
+// already holds a staged decision reports Answered (the worker drains instead of dying);
+// anything else absent or unusable reports Refused and the caller fails closed.
+pub(crate) fn push_body_or_answered(
+    inner: &mut HostInner,
+    token: ConnectionToken,
+    bytes: &[u8],
+) -> BodyPushOutcome {
     let Some(entry) = inner
         .parked
         .get_mut(token.worker_id as usize)
         .and_then(|table| table.get_mut(token.slot as usize))
         .and_then(|entry| entry.as_mut())
     else {
-        return false;
+        return BodyPushOutcome::Refused;
     };
-    if entry.token != token || entry.staged.is_some() {
-        return false;
+    if entry.token != token {
+        return BodyPushOutcome::Refused;
+    }
+    if entry.staged.is_some() {
+        return BodyPushOutcome::Answered;
     }
     if entry.body_pulled + entry.body.len() as u64 + bytes.len() as u64 > entry.body_total {
-        return false;
+        return BodyPushOutcome::Refused;
     }
     entry.body.extend_from_slice(bytes);
-    true
+    BodyPushOutcome::Pushed
 }
 
 // NOTE: stream writes reuse the staged channel with pump-pull delivery: take_staged skips stream

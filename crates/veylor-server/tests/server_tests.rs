@@ -1143,6 +1143,107 @@ fn file_shutdown_mid_transfer_drains_clean() {
 }
 
 #[test]
+fn file_closed_receiver_no_sigpipe_stays_healthy() {
+    let (server, _fixture) = file_server();
+    for _ in 0..8 {
+        let mut stream = connect(&server);
+        get(&mut stream, "/assets/blob.bin");
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => head.push(byte[0]),
+                Err(error) => panic!("read head: {error:?}"),
+            }
+        }
+        let mut partial = [0; 65536];
+        stream.read_exact(&mut partial).expect("read partial body");
+        drop(stream);
+    }
+    // NOTE: Rust ignores SIGPIPE process-wide from lang_start, so every closed-receiver
+    // sendfile above surfaced as EPIPE/PeerClosed or RST/Reset instead of a signal; this
+    // process surviving to serve again pins that discipline with no handler installed.
+    let mut again = connect(&server);
+    get(&mut again, "/hello");
+    let response = read_response(&mut again);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 0, "counts: {counts:?}");
+    assert!(
+        counts.peer_closed + counts.reset + counts.transport_error >= 1,
+        "counts: {counts:?}"
+    );
+}
+
+struct TruncGuard {
+    dir: PathBuf,
+}
+
+impl Drop for TruncGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn file_truncated_mid_transfer_fails_closed() {
+    const BIG_LEN: usize = 16 << 20;
+    let id = NEXT_FILE_ID.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("veylor-srv-trunc-{}-{id}", std::process::id()));
+    let _guard = TruncGuard { dir: dir.clone() };
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).expect("fixture root");
+    let mut big = Vec::with_capacity(BIG_LEN);
+    for i in 0..BIG_LEN {
+        big.push((i % 251) as u8);
+    }
+    std::fs::write(root.join("big.bin"), &big).expect("big file");
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    server
+        .register_file_mount(b"/assets/", &root)
+        .expect("register assets");
+    let server = server.start().expect("start server");
+    let mut stream = connect(&server);
+    get(&mut stream, "/assets/big.bin");
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(error) => panic!("read head: {error:?}"),
+        }
+    }
+    let text = String::from_utf8(head).expect("head utf8");
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status: {text}");
+    assert!(
+        text.contains(&format!("Content-Length: {BIG_LEN}")),
+        "length: {text}"
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("big.bin"))
+        .expect("open big")
+        .set_len(100)
+        .expect("truncate big");
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).expect("read truncated body");
+    // NOTE: a shrink racing a sendfile can zero-fill inside the plan bounds (one call
+    // straddled this ftruncate: zeroed partial-page tail plus a not-yet-discarded page),
+    // where the read_chunk path would serve a short read instead. Either way the transfer
+    // fails closed below: short body, EOF, transport_error, never a short success.
+    assert!(body.len() < BIG_LEN, "short body, got {}", body.len());
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 0, "counts: {counts:?}");
+    assert_eq!(counts.transport_error, 1, "counts: {counts:?}");
+}
+
+#[test]
 fn file_duplicate_and_invalid_mounts_reject() {
     let fixture = FileFixture::build();
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));

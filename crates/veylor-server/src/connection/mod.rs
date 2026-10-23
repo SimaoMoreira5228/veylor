@@ -10,7 +10,9 @@ use veylor_runtime::{
 };
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
-use crate::static_files::{FilePlan, read_chunk};
+use crate::static_files::FilePlan;
+#[cfg(not(target_os = "linux"))]
+use crate::static_files::read_chunk;
 use crate::static_routes::{
     EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_expectation_failed,
     respond_to_head,
@@ -231,9 +233,25 @@ pub fn pump_connection(
     if conn.is_parked() {
         return parked::pump_parked(conn, host);
     }
-    // NOTE: bounded per-turn file staging: one read_chunk slice at most and only with a
-    // fully flushed head/chunk, so slow readers backpressure through write_blocked and a
-    // large file never sits resident; the shared dispatch below flushes the staged slice.
+    // NOTE: zero-copy staging split: Linux moves file bytes straight to the socket with
+    // sendfile while other targets stage one read_chunk slice through the output buffer;
+    // both cap a turn at the same byte width off the same transfer offset, so keep-alive
+    // reuse, pipelined tail, and shutdown drain stay byte-identical while a short send
+    // still fails closed as truncation. Rust ignores SIGPIPE process-wide, so a closed
+    // receiver surfaces here as EPIPE/PeerClosed, never as a signal; EAGAIN backpressures
+    // through write_blocked exactly like a blocked buffer flush.
+    #[cfg(target_os = "linux")]
+    let mut file_sent: u64 = 0;
+    #[cfg(not(target_os = "linux"))]
+    let file_sent: u64 = 0;
+    #[cfg(target_os = "linux")]
+    if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
+        match sendfile_file_chunk(conn, byte_budget) {
+            Ok(sent) => file_sent = sent,
+            Err(reason) => return PumpOutcome::Close(reason),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
         if let Err(reason) = stage_file_chunk(conn) {
             return PumpOutcome::Close(reason);
@@ -316,7 +334,7 @@ pub fn pump_connection(
         WriteStatus::Idle => 0,
     };
     conn.out_sent += accepted;
-    progress.bytes_written = accepted as u64;
+    progress.bytes_written = accepted as u64 + file_sent;
     if closed.is_some() && !conn.has_pending_output() && conn.phase == ConnPhase::ReadingHead {
         return PumpOutcome::Close(ConnClose::PeerClosed);
     }
@@ -550,6 +568,7 @@ fn encode_static(
 // (no fd cache yet); EPIPE and backpressure stay in the dispatch mapping, and Rust
 // ignores SIGPIPE process-wide, so a closed receiver closes as PeerClosed, never a
 // signal. Partial short reads advance the offset and resume on the next turn.
+#[cfg(not(target_os = "linux"))]
 fn stage_file_chunk(conn: &mut ConnState) -> Result<(), ConnClose> {
     let Some(transfer) = conn.file.as_mut() else {
         return Err(ConnClose::TransportError);
@@ -570,6 +589,65 @@ fn stage_file_chunk(conn: &mut ConnState) -> Result<(), ConnClose> {
         }
         Err(_) => Err(ConnClose::TransportError),
     }
+}
+
+// NOTE: a shrink racing a send can zero-fill inside the plan bounds (one call straddled
+// an ftruncate in testing: zeroed partial-page tail plus a not-yet-discarded page), where
+// read_chunk would serve a short read instead. The transfer still fails closed either way:
+// the offset stalls below plan size and the next turn reads zero as truncation. Bytes past
+// plan.size never serve (count clamp) and only this file's pages ever map (no cross-file
+// leak); the race window is one syscall wide and shrinks with nothing here to shrink it.
+#[cfg(target_os = "linux")]
+fn sendfile_file_chunk(conn: &mut ConnState, byte_budget: u64) -> Result<u64, ConnClose> {
+    let Some(transfer) = conn.file.as_ref() else {
+        return Err(ConnClose::TransportError);
+    };
+    if transfer.offset >= transfer.plan.size {
+        return Ok(0);
+    }
+    let width = (transfer.plan.size - transfer.offset)
+        .min(OUTPUT_CAP as u64)
+        .min(byte_budget) as usize;
+    if width == 0 || conn.write_blocked {
+        return Ok(0);
+    }
+    let file = match std::fs::File::open(&transfer.plan.fs_path) {
+        Ok(file) => file,
+        Err(_) => return Err(ConnClose::TransportError),
+    };
+    let mut cursor = transfer.offset;
+    for _ in 0..2 {
+        match rustix::fs::sendfile(&conn.stream, &file, Some(&mut cursor), width) {
+            Ok(sent) => {
+                if sent == 0 {
+                    return Err(ConnClose::TransportError);
+                }
+                let Some(transfer) = conn.file.as_mut() else {
+                    return Err(ConnClose::TransportError);
+                };
+                transfer.offset = cursor;
+                return Ok(sent as u64);
+            }
+            Err(error) if error == rustix::io::Errno::INTR => continue,
+            Err(error) => return sendfile_close(conn, error),
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+fn sendfile_close(conn: &mut ConnState, error: rustix::io::Errno) -> Result<u64, ConnClose> {
+    if error == rustix::io::Errno::AGAIN {
+        conn.write_blocked = true;
+        return Ok(0);
+    }
+    if error == rustix::io::Errno::PIPE {
+        return Err(ConnClose::PeerClosed);
+    }
+    if error == rustix::io::Errno::CONNRESET {
+        return Err(ConnClose::Reset);
+    }
+    Err(ConnClose::TransportError)
 }
 
 fn send_bad_request(conn: &mut ConnState) {
