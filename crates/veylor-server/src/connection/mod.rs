@@ -13,8 +13,8 @@ use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_files::FilePlan;
 use crate::static_files::read_chunk;
 use crate::static_routes::{
-    EncodedStaticResponse, StaticRoutes, respond_bad_request, respond_expectation_failed,
-    respond_to_head,
+    EncodedStaticResponse, RouteBuildError, StaticRoutes, respond_bad_request,
+    respond_expectation_failed, respond_to_head,
 };
 
 pub const INPUT_CAP: usize = 8192;
@@ -582,6 +582,10 @@ fn encode_static(
             }
             ExchangeOutcome::Responded
         }
+        // NOTE: handler-reported failure closes as response-overflow (bounded-response family,
+        // like static); NativePanic is defense-in-depth for the boundary closure itself —
+        // a panic inside the handler aborts nounwind before it can reach here.
+        Err(RouteBuildError::NativePanic) => ExchangeOutcome::Close(ConnClose::ProtocolError),
         Err(_) => ExchangeOutcome::Close(ConnClose::ResponseOverflow),
     }
 }

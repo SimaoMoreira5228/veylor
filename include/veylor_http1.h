@@ -963,6 +963,76 @@ vyl_http1_result vyl_managed_static_host_is_writable(
     uint32_t* out_writable
 );
 
+/* NOTE: Native (worker-executed) routes. The handler runs on the connection owner worker and
+   must return promptly without calling back into server APIs; registry and dispatch entries
+   fail while a handler runs. Joining from inside a handler deadlocks (the worker waits on
+   itself): a busy report needs a later slice exposing the server reentrancy guard. Request
+   bytes are borrowed for the call; the engine copies reason/body into bounded scratch before
+   returning, so handler memory only needs to outlive the call. Native routes win over static
+   and file routes for the same method and path (any overlap rejects as a duplicate). The
+   request carries framing only (has_body/body_len); staged body bytes stay host-routed in
+   this slice. A nonzero return fails the request closed without a partial write. Handlers
+   are nounwind: unwinding (C++ exceptions, Rust panics) aborts the process, so handlers must
+   catch their own failures and return nonzero instead. user_data stores opaque and comes back
+   verbatim on every call, never dereferenced; it must outlive the handle and its
+   thread-safety is the host's contract. Register before start; method/path copy before
+   return, null handlers reject, post-start rejects. */
+typedef struct {
+    const uint8_t* method;
+    size_t method_len;
+    const uint8_t* path;
+    size_t path_len;
+    uint8_t has_body;
+    uint64_t body_len;
+} vyl_managed_static_native_request;
+
+typedef struct {
+    int32_t status;
+    const uint8_t* reason;
+    size_t reason_len;
+    const uint8_t* body;
+    size_t body_len;
+} vyl_managed_static_native_response;
+
+typedef int32_t (*vyl_managed_static_native_handler)(
+    void* user_data,
+    const vyl_managed_static_native_request* request,
+    vyl_managed_static_native_response* response
+);
+
+_Static_assert(
+    sizeof(vyl_managed_static_native_request) == 48,
+    "native request twin must match Rust NativeRequestView"
+);
+_Static_assert(
+    offsetof(vyl_managed_static_native_request, has_body) == 32,
+    "native request has_body offset must match Rust"
+);
+_Static_assert(
+    offsetof(vyl_managed_static_native_request, body_len) == 40,
+    "native request body_len offset must match Rust"
+);
+_Static_assert(
+    sizeof(vyl_managed_static_native_response) == 40,
+    "native response twin must match Rust NativeResponseOut"
+);
+_Static_assert(
+    offsetof(vyl_managed_static_native_response, reason) == 8,
+    "native response reason offset must match Rust"
+);
+_Static_assert(
+    offsetof(vyl_managed_static_native_response, body_len) == 32,
+    "native response body_len offset must match Rust"
+);
+
+vyl_http1_result vyl_managed_static_register_native_route(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    vyl_managed_static_native_handler handler,
+    void* user_data
+);
+
 #ifdef __cplusplus
 }
 #endif

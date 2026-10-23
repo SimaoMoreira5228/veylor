@@ -12,7 +12,7 @@ use veylor_runtime::{
 use crate::connection::ConnClose;
 use crate::host::{HostHandle, HostShared};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
-use crate::static_routes::{MAX_ROUTES, RouteBuildError, StaticRoutes};
+use crate::static_routes::{MAX_ROUTES, NativeHandler, RouteBuildError, StaticRoutes};
 
 pub(crate) mod turn;
 
@@ -118,6 +118,7 @@ impl From<RouteBuildError> for ServerError {
             RouteBuildError::Duplicate => Self::DuplicateRoute,
             RouteBuildError::Full => Self::RouteCapacity,
             RouteBuildError::BodyTooLarge => Self::ResponseTooLarge,
+            RouteBuildError::NativePanic => Self::InvalidRoute,
             RouteBuildError::Invalid => Self::InvalidRoute,
         }
     }
@@ -252,6 +253,21 @@ impl Server {
     ) -> Result<(), ServerError> {
         self.routes
             .register_managed(method, path, max_body_bytes, trailers)
+            .map_err(ServerError::from)
+    }
+
+    // NOTE: native handlers run on the owner worker only; h2c serves no native routes yet
+    // (404 there) since the h2 projection has no native kind. user_data crosses as an
+    // address-sized value with the handler. Frozen at start like every other register path.
+    pub fn register_native(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        handler: Option<NativeHandler>,
+        user_data: usize,
+    ) -> Result<(), ServerError> {
+        self.routes
+            .register_native(method, path, handler, user_data)
             .map_err(ServerError::from)
     }
 

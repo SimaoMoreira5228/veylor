@@ -1,15 +1,11 @@
+use std::cell::Cell;
+use std::ffi::c_void;
 use std::path::Path;
 
-use veylor_http1::{
-    ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
-    connection_header_for_response, encode_response_head, is_token,
-};
-use veylor_router::{
-    RouteBodyPolicy, RouteCapture, RouteConfig, RouteError, RouteKind, RouteSlot, RouteTable,
-};
+use veylor_http1::is_token;
+use veylor_router::{RouteBodyPolicy, RouteConfig, RouteError, RouteKind, RouteSlot, RouteTable};
 
-use crate::connection::field;
-use crate::static_files::{FileMounts, FilePlan, FileReject, MountError, RangeApply};
+use crate::static_files::{FileMounts, MountError};
 
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_RESPONSE_BODY: usize = 4096;
@@ -20,16 +16,6 @@ pub(crate) const MAX_TRAILER_NAME_BYTES: usize = 128;
 // buffers of skip work at most, while still admitting small form posts. A zero cap admits no
 // body bytes at all; u64::MAX leaves the route uncapped except for input-buffer/deadline stops.
 pub const MAX_STATIC_BODY_BYTES: u64 = 64 * 1024;
-const CAPTURE_SLOTS: usize = 8;
-// NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
-const CONTENT_RANGE_BYTES: usize = 80;
-// NOTE: "multipart/byteranges; boundary=" plus the fixed token and three hex fields tops out near 91 bytes;
-// 128 leaves margin, and the same buffer doubles as the Content-Range scratch since the two never coexist.
-const MULTIPART_CTYPE_BYTES: usize = 128;
-const NOT_FOUND_BODY: &[u8] = b"Not Found";
-const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
-const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
-const EXPECTATION_FAILED_BODY: &[u8] = b"Expectation Failed";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteBuildError {
@@ -37,6 +23,9 @@ pub enum RouteBuildError {
     Duplicate,
     Full,
     BodyTooLarge,
+    // NOTE: dispatch-only bucket for a panicking native handler; registration never produces
+    // it, so the server mapping reads it as InvalidRoute (unreachable there).
+    NativePanic,
 }
 
 impl From<RouteError> for RouteBuildError {
@@ -50,12 +39,12 @@ impl From<RouteError> for RouteBuildError {
 }
 
 pub struct StaticRoute {
-    method: Vec<u8>,
-    path: Vec<u8>,
-    status: u16,
-    reason: Vec<u8>,
-    body: Vec<u8>,
-    max_body_bytes: u64,
+    pub(crate) method: Vec<u8>,
+    pub(crate) path: Vec<u8>,
+    pub(crate) status: u16,
+    pub(crate) reason: Vec<u8>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) max_body_bytes: u64,
 }
 
 pub struct ManagedRoute {
@@ -65,10 +54,64 @@ pub struct ManagedRoute {
     trailers: Vec<Vec<u8>>,
 }
 
+// NOTE: C-ABI native handlers run on the owner worker inside the pump (never on a host
+// thread) with borrowed request views; the engine copies reason/body into caller buffers
+// before returning and never retains handler memory. No headers in v1: method+path plus
+// framing presence/length keeps the call FFI-trivial while staged bytes stay host-routed.
+// No user_data in v1 either: the registry stores the bare pointer and the FFI slice adds
+// the context field alongside the C struct twins.
+#[repr(C)]
+pub struct NativeRequestView {
+    pub method: *const u8,
+    pub method_len: usize,
+    pub path: *const u8,
+    pub path_len: usize,
+    pub has_body: u8,
+    pub body_len: u64,
+}
+
+#[repr(C)]
+pub struct NativeResponseOut {
+    pub status: i32,
+    pub reason: *const u8,
+    pub reason_len: usize,
+    pub body: *const u8,
+    pub body_len: usize,
+}
+
+// NOTE: unsafe because the engine cannot verify the pointer; registration rejects None
+// (null) so dispatch never calls null. Return is 0 on success, nonzero fails the request
+// closed without a partial write. user_data crosses as an address-sized value (Send-safe,
+// never dereferenced): the engine passes it back verbatim and its validity for the call is
+// the registrant's contract.
+pub type NativeHandler =
+    unsafe extern "C" fn(*mut c_void, *const NativeRequestView, *mut NativeResponseOut) -> i32;
+
+pub struct NativeRoute {
+    pub(crate) method: Vec<u8>,
+    pub(crate) path: Vec<u8>,
+    pub(crate) handler: NativeHandler,
+    pub(crate) user_data: usize,
+}
+
+// NOTE: reentrancy guard: handlers must not call back into server APIs, so every registry
+// and dispatch entry fails Invalid while a handler runs on this worker thread. Thread-local
+// (workers own their pump), not per-connection: nested dispatch from any connection on the
+// same worker trips it. Prompt return is documented, not enforced; join-from-handler stays
+// a documented rule until the FFI slice owns join (no handle is reachable here to enforce).
+thread_local! {
+    pub(crate) static IN_NATIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn in_native_handler() -> bool {
+    IN_NATIVE.get()
+}
+
 pub struct StaticRoutes {
     routes: Vec<StaticRoute>,
     managed: Vec<ManagedRoute>,
-    files: FileMounts,
+    natives: Vec<NativeRoute>,
+    pub(crate) files: FileMounts,
 }
 
 impl StaticRoutes {
@@ -76,8 +119,23 @@ impl StaticRoutes {
         Self {
             routes: Vec::new(),
             managed: Vec::new(),
+            natives: Vec::new(),
             files: FileMounts::new(),
         }
+    }
+
+    fn is_registered(&self, method: &[u8], path: &[u8]) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.method == method && route.path == path)
+            || self
+                .managed
+                .iter()
+                .any(|route| route.method == method && route.path == path)
+            || self
+                .natives
+                .iter()
+                .any(|route| route.method == method && route.path == path)
     }
 
     pub fn register(
@@ -89,6 +147,9 @@ impl StaticRoutes {
         body: &[u8],
         max_body_bytes: u64,
     ) -> Result<(), RouteBuildError> {
+        if in_native_handler() {
+            return Err(RouteBuildError::Invalid);
+        }
         if method.is_empty()
             || !method.iter().copied().all(is_token)
             || path.is_empty()
@@ -103,15 +164,7 @@ impl StaticRoutes {
         if self.routes.len() >= MAX_ROUTES {
             return Err(RouteBuildError::Full);
         }
-        if self
-            .routes
-            .iter()
-            .any(|route| route.method == method && route.path == path)
-            || self
-                .managed
-                .iter()
-                .any(|route| route.method == method && route.path == path)
-        {
+        if self.is_registered(method, path) {
             return Err(RouteBuildError::Duplicate);
         }
         self.routes.push(StaticRoute {
@@ -132,6 +185,9 @@ impl StaticRoutes {
         max_body_bytes: u64,
         trailers: &[&[u8]],
     ) -> Result<(), RouteBuildError> {
+        if in_native_handler() {
+            return Err(RouteBuildError::Invalid);
+        }
         if method.is_empty()
             || method.len() > crate::host::HOST_MAX_METHOD_BYTES
             || !method.iter().copied().all(is_token)
@@ -155,15 +211,7 @@ impl StaticRoutes {
         if self.routes.len() + self.managed.len() >= MAX_ROUTES {
             return Err(RouteBuildError::Full);
         }
-        if self
-            .routes
-            .iter()
-            .any(|route| route.method == method && route.path == path)
-            || self
-                .managed
-                .iter()
-                .any(|route| route.method == method && route.path == path)
-        {
+        if self.is_registered(method, path) {
             return Err(RouteBuildError::Duplicate);
         }
         self.managed.push(ManagedRoute {
@@ -178,11 +226,48 @@ impl StaticRoutes {
     // NOTE: file mounts register alongside static routes and freeze structurally at
     // start: Server is consumed by start, so no &mut handle survives to register late.
     // Frozen therefore maps to Invalid; duplicates and capacity keep their own errors.
+    // NOTE: native routes freeze the same way with a fixed drain cap (no per-route body
+    // bound in v1); same method+path in any kind is Duplicate, and natives ride Static
+    // table slots below so they win over file mounts, which serve only table misses.
+    pub fn register_native(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        handler: Option<NativeHandler>,
+        user_data: usize,
+    ) -> Result<(), RouteBuildError> {
+        let Some(handler) = handler else {
+            return Err(RouteBuildError::Invalid);
+        };
+        if in_native_handler() {
+            return Err(RouteBuildError::Invalid);
+        }
+        if method.is_empty() || !method.iter().copied().all(is_token) || path.is_empty() {
+            return Err(RouteBuildError::Invalid);
+        }
+        if self.routes.len() + self.managed.len() + self.natives.len() >= MAX_ROUTES {
+            return Err(RouteBuildError::Full);
+        }
+        if self.is_registered(method, path) {
+            return Err(RouteBuildError::Duplicate);
+        }
+        self.natives.push(NativeRoute {
+            method: method.to_vec(),
+            path: path.to_vec(),
+            handler,
+            user_data,
+        });
+        Ok(())
+    }
+
     pub fn register_file_mount(
         &mut self,
         prefix: &[u8],
         root: &Path,
     ) -> Result<(), RouteBuildError> {
+        if in_native_handler() {
+            return Err(RouteBuildError::Invalid);
+        }
         self.files
             .register(prefix, root)
             .map_err(|error| match error {
@@ -196,6 +281,9 @@ impl StaticRoutes {
         &'data self,
         slots: &'slots mut [RouteSlot<'data>],
     ) -> Result<RouteTable<'slots, 'data>, RouteBuildError> {
+        if in_native_handler() {
+            return Err(RouteBuildError::Invalid);
+        }
         let mut table = RouteTable::new(slots);
         for route in self.routes.iter() {
             let config = RouteConfig {
@@ -220,11 +308,23 @@ impl StaticRoutes {
             };
             table.register(route.method.as_slice(), route.path.as_slice(), config)?;
         }
+        // NOTE: natives ride Static slots (router crate untouched): same method+path can never
+        // sit in both lists, so dispatch prefers the native list first with identical fallback.
+        for route in self.natives.iter() {
+            let config = RouteConfig {
+                kind: RouteKind::Static,
+                body: RouteBodyPolicy::Stream {
+                    max_body_bytes: MAX_STATIC_BODY_BYTES,
+                    permitted_trailers: &[],
+                },
+            };
+            table.register(route.method.as_slice(), route.path.as_slice(), config)?;
+        }
         table.freeze()?;
         Ok(table)
     }
 
-    fn lookup(&self, method: &[u8], pattern: &[u8]) -> Option<&StaticRoute> {
+    pub(crate) fn lookup(&self, method: &[u8], pattern: &[u8]) -> Option<&StaticRoute> {
         let found = self
             .routes
             .iter()
@@ -233,6 +333,23 @@ impl StaticRoutes {
             Some(route) => Some(route),
             None if method == b"HEAD" => self
                 .routes
+                .iter()
+                .find(|route| route.method == b"GET" && route.path == pattern),
+            None => None,
+        }
+    }
+
+    // NOTE: same HEAD-to-GET fallback shape as the static lookup so HEAD on a GET native
+    // behaves identically; the table slot carries whichever method was registered.
+    pub(crate) fn lookup_native(&self, method: &[u8], pattern: &[u8]) -> Option<&NativeRoute> {
+        let found = self
+            .natives
+            .iter()
+            .find(|route| route.method == method && route.path == pattern);
+        match found {
+            Some(route) => Some(route),
+            None if method == b"HEAD" => self
+                .natives
                 .iter()
                 .find(|route| route.method == b"GET" && route.path == pattern),
             None => None,
@@ -275,467 +392,17 @@ pub(crate) fn route_cap(body: RouteBodyPolicy<'_>) -> u64 {
     }
 }
 
-pub struct EncodedStaticResponse {
-    pub length: usize,
-    pub keep_open: bool,
-    pub drain_total: u64,
-    pub interim_len: usize,
-    pub file: Option<FilePlan>,
-}
-
-pub fn respond_to_head(
-    routes: &StaticRoutes,
-    table: &RouteTable<'_, '_>,
-    head: RequestHead,
-    headers: &[Header],
-    input: &[u8],
-    output: &mut [u8],
-) -> Result<EncodedStaticResponse, RouteBuildError> {
-    let mut captures = [RouteCapture::default(); CAPTURE_SLOTS];
-    let found = table.find_request(head, input, &mut captures);
-    // NOTE: exact static routes win; file mounts serve only table misses, so existing
-    // routes never change behavior when mounts are added.
-    if matches!(found, Err(RouteError::NotFound)) {
-        if let Some(file) = respond_file(routes, head, headers, input, output)? {
-            return Ok(file);
-        }
-    }
-    // NOTE: unmatched requests have no route cap of their own, so 404s keep the default.
-    let (status, reason, body, cap) = match found {
-        Ok(found) => {
-            let cap = route_cap(found.body);
-            match routes.lookup(head.method(input).unwrap_or_default(), found.pattern) {
-                Some(route) => (
-                    route.status,
-                    route.reason.as_slice(),
-                    route.body.as_slice(),
-                    cap,
-                ),
-                None => return Err(RouteBuildError::Invalid),
-            }
-        }
-        Err(RouteError::NotFound) => (
-            404,
-            b"Not Found".as_slice(),
-            NOT_FOUND_BODY,
-            MAX_STATIC_BODY_BYTES,
-        ),
-        Err(error) => return Err(RouteBuildError::from(error)),
-    };
-    let method = head.method(input).unwrap_or_default();
-    // NOTE: static routes cannot use trailers, so any chunked request rejects without reading;
-    // oversized declarations reject the same way with no interim, both against the matched
-    // route's cap (zero admits no body byte at all; u64::MAX is input-buffer bounded).
-    if head.is_chunked {
-        return reject_payload(output, method);
-    }
-    let drain_total = match head.content_length {
-        Some(length) if length > cap => return reject_payload(output, method),
-        Some(length) => length,
-        None => 0,
-    };
-    let interim_len = if head.expect_continue {
-        encode_continue(output)?
-    } else {
-        0
-    };
-    // NOTE: a declared body at or under the cap is drained by the connection before any response
-    // byte is written, so framing treats it as complete now; chunked and oversized already left.
-    let response_close = status == 404;
-    let connection = connection_header_for_response(
-        head,
-        input,
-        status,
-        ResponseFraming::FixedLength,
-        true,
-        response_close,
-    );
-    let response = ResponseToWrite {
-        request_method: method,
-        requested_upgrade: b"",
-        status,
-        reason,
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: body.len() as u64,
-        connection,
-    };
-    let final_buf = output
-        .get_mut(interim_len..)
-        .ok_or(RouteBuildError::Invalid)?;
-    let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
-    let mut length = interim_len + encoded.length;
-    if encoded.body_allowed && !body.is_empty() {
-        let end = length + body.len();
-        output
-            .get_mut(length..end)
-            .ok_or(RouteBuildError::Invalid)?
-            .copy_from_slice(body);
-        length = end;
-    }
-    Ok(EncodedStaticResponse {
-        length,
-        keep_open: connection != ConnectionHeader::Close,
-        drain_total,
-        interim_len,
-        file: None,
-    })
-}
-
-// NOTE: rejection mapping stays inside the static path's 404/400+close and 413+close
-// families: NotFound/Forbidden/NotAFile all read as 404+close (traversal gets no
-// existence oracle), TooLarge reads as 413+close like any over-cap body. No new status.
-// Bodies drain within the same default cap as unmatched static paths; chunked rejects.
-fn respond_file(
-    routes: &StaticRoutes,
-    head: RequestHead,
-    headers: &[Header],
-    input: &[u8],
-    output: &mut [u8],
-) -> Result<Option<EncodedStaticResponse>, RouteBuildError> {
-    let Some((method, path)) = file_target(head, input) else {
-        return Ok(None);
-    };
-    if head.is_chunked {
-        return Ok(Some(reject_payload(output, method)?));
-    }
-    let drain_total = match head.content_length {
-        Some(length) if length > MAX_STATIC_BODY_BYTES => {
-            return Ok(Some(reject_payload(output, method)?));
-        }
-        Some(length) => length,
-        None => 0,
-    };
-    let interim_len = if head.expect_continue {
-        encode_continue(output)?
-    } else {
-        0
-    };
-    let mut plan = match routes.files.resolve(method, path) {
-        Ok(plan) => plan,
-        Err(FileReject::TooLarge) => return Ok(Some(reject_payload(output, method)?)),
-        Err(FileReject::NotFound | FileReject::Forbidden | FileReject::NotAFile) => {
-            return Ok(None);
-        }
-    };
-    // NOTE: a satisfiable single range narrows the plan window for a 206 while the pump
-    // keeps 0-based offsets; ignored headers fall back to 200 full and unsatisfiable
-    // windows answer 416 with bytes */size and no body, closed like a 404.
-    // NOTE (RFC 9110 section 14.2): range handling is defined only for GET; HEAD (the only
-    // other file method here) ignores Range and answers 200 full headers.
-    let range = (method == b"GET")
-        .then(|| range_header_value(headers, head, input))
-        .flatten();
-    let outcome = plan.apply_range(range);
-    if outcome == RangeApply::Unsatisfiable {
-        return Ok(Some(respond_range_unsatisfiable(
-            head,
-            input,
-            method,
-            &plan,
-            drain_total,
-            interim_len,
-            output,
-        )?));
-    }
-    // NOTE: two or more satisfiable ranges frame as one multipart body: the virtual length rides plan.size and the pump pages it
-    // through read_chunk, so this path only swaps the Content-Type.
-    let multipart = outcome == RangeApply::Multipart;
-    let status = if plan.partial { 206 } else { 200 };
-    let reason = if plan.partial {
-        b"Partial Content".as_slice()
-    } else {
-        b"OK".as_slice()
-    };
-    let connection = connection_header_for_response(
-        head,
-        input,
-        status,
-        ResponseFraming::FixedLength,
-        true,
-        false,
-    );
-    let mut value = [0u8; MULTIPART_CTYPE_BYTES];
-    let range_len = if plan.partial && !multipart {
-        write_content_range(
-            &mut value,
-            Some((plan.start, plan.start + plan.size - 1)),
-            plan.total,
-        )
-    } else {
-        0
-    };
-    let ctype_len = if multipart {
-        plan.multipart_content_type(&mut value)
-    } else {
-        0
-    };
-    let ctype_value = if multipart {
-        &value[..ctype_len]
-    } else {
-        plan.content_type.as_bytes()
-    };
-    let mut fields = [Field {
-        name: b"Content-Type",
-        value: ctype_value,
-    }; 3];
-    fields[1] = Field {
-        name: b"Accept-Ranges",
-        value: b"bytes",
-    };
-    let field_len = if plan.partial && !multipart {
-        fields[2] = Field {
-            name: b"Content-Range",
-            value: &value[..range_len],
-        };
-        3
-    } else {
-        2
-    };
-    let response = ResponseToWrite {
-        request_method: method,
-        requested_upgrade: b"",
-        status,
-        reason,
-        fields: &fields[..field_len],
-        framing: ResponseFraming::FixedLength,
-        content_length: plan.size,
-        connection,
-    };
-    let final_buf = output
-        .get_mut(interim_len..)
-        .ok_or(RouteBuildError::Invalid)?;
-    let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
-    let length = interim_len + encoded.length;
-    // NOTE: HEAD and empty files complete with the head alone; only GET with bytes
-    // streams, so the pump never stages zero-length transfers.
-    let file = if plan.head_only || plan.size == 0 {
-        None
-    } else {
-        Some(plan)
-    };
-    Ok(Some(EncodedStaticResponse {
-        length,
-        keep_open: connection != ConnectionHeader::Close,
-        drain_total,
-        interim_len,
-        file,
-    }))
-}
-
-fn range_header_value<'a>(
-    headers: &'a [Header],
-    head: RequestHead,
-    input: &'a [u8],
-) -> Option<&'a [u8]> {
-    headers.iter().take(head.header_count).find_map(|header| {
-        let name = field(input, header.name)?;
-        if !name.eq_ignore_ascii_case(b"range") {
-            return None;
-        }
-        field(input, header.value)
-    })
-}
-
-fn respond_range_unsatisfiable(
-    head: RequestHead,
-    input: &[u8],
-    method: &[u8],
-    plan: &FilePlan,
-    drain_total: u64,
-    interim_len: usize,
-    output: &mut [u8],
-) -> Result<EncodedStaticResponse, RouteBuildError> {
-    let mut value = [0u8; CONTENT_RANGE_BYTES];
-    let value_len = write_content_range(&mut value, None, plan.total);
-    let fields = [Field {
-        name: b"Content-Range",
-        value: &value[..value_len],
-    }];
-    let connection =
-        connection_header_for_response(head, input, 416, ResponseFraming::FixedLength, true, true);
-    let response = ResponseToWrite {
-        request_method: method,
-        requested_upgrade: b"",
-        status: 416,
-        reason: b"Range Not Satisfiable",
-        fields: &fields,
-        framing: ResponseFraming::FixedLength,
-        content_length: 0,
-        connection,
-    };
-    let final_buf = output
-        .get_mut(interim_len..)
-        .ok_or(RouteBuildError::Invalid)?;
-    let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
-    Ok(EncodedStaticResponse {
-        length: interim_len + encoded.length,
-        keep_open: connection != ConnectionHeader::Close,
-        drain_total,
-        interim_len,
-        file: None,
-    })
-}
-
-fn write_content_range(out: &mut [u8], range: Option<(u64, u64)>, total: u64) -> usize {
-    use crate::static_files::{push_bytes, push_decimal};
-    let mut len = push_bytes(out, 0, b"bytes ");
-    match range {
-        Some((start, last)) => {
-            len = push_decimal(out, len, start);
-            len = push_bytes(out, len, b"-");
-            len = push_decimal(out, len, last);
-            len = push_bytes(out, len, b"/");
-        }
-        None => len = push_bytes(out, len, b"*/"),
-    }
-    push_decimal(out, len, total)
-}
-
-// NOTE: query strings strip like the router so /assets/a.css?x=1 names the file;
-// fragments never arrive on the wire and anything else rejects inside resolve.
-fn file_target(head: RequestHead, input: &[u8]) -> Option<(&[u8], &[u8])> {
-    let method = head.method(input)?;
-    let target = head.target(input)?;
-    let path = match head.target_form {
-        TargetForm::Origin => strip_query(target),
-        TargetForm::Absolute => absolute_path(target)?,
-        TargetForm::Authority | TargetForm::Asterisk => return None,
-    };
-    if path.is_empty() || path[0] != b'/' {
-        return None;
-    }
-    Some((method, path))
-}
-
-fn strip_query(target: &[u8]) -> &[u8] {
-    let end = target
-        .iter()
-        .position(|byte| *byte == b'?')
-        .unwrap_or(target.len());
-    &target[..end]
-}
-
-fn absolute_path(target: &[u8]) -> Option<&[u8]> {
-    let colon = target.iter().position(|byte| *byte == b':')?;
-    let after = target.get(colon + 1..)?;
-    let authority = after.strip_prefix(b"//")?;
-    let end = authority
-        .iter()
-        .position(|byte| matches!(byte, b'/' | b'?'))
-        .unwrap_or(authority.len());
-    if end == authority.len() || authority[end] == b'?' {
-        return Some(b"/");
-    }
-    Some(strip_query(&authority[end..]))
-}
-
-fn reject_payload(
-    output: &mut [u8],
-    method: &[u8],
-) -> Result<EncodedStaticResponse, RouteBuildError> {
-    let length = respond_payload_too_large(output, method)?;
-    Ok(EncodedStaticResponse {
-        length,
-        keep_open: false,
-        drain_total: 0,
-        interim_len: 0,
-        file: None,
-    })
-}
-
-pub(crate) fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildError> {
-    let interim = ResponseToWrite {
-        request_method: b"GET",
-        requested_upgrade: b"",
-        status: 100,
-        reason: b"Continue",
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: 0,
-        connection: ConnectionHeader::Omit,
-    };
-    let encoded = encode_response_head(&interim, output).map_err(|_| RouteBuildError::Invalid)?;
-    Ok(encoded.length)
-}
-
-pub fn respond_payload_too_large(
-    output: &mut [u8],
-    method: &[u8],
-) -> Result<usize, RouteBuildError> {
-    let response = ResponseToWrite {
-        request_method: method,
-        requested_upgrade: b"",
-        status: 413,
-        reason: b"Payload Too Large",
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: PAYLOAD_TOO_LARGE_BODY.len() as u64,
-        connection: ConnectionHeader::Close,
-    };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
-    let mut length = encoded.length;
-    if encoded.body_allowed && !PAYLOAD_TOO_LARGE_BODY.is_empty() {
-        let end = length + PAYLOAD_TOO_LARGE_BODY.len();
-        output
-            .get_mut(length..end)
-            .ok_or(RouteBuildError::Invalid)?
-            .copy_from_slice(PAYLOAD_TOO_LARGE_BODY);
-        length = end;
-    }
-    Ok(length)
-}
-
-pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuildError> {
-    let response = ResponseToWrite {
-        request_method: b"GET",
-        requested_upgrade: b"",
-        status: 417,
-        reason: b"Expectation Failed",
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: EXPECTATION_FAILED_BODY.len() as u64,
-        connection: ConnectionHeader::Close,
-    };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
-    let mut length = encoded.length;
-    if encoded.body_allowed && !EXPECTATION_FAILED_BODY.is_empty() {
-        let end = length + EXPECTATION_FAILED_BODY.len();
-        output
-            .get_mut(length..end)
-            .ok_or(RouteBuildError::Invalid)?
-            .copy_from_slice(EXPECTATION_FAILED_BODY);
-        length = end;
-    }
-    Ok(length)
-}
-
-pub fn respond_bad_request(output: &mut [u8]) -> Result<usize, RouteBuildError> {
-    let response = ResponseToWrite {
-        request_method: b"GET",
-        requested_upgrade: b"",
-        status: 400,
-        reason: b"Bad Request",
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: BAD_REQUEST_BODY.len() as u64,
-        connection: ConnectionHeader::Close,
-    };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
-    let end = encoded.length + BAD_REQUEST_BODY.len();
-    output
-        .get_mut(encoded.length..end)
-        .ok_or(RouteBuildError::Invalid)?
-        .copy_from_slice(BAD_REQUEST_BODY);
-    Ok(end)
-}
-
-fn valid_reason(reason: &[u8]) -> bool {
+pub(crate) fn valid_reason(reason: &[u8]) -> bool {
     !reason.is_empty()
         && !reason.iter().any(|byte| {
             *byte == b'\r' || *byte == b'\n' || (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f
         })
 }
+
+mod respond;
+
+pub(crate) use respond::encode_continue;
+pub use respond::{
+    EncodedStaticResponse, respond_bad_request, respond_expectation_failed,
+    respond_payload_too_large, respond_to_head,
+};

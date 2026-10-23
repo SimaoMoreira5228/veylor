@@ -497,7 +497,7 @@ unsafe fn local_addr(server: *mut VylManagedStaticServer, out_port: *mut u16) ->
     VylResult::Ok
 }
 
-unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
+pub(super) unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
     if (bytes.data.is_null() && bytes.length != 0) || !slice_length_valid::<u8>(bytes.length) {
         return Err(VylResult::InvalidArgument);
     }
