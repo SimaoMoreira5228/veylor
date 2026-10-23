@@ -163,7 +163,19 @@ impl Server {
         max_body_bytes: u64,
     ) -> Result<(), ServerError> {
         self.routes
-            .register_managed(method, path, max_body_bytes)
+            .register_managed(method, path, max_body_bytes, &[])
+            .map_err(ServerError::from)
+    }
+
+    pub fn register_managed_with_trailers(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        max_body_bytes: u64,
+        trailers: &[&[u8]],
+    ) -> Result<(), ServerError> {
+        self.routes
+            .register_managed(method, path, max_body_bytes, trailers)
             .map_err(ServerError::from)
     }
 

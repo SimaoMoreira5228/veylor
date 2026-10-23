@@ -6,6 +6,7 @@ mod static_server;
 
 pub use connection::{ConnClose, PumpOutcome, PumpProgress};
 pub use connection::{HEADER_SLOTS, INPUT_CAP, OUTPUT_CAP};
+pub use connection::{TrailerOutcome, TrailerReport};
 pub use host::{
     BodyPull, CancelOutcome, EventSlot, HOST_MAX_METHOD_BYTES, HOST_MAX_PATH_BYTES,
     HOST_MAX_REASON_BYTES, HOST_QUEUE_DEPTH, HostCounters, HostEventKind, HostHandle, PollReport,

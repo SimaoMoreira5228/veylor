@@ -8,6 +8,8 @@ use veylor_router::{
 
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_RESPONSE_BODY: usize = 4096;
+pub(crate) const MAX_TRAILER_NAMES: usize = 32;
+pub(crate) const MAX_TRAILER_NAME_BYTES: usize = 128;
 // NOTE: default per-route body cap for callers that keep the old behavior: static routes never
 // consume request bodies, so the cap only bounds drain work. 64 KiB is eight full 8 KiB input
 // buffers of skip work at most, while still admitting small form posts. A zero cap admits no
@@ -50,6 +52,7 @@ pub struct ManagedRoute {
     method: Vec<u8>,
     path: Vec<u8>,
     max_body_bytes: u64,
+    trailers: Vec<Vec<u8>>,
 }
 
 pub struct StaticRoutes {
@@ -115,14 +118,27 @@ impl StaticRoutes {
         method: &[u8],
         path: &[u8],
         max_body_bytes: u64,
+        trailers: &[&[u8]],
     ) -> Result<(), RouteBuildError> {
         if method.is_empty()
             || method.len() > crate::host::HOST_MAX_METHOD_BYTES
             || !method.iter().copied().all(is_token)
             || path.is_empty()
             || path.len() > crate::host::HOST_MAX_PATH_BYTES
+            || trailers.len() > MAX_TRAILER_NAMES
         {
             return Err(RouteBuildError::Invalid);
+        }
+        for (index, name) in trailers.iter().enumerate() {
+            let dupe = trailers[..index]
+                .iter()
+                .any(|previous| previous.eq_ignore_ascii_case(name));
+            if name.is_empty() || name.len() > MAX_TRAILER_NAME_BYTES || dupe {
+                return Err(RouteBuildError::Invalid);
+            }
+            if !name.iter().copied().all(is_token) {
+                return Err(RouteBuildError::Invalid);
+            }
         }
         if self.routes.len() + self.managed.len() >= MAX_ROUTES {
             return Err(RouteBuildError::Full);
@@ -142,6 +158,7 @@ impl StaticRoutes {
             method: method.to_vec(),
             path: path.to_vec(),
             max_body_bytes,
+            trailers: trailers.iter().map(|name| name.to_vec()).collect(),
         });
         Ok(())
     }
@@ -190,6 +207,26 @@ impl StaticRoutes {
                 .iter()
                 .find(|route| route.method == b"GET" && route.path == pattern),
             None => None,
+        }
+    }
+
+    // NOTE: the frozen table keeps an empty trailer view for managed routes, so the park path
+    // reads the allowlist here instead: same match shape as the static lookup above, empty when
+    // the route is gone so trailer staging fails closed without disturbing the body path.
+    pub(crate) fn managed_trailers(&self, method: &[u8], pattern: &[u8]) -> &[Vec<u8>] {
+        let found = self
+            .managed
+            .iter()
+            .find(|route| route.method == method && route.path == pattern);
+        match found {
+            Some(route) => route.trailers.as_slice(),
+            None if method == b"HEAD" => self
+                .managed
+                .iter()
+                .find(|route| route.method == b"GET" && route.path == pattern)
+                .map(|route| route.trailers.as_slice())
+                .unwrap_or(&[]),
+            None => &[],
         }
     }
 }

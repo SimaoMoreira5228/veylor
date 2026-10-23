@@ -25,7 +25,10 @@ typedef enum {
     VYL_HTTP1_BODY_TOO_LONG = 8,
     VYL_HTTP1_BAD_STATE = 9,
     VYL_HTTP1_WRITE_OVERRUN = 10,
-    VYL_HTTP1_CANCELLED = 11
+    VYL_HTTP1_CANCELLED = 11,
+    VYL_HTTP1_STALE_TOKEN = 12,
+    VYL_HTTP1_DUPLICATE = 13,
+    VYL_HTTP1_GONE = 14
 } vyl_http1_result;
 
 typedef enum {
@@ -787,6 +790,78 @@ vyl_http1_result vyl_managed_static_join(
 vyl_http1_result vyl_managed_static_local_addr(
     vyl_managed_static_server* server,
     uint16_t* out_port
+);
+
+enum {
+    VYL_MANAGED_STATIC_EVENT_REQUEST = 0u,
+    VYL_MANAGED_STATIC_EVENT_SHUTDOWN = 1u
+};
+
+typedef struct {
+    uint32_t worker_id;
+    uint32_t slot;
+    uint32_t request_seq;
+    uint32_t stream_id;
+    uint64_t worker_generation;
+    uint64_t generation;
+} vyl_managed_static_token;
+
+typedef struct {
+    uint32_t kind;
+    vyl_managed_static_token token;
+    uint64_t route_id;
+    size_t method_len;
+    size_t path_len;
+    size_t method_offset;
+    size_t path_offset;
+} vyl_managed_static_event;
+
+typedef struct {
+    size_t copied;
+    size_t events_required;
+    size_t method_required;
+    size_t path_required;
+} vyl_managed_static_poll_report;
+
+/* NOTE: Whole-event dequeue into caller buffers: the first pending event that does not fit
+   reports its required capacities and stays queued; zero event capacity reports the pending
+   depth. timeout_ns == 0 takes a single pass, UINT64_MAX waits. Valid only while running. */
+vyl_http1_result vyl_managed_static_poll_events(
+    vyl_managed_static_server* server,
+    uint64_t timeout_ns,
+    vyl_managed_static_event* events,
+    size_t event_capacity,
+    uint8_t* methods,
+    size_t method_capacity,
+    uint8_t* paths,
+    size_t path_capacity,
+    vyl_managed_static_poll_report* out_report
+);
+/* NOTE: One-shot bounded answer for a parked token: a repeat reports DUPLICATE, a token whose
+   connection closed reports GONE, unknown or superseded tokens report STALE_TOKEN. The body
+   is bounded inline; the server cap still applies. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_respond(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    vyl_http1_bytes body
+);
+/* NOTE: Cancels a parked request; the owner worker closes the connection. A repeat or an
+   unknown token reports STALE_TOKEN. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_cancel(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token
+);
+/* NOTE: Partial body copies are normal; out_pulled counts this call, out_end flags the last
+   byte. A zero-capacity call queries completion without consuming. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_pull_body(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint8_t* out,
+    size_t out_capacity,
+    size_t* out_pulled,
+    uint32_t* out_end
 );
 
 #ifdef __cplusplus

@@ -2,7 +2,7 @@ pub(crate) mod parked;
 
 pub(crate) use parked::{pull_staged_body, push_staged_body};
 
-use veylor_http1::{BodyDecoder, Header, Limits, ParseError, Parser};
+use veylor_http1::{BodyDecoder, Header, Limits, ParseError, Parser, Span, is_token};
 use veylor_router::{RouteKind, RouteTable};
 use veylor_runtime::{
     CloseReason, ConnectionToken, IoBatch, ReadStatus, TcpStream, WriteStatus, dispatch,
@@ -17,6 +17,32 @@ use crate::static_routes::{
 pub const INPUT_CAP: usize = 8192;
 pub const OUTPUT_CAP: usize = 8192;
 pub const HEADER_SLOTS: usize = 100;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StagedTrailer {
+    pub(crate) name: Vec<u8>,
+    pub(crate) value: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrailerOutcome {
+    Ok,
+    NotReady,
+    #[default]
+    Stale,
+    Gone,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TrailerReport {
+    pub outcome: TrailerOutcome,
+    pub fields: usize,
+    pub names_copied: usize,
+    pub values_copied: usize,
+    pub names_required: usize,
+    pub values_required: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnPhase {
@@ -64,6 +90,10 @@ pub struct ConnState {
     pub(crate) headers: Box<[Header; HEADER_SLOTS]>,
     pub(crate) input: Box<[u8; INPUT_CAP]>,
     pub(crate) chunked_decoder: Option<BodyDecoder>,
+    pub(crate) trailer_allow: Vec<Vec<u8>>,
+    pub(crate) trailer_conn: Vec<u8>,
+    pub(crate) trailer_slots: [Header; crate::connection::parked::TRAILER_SLOTS],
+    pub(crate) trailer_staged: usize,
     pub(crate) len: usize,
     pub(crate) head_len: usize,
     pub(crate) output: Box<[u8; OUTPUT_CAP]>,
@@ -87,6 +117,10 @@ impl ConnState {
             headers: Box::new([Header::default(); HEADER_SLOTS]),
             input: Box::new([0; INPUT_CAP]),
             chunked_decoder: None,
+            trailer_allow: Vec::new(),
+            trailer_conn: Vec::new(),
+            trailer_slots: [Header::default(); crate::connection::parked::TRAILER_SLOTS],
+            trailer_staged: 0,
             len: 0,
             head_len: 0,
             output: Box::new([0; OUTPUT_CAP]),
@@ -386,7 +420,21 @@ fn park_or_respond(
     match found {
         Ok(found) if found.kind == RouteKind::Managed => {
             let cap = crate::static_routes::route_cap(found.body);
-            parked::park_request(conn, head, found.route_id, worker_id, host, draining, cap)
+            let method = head.method(&conn.input[..conn.len]).unwrap_or_default();
+            let mut snapshot = [0u8; HOST_MAX_METHOD_BYTES];
+            let take = method.len().min(HOST_MAX_METHOD_BYTES);
+            snapshot[..take].copy_from_slice(&method[..take]);
+            let trailers = routes.managed_trailers(&snapshot[..take], found.pattern);
+            parked::park_request(
+                conn,
+                head,
+                found.route_id,
+                worker_id,
+                host,
+                draining,
+                cap,
+                trailers,
+            )
         }
         Ok(_) | Err(_) => encode_static(conn, routes, table, head),
     }
@@ -492,4 +540,71 @@ fn reuse_keep_alive(conn: &mut ConnState) {
     conn.phase = ConnPhase::ReadingHead;
     conn.parser.reset();
     conn.read_ready = tail > 0;
+}
+
+// NOTE: the worker-side decoder runs the response trailer policy, which permits keep-alive and
+// proxy-connection; RFC 9110 forbids both in request trailers, so the allowlist gate rejects them
+// here alongside unlisted and Connection-nominated names. Decoder verdicts stay authoritative for
+// syntax and its own prohibited set; anything refused anywhere fails the connection closed.
+pub(crate) fn trailer_allowed(allow: &[Vec<u8>], connection: &[u8], name: &[u8]) -> bool {
+    if name.eq_ignore_ascii_case(b"keep-alive") || name.eq_ignore_ascii_case(b"proxy-connection") {
+        return false;
+    }
+    if !allow
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    {
+        return false;
+    }
+    !connection_nominates(connection, name)
+}
+
+pub(crate) fn connection_nominates(value: &[u8], name: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    for option in value.split(|byte| *byte == b',') {
+        let trimmed = trim_ows(option);
+        if trimmed.is_empty() || !trimmed.iter().copied().all(is_token) {
+            return true;
+        }
+        if trimmed.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn connection_value<'a>(
+    headers: &'a [Header],
+    head: veylor_http1::RequestHead,
+    input: &'a [u8],
+) -> &'a [u8] {
+    for header in headers.iter().take(head.header_count) {
+        let (Some(name), Some(value)) = (field(input, header.name), field(input, header.value))
+        else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(b"connection") {
+            return value;
+        }
+    }
+    b""
+}
+
+fn trim_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| *byte != b' ' && *byte != b'\t');
+    let end = value
+        .iter()
+        .rposition(|byte| *byte != b' ' && *byte != b'\t');
+    match (start, end) {
+        (Some(start), Some(end)) => &value[start..end + 1],
+        _ => b"",
+    }
+}
+
+pub(crate) fn field(input: &[u8], span: Span) -> Option<&[u8]> {
+    input.get(span.offset..span.offset.checked_add(span.length)?)
 }

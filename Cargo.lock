@@ -70,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "veylor-http1",
  "veylor-http2",
+ "veylor-runtime",
  "veylor-server",
 ]
 

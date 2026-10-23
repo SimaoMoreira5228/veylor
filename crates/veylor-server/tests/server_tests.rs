@@ -792,10 +792,19 @@ fn managed_cap_rejects_over_cap_and_parks_under_cap() {
     assert_eq!(report.copied, 1);
     assert_eq!(events[0].kind, HostEventKind::Request);
     let mut staged = [0; 16];
-    assert_eq!(
-        host.pull_body(events[0].token, &mut staged),
-        (RespondOutcome::Ok, 5, true)
-    );
+    // NOTE: the head and body travel in separate segments, so the park event can win the race
+    // against the body pump; retry the pull until the staged bytes land or the test times out.
+    let pulled = {
+        let start = Instant::now();
+        loop {
+            let pulled = host.pull_body(events[0].token, &mut staged);
+            if pulled == (RespondOutcome::Ok, 5, true) || start.elapsed() >= DEADLINE {
+                break pulled;
+            }
+            std::thread::yield_now();
+        }
+    };
+    assert_eq!(pulled, (RespondOutcome::Ok, 5, true));
     assert_eq!(&staged[..5], b"hello");
     assert_eq!(
         host.respond(events[0].token, 200, b"OK", b"m-ok"),

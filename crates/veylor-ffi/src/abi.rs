@@ -116,6 +116,9 @@ pub enum VylResult {
     BadState = 9,
     WriteOverrun = 10,
     Cancelled = 11,
+    StaleToken = 12,
+    Duplicate = 13,
+    Gone = 14,
 }
 
 pub fn catch_ffi(call: impl FnOnce() -> VylResult) -> VylResult {

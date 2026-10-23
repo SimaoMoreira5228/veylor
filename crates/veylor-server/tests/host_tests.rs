@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use veylor_runtime::{ConnectionTimeouts, ConnectionToken};
 use veylor_server::{
     CancelOutcome, EventSlot, HostEventKind, HostHandle, MAX_STATIC_BODY_BYTES, PollReport,
-    RespondOutcome, RunningServer, Server, ServerConfig,
+    RespondOutcome, RunningServer, Server, ServerConfig, ServerError, TrailerOutcome,
+    TrailerReport,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -19,7 +20,12 @@ fn managed_server(config: ServerConfig) -> RunningServer {
         .register_managed(b"GET", b"/work", MAX_STATIC_BODY_BYTES)
         .expect("register managed");
     server
-        .register_managed(b"POST", b"/upload", MAX_STATIC_BODY_BYTES)
+        .register_managed_with_trailers(
+            b"POST",
+            b"/upload",
+            MAX_STATIC_BODY_BYTES,
+            &[b"x-checksum"],
+        )
         .expect("register managed upload");
     server
         .register_route(
@@ -819,4 +825,204 @@ fn zero_cap_route_rejects_chunked_without_park_or_interim() {
     assert_eq!(host.parked_count(), 0, "rejected chunked never parks");
     server.stop_accepting();
     let _ = server.join().expect("join server");
+}
+
+fn pull_trailer_set(
+    host: &HostHandle,
+    token: ConnectionToken,
+) -> (TrailerReport, Vec<u8>, Vec<u8>) {
+    let mut names = vec![0; 256];
+    let mut values = vec![0; 256];
+    let report = host.pull_trailers(token, &mut names, &mut values);
+    names.truncate(report.names_copied);
+    values.truncate(report.values_copied);
+    (report, names, values)
+}
+
+fn pull_body_complete(host: &HostHandle, token: ConnectionToken) -> Vec<u8> {
+    let mut collected = Vec::new();
+    let mut complete = false;
+    let deadline = Instant::now() + DEADLINE;
+    while !complete {
+        assert!(Instant::now() < deadline, "chunked body stalls");
+        let mut buf = [0; 16];
+        let (outcome, n, done) = host.pull_body(token, &mut buf);
+        assert_eq!(outcome, RespondOutcome::Ok);
+        collected.extend_from_slice(&buf[..n]);
+        complete = done;
+        if n == 0 && !done {
+            std::thread::yield_now();
+        }
+    }
+    collected
+}
+
+#[test]
+fn managed_trailers_listed_stage_and_copy_exact() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc123\r\n\r\n")
+        .expect("write chunks with listed trailer");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(pull_body_complete(&host, event.token), b"hello");
+    let mut tiny_names = [0; 4];
+    let mut tiny_values = [0; 64];
+    let short = host.pull_trailers(event.token, &mut tiny_names, &mut tiny_values);
+    assert_eq!(short.outcome, TrailerOutcome::Ok);
+    assert_eq!(short.fields, 1);
+    assert_eq!(short.names_copied, 0);
+    assert_eq!(short.values_copied, 0);
+    assert_eq!(short.names_required, 10);
+    assert_eq!(short.values_required, 6);
+    let (report, names, values) = pull_trailer_set(&host, event.token);
+    assert_eq!(report.outcome, TrailerOutcome::Ok);
+    assert_eq!(report.fields, 1);
+    assert_eq!(report.names_copied, 10);
+    assert_eq!(report.values_copied, 6);
+    assert_eq!(names, b"X-Checksum");
+    assert_eq!(values, b"abc123");
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"done");
+    get(&mut stream, "/work");
+    let (second, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(second.token, 200, b"OK", b"again"),
+        RespondOutcome::Ok
+    );
+    let reused = read_response(&mut stream);
+    assert_eq!(reused.status, 200);
+    assert_eq!(reused.body, b"again");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_trailers_pull_before_complete_not_ready() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n")
+        .expect("write data chunk without terminal");
+    let (event, _, _) = poll_request(&host);
+    let mut names = [0; 64];
+    let mut values = [0; 64];
+    assert_eq!(
+        host.pull_trailers(event.token, &mut names, &mut values)
+            .outcome,
+        TrailerOutcome::NotReady
+    );
+    stream
+        .write_all(b"0\r\n\r\n")
+        .expect("terminal chunk without trailers");
+    assert_eq!(pull_body_complete(&host, event.token), b"hello");
+    let (report, names, values) = pull_trailer_set(&host, event.token);
+    assert_eq!(report.outcome, TrailerOutcome::Ok);
+    assert_eq!(report.fields, 0);
+    assert!(names.is_empty() && values.is_empty());
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let response = read_response(&mut stream);
+    assert_eq!(response.body, b"done");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_trailers_over_count_closes() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    let mut request = b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n3\r\nabc\r\n0\r\n".to_vec();
+    for index in 0..9 {
+        request.extend_from_slice(format!("X-Checksum: v{index}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    stream
+        .write_all(&request)
+        .expect("write nine listed trailers");
+    let (event, _, _) = poll_request(&host);
+    expect_eof(&mut stream);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"late"),
+        RespondOutcome::Gone,
+        "ninth staged field breaches slot capacity and fails closed"
+    );
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_trailers_over_bytes_close() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    let mut request = b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n3\r\nabc\r\n0\r\nX-Checksum: ".to_vec();
+    request.extend_from_slice(&[b'a'; 2048]);
+    request.extend_from_slice(b"\r\n\r\n");
+    stream
+        .write_all(&request)
+        .expect("write oversized trailer value");
+    let (event, _, _) = poll_request(&host);
+    expect_eof(&mut stream);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"late"),
+        RespondOutcome::Gone,
+        "staged trailer bytes past 1 KiB fail closed"
+    );
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_trailers_registration_rejects_bad_allowlist() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, ServerConfig::default()).expect("bind loopback");
+    let overlong: Vec<Vec<u8>> = (0..33)
+        .map(|index| format!("x-t{index:02}").into_bytes())
+        .collect();
+    let refs: Vec<&[u8]> = overlong.iter().map(Vec::as_slice).collect();
+    assert!(
+        matches!(
+            server.register_managed_with_trailers(b"POST", b"/t", MAX_STATIC_BODY_BYTES, &refs),
+            Err(ServerError::InvalidRoute)
+        ),
+        "allowlist past 32 names rejects at registration"
+    );
+    assert!(
+        matches!(
+            server.register_managed_with_trailers(
+                b"POST",
+                b"/t",
+                MAX_STATIC_BODY_BYTES,
+                &[b"bad name"]
+            ),
+            Err(ServerError::InvalidRoute)
+        ),
+        "non-token trailer name rejects at registration"
+    );
+    assert!(
+        matches!(
+            server.register_managed_with_trailers(
+                b"POST",
+                b"/t",
+                MAX_STATIC_BODY_BYTES,
+                &[b"x-a", b"X-A"]
+            ),
+            Err(ServerError::InvalidRoute)
+        ),
+        "duplicate trailer name rejects at registration"
+    );
+    server
+        .register_managed_with_trailers(b"POST", b"/t", MAX_STATIC_BODY_BYTES, &[b"x-a"])
+        .expect("valid allowlist registers");
 }

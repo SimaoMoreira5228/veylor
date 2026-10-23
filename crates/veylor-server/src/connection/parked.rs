@@ -1,6 +1,6 @@
 use veylor_http1::{
-    BodyDecoder, BodyEvent, BodyLimits, ConnectionHeader, Limits, ResponseBody, ResponseFraming,
-    ResponseToWrite, connection_header_for_response, encode_response_head,
+    BodyDecoder, BodyEvent, BodyLimits, ConnectionHeader, Header, Limits, ResponseBody,
+    ResponseFraming, ResponseToWrite, connection_header_for_response, encode_response_head,
 };
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
 
@@ -12,7 +12,13 @@ use crate::static_routes::{encode_continue, respond_payload_too_large};
 
 use super::{
     ConnClose, ConnPhase, ConnState, ExchangeOutcome, INPUT_CAP, PumpOutcome, PumpProgress,
+    StagedTrailer, TrailerOutcome, TrailerReport, connection_value, field, trailer_allowed,
 };
+
+// NOTE: request-trailer staging bounds: at most TRAILER_SLOTS fields and MAX_STAGED_TRAILER_BYTES
+// of staged name/value bytes per park; the first field past either cap fails the connection closed.
+pub(crate) const TRAILER_SLOTS: usize = 8;
+pub(crate) const MAX_STAGED_TRAILER_BYTES: usize = 1024;
 
 impl ConnState {
     // NOTE: one-shot bounded response over the parked snapshot: the static encode path
@@ -239,6 +245,7 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
 // NOTE: drain stops new parks: a head that arrives mid-drain closes instead of waiting
 // on a host that may have stopped polling. Already-parked requests are in-flight and
 // may still be responded during drain; unresponded parks close at the force deadline.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn park_request(
     conn: &mut ConnState,
     head: veylor_http1::RequestHead,
@@ -247,6 +254,7 @@ pub(crate) fn park_request(
     host: &HostShared,
     draining: bool,
     max_body_bytes: u64,
+    trailers: &[Vec<u8>],
 ) -> ExchangeOutcome {
     if draining {
         return ExchangeOutcome::Close(ConnClose::Shutdown);
@@ -322,6 +330,10 @@ pub(crate) fn park_request(
     }
     conn.write_blocked = false;
     conn.pending_len = 0;
+    conn.trailer_allow = trailers.to_vec();
+    conn.trailer_conn = connection_value(&conn.headers[..], head, &conn.input[..len]).to_vec();
+    conn.trailer_slots = [Header::default(); TRAILER_SLOTS];
+    conn.trailer_staged = 0;
     let buffered = (conn.len - conn.head_len) as u64;
     let take = if chunked {
         0
@@ -391,6 +403,7 @@ impl ParkedEntry {
             body_total,
             body: Vec::new(),
             body_pulled: 0,
+            trailers: None,
         }
     }
 }
@@ -480,23 +493,185 @@ impl HostShared {
                         return false;
                     }
                     entry.body_total = entry.body_pulled + entry.body.len() as u64;
+                    entry.trailers.get_or_insert_with(Vec::new);
                     true
                 });
             (done, None)
         });
         marked.is_some_and(|(done, _)| done)
     }
+
+    pub(crate) fn stage_trailer_field(
+        &self,
+        token: ConnectionToken,
+        name: &[u8],
+        value: &[u8],
+    ) -> bool {
+        let staged = self.with_inner(|inner| {
+            let entry = inner
+                .parked
+                .get_mut(token.worker_id as usize)
+                .and_then(|table| table.get_mut(token.slot as usize))
+                .and_then(|entry| entry.as_mut());
+            let Some(entry) = entry else {
+                return (false, None);
+            };
+            if entry.token != token || entry.staged.is_some() {
+                return (false, None);
+            }
+            if entry
+                .trailers
+                .as_ref()
+                .is_some_and(|fields| fields.len() >= TRAILER_SLOTS)
+            {
+                return (false, None);
+            }
+            let mut total = 0usize;
+            for field in entry.trailers.iter().flatten() {
+                total += field.name.len() + field.value.len();
+            }
+            if total + name.len() + value.len() > MAX_STAGED_TRAILER_BYTES {
+                return (false, None);
+            }
+            entry
+                .trailers
+                .get_or_insert_with(Vec::new)
+                .push(StagedTrailer {
+                    name: name.to_vec(),
+                    value: value.to_vec(),
+                });
+            (true, None)
+        });
+        staged.is_some_and(|(done, _)| done)
+    }
 }
 
-// NOTE: the decoder is driven directly, not via the request wrapper: managed registration
-// carries no trailer names, so the effective allowlist is empty and zero-capacity trailer
-// storage turns ANY trailer field into HeaderCapacity, which fails closed here. Prohibited
-// names and quota breaches fail inside the decoder verdicts; chunk extensions are consumed
-// and ignored within the extension quota by the same verdicts. No framing syntax is
-// re-implemented: size lines, CRLF strictness, and overflow checks are the http1 layer's.
+impl crate::host::HostHandle {
+    pub fn pull_trailers(
+        &self,
+        token: ConnectionToken,
+        names: &mut [u8],
+        values: &mut [u8],
+    ) -> TrailerReport {
+        let pulled = self
+            .shared
+            .with_inner(|inner| (pull_parked_trailers(inner, token, names, values), None));
+        pulled.map(|(report, _)| report).unwrap_or_default()
+    }
+}
+
+// NOTE: whole-set trailer copy after end-of-body: names and values join with NUL separators and
+// copy only when both buffers fit, otherwise nothing copies and the report carries the required
+// capacities; staged bytes are peeked, never drained, so repeated pulls observe the same set.
+fn pull_parked_trailers(
+    inner: &mut HostInner,
+    token: ConnectionToken,
+    names: &mut [u8],
+    values: &mut [u8],
+) -> TrailerReport {
+    let entry = inner
+        .parked
+        .get(token.worker_id as usize)
+        .and_then(|table| table.get(token.slot as usize))
+        .and_then(|entry| entry.as_ref())
+        .filter(|entry| entry.token == token && entry.staged.is_none());
+    let Some(entry) = entry else {
+        let outcome = match find_tomb(inner, token.worker_id as usize, token) {
+            Some(TombCause::Gone) => TrailerOutcome::Gone,
+            Some(TombCause::Responded) => TrailerOutcome::Duplicate,
+            Some(TombCause::Cancelled) | None => TrailerOutcome::Stale,
+        };
+        return TrailerReport {
+            outcome,
+            ..TrailerReport::default()
+        };
+    };
+    if entry.trailers.is_none() || entry.body_pulled != entry.body_total {
+        return TrailerReport {
+            outcome: TrailerOutcome::NotReady,
+            ..TrailerReport::default()
+        };
+    }
+    let fields = entry.trailers.as_deref().unwrap_or(&[]);
+    let mut names_need = 0usize;
+    let mut values_need = 0usize;
+    for (index, field) in fields.iter().enumerate() {
+        names_need += field.name.len() + usize::from(index > 0);
+        values_need += field.value.len() + usize::from(index > 0);
+    }
+    if names.len() < names_need || values.len() < values_need {
+        return TrailerReport {
+            outcome: TrailerOutcome::Ok,
+            fields: fields.len(),
+            names_required: names_need,
+            values_required: values_need,
+            ..TrailerReport::default()
+        };
+    }
+    let mut names_used = 0usize;
+    let mut values_used = 0usize;
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            names[names_used] = b'\0';
+            names_used += 1;
+            values[values_used] = b'\0';
+            values_used += 1;
+        }
+        names[names_used..names_used + field.name.len()].copy_from_slice(&field.name);
+        names_used += field.name.len();
+        values[values_used..values_used + field.value.len()].copy_from_slice(&field.value);
+        values_used += field.value.len();
+    }
+    TrailerReport {
+        outcome: TrailerOutcome::Ok,
+        fields: fields.len(),
+        names_copied: names_used,
+        values_copied: values_used,
+        ..TrailerReport::default()
+    }
+}
+
+fn stage_new_trailers(
+    conn: &mut ConnState,
+    host: &HostShared,
+    event_token: ConnectionToken,
+    base: usize,
+    end: usize,
+) -> bool {
+    while conn.trailer_staged < TRAILER_SLOTS {
+        let staged = conn.trailer_staged;
+        let header = conn.trailer_slots[staged];
+        if header.name.length == 0 {
+            break;
+        }
+        let input = &conn.input[base..end];
+        let (Some(name), Some(value)) = (field(input, header.name), field(input, header.value))
+        else {
+            return false;
+        };
+        if !trailer_allowed(&conn.trailer_allow, &conn.trailer_conn, name) {
+            return false;
+        }
+        if !host.stage_trailer_field(event_token, name, value) {
+            return false;
+        }
+        conn.trailer_staged = staged + 1;
+    }
+    true
+}
+
+// NOTE: the decoder is driven directly, not via the request wrapper: the route allowlist copied at
+// park gates each stored field alongside Connection-nominated and request-prohibited names, while
+// staged bytes copy into the host entry for whole-set pulls after end-of-body. Unlisted or refused
+// fields fail closed here; prohibited names and quota breaches also fail inside the decoder verdicts,
+// and chunk extensions are consumed and ignored within the extension quota by the same verdicts. No
+// framing syntax is re-implemented: size lines, CRLF strictness, and overflow checks are the http1
+// layer's.
 // NOTE: the decoder lives worker-side because BodyDecoder is !Send on this toolchain (raw
 // trailer-base pointer) while HostInner crosses threads; ConnState never leaves its worker,
-// matching the existing parser/headers placement.
+// matching the existing parser/headers placement. The slots buffer lives in ConnState so the base
+// pointer stays stable across turns; spans never escape the turn that stored them because each new
+// field copies out to host staging before any compaction runs.
 fn decode_chunked(
     conn: &mut ConnState,
     host: &HostShared,
@@ -513,10 +688,12 @@ fn decode_chunked(
             feed.failed = true;
             break;
         };
+        let base = feed.consumed;
+        let end = conn.len;
         let next = match decoder.next(
-            &conn.input[feed.consumed..conn.len],
+            &conn.input[base..end],
             false,
-            &mut [],
+            &mut conn.trailer_slots,
             Limits::default(),
         ) {
             Ok(next) => next,
@@ -525,16 +702,20 @@ fn decode_chunked(
                 break;
             }
         };
+        if !stage_new_trailers(conn, host, event_token, base, end) {
+            feed.failed = true;
+            break;
+        }
         match next.event {
             Some(BodyEvent::Data(span)) => {
-                let start = feed.consumed + span.offset;
+                let start = base + span.offset;
                 if !host.push_body(event_token, &conn.input[start..start + span.length]) {
                     break;
                 }
                 feed.decoded += span.length as u64;
             }
             Some(BodyEvent::Trailers { count }) => {
-                if count > 0 || !host.mark_chunked_done(event_token) {
+                if count != conn.trailer_staged || !host.mark_chunked_done(event_token) {
                     feed.failed = true;
                     break;
                 }

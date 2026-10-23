@@ -1,5 +1,7 @@
 #[allow(unsafe_code)]
 mod api;
+#[allow(unsafe_code)]
+mod dispatch;
 
 #[cfg(test)]
 #[allow(unsafe_code)]
@@ -12,11 +14,17 @@ pub use api::{
     vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_start,
     vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
+pub use dispatch::{
+    vyl_managed_static_host_cancel, vyl_managed_static_host_pull_body,
+    vyl_managed_static_host_respond, vyl_managed_static_poll_events,
+};
 use veylor_server::{CloseCounts, RunningServer, Server, ServerConfig};
 
 use crate::abi::VylResult;
 
 pub const VYL_MANAGED_STATIC_ABI_VERSION: u32 = 1;
+pub const VYL_MANAGED_STATIC_EVENT_REQUEST: u32 = 0;
+pub const VYL_MANAGED_STATIC_EVENT_SHUTDOWN: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -140,3 +148,42 @@ pub(super) fn server_error_to_result(error: veylor_server::ServerError) -> VylRe
 
 const _: () = assert!(std::mem::size_of::<VylManagedStaticConfig>() > 0);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticCloseCounts>() == 8 * 8);
+const _: () = assert!(std::mem::size_of::<VylManagedStaticToken>() == 4 * 4 + 8 * 2);
+const _: () = assert!(std::mem::size_of::<VylManagedStaticPollReport>() == 8 * 4);
+
+
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VylManagedStaticToken {
+    pub worker_id: u32,
+    pub slot: u32,
+    pub request_seq: u32,
+    pub stream_id: u32,
+    pub worker_generation: u64,
+    pub generation: u64,
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VylManagedStaticEvent {
+    pub kind: u32,
+    pub token: VylManagedStaticToken,
+    pub route_id: u64,
+    pub method_len: usize,
+    pub path_len: usize,
+    pub method_offset: usize,
+    pub path_offset: usize,
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VylManagedStaticPollReport {
+    pub copied: usize,
+    pub events_required: usize,
+    pub method_required: usize,
+    pub path_required: usize,
+}
