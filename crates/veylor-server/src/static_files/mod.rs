@@ -50,6 +50,8 @@ pub struct FilePlan {
     pub multipart: bool,
     pub ranges: [(u64, u64); MAX_RANGES],
     pub range_count: u8,
+    dev: u64,
+    ino: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,8 +368,7 @@ fn read_multipart_chunk(plan: &FilePlan, offset: u64, out: &mut [u8]) -> std::io
             let skip = offset.saturating_sub(cursor);
             let take = (width - skip).min((out.len() - staged) as u64) as usize;
             if take > 0 {
-                let got =
-                    read_window(&plan.fs_path, start + skip, &mut out[staged..staged + take])?;
+                let got = read_window(plan, start + skip, &mut out[staged..staged + take])?;
                 if got == 0 {
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -530,6 +531,8 @@ impl FileMounts {
         let mut fs_path = mount.root.clone();
         let mut size = 0;
         let mut mtime = 0;
+        let mut dev = 0;
+        let mut ino = 0;
         for (index, segment) in segments.iter().enumerate() {
             push_segment(&mut fs_path, segment)?;
             let meta = match std::fs::symlink_metadata(&fs_path) {
@@ -553,6 +556,9 @@ impl FileMounts {
                 }
                 size = meta.len();
                 mtime = system_time_secs(meta.modified().ok());
+                let key = file_key(&meta);
+                dev = key.0;
+                ino = key.1;
             }
         }
         if size > MAX_FILE_SIZE {
@@ -570,6 +576,8 @@ impl FileMounts {
             multipart: false,
             ranges: [(0, 0); MAX_RANGES],
             range_count: 0,
+            dev,
+            ino,
         })
     }
 }
@@ -613,7 +621,14 @@ pub fn content_type_for_name(file_name: &[u8]) -> &'static str {
     "application/octet-stream"
 }
 
-// NOTE: the pump opens per response through this helper; no fd cache yet, so each response pays one open plus one seek. TOCTOU: resolve's component checks and this open are not atomic under stable std (no openat); a rename race could swap the leaf between plan and open. The follow-up either re-validates here (fstat type check on the opened fd) or moves to openat2/O_NOFOLLOW. Short reads from a shrunk file surface as Ok(n); the pump must treat a short total as truncation, never as success.
+// NOTE: the pump opens per chunk through this helper, so each chunk pays one open plus one fstat plus one seek. TOCTOU:
+// resolve's component checks and each open are still not atomic under stable std (no openat), so a rename race can swap
+// the leaf between plan and open; every open therefore re-validates the fd itself (regular-file type plus the
+// resolve-time dev+ino identity) and any mismatch fails closed before the seek, so swapped bytes never serve.
+// Same-inode mutation (truncate/grow in place) keeps the old clamp/short-read rules, and a leaf swapped to a fifo can
+// still block the open itself (std has no nonblocking open). Non-Unix degrades to the type check alone, the same
+// file_key shape as the H2 retained-fd path. Short reads from a shrunk file surface as Ok(n); the pump must treat a
+// short total as truncation, never as success.
 pub fn read_chunk(plan: &FilePlan, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
     if plan.multipart {
         return read_multipart_chunk(plan, offset, out);
@@ -629,15 +644,42 @@ pub fn read_chunk(plan: &FilePlan, offset: u64, out: &mut [u8]) -> std::io::Resu
         return Ok(0);
     }
     let end = remaining.min(out.len() as u64) as usize;
-    read_window(&plan.fs_path, plan.start + offset, &mut out[..end])
+    read_window(plan, plan.start + offset, &mut out[..end])
 }
 
-fn read_window(path: &Path, abs_start: u64, out: &mut [u8]) -> std::io::Result<usize> {
-    let mut file = File::open(path)?;
+fn read_window(plan: &FilePlan, abs_start: u64, out: &mut [u8]) -> std::io::Result<usize> {
+    let mut file = File::open(&plan.fs_path)?;
+    let fresh = file.metadata()?;
+    if !fresh.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "open file is not a regular file",
+        ));
+    }
+    if file_key(&fresh) != (plan.dev, plan.ino) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "file replaced underfoot",
+        ));
+    }
     // NOTE: pump offsets stay window-relative, so the seek anchors at plan start; the
     // window always sits inside total, hence start + offset cannot overflow u64 here.
     file.seek(SeekFrom::Start(abs_start))?;
     file.read(out)
+}
+
+#[cfg(unix)]
+fn file_key(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+// NOTE: non-Unix identity degrades to the type check alone (the key reads (0, 0) on both sides, so the comparison
+// passes trivially); size+mtime cannot pin the leaf because the pump must keep serving clamped/short reads across
+// in-place grow/shrink. No Linux-only code, no extra gating.
+#[cfg(not(unix))]
+fn file_key(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
 }
 
 fn decode_segment(segment: &[u8]) -> Result<Vec<u8>, FileReject> {

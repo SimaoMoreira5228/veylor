@@ -3260,6 +3260,46 @@ fn h2_file_mount_streams_large_file_across_turns() {
 }
 
 #[test]
+fn h2_file_mount_sequential_gets_stay_exact_across_1mib() {
+    let root = file_mount_root("mib-seq");
+    let mut bytes = vec![0u8; 32_768];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    std::fs::write(root.join("big-32k.bin"), &bytes).expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    let mut stream_id = 1;
+    for _ in 0..32 {
+        send_headers(&mut client, stream_id, b"GET", b"/assets/big-32k.bin", true);
+        let got = read_response_stateful(&mut client, stream_id, &mut dec);
+        assert_eq!(got.status, 200);
+        assert_eq!(got.content_length, 32_768);
+        assert_eq!(got.body, bytes);
+        assert_eq!(got.content_type, b"application/octet-stream");
+        send_window_update(&mut client, 0, 32_768);
+        stream_id += 2;
+    }
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 32, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn send_window_update(stream: &mut TcpStream, id: u32, increment: u32) {
+    write_frame(
+        stream,
+        FrameType::WindowUpdate,
+        0,
+        id,
+        &increment.to_be_bytes(),
+    );
+}
+
+#[test]
 fn h2_file_mount_single_range_206_and_fail_closed() {
     let root = file_mount_root("range");
     let mut bytes = vec![0u8; 1000];

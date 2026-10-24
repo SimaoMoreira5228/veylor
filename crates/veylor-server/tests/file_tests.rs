@@ -421,6 +421,77 @@ fn read_chunk_clamps_overgrown_file_to_plan_size() {
     assert_eq!(&out[..got], b"<html>hello</html>");
 }
 
+#[test]
+fn read_chunk_swapped_leaf_dir_fails_closed() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let victim = fixture.root.join("victim_dir.txt");
+    fs::write(&victim, b"victim-bytes-1234").expect("victim");
+    let plan = mounts
+        .resolve(b"GET", b"/assets/victim_dir.txt")
+        .expect("victim plan");
+    fs::remove_file(&victim).expect("remove victim");
+    fs::create_dir(&victim).expect("swap dir");
+    let mut out = [0u8; 64];
+    // NOTE: deterministic TOCTOU stage: resolve, swap on disk, then read on the stale plan.
+    let error = read_chunk(&plan, 0, &mut out).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn read_chunk_swapped_leaf_symlink_fails_closed() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let victim = fixture.root.join("victim_link.txt");
+    fs::write(&victim, b"victim-bytes-1234").expect("victim");
+    let decoy = fixture.root.join("decoy.txt");
+    fs::write(&decoy, b"decoy--bytes-1234").expect("decoy");
+    assert_eq!(
+        fs::metadata(&decoy).expect("decoy stat").len(),
+        fs::metadata(&victim).expect("victim stat").len(),
+        "same size pins the identity check, not the length"
+    );
+    let plan = mounts
+        .resolve(b"GET", b"/assets/victim_link.txt")
+        .expect("victim plan");
+    fs::rename(&victim, fixture.root.join("victim_backup.txt")).expect("move aside");
+    symlink(&decoy, &victim).expect("swap link");
+    let mut out = [0u8; 64];
+    // NOTE: deterministic TOCTOU stage: resolve, swap on disk, then read on the stale plan.
+    let error = read_chunk(&plan, 0, &mut out).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn read_chunk_swapped_leaf_fifo_fails_closed() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let victim = fixture.root.join("victim_fifo.txt");
+    fs::write(&victim, b"victim-bytes-1234").expect("victim");
+    let plan = mounts
+        .resolve(b"GET", b"/assets/victim_fifo.txt")
+        .expect("victim plan");
+    fs::remove_file(&victim).expect("remove victim");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&victim)
+            .status()
+            .expect("spawn mkfifo")
+            .success(),
+        "mkfifo stages the fifo leaf"
+    );
+    // NOTE: the writer rendezvous lets the read-side open return so the fstat check runs; without it the open blocks.
+    let path = victim.clone();
+    let writer = std::thread::spawn(move || {
+        let _ = std::fs::File::create(path);
+    });
+    let mut out = [0u8; 64];
+    // NOTE: deterministic TOCTOU stage: resolve, swap on disk, then read on the stale plan.
+    let error = read_chunk(&plan, 0, &mut out).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    writer.join().expect("writer joins");
+}
+
 #[cfg(target_os = "linux")]
 fn cache_read_all(cache: &mut FdCache, plan: &veylor_server::FilePlan) -> Vec<u8> {
     let mut assembled = Vec::new();
