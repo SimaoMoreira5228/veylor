@@ -2948,8 +2948,43 @@ fn h2c_serves_native_routes_live() {
 }
 // NOTE: H2C file-mount proof through a live Server::bind plus real H2C bytes (never
 // driver-only, so projection wiring is covered): full GET/HEAD 200s with Last-Modified,
-// 304 revalidation, single-range 206, and fail-closed 404/413/416 mappings over one
-// multiplexed connection. Multipart ranges stay OUT (RST RefusedStream, follow-up).
+// 304 revalidation, single-range 206, multipart 206 byte-exact with H1, and fail-closed
+// 404/413/416 mappings over one multiplexed connection.
+
+fn expected_multipart(
+    boundary: &[u8],
+    content_type: &[u8],
+    total: u64,
+    windows: &[(u64, u64)],
+    file: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (start, end) in windows.iter().copied() {
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(boundary);
+        body.extend_from_slice(b"\r\nContent-Type: ");
+        body.extend_from_slice(content_type);
+        body.extend_from_slice(
+            format!(
+                "\r\nContent-Range: bytes {start}-{}/{total}\r\n\r\n",
+                end - 1
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&file[start as usize..end as usize]);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary);
+    body.extend_from_slice(b"--\r\n");
+    body
+}
+
+fn multipart_boundary_of(content_type: &[u8]) -> Vec<u8> {
+    const PREFIX: &[u8] = b"multipart/byteranges; boundary=";
+    assert!(content_type.starts_with(PREFIX), "multipart ctype");
+    content_type[PREFIX.len()..].to_vec()
+}
 
 fn file_mount_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("veylor-h2f-{}-{name}", std::process::id()));
@@ -3153,11 +3188,20 @@ fn h2_file_mount_single_range_206_and_fail_closed() {
         &[(b"range".as_slice(), b"bytes=0-1, 3-4".as_slice())],
         true,
     );
-    // NOTE: a satisfiable multi-range set is not unsatisfiable, so it RST-refuses with no
-    // HEADERS first (multipart 206 framing stays a follow-up); the connection survives.
-    let (rst_stream, rst_code) = read_rst(&mut client);
-    assert_eq!(rst_stream, 7);
-    assert_eq!(rst_code, ErrorCode::RefusedStream);
+    let multi = read_response_stateful(&mut client, 7, &mut dec);
+    assert_eq!(multi.status, 206);
+    assert!(multi.content_range.is_empty());
+    assert!(!multi.last_modified.is_empty());
+    let boundary = multipart_boundary_of(&multi.content_type);
+    let expected = expected_multipart(
+        &boundary,
+        b"application/octet-stream",
+        1000,
+        &[(0, 2), (3, 5)],
+        &bytes,
+    );
+    assert_eq!(multi.body, expected);
+    assert_eq!(multi.content_length, expected.len() as u64);
     send_headers(&mut client, 9, b"GET", b"/assets/data.bin", true);
     let sibling = read_response_stateful(&mut client, 9, &mut dec);
     assert_eq!(sibling.status, 200);
@@ -3174,7 +3218,91 @@ fn h2_file_mount_single_range_206_and_fail_closed() {
     assert_eq!(big.status, 413);
     assert_eq!(big.body, b"Payload Too Large");
     let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 6, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn h2_file_mount_multipart_subset_and_overcap_rules() {
+    let root = file_mount_root("multi-rules");
+    let mut bytes = vec![0u8; 1000];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    std::fs::write(root.join("data.bin"), &bytes).expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    send_headers_extra(
+        &mut client,
+        1,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=0-1,5000-6000".as_slice())],
+        true,
+    );
+    let single = read_response_stateful(&mut client, 1, &mut dec);
+    assert_eq!(single.status, 206);
+    assert_eq!(single.body, &bytes[..2]);
+    assert_eq!(single.content_range, b"bytes 0-1/1000");
+    assert_eq!(single.content_type, b"application/octet-stream");
+    send_headers_extra(
+        &mut client,
+        3,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=5000-,6000-7000".as_slice())],
+        true,
+    );
+    let bad = read_response_stateful(&mut client, 3, &mut dec);
+    assert_eq!(bad.status, 416);
+    assert!(bad.body.is_empty());
+    assert_eq!(bad.content_range, b"bytes */1000");
+    for (id, range) in [
+        (5, b"bytes=a-b,c-d".as_slice()),
+        (7, b"bytes=0-0,1-1,2-2,3-3,4-4,5-5,6-6,7-7,8-8".as_slice()),
+    ] {
+        send_headers_extra(
+            &mut client,
+            id,
+            b"GET",
+            b"/assets/data.bin",
+            &[(b"range".as_slice(), range)],
+            true,
+        );
+        let full = read_response_stateful(&mut client, id, &mut dec);
+        assert_eq!(full.status, 200);
+        assert_eq!(full.body, bytes);
+        assert_eq!(full.content_type, b"application/octet-stream");
+        assert!(full.content_range.is_empty());
+    }
+    send_headers_extra(
+        &mut client,
+        9,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=0-1,4-5,5000-".as_slice())],
+        true,
+    );
+    let multi = read_response_stateful(&mut client, 9, &mut dec);
+    assert_eq!(multi.status, 206);
+    assert!(multi.content_range.is_empty());
+    let boundary = multipart_boundary_of(&multi.content_type);
+    let expected = expected_multipart(
+        &boundary,
+        b"application/octet-stream",
+        1000,
+        &[(0, 2), (4, 6)],
+        &bytes,
+    );
+    assert_eq!(multi.body, expected);
+    assert_eq!(multi.content_length, expected.len() as u64);
+    let counts = stop_join(server);
     assert_eq!(counts.h2_served, 5, "counts: {counts:?}");
-    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -9,12 +9,12 @@ use crate::connection::StagedTrailer;
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::streams::{StreamCmd, take_stream_cmd};
 use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
-use crate::static_files::{FilePlan, FileReject, RangeApply, parse_http_date, read_chunk};
 use crate::static_routes::{
     MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
 };
 
-use super::routes::{FileHead, FrozenRoutesView, NOT_FOUND_BODY, field, send_file_head, send_full};
+use super::file::FileDecision;
+use super::routes::{FrozenRoutesView, NOT_FOUND_BODY, field, send_full};
 use super::turn;
 use super::{
     H2_BODY_CAP, H2Conn, H2FileTransfer, H2HostCtx, Phase, STREAM_SLOTS, StepOutcome, StreamEvent,
@@ -36,7 +36,7 @@ pub(crate) struct Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
 }
 
 impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
-    fn fail(&mut self, code: ErrorCode) {
+    pub(crate) fn fail(&mut self, code: ErrorCode) {
         let last = self.server.driver().streams().highest_remote();
         let max = self
             .server
@@ -55,7 +55,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         );
     }
 
-    fn deny(&mut self, stream: u32, code: ErrorCode, close: bool) {
+    pub(crate) fn deny(&mut self, stream: u32, code: ErrorCode, close: bool) {
         let staged = if code == ErrorCode::RefusedStream {
             self.server.refuse(stream, &mut self.output[*self.used..])
         } else {
@@ -142,221 +142,6 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         ) {
             Ok(()) => self.outcome.served += 1,
             Err(code) => self.fail(code),
-        }
-    }
-
-    // NOTE: H2 file dispatch with the H1 respond_file contract: NotFound/Forbidden/NotAFile
-    // read as Miss (the caller falls through to the untouched static 404 shapes), TooLarge
-    // reads as 413, If-Modified-Since drives 304 before Range for GET and HEAD alike, HEAD
-    // ignores Range to 200 full headers, one satisfiable range narrows to 206, and an
-    // unsatisfiable window fails closed as 416. A satisfiable multi-range set is not
-    // unsatisfiable (H1 serves 206 multipart there), so it RST-refuses with no HEADERS
-    // first; multipart framing assembly stays a documented follow-up.
-    fn plan_file(
-        &self,
-        method: &[u8],
-        path: &[u8],
-        declared: u64,
-        fields: &[HpackHeader],
-    ) -> FileDecision {
-        if declared > MAX_STATIC_BODY_BYTES {
-            return FileDecision::TooLarge;
-        }
-        let mut plan = match self.routes.resolve_file(method, path) {
-            Ok(plan) => plan,
-            Err(FileReject::TooLarge) => return FileDecision::TooLarge,
-            Err(_) => return FileDecision::Miss,
-        };
-        let since = self.request_header(fields, b"if-modified-since");
-        let fresh = since
-            .and_then(parse_http_date)
-            .is_some_and(|date| plan.mtime <= date);
-        if fresh {
-            let head = FileHead {
-                status: 304,
-                content_length: 0,
-                content_type: None,
-                mtime: Some(plan.mtime),
-                total: plan.total,
-                window: None,
-                accept_ranges: false,
-            };
-            return FileDecision::Serve(plan, head, false);
-        }
-        if plan.head_only {
-            let head = file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, None);
-            return FileDecision::Serve(plan, head, false);
-        }
-        let range = (method == b"GET")
-            .then(|| self.request_header(fields, b"range"))
-            .flatten();
-        match plan.apply_range(range) {
-            RangeApply::Multipart => FileDecision::Refused,
-            RangeApply::Unsatisfiable => {
-                let head = FileHead {
-                    status: 416,
-                    content_length: 0,
-                    content_type: None,
-                    mtime: None,
-                    total: plan.total,
-                    window: None,
-                    accept_ranges: false,
-                };
-                FileDecision::Serve(plan, head, false)
-            }
-            RangeApply::Ranged => {
-                let window = Some((plan.start, plan.start + plan.size - 1));
-                let head =
-                    file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, window);
-                FileDecision::Serve(plan, head, true)
-            }
-            RangeApply::Ignored => {
-                let head =
-                    file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, None);
-                FileDecision::Serve(plan, head, true)
-            }
-        }
-    }
-
-    // NOTE: a declared body at or under the cap with the stream still open mirrors the
-    // static refusal exactly (would-be HEADERS open, then RST plus a connection close);
-    // HEAD/304/416/empty heads complete with HEADERS alone, and only GET bodies with bytes
-    // stage a transfer that pump_files resumes across steps and turns.
-    fn emit_file(
-        &mut self,
-        stream: u32,
-        end: bool,
-        plan: FilePlan,
-        head: FileHead,
-        send_body: bool,
-    ) {
-        let sized = send_body && plan.size > 0;
-        let end_stream = end && !sized;
-        if send_file_head(
-            self.server,
-            stream,
-            &head,
-            end_stream,
-            self.output,
-            self.used,
-        )
-        .is_err()
-        {
-            self.fail(ErrorCode::InternalError);
-            return;
-        }
-        if !end {
-            self.deny(stream, ErrorCode::RefusedStream, true);
-            return;
-        }
-        if !sized {
-            self.outcome.served += 1;
-            return;
-        }
-        let base = *self.used;
-        let mut offset = 0u64;
-        let pump = pump_file_data(
-            self.server,
-            stream,
-            &plan,
-            &mut offset,
-            self.scratch,
-            self.output,
-            self.used,
-        );
-        match pump {
-            FilePump::Done => self.outcome.served += 1,
-            FilePump::Fail(code) => self.fail(code),
-            FilePump::More => {
-                if self.file_insert(stream, plan, offset).is_err() {
-                    self.deny(stream, ErrorCode::RefusedStream, false);
-                } else if *self.used > base {
-                    self.outcome.pending = true;
-                }
-            }
-        }
-    }
-
-    fn request_header(&self, fields: &[HpackHeader], name: &[u8]) -> Option<&[u8]> {
-        fields.iter().find_map(|header| {
-            let (found, value) = self.server.driver().resolve_header(*header)?;
-            if found.eq_ignore_ascii_case(name) {
-                Some(value)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn file_insert(&mut self, stream: u32, plan: FilePlan, offset: u64) -> Result<(), ()> {
-        let Some(slot) = self.files.iter_mut().find(|slot| slot.is_none()) else {
-            return Err(());
-        };
-        *slot = Some(H2FileTransfer {
-            stream,
-            plan,
-            offset,
-        });
-        Ok(())
-    }
-
-    // NOTE: per-step file resume for transfers wider than one output buffer: stale entries
-    // (peer reset, raced close) drop without a frame, completions count served, and anything
-    // left sets pending only when this step framed bytes, so a saturated socket idles until
-    // the next turn instead of spinning the step cap.
-    pub(crate) fn pump_files(&mut self) {
-        let base = *self.used;
-        let mut more = false;
-        let mut index = 0;
-        while index < STREAM_SLOTS {
-            match self.pump_file_slot(index) {
-                FileSlot::Empty | FileSlot::Dropped => {}
-                FileSlot::Done => self.outcome.served += 1,
-                FileSlot::More => more = true,
-                FileSlot::Fail(code) => {
-                    self.fail(code);
-                    return;
-                }
-            }
-            index += 1;
-        }
-        if more && *self.used > base {
-            self.outcome.pending = true;
-        }
-    }
-
-    fn pump_file_slot(&mut self, index: usize) -> FileSlot {
-        let stream = match self.files[index].as_ref() {
-            Some(transfer) => transfer.stream,
-            None => return FileSlot::Empty,
-        };
-        let live = self.server.driver().streams().find(stream);
-        if live.is_none_or(|found| found.state == StreamState::Closed) {
-            self.files[index] = None;
-            return FileSlot::Dropped;
-        }
-        let Some(transfer) = self.files[index].as_mut() else {
-            return FileSlot::Empty;
-        };
-        let pump = pump_file_data(
-            self.server,
-            stream,
-            &transfer.plan,
-            &mut transfer.offset,
-            self.scratch,
-            self.output,
-            self.used,
-        );
-        match pump {
-            FilePump::Done => {
-                self.files[index] = None;
-                FileSlot::Done
-            }
-            FilePump::More => FileSlot::More,
-            FilePump::Fail(code) => {
-                self.files[index] = None;
-                FileSlot::Fail(code)
-            }
         }
     }
 
@@ -495,10 +280,6 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     let declared = request.content_length.unwrap_or(0);
                     match self.plan_file(request.method, path, declared, fields) {
                         FileDecision::Miss => {}
-                        FileDecision::Refused => {
-                            self.deny(stream, ErrorCode::RefusedStream, false);
-                            return;
-                        }
                         FileDecision::TooLarge => {
                             match send_full(
                                 self.server,
@@ -609,96 +390,6 @@ fn park_stream(
     }
 }
 
-// NOTE: large by construction (FilePlan rides by value so no per-request alloc lands
-// beside the already-boxed transfer table); the allow mirrors the tradeoff explicitly.
-#[allow(clippy::large_enum_variant)]
-enum FileDecision {
-    Miss,
-    TooLarge,
-    Refused,
-    Serve(FilePlan, FileHead, bool),
-}
-
-fn file_head_200(
-    size: u64,
-    content_type: &'static str,
-    mtime: u64,
-    total: u64,
-    window: Option<(u64, u64)>,
-) -> FileHead {
-    FileHead {
-        status: if window.is_some() { 206 } else { 200 },
-        content_length: size,
-        content_type: Some(content_type),
-        mtime: Some(mtime),
-        total,
-        window,
-        accept_ranges: true,
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum FilePump {
-    Done,
-    More,
-    Fail(ErrorCode),
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum FileSlot {
-    Empty,
-    Dropped,
-    Done,
-    More,
-    Fail(ErrorCode),
-}
-
-// NOTE: bounded file DATA framing through the shared chunk scratch: each iteration stages
-// at most one scratch slice and frames exactly one DATA frame, so output room (the turn
-// budget) bounds a step and the plan window bounds the stream. A short read means the file
-// shrank underfoot and fails closed like the H1 truncation rule; an exhausted window or a
-// refused frame fails the same way the static DATA path does, never as wrong bytes.
-fn pump_file_data(
-    server: &mut H2ServerDriver<'_, '_, '_, '_>,
-    stream: u32,
-    plan: &FilePlan,
-    offset: &mut u64,
-    scratch: &mut [u8],
-    output: &mut [u8],
-    used: &mut usize,
-) -> FilePump {
-    while *offset < plan.size {
-        let room = output.len() - *used;
-        if room < 10 {
-            return FilePump::More;
-        }
-        let width = (room - 9).min(scratch.len());
-        let take = (plan.size - *offset).min(width as u64) as usize;
-        if take == 0 {
-            return FilePump::More;
-        }
-        let got = match read_chunk(plan, *offset, &mut scratch[..take]) {
-            Ok(got) => got,
-            Err(_) => return FilePump::Fail(ErrorCode::InternalError),
-        };
-        if got == 0 {
-            return FilePump::Fail(ErrorCode::InternalError);
-        }
-        let last = *offset + got as u64 == plan.size;
-        match server.send_data(stream, &scratch[..got], last, &mut output[*used..]) {
-            Ok(sent) => {
-                *used += sent.writer.pending_bytes().len();
-                if sent.frame.payload_length == 0 {
-                    return FilePump::Fail(ErrorCode::FlowControlError);
-                }
-                *offset += sent.frame.payload_length as u64;
-            }
-            Err(_) => return FilePump::Fail(ErrorCode::FlowControlError),
-        }
-    }
-    FilePump::Done
-}
-
 #[derive(Clone, Copy)]
 enum H2Trailer {
     Staged,
@@ -807,6 +498,9 @@ fn push_h2_data(ctx: H2HostCtx<'_>, stream: u32, bytes: &[u8], end: bool) -> H2D
     let Some((result, _)) = outcome else {
         return H2DataOutcome::Gone;
     };
+    if matches!(result, H2DataOutcome::Stored) && !bytes.is_empty() {
+        ctx.host.notify_pollers();
+    }
     result
 }
 

@@ -4184,3 +4184,100 @@ fn h2c_managed_body_available_signals_ready_and_end() {
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
+
+// NOTE: H2 DATA wake pin: staged DATA must wake a thread-blocked poll the way the H1
+// push_body paths do. The waiter blocks in long-timeout polls after the REQUEST drain, so
+// only a DATA-driven notify returns it promptly; without one it sleeps the full timeout.
+#[test]
+fn h2c_data_staged_body_available_wakes_blocked_poll() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h2c = unsafe { h2c_port_of(server) };
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let fields = [
+        h2_field(b":method", b"POST"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", b"/upload"),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"5"),
+    ];
+    h2_send_headers_open(&mut stream, 1, &fields);
+    let token = unsafe { poll_one(server) };
+    assert_eq!(token.stream_id, 1);
+    let raw = server as usize;
+    let waiter = std::thread::spawn(move || {
+        let server = raw as *mut VylManagedStaticServer;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let mut found = false;
+        while !found && std::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut events = [VylManagedStaticEvent::default(); 8];
+            let mut methods = [0u8; 256];
+            let mut paths = [0u8; 4096];
+            let report = unsafe {
+                poll_into(
+                    server,
+                    left.as_nanos() as u64,
+                    &mut events,
+                    &mut methods,
+                    &mut paths,
+                )
+            };
+            found = events.iter().take(report.copied).any(|event| {
+                event.kind == VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE && event.token == token
+            });
+        }
+        (start.elapsed(), found)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    h2_write_data(&mut stream, 1, b"hello", true);
+    let (elapsed, found) = waiter.join().expect("waiter joins");
+    assert!(found, "blocked poll never observed the H2 DATA body signal");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "blocked poll slept {elapsed:?}: H2 DATA staged no wake"
+    );
+    assert_eq!(unsafe { drain_body(server, token) }, b"hello");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"done"))
+        },
+        VylResult::Ok
+    );
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    let (header, payload) = h2_next_non_grant(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(header.stream_id, 1);
+    let (count, _) = decode_header_block(&payload, &mut decoder, &mut decoded).expect("decode");
+    let mut status = 0;
+    for header in decoded.iter().take(count) {
+        let name = decoder.resolve(header.field.name).expect("name");
+        let value = decoder.resolve(header.field.value).expect("value");
+        if name == b":status" {
+            status = std::str::from_utf8(value)
+                .expect("status utf8")
+                .parse()
+                .expect("status int");
+        }
+    }
+    assert_eq!(status, 200);
+    let (header, body) = h2_next_non_grant(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Data);
+    assert_eq!(header.stream_id, 1);
+    assert_eq!(header.flags & DATA_FLAG_END_STREAM, DATA_FLAG_END_STREAM);
+    assert_eq!(body, b"done");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}

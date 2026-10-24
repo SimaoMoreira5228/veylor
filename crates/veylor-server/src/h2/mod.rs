@@ -8,17 +8,19 @@ use veylor_http2::{
 use veylor_runtime::ConnectionToken;
 
 use crate::host::{HostShared, StagedWork};
-use crate::static_files::FilePlan;
 
 // NOTE: worker-turn hook (slot state plus accept/pump/close dispatch). The
 // step driver above stays transport-neutral; turn.rs owns the sockets,
 // listeners, and timers that drive it.
 pub(crate) mod turn;
 // NOTE: seam: routes owns the static table plus sync response assembly, serve owns
-// per-event stream serving (host parks, trailers, streaming writes).
+// per-event stream serving (host parks, trailers, streaming writes), and file owns
+// file-mount assembly (range planning, HEADERS emit, DATA pump).
+mod file;
 mod routes;
 mod serve;
 
+pub(crate) use file::H2FileTransfer;
 pub use routes::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
 pub(crate) use serve::apply_h2_streams;
 
@@ -139,14 +141,6 @@ pub struct H2Conn<'a> {
     // scratch reused every turn, so file bytes frame in bounded slices and never stage whole.
     file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
     file_scratch: Box<[u8; crate::connection::OUTPUT_CAP]>,
-}
-
-// NOTE: per-stream file progress: the plan owns its fs path, offset counts plan-relative
-// bytes already framed, and the entry drops on completion, peer reset, or conn close.
-pub(crate) struct H2FileTransfer {
-    pub(crate) stream: u32,
-    pub(crate) plan: FilePlan,
-    pub(crate) offset: u64,
 }
 
 impl<'a> H2Conn<'a> {

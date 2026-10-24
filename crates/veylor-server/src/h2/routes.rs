@@ -11,6 +11,9 @@ use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 pub(crate) const NOT_FOUND_BODY: &[u8] = b"Not Found";
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
 const CONTENT_RANGE_BYTES: usize = 80;
+// NOTE: "multipart/byteranges; boundary=" plus token and hex fields tops out near 91 bytes;
+// 128 leaves margin, mirroring the H1 multipart scratch.
+const MULTIPART_CTYPE_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrozenRoute<'a> {
@@ -197,7 +200,8 @@ impl<'a> FrozenRoutesView<'a> {
 // NOTE: file HEADERS assembly next to send_full: 200/206 carry content-length, content-
 // type, accept-ranges, and last-modified; 304 carries content-length 0 plus last-modified
 // (H1 emits both); 416 carries content-length 0 plus content-range */total. Single-range
-// 206 adds content-range; multipart never reaches here (it fails closed as 416 in serve).
+// 206 adds content-range; multipart 206 carries the dynamic boundary content-type instead
+// of the file type and no top-level content-range (H1 parity, body pages via read_chunk).
 pub(crate) struct FileHead {
     pub(crate) status: u16,
     pub(crate) content_length: u64,
@@ -206,11 +210,13 @@ pub(crate) struct FileHead {
     pub(crate) total: u64,
     pub(crate) window: Option<(u64, u64)>,
     pub(crate) accept_ranges: bool,
+    pub(crate) multipart: bool,
 }
 
 pub(crate) fn send_file_head(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
+    plan: &FilePlan,
     head: &FileHead,
     end_stream: bool,
     output: &mut [u8],
@@ -231,11 +237,20 @@ pub(crate) fn send_file_head(
     } else {
         0
     };
+    let mut ctype_buf = [0; MULTIPART_CTYPE_BYTES];
+    let ctype_len = if head.multipart {
+        plan.multipart_content_type(&mut ctype_buf)
+    } else {
+        0
+    };
     let mut fields = [field(b"", b""); 6];
     fields[0] = field(b":status", &status_buf[..status_len]);
     fields[1] = field(b"content-length", &length_buf[..length_len]);
     let mut count = 2;
-    if let Some(content_type) = head.content_type {
+    if head.multipart {
+        fields[count] = field(b"content-type", &ctype_buf[..ctype_len]);
+        count += 1;
+    } else if let Some(content_type) = head.content_type {
         fields[count] = field(b"content-type", content_type.as_bytes());
         count += 1;
     }
