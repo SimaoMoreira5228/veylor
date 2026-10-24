@@ -304,6 +304,33 @@ fn strip_file_query(path: &[u8]) -> &[u8] {
     &path[..end]
 }
 
+// NOTE: RFC 9113 forbids content-length on 1xx/204 responses and the driver rejects it
+// at send_response time, so bodyless statuses emit :status-only HEADERS with END_STREAM
+// and never DATA; H1 drops the 204 body the same way (body_allowed gates it out).
+pub(crate) fn send_status_only(
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    stream: u32,
+    status: u16,
+    output: &mut [u8],
+    used: &mut usize,
+) -> Result<(), ErrorCode> {
+    let mut status_buf = [0; DECIMAL_CAP];
+    let status_len = push_decimal(&mut status_buf, u64::from(status));
+    let response_fields = [field(b":status", &status_buf[..status_len])];
+    let mut block = [0; HPACK_BLOCK_CAP];
+    let sent = server
+        .send_response(
+            stream,
+            &response_fields,
+            &mut block,
+            &mut output[*used..],
+            true,
+        )
+        .map_err(|_| ErrorCode::InternalError)?;
+    *used += sent.writer.pending_bytes().len();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_full(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
@@ -315,6 +342,9 @@ pub(crate) fn send_full(
     output: &mut [u8],
     used: &mut usize,
 ) -> Result<(), ErrorCode> {
+    if status == 204 {
+        return send_status_only(server, stream, status, output, used);
+    }
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut length_buf = [0; DECIMAL_CAP];

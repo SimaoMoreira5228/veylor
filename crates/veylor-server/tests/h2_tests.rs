@@ -2465,6 +2465,13 @@ static H2N_204: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     user_data: 0,
 }];
 
+static H2N_204_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_204_body,
+    user_data: 0,
+}];
+
 static H2N_SELECT: [FrozenNativeRoute<'static>; 2] = [
     FrozenNativeRoute {
         method: b"GET",
@@ -2636,6 +2643,15 @@ unsafe extern "C" fn h2n_204(
 }
 
 #[allow(unsafe_code)]
+unsafe extern "C" fn h2n_204_body(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 204, b"No Content", b"stray-body")
+}
+
+#[allow(unsafe_code)]
 unsafe extern "C" fn h2n_select(
     user_data: *mut c_void,
     _request: *const NativeRequestView,
@@ -2795,7 +2811,88 @@ fn h2_native_handler_failures_rst_without_headers() {
     h2n_failure_rsts(&H2N_BAD_STATUS);
     h2n_failure_rsts(&H2N_BIG_BODY);
     h2n_failure_rsts(&H2N_BAD_REASON);
-    h2n_failure_rsts(&H2N_204);
+}
+
+// NOTE: 204 serves :status-only HEADERS with END_STREAM (RFC 9113 forbids content-length on
+// 204): the exact field list proves no length rides the wire, and the sibling read proves no
+// DATA follows (a stray DATA frame would misroute the sibling's stream assertion).
+fn h2n_204_serves(natives: &'static [FrozenNativeRoute<'static>]) {
+    let view = h2n_view(natives);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"GET", b"/fail", true);
+        let outcome = pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        assert_eq!(outcome.served, 1);
+        assert_eq!(outcome.refused, 0);
+        let (header, payload) = read_frame(client);
+        assert_eq!(header.frame_type, FrameType::Headers);
+        assert_eq!(header.stream_id, 1);
+        assert_ne!(header.flags & HEADERS_FLAG_END_STREAM, 0);
+        assert_eq!(
+            decode_fields(&payload),
+            vec![(b":status".to_vec(), b"204".to_vec())]
+        );
+        send_headers(client, 3, b"GET", b"/empty", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        let sibling = read_response(client, 3);
+        assert_eq!(sibling.status, 200);
+        assert!(sibling.body.is_empty());
+    });
+}
+
+#[test]
+fn h2_native_204_serves_status_only_end_stream() {
+    h2n_204_serves(&H2N_204);
+}
+
+#[test]
+fn h2_native_204_drops_handler_body() {
+    h2n_204_serves(&H2N_204_BODY);
+}
+
+// NOTE: managed 204 pin: stage_respond admits any 200..=599 so a host 204 lands in
+// apply_staged, where the shared sender sheds the length and the staged body; the exact
+// field list plus the sync sibling prove the wire shape and conn survival.
+#[test]
+fn h2_managed_respond_204_serves_status_only() {
+    let view = FrozenRoutesView::new(&ROUTES).expect("frozen routes");
+    with_rig(|conn, shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        let ctx = H2HostCtx {
+            host: shared,
+            base: host_base(),
+        };
+        send_headers(client, 1, b"GET", b"/hello", true);
+        let outcome = pump_until(conn, server, &view, Some(ctx), |outcome| outcome.parked > 0);
+        assert_eq!(outcome.parked, 1);
+        let (event, _, _) = poll_request_event(shared);
+        assert_eq!(event.token.stream_id, 1);
+        assert_eq!(
+            shared.stage_respond(event.token, 204, b"No Content", b"stray"),
+            RespondOutcome::Ok
+        );
+        let staged = shared.take_staged(0);
+        assert_eq!(staged.len(), 1);
+        let mut output = [0u8; 16384];
+        let applied = conn.apply_staged(&mut output, &staged[0]);
+        assert_eq!(applied.served, 1);
+        server
+            .write_all(&output[..applied.written])
+            .expect("flush staged");
+        let (header, payload) = read_frame(client);
+        assert_eq!(header.frame_type, FrameType::Headers);
+        assert_eq!(header.stream_id, 1);
+        assert_ne!(header.flags & HEADERS_FLAG_END_STREAM, 0);
+        assert_eq!(
+            decode_fields(&payload),
+            vec![(b":status".to_vec(), b"204".to_vec())]
+        );
+        send_headers(client, 3, b"GET", b"/missing", true);
+        pump_until(conn, server, &view, Some(ctx), |outcome| outcome.served > 0);
+        let sibling = read_response(client, 3);
+        assert_eq!(sibling.status, 404);
+        assert_eq!(sibling.body, b"Not Found");
+    });
 }
 
 #[test]

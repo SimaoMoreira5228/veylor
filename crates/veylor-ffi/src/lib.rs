@@ -42,7 +42,7 @@ pub use managed_static::{
     VylManagedStaticEvent, VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn,
     VylManagedStaticNativeRequest, VylManagedStaticNativeResponse, VylManagedStaticPollReport,
     VylManagedStaticServer, VylManagedStaticToken, VylManagedStaticTrailerReport,
-    vyl_managed_static_destroy, vyl_managed_static_enable_h2c,
+    vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_h2c_addr,
     vyl_managed_static_host_begin_stream, vyl_managed_static_host_cancel,
     vyl_managed_static_host_end_stream, vyl_managed_static_host_end_stream_with_trailers,
     vyl_managed_static_host_is_writable, vyl_managed_static_host_pull_body,

@@ -3367,12 +3367,13 @@ fn h2c_enable_serves_handshake_and_static_route() {
         unsafe { vyl_managed_static_enable_h2c(server, 0) },
         VylResult::BadState
     );
-    let h2c_port = unsafe {
-        let handle = &*server;
-        let ManagedStaticState::Running(running) = &handle.state else {
-            panic!("expected running server");
-        };
-        running.h2c_addr().expect("h2c enabled").port()
+    let h2c_port = {
+        let mut port = 0;
+        assert_eq!(
+            unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+            VylResult::Ok
+        );
+        port
     };
     assert_ne!(h2c_port, 0);
     let mut stream = connect_loopback(h2c_port);
@@ -3541,13 +3542,108 @@ fn join_from_native_handler_reports_busy_without_deadlock() {
 // rides each connection because response blocks index across streams.
 
 unsafe fn h2c_port_of(server: *mut VylManagedStaticServer) -> u16 {
-    unsafe {
-        let handle = &*server;
-        let ManagedStaticState::Running(running) = &handle.state else {
-            panic!("expected running server");
-        };
-        running.h2c_addr().expect("h2c enabled").port()
-    }
+    let mut port = 0;
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+        VylResult::Ok
+    );
+    assert_ne!(port, 0);
+    port
+}
+
+#[test]
+fn h2c_addr_reports_bound_port_and_rejects_unusable_states() {
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(std::ptr::null_mut(), std::ptr::null_mut()) },
+        VylResult::InvalidArgument
+    );
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    let mut port = 0xBEEFu16;
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(std::ptr::null_mut(), &mut port) },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, std::ptr::null_mut()) },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+        VylResult::BadState,
+        "pre-start reports BadState: the H2C listener binds at start"
+    );
+    assert_eq!(port, 0);
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+        VylResult::BadState,
+        "staged but unbound still reports BadState"
+    );
+    assert_eq!(port, 0);
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+        VylResult::Ok
+    );
+    assert_ne!(port, 0);
+    assert_ne!(port, unsafe { local_port(server) });
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 0, "counts: {counts:?}");
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+        VylResult::BadState
+    );
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn h2c_addr_reports_disabled_and_shared_ports() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let mut port = 0xBEEFu16;
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut port) },
+        VylResult::BadState,
+        "H2C-disabled running handles report BadState"
+    );
+    assert_eq!(port, 0);
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 0, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { vyl_managed_static_set_worker_count(server, 2) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let mut h2c = 0;
+    assert_eq!(
+        unsafe { vyl_managed_static_h2c_addr(server, &mut h2c) },
+        VylResult::Ok
+    );
+    assert_ne!(h2c, 0);
+    let head = get(unsafe { local_port(server) }, "/missing");
+    assert!(
+        head.starts_with("HTTP/1.1 404 Not Found"),
+        "reuse-port H1 still serves: {head:?}"
+    );
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
 
 fn h2_handshake(stream: &mut TcpStream) {

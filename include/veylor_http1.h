@@ -835,6 +835,14 @@ vyl_http1_result vyl_managed_static_local_addr(
     vyl_managed_static_server* server,
     uint16_t* out_port
 );
+/* NOTE: Reports the bound cleartext HTTP/2 loopback port; valid only while running with H2C
+   enabled. Pre-start (the listener binds at start), H2C-disabled, and joined handles report
+   BAD_STATE; null handles or outputs report INVALID_ARGUMENT. Ephemeral staging reports the
+   bound port, multi-worker reuse-port the shared port. */
+vyl_http1_result vyl_managed_static_h2c_addr(
+    vyl_managed_static_server* server,
+    uint16_t* out_port
+);
 
 enum {
     VYL_MANAGED_STATIC_EVENT_REQUEST = 0u,

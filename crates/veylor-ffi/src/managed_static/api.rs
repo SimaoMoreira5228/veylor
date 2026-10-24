@@ -637,6 +637,42 @@ unsafe fn local_addr(server: *mut VylManagedStaticServer, out_port: *mut u16) ->
     VylResult::Ok
 }
 
+
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_h2c_addr(
+    server: *mut VylManagedStaticServer,
+    out_port: *mut u16,
+) -> VylResult {
+    catch_ffi(|| unsafe { h2c_addr(server, out_port) })
+}
+
+unsafe fn h2c_addr(server: *mut VylManagedStaticServer, out_port: *mut u16) -> VylResult {
+    if server.is_null() || out_port.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    unsafe {
+        out_port.write(0);
+    }
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    let Some(addr) = running.h2c_addr() else {
+        return VylResult::BadState;
+    };
+    unsafe {
+        out_port.write(addr.port());
+    }
+    VylResult::Ok
+}
+
 pub(super) unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
     if (bytes.data.is_null() && bytes.length != 0) || !slice_length_valid::<u8>(bytes.length) {
         return Err(VylResult::InvalidArgument);
