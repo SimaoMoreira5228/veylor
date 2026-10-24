@@ -479,6 +479,20 @@ fn abort_stream(
     StreamStep::Dead { used }
 }
 
+fn is_head_park(host: &HostShared, token: ConnectionToken) -> bool {
+    let gated = host.with_inner(|inner| {
+        let table = inner.parked.get(token.worker_id as usize);
+        let slot = table.and_then(|table| table.get(token.slot as usize));
+        let live = slot.and_then(|slot| slot.as_ref());
+        let head = live.is_some_and(|entry| {
+            entry.token == token
+                && entry.method[..usize::from(entry.method_len)].eq_ignore_ascii_case(b"HEAD")
+        });
+        (head, None)
+    });
+    gated.is_some_and(|(head, _)| head)
+}
+
 pub(crate) fn apply_h2_streams(
     meta: &mut turn::H2Meta,
     conn: &mut Option<H2Conn<'_>>,
@@ -557,20 +571,20 @@ pub(crate) fn apply_h2_streams(
     let spare = turn::pending_spare(meta);
     let step = match cmd {
         StreamCmd::Begin { status, .. } => {
-            // NOTE: HEAD-park parity gap, documented-unenforced: H1 fails a host-staged streaming
-            // Begin on a HEAD park closed via the ConnPhase::Parked method snapshot, but ParkedEntry
-            // stores no method and the H2 driver retains none, so apply time cannot see it. Seam in
-            // host/*: snapshot method_len+method onto ParkedEntry in try_park, then token-gate that
-            // snapshot here like push_h2_data and abort_stream on HEAD (RST only its stream, conn
-            // stays up, siblings unaffected); the EndWithTrailers arm needs the same check.
-            let mut used = 0;
-            match send_full(server, stream, status, b"", false, false, spare, &mut used) {
-                Ok(()) => StreamStep::Done {
-                    used,
-                    served: false,
-                    refused: false,
-                },
-                Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+            // NOTE: HEAD-park parity with H1 Begin fail-closed via the ParkedEntry method snapshot.
+            let head = is_head_park(host, token);
+            if head {
+                abort_stream(server, host, token, fail, spare)
+            } else {
+                let mut used = 0;
+                match send_full(server, stream, status, b"", false, false, spare, &mut used) {
+                    Ok(()) => StreamStep::Done {
+                        used,
+                        served: false,
+                        refused: false,
+                    },
+                    Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+                }
             }
         }
         StreamCmd::Write { chunk } => {
@@ -614,43 +628,48 @@ pub(crate) fn apply_h2_streams(
             // NOTE: terminal HEADERS stay per stream: the token-gated take plus the slot-derived
             // unpark bind the set to its stream only, zero-DATA trailers are legal, never-begun
             // sets reject at stage, late sets follow the tomb discipline, and assembly is
-            // all-or-nothing through the shared serve validator. HEAD EndWithTrailers stays
-            // unenforced with the Begin arm until the ParkedEntry method seam lands.
-            let mut fields = [field(b"", b""); TRAILER_SLOTS];
-            let mut valid = trailers.len() <= TRAILER_SLOTS;
-            for (slot, staged) in trailers.iter().enumerate().take(TRAILER_SLOTS) {
-                valid = valid && valid_trailer_field(&staged.name, &staged.value);
-                fields[slot] = field(&staged.name, &staged.value);
-            }
-            let mut block = [0; 1152];
-            let encoded = valid.then(|| {
-                encode_header_block(
-                    &fields[..trailers.len()],
-                    server.driver_mut().hpack_encoder_mut(),
-                    &mut block,
-                )
-            });
-            match encoded {
-                Some(Ok(len)) => {
-                    let mut writer = HeadersFrameWriter::new(spare);
-                    let queued =
-                        writer.queue_headers(server.driver_mut(), stream, &block[..len], true);
-                    match queued {
-                        Ok(queued) => {
-                            let used = queued.output_length;
-                            host.unpark_closed(token.worker_id, token.slot);
-                            StreamStep::Done {
-                                used,
-                                served: true,
-                                refused: false,
+            // all-or-nothing through the shared serve validator.
+            // NOTE: HEAD-park parity with H1 Begin fail-closed via the ParkedEntry method snapshot.
+            let head = is_head_park(host, token);
+            if head {
+                abort_stream(server, host, token, fail, spare)
+            } else {
+                let mut fields = [field(b"", b""); TRAILER_SLOTS];
+                let mut valid = trailers.len() <= TRAILER_SLOTS;
+                for (slot, staged) in trailers.iter().enumerate().take(TRAILER_SLOTS) {
+                    valid = valid && valid_trailer_field(&staged.name, &staged.value);
+                    fields[slot] = field(&staged.name, &staged.value);
+                }
+                let mut block = [0; 1152];
+                let encoded = valid.then(|| {
+                    encode_header_block(
+                        &fields[..trailers.len()],
+                        server.driver_mut().hpack_encoder_mut(),
+                        &mut block,
+                    )
+                });
+                match encoded {
+                    Some(Ok(len)) => {
+                        let mut writer = HeadersFrameWriter::new(spare);
+                        let queued =
+                            writer.queue_headers(server.driver_mut(), stream, &block[..len], true);
+                        match queued {
+                            Ok(queued) => {
+                                let used = queued.output_length;
+                                host.unpark_closed(token.worker_id, token.slot);
+                                StreamStep::Done {
+                                    used,
+                                    served: true,
+                                    refused: false,
+                                }
+                            }
+                            Err(_) => {
+                                abort_stream(server, host, token, fail, turn::pending_spare(meta))
                             }
                         }
-                        Err(_) => {
-                            abort_stream(server, host, token, fail, turn::pending_spare(meta))
-                        }
                     }
+                    _ => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
                 }
-                _ => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
             }
         }
         StreamCmd::Cancel => {

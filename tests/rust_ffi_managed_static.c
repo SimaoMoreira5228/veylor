@@ -39,6 +39,7 @@ int main(void) {
     static const uint8_t mount_prefix[] = "/assets/";
     static const uint8_t mount_file_body[] = "mount-bytes";
     static const char mount_request[] = "GET /assets/hello.txt HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    static const char range_request[] = "GET /assets/hello.txt HTTP/1.1\r\nHost: test\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n";
     vyl_managed_static_config config = {0};
     vyl_managed_static_server* server = NULL;
     vyl_managed_static_close_counts counts = {0};
@@ -166,14 +167,66 @@ int main(void) {
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "mount-bytes") != NULL);
     assert(strstr(response, "text/plain") != NULL);
+    assert(strstr(response, "Last-Modified: ") != NULL);
+
+    char last_modified[64] = {0};
+    {
+        const char* lm = strstr(response, "Last-Modified: ");
+        assert(lm != NULL);
+        lm += strlen("Last-Modified: ");
+        const char* eol = strstr(lm, "\r\n");
+        assert(eol != NULL && (size_t)(eol - lm) < sizeof(last_modified));
+        memcpy(last_modified, lm, (size_t)(eol - lm));
+    }
+
+    fd = connect_loopback(port);
+    assert(send(fd, range_request, sizeof(range_request) - 1, 0) == (ssize_t)(sizeof(range_request) - 1));
+    total = 0;
+    for (;;) {
+        received = recv(fd, response + total, sizeof(response) - 1 - total, 0);
+        assert(received >= 0);
+        if (received == 0) {
+            break;
+        }
+        total += (size_t)received;
+        assert(total < sizeof(response) - 1);
+    }
+    assert(close(fd) == 0);
+    response[total] = '\0';
+    assert(strstr(response, "HTTP/1.1 206") != NULL);
+    assert(strstr(response, "Content-Range: bytes 0-4/11") != NULL);
+    assert(strstr(response, "mount") != NULL);
+    assert(strstr(response, "mount-bytes") == NULL);
+
+    char cond_request[256] = {0};
+    assert(snprintf(cond_request, sizeof(cond_request),
+        "GET /assets/hello.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: %s\r\nConnection: close\r\n\r\n",
+        last_modified) > 0);
+    fd = connect_loopback(port);
+    assert(send(fd, cond_request, strlen(cond_request), 0) == (ssize_t)strlen(cond_request));
+    total = 0;
+    for (;;) {
+        received = recv(fd, response + total, sizeof(response) - 1 - total, 0);
+        assert(received >= 0);
+        if (received == 0) {
+            break;
+        }
+        total += (size_t)received;
+        assert(total < sizeof(response) - 1);
+    }
+    assert(close(fd) == 0);
+    response[total] = '\0';
+    assert(strstr(response, "HTTP/1.1 304") != NULL);
+    assert(strstr(response, "Last-Modified: ") != NULL);
+    assert(strstr(response, "mount-bytes") == NULL);
 
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 3);
+    assert(counts.completed == 5);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 3
+            counts.shutdown == 5
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     assert(remove(mount_path) == 0);

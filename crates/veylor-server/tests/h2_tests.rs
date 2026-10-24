@@ -2084,6 +2084,105 @@ fn h2_managed_stream_trailer_after_cancel_stale() {
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
     assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
 }
+
+// NOTE: HEAD-park Begin parity pin: a host-staged Begin on a HEAD park RSTs InternalError on
+// its stream only (H1 fails the connection closed instead); the connection stays up for
+// siblings and the tomb reads Gone for the exact token.
+#[test]
+fn h2_managed_head_park_begin_aborts_stream_conn_survives() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"HEAD", b"/work", true);
+    let (event, method, _) = poll_h2_request(&host);
+    assert_eq!(method, b"HEAD");
+    assert_eq!(event.token.stream_id, 1);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.parked_count() == 0);
+    let (header, payload) = read_frame(&mut stream);
+    assert_eq!(header.frame_type, FrameType::RstStream);
+    assert_eq!(header.stream_id, 1);
+    assert_eq!(
+        decode_rst_stream_payload(header, &payload).expect("decode rst"),
+        ErrorCode::InternalError
+    );
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Gone
+    );
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+}
+
+// NOTE: HEAD-park trailers parity pin: EndWithTrailers stages only on a begun stream, so a
+// never-begun HEAD park rejects Invalid at stage; the staged Begin then aborts with the same
+// stream-only RST InternalError and no HEADERS/DATA precedes it on that stream.
+#[test]
+fn h2_managed_head_park_end_with_trailers_aborts() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"HEAD", b"/work", true);
+    let (event, method, _) = poll_h2_request(&host);
+    assert_eq!(method, b"HEAD");
+    assert_eq!(event.token.stream_id, 1);
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-head-trailer", b"1")]),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.parked_count() == 0);
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        assert!(Instant::now() < deadline, "no RST for aborted HEAD park");
+        let (header, payload) = read_frame(&mut stream);
+        if header.stream_id == 0 {
+            continue;
+        }
+        assert_eq!(header.stream_id, 1);
+        match header.frame_type {
+            FrameType::RstStream => {
+                assert_eq!(
+                    decode_rst_stream_payload(header, &payload).expect("decode rst"),
+                    ErrorCode::InternalError
+                );
+                break;
+            }
+            FrameType::Headers | FrameType::Continuation | FrameType::Data => {
+                panic!("aborted HEAD park emitted {:?}", header.frame_type);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Gone
+    );
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[(b"x-head-trailer", b"1")]),
+        RespondOutcome::Gone
+    );
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+}
 // NOTE: H2 native-handler tests: FrozenNativeRoute entries ride the frozen view beside
 // static/managed kinds, and HEADERS-time dispatch invokes them through the shared
 // transport-neutral invoke (same guard/panic/validation contract as H1). The rig pumps

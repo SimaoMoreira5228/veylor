@@ -43,6 +43,8 @@ pub(crate) enum StagedAction {
 #[derive(Clone, Debug)]
 pub(crate) struct ParkedEntry {
     pub(crate) token: ConnectionToken,
+    pub(crate) method_len: u8,
+    pub(crate) method: [u8; HOST_MAX_METHOD_BYTES],
     pub(crate) staged: Option<StagedAction>,
     pub(crate) stream_cmd: Option<crate::connection::parked::StreamCmd>,
     pub(crate) stream: Option<crate::connection::parked::StreamState>,
@@ -259,7 +261,7 @@ impl HostShared {
             event.method[..method.len()].copy_from_slice(method);
             event.path[..path.len()].copy_from_slice(path);
             inner.events[worker].push_back(event);
-            inner.parked[worker][slot] = Some(ParkedEntry::new(event_token, body_total));
+            inner.parked[worker][slot] = Some(ParkedEntry::new(event_token, body_total, method));
             inner.counters.parks += 1;
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (Ok(event_token), waker)

@@ -2619,6 +2619,233 @@ fn file_mount_rejects_duplicate_and_bad_roots() {
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
 
+fn file_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn file_exchange(
+    stream: &mut TcpStream,
+    request: &[u8],
+    head_only: bool,
+) -> (u16, String, Vec<u8>) {
+    stream.write_all(request).expect("write request");
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).expect("read head byte");
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n".as_slice()) {
+            break;
+        }
+        assert!(raw.len() < 65536, "head overflow");
+    }
+    let head = String::from_utf8(raw).expect("utf8 head");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .expect("status")
+        .parse()
+        .expect("status int");
+    if head_only {
+        return (status, head, Vec::new());
+    }
+    let length = file_header(&head, "content-length")
+        .expect("content length")
+        .parse()
+        .expect("content length int");
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).expect("read body");
+    (status, head, body)
+}
+
+#[test]
+fn file_mount_single_range_206_and_unsatisfiable_416() {
+    let fixture = FixtureDir::new("range");
+    fixture.write("data.txt", b"0123456789");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    let (status, head, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nRange: bytes=2-5\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 206);
+    assert_eq!(body, b"2345");
+    assert_eq!(file_header(&head, "content-range"), Some("bytes 2-5/10"));
+    assert_eq!(file_header(&head, "accept-ranges"), Some("bytes"));
+    drop(stream);
+    let mut stream = connect_loopback(port);
+    let (status, head, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nRange: bytes=0-1, 4-5\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 206);
+    assert!(
+        file_header(&head, "content-type")
+            .is_some_and(|ctype| ctype.starts_with("multipart/byteranges; boundary=")),
+        "head: {head:?}"
+    );
+    let text = String::from_utf8(body).expect("multipart utf8");
+    assert!(
+        text.contains("Content-Range: bytes 0-1/10"),
+        "body: {text:?}"
+    );
+    assert!(
+        text.contains("Content-Range: bytes 4-5/10"),
+        "body: {text:?}"
+    );
+    assert!(text.contains("01"), "body: {text:?}");
+    assert!(text.contains("45"), "body: {text:?}");
+    drop(stream);
+    let mut stream = connect_loopback(port);
+    let (status, head, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nRange: bytes=99-\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 416);
+    assert_eq!(file_header(&head, "content-range"), Some("bytes */10"));
+    assert!(body.is_empty());
+    assert!(head.contains("Connection: close"), "head: {head:?}");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 3);
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn file_mount_conditional_round_trip_stale_and_garbage_dates() {
+    let fixture = FixtureDir::new("conditional");
+    fixture.write("data.txt", b"0123456789");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    let (status, head, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0123456789");
+    let last_modified = file_header(&head, "last-modified")
+        .expect("last-modified")
+        .to_string();
+    assert_eq!(last_modified.len(), 29, "IMF-fixdate: {last_modified:?}");
+    assert!(
+        last_modified.ends_with(" GMT")
+            && last_modified.contains(", ")
+            && last_modified.matches(':').count() == 2,
+        "IMF-fixdate: {last_modified:?}"
+    );
+    let conditional = format!(
+        "GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: {last_modified}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    let (status, head, body) = file_exchange(&mut stream, conditional.as_bytes(), false);
+    assert_eq!(status, 304);
+    assert!(body.is_empty(), "304 carries no body");
+    assert_eq!(
+        file_header(&head, "last-modified"),
+        Some(last_modified.as_str())
+    );
+    let (status, _, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\nConnection: keep-alive\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0123456789");
+    let (status, _, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: not-a-date\r\nConnection: keep-alive\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0123456789");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 0, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn file_mount_head_conditional_matches_get() {
+    let fixture = FixtureDir::new("head-conditional");
+    fixture.write("data.txt", b"0123456789");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    let (status, head, body) = file_exchange(
+        &mut stream,
+        b"HEAD /assets/data.txt HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n",
+        true,
+    );
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(file_header(&head, "content-length"), Some("10"));
+    let last_modified = file_header(&head, "last-modified")
+        .expect("last-modified")
+        .to_string();
+    let (status, head, _) = file_exchange(
+        &mut stream,
+        b"HEAD /assets/data.txt HTTP/1.1\r\nHost: test\r\nRange: bytes=0-1\r\nConnection: keep-alive\r\n\r\n",
+        true,
+    );
+    assert_eq!(status, 200, "HEAD ignores Range: {head:?}");
+    assert_eq!(file_header(&head, "content-range"), None);
+    assert_eq!(file_header(&head, "content-length"), Some("10"));
+    let conditional = format!(
+        "HEAD /assets/data.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: {last_modified}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    let (status, _, _) = file_exchange(&mut stream, conditional.as_bytes(), true);
+    assert_eq!(status, 304);
+    let (status, _, _) = file_exchange(
+        &mut stream,
+        b"HEAD /assets/data.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\nConnection: keep-alive\r\n\r\n",
+        true,
+    );
+    assert_eq!(status, 200);
+    let (status, _, body) = file_exchange(
+        &mut stream,
+        b"GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n",
+        false,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0123456789");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 0, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
 #[test]
 fn file_mount_rejects_registration_after_start() {
     let fixture = FixtureDir::new("late");
@@ -3265,5 +3492,302 @@ fn join_from_native_handler_reports_busy_without_deadlock() {
     );
     let counts = unsafe { stop_join(server) };
     assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+// NOTE: native-over-H2C coverage through the managed C ABI. Every H2C configuration
+// rebinds at start (api.rs gates the direct path on no-H2C plus single worker), so each
+// test below exercises the ReadyRouteOp::Native replay into the rebound server; the H1
+// reads on the same handles pin the direct path alongside. One stateful HPACK decoder
+// rides each connection because response blocks index across streams.
+
+unsafe fn h2c_port_of(server: *mut VylManagedStaticServer) -> u16 {
+    unsafe {
+        let handle = &*server;
+        let ManagedStaticState::Running(running) = &handle.state else {
+            panic!("expected running server");
+        };
+        running.h2c_addr().expect("h2c enabled").port()
+    }
+}
+
+fn h2_handshake(stream: &mut TcpStream) {
+    stream
+        .write_all(CLIENT_CONNECTION_PREFACE)
+        .expect("write magic");
+    h2_write_frame(stream, FrameType::Settings, 0, 0, &[]);
+    let (header, _) = h2_read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_eq!(header.stream_id, 0);
+    h2_write_frame(stream, FrameType::Settings, SETTINGS_ACK, 0, &[]);
+    let (header, _) = h2_read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_eq!(header.flags & SETTINGS_ACK, SETTINGS_ACK);
+}
+
+fn h2_send_headers(stream: &mut TcpStream, id: u32, fields: &[HpackFieldToEncode<'_>]) {
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 512];
+    let len = encode_header_block(fields, &mut encoder, &mut block).expect("encode block");
+    h2_write_frame(
+        stream,
+        FrameType::Headers,
+        HEADERS_FLAG_END_HEADERS | HEADERS_FLAG_END_STREAM,
+        id,
+        &block[..len],
+    );
+}
+
+fn h2_send_get(stream: &mut TcpStream, id: u32, path: &'static [u8]) {
+    let fields = [
+        h2_field(b":method", b"GET"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", path),
+        h2_field(b":authority", b"localhost"),
+    ];
+    h2_send_headers(stream, id, &fields);
+}
+
+fn h2_send_lying_get(stream: &mut TcpStream, id: u32, path: &'static [u8]) {
+    let fields = [
+        h2_field(b":method", b"GET"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", path),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"5"),
+    ];
+    h2_send_headers(stream, id, &fields);
+}
+
+fn h2_status(
+    stream: &mut TcpStream,
+    decoder: &mut HpackTable<'_>,
+    id: u32,
+    decoded: &mut [HpackHeader; 32],
+) -> u16 {
+    let (header, payload) = h2_read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(header.stream_id, id);
+    let (count, _) = decode_header_block(&payload, decoder, decoded).expect("decode block");
+    let mut status = 0;
+    for header in decoded.iter().take(count) {
+        let name = decoder.resolve(header.field.name).expect("name");
+        let value = decoder.resolve(header.field.value).expect("value");
+        if name == b":status" {
+            status = std::str::from_utf8(value)
+                .expect("status utf8")
+                .parse()
+                .expect("status int");
+        }
+    }
+    status
+}
+
+fn h2_data(stream: &mut TcpStream, id: u32) -> Vec<u8> {
+    let (header, body) = h2_read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::Data);
+    assert_eq!(header.stream_id, id);
+    assert_eq!(header.flags & DATA_FLAG_END_STREAM, DATA_FLAG_END_STREAM);
+    body
+}
+
+fn h2_expect_rst(stream: &mut TcpStream, id: u32) {
+    let (header, payload) = h2_read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::RstStream);
+    assert_eq!(header.stream_id, id);
+    assert_eq!(
+        payload,
+        1u32.to_be_bytes(),
+        "framing lie must RST PROTOCOL_ERROR"
+    );
+}
+
+fn h2_decoder<'a>(
+    entries: &'a mut [HpackEntrySlot; 8],
+    scratch: &'a mut [u8; 512],
+) -> HpackTable<'a> {
+    HpackTable::new(entries, scratch, 4_096)
+}
+
+static H2C_NATIVE_OBSERVED: Mutex<NativeObserved> = Mutex::new(NativeObserved::empty());
+
+unsafe extern "C" fn h2c_native_handler(
+    user_data: *mut c_void,
+    request: *const VylManagedStaticNativeRequest,
+    response: *mut VylManagedStaticNativeResponse,
+) -> i32 {
+    record_native(&H2C_NATIVE_OBSERVED, user_data, request);
+    answer_native(response, 200, b"OK", b"h2c-native");
+    0
+}
+
+#[test]
+fn h2c_native_replays_through_rebind_with_static_alongside() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    let tag = native_tag();
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(
+        unsafe { register_native(server, b"GET", b"/native", Some(h2c_native_handler), tag) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h1 = unsafe { local_port(server) };
+    let h2c = unsafe { h2c_port_of(server) };
+    assert_ne!(h2c, 0);
+    assert_ne!(h2c, h1);
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    h2_send_get(&mut stream, 1, b"/native");
+    assert_eq!(h2_status(&mut stream, &mut decoder, 1, &mut decoded), 200);
+    assert_eq!(h2_data(&mut stream, 1), b"h2c-native");
+    let observed = H2C_NATIVE_OBSERVED.lock().expect("observed");
+    assert_eq!(observed.user_data, tag as usize);
+    assert_eq!(observed.method, b"GET");
+    assert_eq!(observed.path, b"/native");
+    assert_eq!(observed.has_body, 0);
+    assert_eq!(observed.body_len, 0);
+    assert!(observed.body.is_empty());
+    drop(observed);
+    h2_send_get(&mut stream, 3, b"/hello");
+    assert_eq!(h2_status(&mut stream, &mut decoder, 3, &mut decoded), 200);
+    assert_eq!(h2_data(&mut stream, 3), b"hello");
+    h2_send_lying_get(&mut stream, 5, b"/native");
+    h2_expect_rst(&mut stream, 5);
+    h2_send_get(&mut stream, 7, b"/native");
+    assert_eq!(h2_status(&mut stream, &mut decoder, 7, &mut decoded), 200);
+    assert_eq!(h2_data(&mut stream, 7), b"h2c-native");
+    let head = get(h1, "/native");
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK"),
+        "unexpected head: {head:?}"
+    );
+    assert!(head.ends_with("h2c-native"), "unexpected body: {head:?}");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+static H2C_REBIND_OBSERVED: Mutex<NativeObserved> = Mutex::new(NativeObserved::empty());
+
+unsafe extern "C" fn h2c_rebind_handler(
+    user_data: *mut c_void,
+    request: *const VylManagedStaticNativeRequest,
+    response: *mut VylManagedStaticNativeResponse,
+) -> i32 {
+    record_native(&H2C_REBIND_OBSERVED, user_data, request);
+    answer_native(response, 200, b"OK", b"rebind-native");
+    0
+}
+
+#[test]
+fn h2c_native_served_when_h2c_staged_before_register() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    let tag = native_tag();
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { register_native(server, b"GET", b"/native", Some(h2c_rebind_handler), tag) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h1 = unsafe { local_port(server) };
+    let h2c = unsafe { h2c_port_of(server) };
+    assert_ne!(h2c, 0);
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    h2_send_get(&mut stream, 1, b"/native");
+    assert_eq!(h2_status(&mut stream, &mut decoder, 1, &mut decoded), 200);
+    assert_eq!(h2_data(&mut stream, 1), b"rebind-native");
+    let observed = H2C_REBIND_OBSERVED.lock().expect("observed");
+    assert_eq!(observed.user_data, tag as usize);
+    assert_eq!(observed.method, b"GET");
+    assert_eq!(observed.path, b"/native");
+    drop(observed);
+    let head = get(h1, "/native");
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK"),
+        "unexpected head: {head:?}"
+    );
+    assert!(head.ends_with("rebind-native"), "unexpected body: {head:?}");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+static H2C_WORKER_OBSERVED: Mutex<NativeObserved> = Mutex::new(NativeObserved::empty());
+
+unsafe extern "C" fn h2c_worker_handler(
+    user_data: *mut c_void,
+    request: *const VylManagedStaticNativeRequest,
+    response: *mut VylManagedStaticNativeResponse,
+) -> i32 {
+    record_native(&H2C_WORKER_OBSERVED, user_data, request);
+    answer_native(response, 200, b"OK", b"worker-native");
+    0
+}
+
+#[test]
+fn h2c_native_served_with_two_workers() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    let tag = native_tag();
+    assert_eq!(
+        unsafe { vyl_managed_static_set_worker_count(server, 2) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { register_native(server, b"GET", b"/native", Some(h2c_worker_handler), tag) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h1 = unsafe { local_port(server) };
+    let h2c = unsafe { h2c_port_of(server) };
+    assert_ne!(h2c, 0);
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    h2_send_get(&mut stream, 1, b"/native");
+    assert_eq!(h2_status(&mut stream, &mut decoder, 1, &mut decoded), 200);
+    assert_eq!(h2_data(&mut stream, 1), b"worker-native");
+    let observed = H2C_WORKER_OBSERVED.lock().expect("observed");
+    assert_eq!(observed.user_data, tag as usize);
+    assert_eq!(observed.path, b"/native");
+    drop(observed);
+    let head = get(h1, "/native");
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK"),
+        "unexpected head: {head:?}"
+    );
+    assert!(head.ends_with("worker-native"), "unexpected body: {head:?}");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }

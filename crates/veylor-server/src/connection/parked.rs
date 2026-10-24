@@ -413,9 +413,14 @@ fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) ->
 }
 
 impl ParkedEntry {
-    pub(crate) fn new(token: ConnectionToken, body_total: u64) -> Self {
+    pub(crate) fn new(token: ConnectionToken, body_total: u64, method: &[u8]) -> Self {
+        let take = method.len().min(HOST_MAX_METHOD_BYTES);
+        let mut snapshot = [0; HOST_MAX_METHOD_BYTES];
+        snapshot[..take].copy_from_slice(&method[..take]);
         Self {
             token,
+            method_len: take as u8,
+            method: snapshot,
             staged: None,
             stream_cmd: None,
             stream: None,
