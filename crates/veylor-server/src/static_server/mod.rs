@@ -148,6 +148,7 @@ pub(crate) struct H2StaticRoute {
     pub(crate) managed: bool,
     pub(crate) native: Option<(NativeHandler, usize)>,
     pub(crate) file_root: Option<PathBuf>,
+    pub(crate) trailers: Vec<Vec<u8>>,
 }
 
 impl Server {
@@ -212,6 +213,7 @@ impl Server {
                 managed: false,
                 native: None,
                 file_root: None,
+                trailers: Vec::new(),
             });
         }
         Ok(())
@@ -237,6 +239,7 @@ impl Server {
                 managed: true,
                 native: None,
                 file_root: None,
+                trailers: Vec::new(),
             });
         }
         Ok(())
@@ -262,6 +265,7 @@ impl Server {
                 managed: false,
                 native: None,
                 file_root: Some(root.to_path_buf()),
+                trailers: Vec::new(),
             });
         }
         Ok(())
@@ -276,7 +280,22 @@ impl Server {
     ) -> Result<(), ServerError> {
         self.routes
             .register_managed(method, path, max_body_bytes, trailers)
-            .map_err(ServerError::from)
+            .map_err(ServerError::from)?;
+        // NOTE: allowlist rides the mirror beside the park-only dummies: register validated
+        // names and order, so the projection resolves the same list H1 reads at park.
+        if self.h2_routes.len() < MAX_ROUTES {
+            self.h2_routes.push(H2StaticRoute {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                status: 200,
+                body: Vec::new(),
+                managed: true,
+                native: None,
+                file_root: None,
+                trailers: trailers.iter().map(|name| name.to_vec()).collect(),
+            });
+        }
+        Ok(())
     }
 
     // NOTE: native handlers run on the owner worker only, over H1 and H2 alike; user_data
@@ -304,6 +323,7 @@ impl Server {
                     managed: false,
                     native: Some((handler, user_data)),
                     file_root: None,
+                    trailers: Vec::new(),
                 });
             }
         }

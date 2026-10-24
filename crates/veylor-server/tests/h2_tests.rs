@@ -34,6 +34,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         body: b"hello",
         managed: true,
         file_root: None,
+        trailers: &[],
     },
     FrozenRoute {
         method: b"GET",
@@ -42,6 +43,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         body: b"",
         managed: false,
         file_root: None,
+        trailers: &[],
     },
 ];
 
@@ -771,6 +773,7 @@ fn route_view_rejects_bad_input() {
         body: b"",
         managed: false,
         file_root: None,
+        trailers: &[],
     };
     assert_eq!(
         FrozenRoutesView::new(&[bad_status]).unwrap_err(),
@@ -783,6 +786,7 @@ fn route_view_rejects_bad_input() {
         body: b"x",
         managed: false,
         file_root: None,
+        trailers: &[],
     };
     assert_eq!(
         FrozenRoutesView::new(&[bad_method]).unwrap_err(),
@@ -795,6 +799,7 @@ fn route_view_rejects_bad_input() {
         body: &[0; 4097],
         managed: false,
         file_root: None,
+        trailers: &[],
     };
     assert_eq!(
         FrozenRoutesView::new(&[big_body]).unwrap_err(),
@@ -807,6 +812,7 @@ fn route_view_rejects_bad_input() {
         body: b"a",
         managed: false,
         file_root: None,
+        trailers: &[],
     };
     let dupe = FrozenRoute {
         method: b"GET",
@@ -815,6 +821,7 @@ fn route_view_rejects_bad_input() {
         body: b"b",
         managed: false,
         file_root: None,
+        trailers: &[],
     };
     assert_eq!(
         FrozenRoutesView::new(&[first, dupe]).unwrap_err(),
@@ -833,6 +840,7 @@ fn route_view_rejects_bad_input() {
             body: b"x",
             managed: false,
             file_root: None,
+            trailers: &[],
         })
         .collect();
     assert_eq!(
@@ -1847,6 +1855,9 @@ fn read_response_with_trailers(stream: &mut TcpStream, id: u32) -> (Response, Tr
 
 #[test]
 fn h2_managed_request_trailers_stage_and_pull() {
+    // NOTE: one-predicate allowlist enforcement: /upload registers no trailer names, so the
+    // x-checksum/x-count set RSTs with ProtocolError (policy violation, not RefusedStream)
+    // while the conn survives; the sibling proves multiplexing continues.
     let server = managed_h2_body_server();
     let host = server.host();
     let mut stream = h2_connect(&server);
@@ -1855,25 +1866,18 @@ fn h2_managed_request_trailers_stage_and_pull() {
     let (event, method, path) = poll_h2_request(&host);
     assert_eq!(method, b"POST");
     assert_eq!(path, b"/upload");
+    assert_eq!(event.token.stream_id, 1);
     send_trailers(
         &mut stream,
         1,
         &[(b"x-checksum", b"abc"), (b"x-count", b"2")],
     );
-    assert_eq!(pull_all(&host, event.token), b"data");
-    let (names, values) = pull_trailers_ready(&host, event.token);
-    assert_eq!(names, b"x-checksum\x00x-count");
-    assert_eq!(values, b"abc\x002");
-    assert_eq!(
-        host.respond(event.token, 200, b"OK", b"done"),
-        RespondOutcome::Ok
-    );
-    let (grants, response) = read_response_with_grants(&mut stream, 1);
-    assert_eq!(grants, vec![(0, 4), (1, 4)]);
-    assert_eq!(response.status, 200);
-    assert_eq!(response.body, b"done");
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::ProtocolError);
     post_upload(&mut stream, 3, b"again");
     let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(event.token.stream_id, 3);
     assert_eq!(pull_all(&host, event.token), b"again");
     assert_eq!(
         host.respond(event.token, 200, b"OK", b"second"),
@@ -1883,8 +1887,8 @@ fn h2_managed_request_trailers_stage_and_pull() {
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"second");
     let counts = stop_join(server);
-    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
-    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
 }
 
 #[test]
@@ -2522,6 +2526,7 @@ static H2N_PRE_ROUTES: [FrozenRoute<'static>; 1] = [FrozenRoute {
     body: b"static-head",
     managed: false,
     file_root: None,
+    trailers: &[],
 }];
 
 static H2N_PRE_NATIVES: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3432,13 +3437,12 @@ fn h2_file_mount_multipart_subset_and_overcap_rules() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// NOTE: gap pin, fail-closed today: allowlist-registered managed routes push no H2
-// mirror, so H2C answers 404 (mirroring without allowlist enforcement would bless a
-// hole). Flip to positive coverage when the mirror lands together with H2 staging/park
-// enforcement via the shared trailer_allowed predicate; that turn must also adjudicate
-// h2_managed_request_trailers_stage_and_pull, which pins currently-divergent acceptance.
+// NOTE: former gap pin h2c_managed_with_trailers_route_unprojected_documents_gap, now positive
+// coverage: allowlist-registered managed routes mirror to H2C and the park resolves the list;
+// an unlisted trailer RSTs with ProtocolError while the conn survives, and a listed trailer
+// stages for a whole-set pull.
 #[test]
-fn h2c_managed_with_trailers_route_unprojected_documents_gap() {
+fn h2c_managed_with_trailers_mirror_serves_and_enforces() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let config = ServerConfig {
         h2c_port: Some(0),
@@ -3449,12 +3453,46 @@ fn h2c_managed_with_trailers_route_unprojected_documents_gap() {
         .register_managed_with_trailers(b"POST", b"/t", MAX_STATIC_BODY_BYTES, &[b"x-sum"])
         .expect("register trailer route");
     let server = server.start().expect("start server");
+    let host = server.host();
     let mut client = h2_connect(&server);
     handshake(&mut client);
     send_headers(&mut client, 1, b"POST", b"/t", true);
+    let (event, method, path) = poll_h2_request(&host);
+    assert_eq!(method, b"POST");
+    assert_eq!(path, b"/t");
+    assert_eq!(event.token.stream_id, 1);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"mirrored"),
+        RespondOutcome::Ok
+    );
     let response = read_response(&mut client, 1);
-    assert_eq!(response.status, 404);
-    assert_eq!(response.body, b"Not Found");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"mirrored");
+    send_headers_len(&mut client, 3, b"POST", b"/t", Some(4), false);
+    write_frame(&mut client, FrameType::Data, 0, 3, b"data");
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(event.token.stream_id, 3);
+    send_trailers(&mut client, 3, &[(b"x-evil", b"1")]);
+    let (id, code) = read_rst(&mut client);
+    assert_eq!(id, 3);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    send_headers_len(&mut client, 5, b"POST", b"/t", Some(4), false);
+    write_frame(&mut client, FrameType::Data, 0, 5, b"data");
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(event.token.stream_id, 5);
+    send_trailers(&mut client, 5, &[(b"x-sum", b"9f")]);
+    assert_eq!(pull_all(&host, event.token), b"data");
+    let (names, values) = pull_trailers_ready(&host, event.token);
+    assert_eq!(names, b"x-sum");
+    assert_eq!(values, b"9f");
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"staged"),
+        RespondOutcome::Ok
+    );
+    let (_, response) = read_response_with_grants(&mut client, 5);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"staged");
     let counts = stop_join(server);
-    assert_eq!(counts.h2_served, 1);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
 }

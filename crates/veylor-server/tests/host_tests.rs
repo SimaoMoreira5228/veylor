@@ -1651,7 +1651,7 @@ fn unit_token(slot: u32) -> ConnectionToken {
 
 fn unit_park(shared: &HostShared, slot: u32, total: u64) -> ConnectionToken {
     shared
-        .try_park(0, unit_token(slot), 7, b"POST", b"/upload", total)
+        .try_park(0, unit_token(slot), 7, b"POST", b"/upload", total, &[])
         .expect("unit park stages request")
 }
 

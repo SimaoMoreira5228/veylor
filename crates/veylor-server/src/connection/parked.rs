@@ -318,6 +318,7 @@ pub(crate) fn park_request(
         &snapshot[..method_len],
         &conn.input[target_start..target_start + target_len],
         body_total,
+        &[],
     ) {
         Ok(event_token) => event_token,
         Err(ParkError::Full) => return ExchangeOutcome::Close(ConnClose::QueueFull),
@@ -420,7 +421,12 @@ fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) ->
 }
 
 impl ParkedEntry {
-    pub(crate) fn new(token: ConnectionToken, body_total: u64, method: &[u8]) -> Self {
+    pub(crate) fn new(
+        token: ConnectionToken,
+        body_total: u64,
+        method: &[u8],
+        trailer_allow: &[Vec<u8>],
+    ) -> Self {
         let take = method.len().min(HOST_MAX_METHOD_BYTES);
         let mut snapshot = [0; HOST_MAX_METHOD_BYTES];
         snapshot[..take].copy_from_slice(&method[..take]);
@@ -435,6 +441,7 @@ impl ParkedEntry {
             body: Vec::new(),
             body_pulled: 0,
             trailers: None,
+            trailer_allow: trailer_allow.to_vec(),
         }
     }
 }

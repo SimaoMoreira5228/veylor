@@ -8,6 +8,7 @@ use veylor_runtime::ConnectionToken;
 use crate::connection::StagedTrailer;
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::streams::{StreamCmd, take_stream_cmd};
+use crate::connection::trailer_allowed;
 use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
 use crate::static_routes::{
     MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
@@ -177,6 +178,14 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             }
             if entry.staged.is_some() {
                 return (H2Trailer::Stream(ErrorCode::RefusedStream), None);
+            }
+            // NOTE: allowlist second, after the prohibited+syntax gate above (H1 order): the
+            // shared predicate owns listedness, and the empty connection value reads H2
+            // framing truth (connection-specific fields never survive accept_request).
+            for (name, _) in &staged {
+                if !trailer_allowed(&entry.trailer_allow, b"", name) {
+                    return (H2Trailer::Stream(ErrorCode::ProtocolError), None);
+                }
             }
             let have = entry.trailers.as_ref().map_or(0, Vec::len);
             if have + staged.len() > TRAILER_SLOTS {
@@ -365,6 +374,7 @@ fn park_stream(
     let path = request.path.unwrap_or(b"/");
     let route_id = routes.find(request.method, path).map(|index| index as u64);
     let route_id = route_id.unwrap_or(u64::MAX);
+    let trailers = routes.managed_trailers(request.method, path);
     let sub = (stream >> 1) as usize % STREAM_SLOTS;
     let base = ConnectionToken {
         stream_id: stream,
@@ -379,6 +389,7 @@ fn park_stream(
         request.method,
         path,
         total,
+        trailers,
     ) {
         Ok(_) => {
             outcome.parked += 1;

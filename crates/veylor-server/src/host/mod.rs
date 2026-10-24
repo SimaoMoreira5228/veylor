@@ -71,6 +71,7 @@ pub(crate) struct ParkedEntry {
     pub(crate) body: Vec<u8>,
     pub(crate) body_pulled: u64,
     pub(crate) trailers: Option<Vec<crate::connection::StagedTrailer>>,
+    pub(crate) trailer_allow: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +232,7 @@ impl HostShared {
     // NOTE: the parked deadline reuses the AwaitingHandler (body-progress) timeout so an
     // abandoned park times out like an abandoned body. Only the event copy and the staged
     // response cross this lock, never parser pointers or IO.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_park(
         &self,
         worker_id: u32,
@@ -239,6 +241,7 @@ impl HostShared {
         method: &[u8],
         path: &[u8],
         body_total: u64,
+        trailer_allow: &[Vec<u8>],
     ) -> Result<ConnectionToken, ParkError> {
         if method.is_empty()
             || method.len() > HOST_MAX_METHOD_BYTES
@@ -284,7 +287,12 @@ impl HostShared {
             event.method[..method.len()].copy_from_slice(method);
             event.path[..path.len()].copy_from_slice(path);
             inner.events[worker].push_back(event);
-            inner.parked[worker][slot] = Some(ParkedEntry::new(event_token, body_total, method));
+            inner.parked[worker][slot] = Some(ParkedEntry::new(
+                event_token,
+                body_total,
+                method,
+                trailer_allow,
+            ));
             inner.counters.parks += 1;
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (Ok(event_token), waker)

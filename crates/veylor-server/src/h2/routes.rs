@@ -23,6 +23,7 @@ pub struct FrozenRoute<'a> {
     pub body: &'a [u8],
     pub managed: bool,
     pub file_root: Option<&'a Path>,
+    pub trailers: &'a [Vec<u8>],
 }
 
 // NOTE: native projection for the h2c turn: same method+path match shape as FrozenRoute,
@@ -163,6 +164,27 @@ impl<'a> FrozenRoutesView<'a> {
     pub(crate) fn is_managed(&self, method: &[u8], path: &[u8]) -> bool {
         self.find(method, path)
             .is_some_and(|index| self.routes[index].managed)
+    }
+
+    // NOTE: read-only allowlist for the park path: same match shape as find (exact then
+    // HEAD-to-GET), empty when the route is gone so trailer staging fails closed without
+    // disturbing the body path. Mirrors StaticRoutes::managed_trailers field for field.
+    pub(crate) fn managed_trailers(&self, method: &[u8], path: &[u8]) -> &[Vec<u8>] {
+        let found = self.routes.iter().find(|route| {
+            route.file_root.is_none() && route.method == method && route.path == path
+        });
+        match found {
+            Some(route) => route.trailers,
+            None if method == b"HEAD" => self
+                .routes
+                .iter()
+                .find(|route| {
+                    route.file_root.is_none() && route.method == b"GET" && route.path == path
+                })
+                .map(|route| route.trailers)
+                .unwrap_or(&[]),
+            None => &[],
+        }
     }
 
     // NOTE: longest-prefix file match over the mirrored mount entries: exact routes never

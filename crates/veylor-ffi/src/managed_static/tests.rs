@@ -4622,7 +4622,10 @@ fn h2c_managed_stream_end_with_trailers_exact_fields() {
 fn h2c_managed_request_trailers_stage_and_pull() {
     let config = test_config(0);
     let server = unsafe { create(&config) };
-    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    // NOTE: empty-allowlist routes RST trailer sets over H2C (same one-predicate rule as
+    // H1), so this whole-set discipline pins against a listed allowlist.
+    let allow = trailer_bytes(&[b"x-checksum", b"x-count"]);
+    unsafe { register_managed_with_trailers(server, b"POST", b"/upload", u64::MAX, &allow) };
     unsafe { register(server, b"GET", b"/hello", b"hello") };
     assert_eq!(
         unsafe { vyl_managed_static_enable_h2c(server, 0) },
@@ -4723,6 +4726,248 @@ fn h2c_managed_request_trailers_stage_and_pull() {
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
 
+// NOTE: file-mount-over-H2C coverage through the managed C ABI. Enabling H2C forces the
+// start-time rebind (api.rs gates the direct path on no-H2C plus single worker), so the
+// mount below exercises the ReadyRouteOp::FileMount replay (mod.rs ReadyRouteOp::apply
+// into Server::register_file_mount); every stream then pins the H2 file dispatch shapes
+// (h2/file.rs plan_file/emit_file, h2/routes.rs send_file_head) against the H1 matrix
+// above. One stateful HPACK decoder rides the connection because response blocks index.
+
+fn h2_file_field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
+    HpackFieldToEncode {
+        name,
+        value,
+        representation: HpackRepresentation::WithoutIndexing,
+        huffman_name: false,
+        huffman_value: false,
+    }
+}
+
+fn h2_send_file(
+    stream: &mut TcpStream,
+    id: u32,
+    method: &[u8],
+    path: &[u8],
+    extra: &[(&[u8], &[u8])],
+) {
+    let mut fields = Vec::with_capacity(4 + extra.len());
+    fields.push(h2_file_field(b":method", method));
+    fields.push(h2_file_field(b":scheme", b"http"));
+    fields.push(h2_file_field(b":path", path));
+    fields.push(h2_file_field(b":authority", b"localhost"));
+    for (name, value) in extra {
+        fields.push(h2_file_field(name, value));
+    }
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 1024];
+    let len = encode_header_block(&fields, &mut encoder, &mut block).expect("encode block");
+    h2_write_frame(
+        stream,
+        FrameType::Headers,
+        HEADERS_FLAG_END_HEADERS | HEADERS_FLAG_END_STREAM,
+        id,
+        &block[..len],
+    );
+}
+
+type H2FileResponse = (u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>);
+
+fn h2c_read_full(
+    stream: &mut TcpStream,
+    decoder: &mut HpackTable<'_>,
+    decoded: &mut [HpackHeader; 32],
+    id: u32,
+) -> H2FileResponse {
+    let (block, ended) = h2_read_block_skipping_grants(stream, id);
+    let pairs = h2_decode_pairs(decoder, decoded, &block);
+    let status = pairs
+        .iter()
+        .find(|(name, _)| name == b":status")
+        .map(|(_, value)| {
+            std::str::from_utf8(value)
+                .expect("status utf8")
+                .parse()
+                .expect("status int")
+        })
+        .expect(":status");
+    let mut body = Vec::new();
+    if !ended {
+        loop {
+            let (header, payload) = h2_next_non_grant(stream);
+            assert_eq!(header.stream_id, id);
+            assert_eq!(header.frame_type, FrameType::Data);
+            body.extend_from_slice(&payload);
+            if header.flags & DATA_FLAG_END_STREAM != 0 {
+                break;
+            }
+        }
+    }
+    (status, pairs, body)
+}
+
+fn h2_header<'a>(headers: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Option<&'a str> {
+    headers.iter().find_map(|(found, value)| {
+        (found == name.as_bytes()).then(|| std::str::from_utf8(value).expect("header utf8"))
+    })
+}
+
+#[test]
+fn file_mount_h2c_serves_full_range_conditional_matrix() {
+    let fixture = FixtureDir::new("h2c-file");
+    fixture.write("data.txt", b"0123456789");
+    let root = mount_root_bytes(&fixture.path);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe { mount_raw(server, b"/assets/", &root) },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h2c = unsafe { h2c_port_of(server) };
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+
+    h2_send_file(&mut stream, 1, b"GET", b"/assets/data.txt", &[]);
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 1);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0123456789");
+    assert_eq!(h2_header(&headers, "content-type"), Some("text/plain"));
+    assert_eq!(h2_header(&headers, "accept-ranges"), Some("bytes"));
+    assert_eq!(h2_header(&headers, "content-length"), Some("10"));
+    let last_modified = h2_header(&headers, "last-modified")
+        .expect("last-modified")
+        .to_string();
+    assert_eq!(last_modified.len(), 29, "IMF-fixdate: {last_modified:?}");
+
+    h2_send_file(&mut stream, 3, b"HEAD", b"/assets/data.txt", &[]);
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 3);
+    assert_eq!(status, 200);
+    assert!(body.is_empty(), "HEAD carries no body");
+    assert_eq!(h2_header(&headers, "content-length"), Some("10"));
+    assert_eq!(h2_header(&headers, "content-type"), Some("text/plain"));
+    assert_eq!(h2_header(&headers, "content-range"), None);
+
+    h2_send_file(
+        &mut stream,
+        5,
+        b"HEAD",
+        b"/assets/data.txt",
+        &[(b"range" as &[u8], b"bytes=0-1" as &[u8])],
+    );
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 5);
+    assert_eq!(status, 200, "HEAD ignores Range");
+    assert!(body.is_empty(), "HEAD carries no body");
+    assert_eq!(h2_header(&headers, "content-range"), None);
+    assert_eq!(h2_header(&headers, "content-length"), Some("10"));
+
+    h2_send_file(
+        &mut stream,
+        7,
+        b"GET",
+        b"/assets/data.txt",
+        &[(b"range" as &[u8], b"bytes=2-5" as &[u8])],
+    );
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 7);
+    assert_eq!(status, 206);
+    assert_eq!(body, b"2345");
+    assert_eq!(h2_header(&headers, "content-range"), Some("bytes 2-5/10"));
+    assert_eq!(h2_header(&headers, "accept-ranges"), Some("bytes"));
+    assert_eq!(h2_header(&headers, "content-length"), Some("4"));
+
+    h2_send_file(
+        &mut stream,
+        9,
+        b"GET",
+        b"/assets/data.txt",
+        &[(b"range" as &[u8], b"bytes=0-1, 4-5" as &[u8])],
+    );
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 9);
+    assert_eq!(status, 206);
+    let ctype = h2_header(&headers, "content-type").expect("multipart content-type");
+    assert!(
+        ctype.starts_with("multipart/byteranges; boundary="),
+        "ctype: {ctype:?}"
+    );
+    assert_eq!(h2_header(&headers, "content-range"), None);
+    let framed: usize = h2_header(&headers, "content-length")
+        .expect("multipart length")
+        .parse()
+        .expect("length int");
+    assert_eq!(framed, body.len(), "multipart length frames the whole body");
+    let text = String::from_utf8(body).expect("multipart utf8");
+    assert!(
+        text.contains("Content-Range: bytes 0-1/10"),
+        "body: {text:?}"
+    );
+    assert!(
+        text.contains("Content-Range: bytes 4-5/10"),
+        "body: {text:?}"
+    );
+    assert!(text.contains("01"), "body: {text:?}");
+    assert!(text.contains("45"), "body: {text:?}");
+
+    h2_send_file(
+        &mut stream,
+        11,
+        b"GET",
+        b"/assets/data.txt",
+        &[(b"range" as &[u8], b"bytes=99-" as &[u8])],
+    );
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 11);
+    assert_eq!(status, 416);
+    assert_eq!(h2_header(&headers, "content-range"), Some("bytes */10"));
+    assert_eq!(h2_header(&headers, "content-type"), None);
+    assert!(body.is_empty(), "416 carries no body");
+
+    h2_send_file(
+        &mut stream,
+        13,
+        b"GET",
+        b"/assets/data.txt",
+        &[(b"if-modified-since" as &[u8], last_modified.as_bytes())],
+    );
+    let (status, headers, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 13);
+    assert_eq!(status, 304);
+    assert!(body.is_empty(), "304 carries no body");
+    assert_eq!(
+        h2_header(&headers, "last-modified"),
+        Some(last_modified.as_str())
+    );
+
+    h2_send_file(
+        &mut stream,
+        15,
+        b"GET",
+        b"/assets/data.txt",
+        &[(
+            b"if-modified-since" as &[u8],
+            b"Thu, 01 Jan 1970 00:00:00 GMT" as &[u8],
+        )],
+    );
+    let (status, _, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 15);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0123456789");
+
+    h2_send_file(&mut stream, 17, b"GET", b"/assets/missing.txt", &[]);
+    let (status, _, body) = h2c_read_full(&mut stream, &mut decoder, &mut decoded, 17);
+    assert_eq!(status, 404);
+    assert_eq!(body, b"Not Found");
+
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
 // NOTE: gap pin (server sources owned by a parallel slice — do NOT fix here): a route
 // registered ONLY via vyl_managed_static_register_managed_route_with_trailers never parks
 // over H2C. Server::register_managed_with_trailers
@@ -4735,7 +4980,11 @@ fn h2c_managed_request_trailers_stage_and_pull() {
 // never consults the allowlist anyway. Update this test when the mirror lands: the POST
 // must park and pull the staged set.
 #[test]
-fn h2c_managed_with_trailers_route_unprojected_documents_gap() {
+// NOTE: allowlist routes mirror to H2C and enforce there: the listed set stages whole,
+// the unlisted set RSTs the stream, the connection survives. Formerly
+// h2c_managed_with_trailers_route_unprojected_documents_gap (404 pin); flipped when the
+// mirror landed together with H2 staging/park enforcement via trailer_allowed.
+fn h2c_managed_with_trailers_mirror_serves_and_enforces() {
     let config = test_config(0);
     let server = unsafe { create(&config) };
     let allow = trailer_bytes(&[b"x-tag"]);
@@ -4764,31 +5013,68 @@ fn h2c_managed_with_trailers_route_unprojected_documents_gap() {
         h2_field(b"content-length", b"4"),
     ];
     h2_send_headers_open(&mut stream, 1, &fields);
-    let (block, ended) = h2_read_block_skipping_grants(&mut stream, 1);
-    assert!(!ended);
-    assert_eq!(h2_decode_status(&mut decoder, &mut decoded, &block), 404);
-    h2_expect_rst_h2(&mut stream, 1, 7);
-    let mut events = [VylManagedStaticEvent::default(); 8];
-    let mut methods = [0u8; 256];
-    let mut paths = [0u8; 4096];
-    for _ in 0..5 {
-        let report =
-            unsafe { poll_into(server, 100_000_000, &mut events, &mut methods, &mut paths) };
-        assert!(
-            events
-                .iter()
-                .take(report.copied)
-                .all(|event| event.kind != VYL_MANAGED_STATIC_EVENT_REQUEST),
-            "allowlist route must not park over H2C until mirrored"
-        );
-    }
-    // NOTE: the refusal closes the conn too (deny close=true), so the sibling reconnects
-    // fresh: the listener survives and serves it, proving only the refused conn died.
-    drop(stream);
-    let mut stream = connect_loopback(h2c);
-    h2_handshake(&mut stream);
-    h2_send_get(&mut stream, 3, b"/hello");
-    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 3);
+    h2_write_data(&mut stream, 1, b"data", true);
+    let token = unsafe { poll_one(server) };
+    assert_eq!(token.stream_id, 1);
+    assert_eq!(unsafe { drain_body(server, token) }, b"data");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"done"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 1);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"done");
+    h2_send_headers_open(&mut stream, 3, &fields);
+    let refused = unsafe { poll_one(server) };
+    assert_eq!(refused.stream_id, 3);
+    h2_write_data(&mut stream, 3, b"data", false);
+    h2_send_trailers(&mut stream, 3, &[h2_field(b"x-evil", b"0")]);
+    h2_expect_rst_h2(&mut stream, 3, 1);
+    h2_send_headers_open(&mut stream, 5, &fields);
+    let listed = unsafe { poll_one(server) };
+    assert_eq!(listed.stream_id, 5);
+    h2_write_data(&mut stream, 5, b"data", false);
+    h2_send_trailers(&mut stream, 5, &[h2_field(b"x-tag", b"1")]);
+    assert_eq!(unsafe { drain_body(server, listed) }, b"data");
+    let report = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut names = [0u8; 1];
+            let mut values = [0u8; 1];
+            let (short, report) =
+                unsafe { pull_trailers_into(server, listed, &mut names, &mut values) };
+            if short == VylResult::Ok {
+                break report;
+            }
+            assert_eq!(short, VylResult::WouldBlock);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listed trailer set never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_eq!(report.fields, 1);
+    let mut names = [0u8; 5];
+    let mut values = [0u8; 1];
+    let (full, report) = unsafe { pull_trailers_into(server, listed, &mut names, &mut values) };
+    assert_eq!(full, VylResult::Ok);
+    assert_eq!(report.fields, 1);
+    assert_eq!(&names, b"x-tag");
+    assert_eq!(&values, b"1");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, listed, 200, bytes(b"OK"), bytes(b"done"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 5);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"done");
+    h2_send_get(&mut stream, 7, b"/hello");
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 7);
     assert_eq!(status, 200);
     assert_eq!(body, b"hello");
     let counts = unsafe { stop_join(server) };
