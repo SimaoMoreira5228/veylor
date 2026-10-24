@@ -36,6 +36,10 @@ use crate::abi::VylResult;
 pub const VYL_MANAGED_STATIC_ABI_VERSION: u32 = 1;
 pub const VYL_MANAGED_STATIC_EVENT_REQUEST: u32 = 0;
 pub const VYL_MANAGED_STATIC_EVENT_SHUTDOWN: u32 = 1;
+// NOTE: legacy-parity signal kinds numbering 2/3 like the old C ABI. V1 structs stay size-pinned:
+// both reuse VylManagedStaticEvent fields (see the struct docs), never grow it.
+pub const VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE: u32 = 2;
+pub const VYL_MANAGED_STATIC_EVENT_WRITABLE: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -244,6 +248,8 @@ pub(super) fn server_error_to_result(error: veylor_server::ServerError) -> VylRe
 }
 
 const _: () = assert!(std::mem::size_of::<VylManagedStaticConfig>() > 0);
+const _: () = assert!(VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE == 2);
+const _: () = assert!(VYL_MANAGED_STATIC_EVENT_WRITABLE == 3);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticCloseCounts>() == 8 * 8);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticToken>() == 4 * 4 + 8 * 2);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticPollReport>() == 8 * 4);
@@ -262,6 +268,13 @@ pub struct VylManagedStaticToken {
     pub worker_generation: u64,
     pub generation: u64,
 }
+
+
+
+
+
+
+
 
 
 #[repr(C)]

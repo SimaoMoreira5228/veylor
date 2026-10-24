@@ -693,6 +693,7 @@ pub(crate) fn project_routes<'a>(
             status: route.status,
             body: &route.body,
             managed: route.managed,
+            file_root: route.file_root.as_deref(),
         })
         .collect();
     let natives = h2_routes

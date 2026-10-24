@@ -166,6 +166,13 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
     if let Some(cmd) = staged {
         return apply_stream_cmd(conn, host, event_token, cmd, progress);
     }
+    // NOTE: stream re-arm emits one coalesced WRITABLE per release. The emission lives here,
+    // not in take_stream_cmd: the take holds the queue lock (HostShared::stage_writable would
+    // deadlock) and the queue fields are private to host/. The is_writable gate admits only
+    // open armed streams, and a full queue leaves the arm set for the next turn to re-signal.
+    if host.is_writable(event_token) {
+        host.stage_writable(event_token);
+    }
     let read_ready = conn.read_ready;
     let read_scratch = if conn.len < INPUT_CAP {
         &mut conn.input[conn.len..]

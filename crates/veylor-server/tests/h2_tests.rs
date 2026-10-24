@@ -33,6 +33,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         status: 200,
         body: b"hello",
         managed: true,
+        file_root: None,
     },
     FrozenRoute {
         method: b"GET",
@@ -40,6 +41,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         status: 200,
         body: b"",
         managed: false,
+        file_root: None,
     },
 ];
 
@@ -94,7 +96,7 @@ fn stop_join(server: RunningServer) -> CloseCounts {
     server.join().expect("join server")
 }
 
-fn field(name: &'static [u8], value: &'static [u8]) -> HpackFieldToEncode<'static> {
+fn field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
     HpackFieldToEncode {
         name,
         value,
@@ -147,16 +149,30 @@ fn send_headers(
     path: &'static [u8],
     end: bool,
 ) {
-    let fields = [
+    send_headers_extra(stream, id, method, path, &[], end);
+}
+
+fn send_headers_extra(
+    stream: &mut TcpStream,
+    id: u32,
+    method: &[u8],
+    path: &[u8],
+    extra: &[(&[u8], &[u8])],
+    end: bool,
+) {
+    let mut fields = vec![
         field(b":method", method),
         field(b":scheme", b"http"),
         field(b":path", path),
         field(b":authority", b"localhost"),
     ];
+    for (name, value) in extra {
+        fields.push(field(name, value));
+    }
     let mut entries = [HpackEntrySlot::EMPTY; 8];
     let mut scratch = [0; 512];
     let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
-    let mut block = [0; 512];
+    let mut block = [0; 2048];
     let len = encode_header_block(&fields, &mut encoder, &mut block).expect("encode block");
     let mut flags = HEADERS_FLAG_END_HEADERS;
     if end {
@@ -168,6 +184,9 @@ fn send_headers(
 struct Response {
     status: u16,
     content_length: u64,
+    content_type: Vec<u8>,
+    last_modified: Vec<u8>,
+    content_range: Vec<u8>,
     body: Vec<u8>,
 }
 
@@ -215,10 +234,20 @@ fn decode_response(block: &[u8]) -> Response {
     let mut entries = [HpackEntrySlot::EMPTY; 8];
     let mut scratch = [0; 512];
     let mut decoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    decode_with(&mut decoder, block)
+}
+
+// NOTE: stateful HPACK decode for connections whose responses use the dynamic table (file
+// headers index content-type incrementally): pass one table per connection, since a fresh
+// table per response wipes the entries and desyncs after the first insertion.
+fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
     let mut decoded = [HpackHeader::EMPTY; 32];
-    let (count, _) = decode_header_block(block, &mut decoder, &mut decoded).expect("decode block");
+    let (count, _) = decode_header_block(block, decoder, &mut decoded).expect("decode block");
     let mut status = 0;
     let mut content_length = 0;
+    let mut content_type = Vec::new();
+    let mut last_modified = Vec::new();
+    let mut content_range = Vec::new();
     for header in decoded.iter().take(count) {
         let name = decoder.resolve(header.field.name).expect("name");
         let value = decoder.resolve(header.field.value).expect("value");
@@ -232,14 +261,67 @@ fn decode_response(block: &[u8]) -> Response {
                 .expect("length utf8")
                 .parse()
                 .expect("length int");
+        } else if name == b"content-type" {
+            content_type = value.to_vec();
+        } else if name == b"last-modified" {
+            last_modified = value.to_vec();
+        } else if name == b"content-range" {
+            content_range = value.to_vec();
         }
     }
     assert_ne!(status, 0, "response carries :status");
     Response {
         status,
         content_length,
+        content_type,
+        last_modified,
+        content_range,
         body: Vec::new(),
     }
+}
+
+fn read_response_stateful(
+    stream: &mut TcpStream,
+    id: u32,
+    decoder: &mut HpackTable<'_>,
+) -> Response {
+    let mut block = Vec::new();
+    let mut headers_ended_stream = false;
+    loop {
+        let (header, payload) = read_frame(stream);
+        assert_eq!(header.stream_id, id);
+        match header.frame_type {
+            FrameType::Headers => {
+                headers_ended_stream = header.flags & HEADERS_FLAG_END_STREAM != 0;
+                block.extend_from_slice(&payload);
+                if header.flags & HEADERS_FLAG_END_HEADERS != 0 {
+                    break;
+                }
+            }
+            FrameType::Continuation => {
+                block.extend_from_slice(&payload);
+                if header.flags & CONTINUATION_FLAG_END_HEADERS != 0 {
+                    break;
+                }
+            }
+            found => panic!("expected HEADERS, got {found:?}"),
+        }
+    }
+    let mut response = decode_with(decoder, &block);
+    let mut body = Vec::new();
+    if !headers_ended_stream {
+        loop {
+            let (header, payload) = read_frame(stream);
+            assert_eq!(header.stream_id, id);
+            assert_eq!(header.frame_type, FrameType::Data);
+            body.extend_from_slice(&payload);
+            if header.flags & DATA_FLAG_END_STREAM != 0 {
+                break;
+            }
+        }
+    }
+    response.body = body;
+    response
 }
 
 fn read_eof(stream: &mut TcpStream) {
@@ -688,6 +770,7 @@ fn route_view_rejects_bad_input() {
         status: 204,
         body: b"",
         managed: false,
+        file_root: None,
     };
     assert_eq!(
         FrozenRoutesView::new(&[bad_status]).unwrap_err(),
@@ -699,6 +782,7 @@ fn route_view_rejects_bad_input() {
         status: 200,
         body: b"x",
         managed: false,
+        file_root: None,
     };
     assert_eq!(
         FrozenRoutesView::new(&[bad_method]).unwrap_err(),
@@ -710,6 +794,7 @@ fn route_view_rejects_bad_input() {
         status: 200,
         body: &[0; 4097],
         managed: false,
+        file_root: None,
     };
     assert_eq!(
         FrozenRoutesView::new(&[big_body]).unwrap_err(),
@@ -721,6 +806,7 @@ fn route_view_rejects_bad_input() {
         status: 200,
         body: b"a",
         managed: false,
+        file_root: None,
     };
     let dupe = FrozenRoute {
         method: b"GET",
@@ -728,6 +814,7 @@ fn route_view_rejects_bad_input() {
         status: 200,
         body: b"b",
         managed: false,
+        file_root: None,
     };
     assert_eq!(
         FrozenRoutesView::new(&[first, dupe]).unwrap_err(),
@@ -745,6 +832,7 @@ fn route_view_rejects_bad_input() {
             status: 200,
             body: b"x",
             managed: false,
+            file_root: None,
         })
         .collect();
     assert_eq!(
@@ -1891,6 +1979,132 @@ fn h2_managed_write_after_trailers_fail_closed() {
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
 
+fn wait_h2_writable(host: &HostHandle, token: ConnectionToken) -> EventSlot {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let mut events = [host_slot(); 8];
+        let mut methods = [0; 64];
+        let mut paths = [0; 4096];
+        let report = host.poll(100_000_000, &mut events, &mut methods, &mut paths);
+        for event in events.iter().take(report.copied) {
+            if event.kind == HostEventKind::Writable && event.token == token {
+                return *event;
+            }
+        }
+        assert!(Instant::now() < deadline, "writable signal stalls");
+    }
+}
+
+// NOTE: H2 WRITABLE emission pin: the applied head and each consumed write re-arm exactly one
+// coalesced signal, and each signal admits one write. poll_h2_request keeps skipping advisory
+// signals; only this waiter keeps them, so batch shape never matters.
+#[test]
+fn h2_managed_stream_writable_event_per_release() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    let first = wait_h2_writable(&host, event.token);
+    assert_eq!(first.kind, HostEventKind::Writable);
+    assert_eq!(first.token, event.token);
+    assert_eq!(first.route_id, 0);
+    assert_eq!((first.method_len, first.path_len), (0, 0));
+    assert_eq!((first.method_offset, first.path_offset), (0, 0));
+    assert_eq!(
+        host.write_stream(event.token, b"chunk-one"),
+        RespondOutcome::Ok
+    );
+    let second = wait_h2_writable(&host, event.token);
+    assert_eq!(second.token, event.token);
+    assert_eq!(second.route_id, 0);
+    assert_eq!(
+        host.write_stream(event.token, b"chunk-two"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let response = read_response(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"chunk-onechunk-two");
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+}
+
+// NOTE: H2 BODY_AVAILABLE pin: staged DATA carries ready bytes with the end flag in the reused
+// length fields like H1, so the host observes the full window before pulling.
+#[test]
+fn h2_managed_body_available_signals_ready_and_end() {
+    let server = managed_h2_body_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    post_upload(&mut stream, 1, b"hello");
+    let deadline = Instant::now() + DEADLINE;
+    let mut kept = Vec::new();
+    let request = loop {
+        let mut events = [host_slot(); 8];
+        let mut methods = [0; 64];
+        let mut paths = [0; 4096];
+        let report = host.poll(100_000_000, &mut events, &mut methods, &mut paths);
+        let mut found = None;
+        for event in events.iter().take(report.copied) {
+            if event.kind == HostEventKind::Request {
+                found = Some(*event);
+            } else if event.kind == HostEventKind::BodyAvailable {
+                kept.push(*event);
+            }
+        }
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for request");
+    };
+    assert_eq!(request.token.stream_id, 1);
+    let deadline = Instant::now() + DEADLINE;
+    let signal = loop {
+        if let Some(done) = kept.iter().find(|event| {
+            event.kind == HostEventKind::BodyAvailable
+                && event.token == request.token
+                && event.path_len == 1
+        }) {
+            break *done;
+        }
+        let mut events = [host_slot(); 8];
+        let mut methods = [0; 64];
+        let mut paths = [0; 4096];
+        let report = host.poll(100_000_000, &mut events, &mut methods, &mut paths);
+        kept.extend(events.iter().take(report.copied).filter(|event| {
+            event.kind == HostEventKind::BodyAvailable && event.token == request.token
+        }));
+        assert!(Instant::now() < deadline, "terminal body signal stalls");
+    };
+    assert_eq!(signal.token, request.token);
+    assert_eq!(signal.route_id, 0);
+    assert_eq!(signal.method_len, 5);
+    assert_eq!((signal.method_offset, signal.path_offset), (0, 0));
+    assert_eq!(pull_all(&host, request.token), b"hello");
+    assert_eq!(
+        host.respond(request.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let (grants, response) = read_response_with_grants(&mut stream, 1);
+    assert_eq!(grants, vec![(0, 5), (1, 5)]);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"done");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
 // NOTE: paired trailer reader: concurrent trailered streams interleave DATA/HEADERS frame by
 // frame (one stream command applies per turn), so sequential per-stream readers would misroute
 // siblings. This demuxes both streams in one loop until each sees its terminal HEADERS.
@@ -2272,6 +2486,7 @@ static H2N_PRE_ROUTES: [FrozenRoute<'static>; 1] = [FrozenRoute {
     status: 200,
     body: b"static-head",
     managed: false,
+    file_root: None,
 }];
 
 static H2N_PRE_NATIVES: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -2730,4 +2945,236 @@ fn h2c_serves_native_routes_live() {
     assert_eq!(static_response.body, b"hello");
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 2);
+}
+// NOTE: H2C file-mount proof through a live Server::bind plus real H2C bytes (never
+// driver-only, so projection wiring is covered): full GET/HEAD 200s with Last-Modified,
+// 304 revalidation, single-range 206, and fail-closed 404/413/416 mappings over one
+// multiplexed connection. Multipart ranges stay OUT (RST RefusedStream, follow-up).
+
+fn file_mount_root(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("veylor-h2f-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mount root");
+    root
+}
+
+fn file_mount_server(root: &std::path::Path) -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_route(
+            b"GET",
+            b"/assets/exact",
+            200,
+            b"OK",
+            b"static-wins",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register exact");
+    server
+        .register_file_mount(b"/assets/", root)
+        .expect("register mount");
+    server.start().expect("start server")
+}
+
+#[test]
+fn h2_file_mount_get_head_last_modified_304() {
+    let root = file_mount_root("basic");
+    std::fs::write(root.join("hello.txt"), b"file-content").expect("mount file");
+    std::fs::write(root.join("exact"), b"file-loses").expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    send_headers(&mut client, 1, b"GET", b"/assets/hello.txt", true);
+    let got = read_response_stateful(&mut client, 1, &mut dec);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.content_length, 12);
+    assert_eq!(got.body, b"file-content");
+    assert_eq!(got.content_type, b"text/plain");
+    assert!(!got.last_modified.is_empty());
+    send_headers(&mut client, 3, b"HEAD", b"/assets/hello.txt", true);
+    let head = read_response_stateful(&mut client, 3, &mut dec);
+    assert_eq!(head.status, 200);
+    assert_eq!(head.content_length, 12);
+    assert!(head.body.is_empty());
+    assert_eq!(head.last_modified, got.last_modified);
+    let since: &[u8] = &got.last_modified;
+    send_headers_extra(
+        &mut client,
+        5,
+        b"GET",
+        b"/assets/hello.txt",
+        &[(b"if-modified-since".as_slice(), since)],
+        true,
+    );
+    let fresh = read_response_stateful(&mut client, 5, &mut dec);
+    assert_eq!(fresh.status, 304);
+    assert_eq!(fresh.content_length, 0);
+    assert!(fresh.body.is_empty());
+    assert_eq!(fresh.last_modified, got.last_modified);
+    send_headers_extra(
+        &mut client,
+        7,
+        b"GET",
+        b"/assets/hello.txt",
+        &[(
+            b"if-modified-since".as_slice(),
+            b"Thu, 01 Jan 1970 00:00:00 GMT".as_slice(),
+        )],
+        true,
+    );
+    let stale = read_response_stateful(&mut client, 7, &mut dec);
+    assert_eq!(stale.status, 200);
+    assert_eq!(stale.body, b"file-content");
+    send_headers(&mut client, 9, b"GET", b"/assets/missing.txt", true);
+    let missing = read_response_stateful(&mut client, 9, &mut dec);
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.body, b"Not Found");
+    send_headers(&mut client, 11, b"GET", b"/assets/exact", true);
+    let exact = read_response_stateful(&mut client, 11, &mut dec);
+    assert_eq!(exact.status, 200);
+    assert_eq!(exact.body, b"static-wins");
+    send_headers(&mut client, 13, b"GET", b"/assets/../hello.txt", true);
+    let traversal = read_response_stateful(&mut client, 13, &mut dec);
+    assert_eq!(traversal.status, 404);
+    assert_eq!(traversal.body, b"Not Found");
+    send_headers(&mut client, 15, b"POST", b"/assets/hello.txt", true);
+    let wrong_method = read_response_stateful(&mut client, 15, &mut dec);
+    assert_eq!(wrong_method.status, 404);
+    send_headers_extra(
+        &mut client,
+        17,
+        b"HEAD",
+        b"/assets/hello.txt",
+        &[(b"range".as_slice(), b"bytes=0-3".as_slice())],
+        true,
+    );
+    let head_range = read_response_stateful(&mut client, 17, &mut dec);
+    assert_eq!(head_range.status, 200);
+    assert_eq!(head_range.content_length, 12);
+    assert!(head_range.body.is_empty());
+    send_headers(&mut client, 19, b"GET", b"/assets/hello.txt?v=2", true);
+    let query = read_response_stateful(&mut client, 19, &mut dec);
+    assert_eq!(query.status, 200);
+    assert_eq!(query.body, b"file-content");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 10, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn h2_file_mount_streams_large_file_across_turns() {
+    let root = file_mount_root("large");
+    let mut bytes = vec![0u8; 20_000];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    std::fs::write(root.join("big.bin"), &bytes).expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    send_headers(&mut client, 1, b"GET", b"/assets/big.bin", true);
+    let got = read_response_stateful(&mut client, 1, &mut dec);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.content_length, 20_000);
+    assert_eq!(got.body, bytes);
+    assert_eq!(got.content_type, b"application/octet-stream");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn h2_file_mount_single_range_206_and_fail_closed() {
+    let root = file_mount_root("range");
+    let mut bytes = vec![0u8; 1000];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    std::fs::write(root.join("data.bin"), &bytes).expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    send_headers_extra(
+        &mut client,
+        1,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=0-99".as_slice())],
+        true,
+    );
+    let ranged = read_response_stateful(&mut client, 1, &mut dec);
+    assert_eq!(ranged.status, 206);
+    assert_eq!(ranged.content_length, 100);
+    assert_eq!(ranged.body, &bytes[..100]);
+    assert_eq!(ranged.content_range, b"bytes 0-99/1000");
+    send_headers_extra(
+        &mut client,
+        3,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=-10".as_slice())],
+        true,
+    );
+    let suffix = read_response_stateful(&mut client, 3, &mut dec);
+    assert_eq!(suffix.status, 206);
+    assert_eq!(suffix.body, &bytes[990..]);
+    assert_eq!(suffix.content_range, b"bytes 990-999/1000");
+    send_headers_extra(
+        &mut client,
+        5,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=5000-6000".as_slice())],
+        true,
+    );
+    let bad = read_response_stateful(&mut client, 5, &mut dec);
+    assert_eq!(bad.status, 416);
+    assert!(bad.body.is_empty());
+    assert_eq!(bad.content_range, b"bytes */1000");
+    send_headers_extra(
+        &mut client,
+        7,
+        b"GET",
+        b"/assets/data.bin",
+        &[(b"range".as_slice(), b"bytes=0-1, 3-4".as_slice())],
+        true,
+    );
+    // NOTE: a satisfiable multi-range set is not unsatisfiable, so it RST-refuses with no
+    // HEADERS first (multipart 206 framing stays a follow-up); the connection survives.
+    let (rst_stream, rst_code) = read_rst(&mut client);
+    assert_eq!(rst_stream, 7);
+    assert_eq!(rst_code, ErrorCode::RefusedStream);
+    send_headers(&mut client, 9, b"GET", b"/assets/data.bin", true);
+    let sibling = read_response_stateful(&mut client, 9, &mut dec);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, bytes);
+    send_headers_len(
+        &mut client,
+        11,
+        b"GET",
+        b"/assets/data.bin",
+        Some(1_000_000),
+        true,
+    );
+    let big = read_response_stateful(&mut client, 11, &mut dec);
+    assert_eq!(big.status, 413);
+    assert_eq!(big.body, b"Payload Too Large");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 5, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
 }

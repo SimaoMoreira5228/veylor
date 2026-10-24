@@ -8,15 +8,18 @@ use veylor_server::{
 
 use super::VylManagedStaticServer;
 use super::{
-    ManagedStaticState, VYL_MANAGED_STATIC_EVENT_REQUEST, VYL_MANAGED_STATIC_EVENT_SHUTDOWN,
-    VylManagedStaticEvent, VylManagedStaticPollReport, VylManagedStaticToken,
-    VylManagedStaticTrailerReport,
+    ManagedStaticState, VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE, VYL_MANAGED_STATIC_EVENT_REQUEST,
+    VYL_MANAGED_STATIC_EVENT_SHUTDOWN, VYL_MANAGED_STATIC_EVENT_WRITABLE, VylManagedStaticEvent,
+    VylManagedStaticPollReport, VylManagedStaticToken, VylManagedStaticTrailerReport,
 };
 use crate::abi::{VylBytes, VylField, VylResult, catch_ffi, slice_length_valid};
 
 // NOTE: mirrors the `veylor-server` staged response-trailer bounds; enforced here before any copy.
 const MAX_RESPONSE_TRAILER_FIELDS: usize = 8;
 const MAX_RESPONSE_TRAILER_BYTES: usize = 1024;
+
+
+
 
 
 
@@ -574,10 +577,13 @@ fn token_from_server(token: ConnectionToken) -> VylManagedStaticToken {
     }
 }
 
-fn event_from_slot(slot: EventSlot) -> VylManagedStaticEvent {
+// NOTE: pub(super) so the in-module tests pin the signal field reuse without an engine round trip.
+pub(super) fn event_from_slot(slot: EventSlot) -> VylManagedStaticEvent {
     let kind = match slot.kind {
         HostEventKind::Request => VYL_MANAGED_STATIC_EVENT_REQUEST,
         HostEventKind::Shutdown => VYL_MANAGED_STATIC_EVENT_SHUTDOWN,
+        HostEventKind::BodyAvailable => VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE,
+        HostEventKind::Writable => VYL_MANAGED_STATIC_EVENT_WRITABLE,
     };
     VylManagedStaticEvent {
         kind,

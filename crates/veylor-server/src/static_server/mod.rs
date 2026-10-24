@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -135,8 +136,9 @@ pub struct Server {
 
 // NOTE: owned route projection for the h2c turn: StaticRoutes stays read-only
 // (frozen), so register paths mirror validated entries here and the worker projects
-// borrows per turn. Managed routes mirror as park-only entries; file mounts stay
-// H1-only and h2c answers 404 for them.
+// borrows per turn. Managed routes mirror as park-only entries; file mounts mirror
+// as prefix entries (path carries the prefix, file_root the root) and the H2 view
+// skips them in exact-match lookups, so statics keep precedence exactly like H1.
 #[derive(Clone, Debug)]
 pub(crate) struct H2StaticRoute {
     pub(crate) method: Vec<u8>,
@@ -145,6 +147,7 @@ pub(crate) struct H2StaticRoute {
     pub(crate) body: Vec<u8>,
     pub(crate) managed: bool,
     pub(crate) native: Option<(NativeHandler, usize)>,
+    pub(crate) file_root: Option<PathBuf>,
 }
 
 impl Server {
@@ -208,6 +211,7 @@ impl Server {
                 body: body.to_vec(),
                 managed: false,
                 native: None,
+                file_root: None,
             });
         }
         Ok(())
@@ -232,6 +236,7 @@ impl Server {
                 body: Vec::new(),
                 managed: true,
                 native: None,
+                file_root: None,
             });
         }
         Ok(())
@@ -244,7 +249,22 @@ impl Server {
     ) -> Result<(), ServerError> {
         self.routes
             .register_file_mount(prefix, root)
-            .map_err(ServerError::from)
+            .map_err(ServerError::from)?;
+        // NOTE: prefix entry for the H2 projection: method is a GET-shaped dummy (mounts
+        // serve GET and HEAD through the prefix match, never the exact table), status and
+        // body dummies pass the projection filter, and the view skips file entries there.
+        if self.h2_routes.len() < MAX_ROUTES {
+            self.h2_routes.push(H2StaticRoute {
+                method: b"GET".to_vec(),
+                path: prefix.to_vec(),
+                status: 200,
+                body: Vec::new(),
+                managed: false,
+                native: None,
+                file_root: Some(root.to_path_buf()),
+            });
+        }
+        Ok(())
     }
 
     pub fn register_managed_with_trailers(
@@ -283,6 +303,7 @@ impl Server {
                     body: Vec::new(),
                     managed: false,
                     native: Some((handler, user_data)),
+                    file_root: None,
                 });
             }
         }

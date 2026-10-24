@@ -28,6 +28,17 @@ const SHUTDOWN_PUSH_RETRIES: usize = 50_000;
 pub enum HostEventKind {
     Request,
     Shutdown,
+    // NOTE: advisory body signal staged at byte admission: token names the parked exchange,
+    // the counts ride the reused poll length fields (ready bytes, end flag), route is zero.
+    // One pending per token, latest-wins; a full queue with no coalesce target refuses the
+    // byte admission itself, so the stranded-signal case cannot happen. Terminal framing with
+    // no new bytes (chunked 0-chunk) stages no signal: completion is observed via pull.
+    BodyAvailable,
+    // NOTE: unenforced until the stream re-arm seam lands: stage one coalesced event per token
+    // via HostShared::stage_writable where the arm releases (take_stream_cmd re-arm in
+    // connection/streams.rs plus the H2 re-arm loop in h2/serve.rs). Each event admits exactly
+    // one write_stream continuation; the is_writable query stays authoritative on a full queue.
+    Writable,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +86,8 @@ pub(crate) struct HostEvent {
     method: [u8; HOST_MAX_METHOD_BYTES],
     path_len: u16,
     path: [u8; HOST_MAX_PATH_BYTES],
+    body_ready: usize,
+    body_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +270,8 @@ impl HostShared {
                 method: [0; HOST_MAX_METHOD_BYTES],
                 path_len: path.len() as u16,
                 path: [0; HOST_MAX_PATH_BYTES],
+                body_ready: 0,
+                body_complete: false,
             };
             event.method[..method.len()].copy_from_slice(method);
             event.path[..path.len()].copy_from_slice(path);
@@ -290,6 +305,7 @@ impl HostShared {
             // observes Gone; anything else is Stale.
             match entry {
                 Some(entry) => {
+                    retire_signals(inner, worker, entry.token);
                     push_tomb(inner, worker, entry.token, TombCause::Gone);
                     (true, None)
                 }
@@ -300,8 +316,26 @@ impl HostShared {
     }
 
     pub fn push_body(&self, token: ConnectionToken, bytes: &[u8]) -> bool {
-        let done = self.with_inner(|inner| (push_staged_body(inner, token, bytes), None));
-        done.is_some_and(|(ok, _)| ok)
+        let done = self.with_inner(|inner| {
+            if !push_staged_body(inner, token, bytes) {
+                return (false, None);
+            }
+            if bytes.is_empty() {
+                return (true, None);
+            }
+            if stage_body_available(inner, token.worker_id as usize, token) {
+                return (true, None);
+            }
+            // NOTE: atomic admission: the signal has no coalesce target and no room, so the
+            // appended bytes roll back and the caller stalls or fails closed like any refusal.
+            retract_body_append(inner, token, bytes.len());
+            (false, None)
+        });
+        let staged = done.is_some_and(|(ok, _)| ok);
+        if staged && !bytes.is_empty() {
+            self.wake.notify_one();
+        }
+        staged
     }
 
     pub(crate) fn push_body_or_answered(
@@ -310,13 +344,23 @@ impl HostShared {
         bytes: &[u8],
     ) -> BodyPushOutcome {
         let done = self.with_inner(|inner| {
-            (
-                crate::connection::streams::push_body_or_answered(inner, token, bytes),
-                None,
-            )
+            let outcome = crate::connection::streams::push_body_or_answered(inner, token, bytes);
+            if outcome != BodyPushOutcome::Pushed || bytes.is_empty() {
+                return (outcome, None);
+            }
+            if stage_body_available(inner, token.worker_id as usize, token) {
+                return (outcome, None);
+            }
+            retract_body_append(inner, token, bytes.len());
+            (BodyPushOutcome::Refused, None)
         });
-        done.map(|(outcome, _)| outcome)
-            .unwrap_or(BodyPushOutcome::Refused)
+        let outcome = done
+            .map(|(outcome, _)| outcome)
+            .unwrap_or(BodyPushOutcome::Refused);
+        if outcome == BodyPushOutcome::Pushed && !bytes.is_empty() {
+            self.wake.notify_one();
+        }
+        outcome
     }
 
     pub fn stage_respond(
@@ -362,6 +406,7 @@ impl HostShared {
                         reason: reason.to_vec(),
                         body: body.to_vec(),
                     });
+                    retire_signals(inner, worker, token);
                     inner.counters.responds_ok += 1;
                     let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
                     return (RespondOutcome::Ok, waker);
@@ -410,6 +455,7 @@ impl HostShared {
             if let Some(entry) = inner.parked[worker][slot].as_mut() {
                 entry.staged = Some(StagedAction::Cancel);
             }
+            retire_signals(inner, worker, token);
             inner.counters.cancels_ok += 1;
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (CancelOutcome::Ok, waker)
@@ -429,6 +475,26 @@ impl HostShared {
         let done = self.with_inner(|inner| (pull_staged_body(inner, token, out), None));
         done.map(|(r, _)| r)
             .unwrap_or((RespondOutcome::Stale, 0, false))
+    }
+
+    // NOTE: coalesced writable staging for the re-arm call sites (take_stream_cmd in
+    // connection/streams.rs and the H2 re-arm loop in h2/serve.rs): call once where the arm
+    // releases. A repeat while the signal is pending reports true without duplicating; a full
+    // queue reports false and the arm state persists, so the next release re-signals and the
+    // is_writable query stays authoritative throughout.
+    pub fn stage_writable(&self, token: ConnectionToken) -> bool {
+        let done = self.with_inner(|inner| {
+            let worker = token.worker_id as usize;
+            if inner.events.len() <= worker || token.generation == 0 {
+                return (false, None);
+            }
+            (stage_writable_locked(inner, worker, token), None)
+        });
+        let staged = done.is_some_and(|(ok, _)| ok);
+        if staged {
+            self.wake.notify_one();
+        }
+        staged
     }
 
     pub fn take_staged(&self, worker_id: u32) -> Vec<StagedWork> {
@@ -569,6 +635,8 @@ impl HostShared {
                     method: [0; HOST_MAX_METHOD_BYTES],
                     path_len: 0,
                     path: [0; HOST_MAX_PATH_BYTES],
+                    body_ready: 0,
+                    body_complete: false,
                 });
                 inner.counters.shutdowns += 1;
                 (true, None)
@@ -669,6 +737,124 @@ fn push_tomb(inner: &mut HostInner, worker: usize, token: ConnectionToken, cause
     queue.push_back(Tomb { token, cause });
 }
 
+// NOTE: advisory body signal staged at admission under the queue lock: at most one pending
+// BodyAvailable per token, a repeat updates the staged counts latest-wins. A full queue with
+// no coalesce target reports false and bumps queue-full; the caller rolls the byte admission
+// back, so bytes and signals stay atomic and no signal ever strands staged bytes.
+pub(crate) fn stage_body_available(
+    inner: &mut HostInner,
+    worker: usize,
+    token: ConnectionToken,
+) -> bool {
+    let Some(queue) = inner.events.get_mut(worker) else {
+        return false;
+    };
+    let staged = inner
+        .parked
+        .get(worker)
+        .and_then(|table| table.get(token.slot as usize))
+        .and_then(|entry| entry.as_ref())
+        .filter(|entry| entry.token == token)
+        .map(|entry| {
+            let ready = entry.body.len();
+            let complete = entry.body_pulled + ready as u64 == entry.body_total;
+            (ready, complete)
+        });
+    let Some((ready, complete)) = staged else {
+        return false;
+    };
+    if let Some(pending) = queue
+        .iter_mut()
+        .find(|event| event.kind == HostEventKind::BodyAvailable && event.token == token)
+    {
+        pending.body_ready = ready;
+        pending.body_complete = complete;
+        return true;
+    }
+    if queue.len() >= HOST_QUEUE_DEPTH {
+        inner.counters.queue_full += 1;
+        return false;
+    }
+    queue.push_back(HostEvent {
+        kind: HostEventKind::BodyAvailable,
+        token,
+        route_id: 0,
+        method_len: 0,
+        method: [0; HOST_MAX_METHOD_BYTES],
+        path_len: 0,
+        path: [0; HOST_MAX_PATH_BYTES],
+        body_ready: ready,
+        body_complete: complete,
+    });
+    true
+}
+
+fn stage_writable_locked(inner: &mut HostInner, worker: usize, token: ConnectionToken) -> bool {
+    let Some(queue) = inner.events.get_mut(worker) else {
+        return false;
+    };
+    let live = inner
+        .parked
+        .get(worker)
+        .and_then(|table| table.get(token.slot as usize))
+        .and_then(|entry| entry.as_ref())
+        .is_some_and(|entry| entry.token == token);
+    if !live {
+        return false;
+    }
+    let pending = queue
+        .iter()
+        .any(|event| event.kind == HostEventKind::Writable && event.token == token);
+    if pending {
+        return true;
+    }
+    if queue.len() >= HOST_QUEUE_DEPTH {
+        inner.counters.queue_full += 1;
+        return false;
+    }
+    queue.push_back(HostEvent {
+        kind: HostEventKind::Writable,
+        token,
+        route_id: 0,
+        method_len: 0,
+        method: [0; HOST_MAX_METHOD_BYTES],
+        path_len: 0,
+        path: [0; HOST_MAX_PATH_BYTES],
+        body_ready: 0,
+        body_complete: false,
+    });
+    true
+}
+
+// NOTE: admission rollback: the appended tail belongs to this call (append-only under the
+// lock), so truncating it restores the pre-push staging exactly.
+fn retract_body_append(inner: &mut HostInner, token: ConnectionToken, appended: usize) {
+    let Some(entry) = inner
+        .parked
+        .get_mut(token.worker_id as usize)
+        .and_then(|table| table.get_mut(token.slot as usize))
+        .and_then(|entry| entry.as_mut())
+        .filter(|entry| entry.token == token)
+    else {
+        return;
+    };
+    let staged = entry.body.len();
+    entry.body.truncate(staged.saturating_sub(appended));
+}
+
+// NOTE: signal hygiene: answering or closing an exchange retires its pending advisory signals
+// under the same lock, so a later poll never observes a stale signal ahead of fresh events.
+pub(crate) fn retire_signals(inner: &mut HostInner, worker: usize, token: ConnectionToken) {
+    if let Some(queue) = inner.events.get_mut(worker) {
+        queue.retain(|event| {
+            !matches!(
+                event.kind,
+                HostEventKind::BodyAvailable | HostEventKind::Writable
+            ) || event.token != token
+        });
+    }
+}
+
 pub(crate) fn find_tomb(
     inner: &HostInner,
     worker: usize,
@@ -710,10 +896,19 @@ fn drain_pending(
             continue;
         };
         let (kind, token, route_id) = (event.kind, event.token, event.route_id);
-        let method_len = usize::from(event.method_len);
-        let path_len = usize::from(event.path_len);
+        // NOTE: signal events carry advisory counts in the reused length fields and no bytes:
+        // BodyAvailable reports staged-ready bytes with the end flag, Writable carries the
+        // token alone. Both always fit; only Request/Shutdown touch the caller buffers.
+        let signal = matches!(kind, HostEventKind::BodyAvailable | HostEventKind::Writable);
+        let (method_len, path_len) = if signal {
+            (event.body_ready, usize::from(event.body_complete))
+        } else {
+            (usize::from(event.method_len), usize::from(event.path_len))
+        };
         empty_workers = 0;
-        if method_used + method_len > methods.len() || path_used + path_len > paths.len() {
+        if !signal
+            && (method_used + method_len > methods.len() || path_used + path_len > paths.len())
+        {
             if report.copied == 0 {
                 report.method_required = method_len;
                 report.path_required = path_len;
@@ -722,19 +917,27 @@ fn drain_pending(
         }
         let event = inner.events[cursor].pop_front();
         let Some(event) = event else { break };
-        methods[method_used..method_used + method_len].copy_from_slice(&event.method[..method_len]);
-        paths[path_used..path_used + path_len].copy_from_slice(&event.path[..path_len]);
+        let (method_offset, path_offset) = if signal {
+            (0, 0)
+        } else {
+            methods[method_used..method_used + method_len]
+                .copy_from_slice(&event.method[..method_len]);
+            paths[path_used..path_used + path_len].copy_from_slice(&event.path[..path_len]);
+            (method_used, path_used)
+        };
         events[report.copied] = EventSlot {
             kind,
             token,
             route_id,
             method_len,
             path_len,
-            method_offset: method_used,
-            path_offset: path_used,
+            method_offset,
+            path_offset,
         };
-        method_used += method_len;
-        path_used += path_len;
+        if !signal {
+            method_used += method_len;
+            path_used += path_len;
+        }
         report.copied += 1;
         cursor = (cursor + 1) % workers;
     }

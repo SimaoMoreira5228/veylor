@@ -838,7 +838,9 @@ vyl_http1_result vyl_managed_static_local_addr(
 
 enum {
     VYL_MANAGED_STATIC_EVENT_REQUEST = 0u,
-    VYL_MANAGED_STATIC_EVENT_SHUTDOWN = 1u
+    VYL_MANAGED_STATIC_EVENT_SHUTDOWN = 1u,
+    VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE = 2u,
+    VYL_MANAGED_STATIC_EVENT_WRITABLE = 3u
 };
 
 typedef struct {

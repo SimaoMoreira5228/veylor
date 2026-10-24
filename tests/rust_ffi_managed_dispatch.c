@@ -60,6 +60,30 @@ static void wait_stream_writable(vyl_managed_static_server* server, vyl_managed_
     assert(0 && "stream never armed writable");
 }
 
+static void recv_exact(int fd, void* out, size_t length) {
+    size_t total = 0;
+    while (total < length) {
+        ssize_t received = recv(fd, (char*)out + total, length - total, 0);
+        assert(received > 0);
+        total += (size_t)received;
+    }
+}
+
+static size_t read_head(int fd, char* out, size_t capacity) {
+    size_t total = 0;
+    for (;;) {
+        char byte = 0;
+        assert(recv(fd, &byte, 1, 0) == 1);
+        assert(total < capacity - 1);
+        out[total++] = byte;
+        if (total >= 4 && memcmp(out + total - 4, "\r\n\r\n", 4) == 0) {
+            break;
+        }
+    }
+    out[total] = '\0';
+    return total;
+}
+
 int main(void) {
     static const uint8_t get_method[] = "GET";
     static const uint8_t post_method[] = "POST";
@@ -198,18 +222,41 @@ int main(void) {
     assert(close(fd) == 0);
     assert(vyl_managed_static_host_cancel(server, token) == VYL_HTTP1_STALE_TOKEN);
 
+    static const uint8_t hello_body[] = "hello";
     fd = connect_loopback(port);
     assert(
         send(fd, chunked_request, sizeof(chunked_request) - 1, 0) ==
         (ssize_t)(sizeof(chunked_request) - 1)
     );
-    assert(
-        vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
-        ) == VYL_HTTP1_OK
-    );
-    assert(report.copied == 1);
-    token = events[0].token;
+    int have_request = 0;
+    int have_body = 0;
+    size_t body_ready = 0;
+    for (int i = 0; i < 500 && (!have_request || body_ready != sizeof(hello_body) - 1); i++) {
+        assert(
+            vyl_managed_static_poll_events(
+                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                &report
+            ) == VYL_HTTP1_OK
+        );
+        for (size_t k = 0; k < report.copied; k++) {
+            if (events[k].kind == (uint32_t)VYL_MANAGED_STATIC_EVENT_REQUEST) {
+                token = events[k].token;
+                have_request = 1;
+            }
+            /* NOTE: body-available reuses method_len for staged-ready bytes and
+               path_len for the end flag; see the Rust field-reuse docs. */
+            if (events[k].kind == (uint32_t)VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE) {
+                assert(events[k].route_id == 0);
+                assert(events[k].method_offset == 0 && events[k].path_offset == 0);
+                assert(events[k].path_len == 0);
+                body_ready = events[k].method_len;
+                have_body = 1;
+            }
+        }
+    }
+    assert(have_request == 1);
+    assert(have_body == 1);
+    assert(body_ready == sizeof(hello_body) - 1);
     uint8_t staged[16] = {0};
     size_t staged_total = 0;
     uint32_t body_end = 0;
@@ -325,6 +372,93 @@ int main(void) {
     assert(strstr(response, "0\r\n\r\n") != NULL);
     assert(vyl_managed_static_host_end_stream(server, token) == VYL_HTTP1_GONE);
 
+    /* NOTE: no C-visible H2C port accessor exists (local_addr reports H1 only), so H2
+       BODY_AVAILABLE stays covered in Rust (managed_static/tests.rs, h2_tests.rs); this
+       exchange pins the WRITABLE half on the wire instead. Each consumed write re-arms
+       exactly one event, and each event admits exactly one write: the first chunk is
+       consumed on the wire before the re-arm is observed, pinning release-then-signal. */
+    static const uint8_t hi_chunk[] = "hi";
+    static const uint8_t yo_chunk[] = "yo";
+    fd = connect_loopback(port);
+    assert(
+        send(fd, stream_request, sizeof(stream_request) - 1, 0) ==
+        (ssize_t)(sizeof(stream_request) - 1)
+    );
+    assert(
+        vyl_managed_static_poll_events(
+            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+        ) == VYL_HTTP1_OK
+    );
+    assert(report.copied == 1);
+    assert(events[0].kind == (uint32_t)VYL_MANAGED_STATIC_EVENT_REQUEST);
+    token = events[0].token;
+    assert(
+        vyl_managed_static_host_begin_stream(
+            server,
+            token,
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    assert(
+        vyl_managed_static_host_write_stream(
+            server,
+            token,
+            (vyl_http1_bytes){.data = hi_chunk, .length = sizeof(hi_chunk) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    {
+        char head[1024] = {0};
+        read_head(fd, head, sizeof(head));
+        assert(strstr(head, "HTTP/1.1 200 OK") != NULL);
+        assert(strstr(head, "Transfer-Encoding: chunked") != NULL);
+        char frame[8] = {0};
+        recv_exact(fd, frame, 3);
+        assert(memcmp(frame, "2\r\n", 3) == 0);
+        recv_exact(fd, frame, 2);
+        assert(memcmp(frame, "hi", 2) == 0);
+        recv_exact(fd, frame, 2);
+        assert(memcmp(frame, "\r\n", 2) == 0);
+    }
+    int have_writable = 0;
+    for (int i = 0; i < 500 && !have_writable; i++) {
+        assert(
+            vyl_managed_static_poll_events(
+                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                &report
+            ) == VYL_HTTP1_OK
+        );
+        for (size_t k = 0; k < report.copied; k++) {
+            assert(events[k].kind == (uint32_t)VYL_MANAGED_STATIC_EVENT_WRITABLE);
+            assert(memcmp(&events[k].token, &token, sizeof(token)) == 0);
+            assert(events[k].route_id == 0);
+            assert(events[k].method_len == 0 && events[k].path_len == 0);
+            assert(events[k].method_offset == 0 && events[k].path_offset == 0);
+            have_writable = 1;
+        }
+    }
+    assert(have_writable == 1);
+    /* NOTE: the observed event may predate the just-consumed write (coalesced staging dedupes
+       repeats while one is pending), so the authoritative query gates the next admission. */
+    wait_stream_writable(server, token);
+    assert(
+        vyl_managed_static_host_write_stream(
+            server,
+            token,
+            (vyl_http1_bytes){.data = yo_chunk, .length = sizeof(yo_chunk) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    assert(vyl_managed_static_host_end_stream(server, token) == VYL_HTTP1_OK);
+    {
+        char tail[16] = {0};
+        recv_exact(fd, tail, sizeof("2\r\nyo\r\n0\r\n\r\n") - 1);
+        assert(memcmp(tail, "2\r\nyo\r\n0\r\n\r\n", sizeof("2\r\nyo\r\n0\r\n\r\n") - 1) == 0);
+    }
+    assert(close(fd) == 0);
+    assert(vyl_managed_static_host_end_stream(server, token) == VYL_HTTP1_GONE);
+
     static const uint8_t checksum_name[] = "x-checksum";
     static const uint8_t checksum_value[] = "abc";
     static const uint8_t tag_value[] = "v1";
@@ -386,11 +520,11 @@ int main(void) {
 
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 4);
+    assert(counts.completed == 5);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 4
+            counts.shutdown == 5
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

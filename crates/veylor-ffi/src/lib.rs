@@ -36,8 +36,9 @@ pub use h2_server::{
     vyl_h2_server_send_settings_ack, vyl_h2_server_send_window_update,
 };
 pub use managed_static::{
-    VYL_MANAGED_STATIC_ABI_VERSION, VYL_MANAGED_STATIC_EVENT_REQUEST,
-    VYL_MANAGED_STATIC_EVENT_SHUTDOWN, VylManagedStaticCloseCounts, VylManagedStaticConfig,
+    VYL_MANAGED_STATIC_ABI_VERSION, VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE,
+    VYL_MANAGED_STATIC_EVENT_REQUEST, VYL_MANAGED_STATIC_EVENT_SHUTDOWN,
+    VYL_MANAGED_STATIC_EVENT_WRITABLE, VylManagedStaticCloseCounts, VylManagedStaticConfig,
     VylManagedStaticEvent, VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn,
     VylManagedStaticNativeRequest, VylManagedStaticNativeResponse, VylManagedStaticPollReport,
     VylManagedStaticServer, VylManagedStaticToken, VylManagedStaticTrailerReport,

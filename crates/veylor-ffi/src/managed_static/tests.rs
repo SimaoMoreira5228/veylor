@@ -508,21 +508,73 @@ unsafe fn drain_body(server: *mut VylManagedStaticServer, token: VylManagedStati
 }
 
 unsafe fn poll_one(server: *mut VylManagedStaticServer) -> VylManagedStaticToken {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut events = [VylManagedStaticEvent::default(); 8];
     let mut methods = [0u8; 256];
     let mut paths = [0u8; 4096];
-    let report = unsafe {
-        poll_into(
-            server,
-            DISPATCH_TIMEOUT_NS,
-            &mut events,
-            &mut methods,
-            &mut paths,
-        )
-    };
-    assert_eq!(report.copied, 1);
-    assert_eq!(events[0].kind, VYL_MANAGED_STATIC_EVENT_REQUEST);
-    events[0].token
+    loop {
+        let report =
+            unsafe { poll_into(server, 100_000_000, &mut events, &mut methods, &mut paths) };
+        for event in events.iter().take(report.copied) {
+            if event.kind == VYL_MANAGED_STATIC_EVENT_REQUEST {
+                return event.token;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for request event"
+        );
+    }
+}
+
+// NOTE: polls until a REQUEST arrives, keeping any BODY_AVAILABLE signals seen along the way.
+// poll_one-style discarding would eat the admission signal: the worker stages body bytes right
+// behind the park, so the signal often shares the first batches with its own REQUEST.
+unsafe fn poll_request_with_signals(
+    server: *mut VylManagedStaticServer,
+) -> (VylManagedStaticToken, Vec<VylManagedStaticEvent>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut signals = Vec::new();
+    let mut events = [VylManagedStaticEvent::default(); 8];
+    let mut methods = [0u8; 256];
+    let mut paths = [0u8; 4096];
+    loop {
+        let report =
+            unsafe { poll_into(server, 100_000_000, &mut events, &mut methods, &mut paths) };
+        let mut token = None;
+        for event in events.iter().take(report.copied) {
+            if event.kind == VYL_MANAGED_STATIC_EVENT_REQUEST {
+                token = Some(event.token);
+            }
+            if event.kind == VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE {
+                signals.push(*event);
+            }
+        }
+        if let Some(token) = token {
+            return (token, signals);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for request event"
+        );
+    }
+}
+
+// NOTE: appends fresh BODY_AVAILABLE signals to the set; callers loop until their terminal
+// shape appears. Signals are advisory snapshots, so only the end-flagged full window is exact.
+unsafe fn gather_signals(
+    server: *mut VylManagedStaticServer,
+    signals: &mut Vec<VylManagedStaticEvent>,
+) {
+    let mut events = [VylManagedStaticEvent::default(); 8];
+    let mut methods = [0u8; 256];
+    let mut paths = [0u8; 4096];
+    let report = unsafe { poll_into(server, 100_000_000, &mut events, &mut methods, &mut paths) };
+    for event in events.iter().take(report.copied) {
+        if event.kind == VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE {
+            signals.push(*event);
+        }
+    }
 }
 
 unsafe fn is_writable(
@@ -1705,20 +1757,7 @@ fn dispatch_pull_body_partial_copies_and_completion_query() {
     stream
         .write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 11\r\n\r\nhello world")
         .expect("write request");
-    let mut events = [VylManagedStaticEvent::default(); 8];
-    let mut methods = [0u8; 256];
-    let mut paths = [0u8; 4096];
-    let report = unsafe {
-        poll_into(
-            server,
-            DISPATCH_TIMEOUT_NS,
-            &mut events,
-            &mut methods,
-            &mut paths,
-        )
-    };
-    assert_eq!(report.copied, 1);
-    let token = events[0].token;
+    let token = unsafe { poll_one(server) };
     let mut staged = Vec::new();
     let mut chunk = [0u8; 4];
     let (first, pulled, end) = unsafe { pull_into(server, token, &mut chunk) };
@@ -3788,6 +3827,360 @@ fn h2c_native_served_with_two_workers() {
     assert!(head.ends_with("worker-native"), "unexpected body: {head:?}");
     let counts = unsafe { stop_join(server) };
     assert_eq!(counts.completed, 1, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn dispatch_body_available_signal_admits_pull_then_count() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nhello")
+        .expect("write post");
+    let (token, mut signals) = unsafe { poll_request_with_signals(server) };
+    // NOTE: the terminal signal carries the full staged window: fixed-length admission stages
+    // every buffered byte at park, so the first end-flagged signal already counts the body.
+    // Segment splits may stage partial updates first; the loop skips them for the terminal one.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let signal = loop {
+        if let Some(done) = signals.iter().find(|event| event.path_len == 1) {
+            break *done;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal body signal stalls"
+        );
+        unsafe { gather_signals(server, &mut signals) };
+    };
+    assert_eq!(signal.token, token);
+    assert_eq!(
+        signal.route_id, 0,
+        "signals reuse route_id as zero, the token correlates"
+    );
+    assert_eq!(signal.method_len, 5);
+    assert_eq!(signal.path_len, 1);
+    assert_eq!((signal.method_offset, signal.path_offset), (0, 0));
+    assert_eq!(unsafe { drain_body(server, token) }, b"hello");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"stored"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"stored");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn dispatch_body_available_partial_signal_precedes_completion() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 11\r\n\r\nhello")
+        .expect("write head and first segment");
+    let (token, mut signals) = unsafe { poll_request_with_signals(server) };
+    // NOTE: a partial signal admits a partial pull without consuming the exchange: the event is
+    // advisory, so the completion flag stays clear until the staged window covers the total.
+    // The rest stays unsent until the full first segment stages, so the terminal signal cannot
+    // arrive early; coalesced updates grow the count monotonically to exactly the bytes sent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if signals
+            .iter()
+            .any(|event| event.method_len == 5 && event.path_len == 0)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "partial body signal stalls"
+        );
+        unsafe { gather_signals(server, &mut signals) };
+    }
+    for signal in &signals {
+        assert_eq!(signal.token, token);
+        assert_eq!(signal.path_len, 0, "no completion with 5 of 11 bytes sent");
+        assert!(
+            signal.method_len <= 5,
+            "signal never over-counts staged bytes"
+        );
+    }
+    let mut first = [0u8; 5];
+    let (result, pulled, end) = unsafe { pull_into(server, token, &mut first) };
+    assert_eq!((result, pulled, end), (VylResult::Ok, 5, 0));
+    assert_eq!(&first, b"hello");
+    stream.write_all(b" world").expect("write second segment");
+    assert_eq!(unsafe { drain_body(server, token) }, b" world");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"stored"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"stored");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn dispatch_event_kind_mapping_reuses_length_fields_without_growth() {
+    assert_eq!(VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE, 2);
+    assert_eq!(VYL_MANAGED_STATIC_EVENT_WRITABLE, 3);
+    assert_eq!(std::mem::size_of::<VylManagedStaticEvent>(), 80);
+    let token = VylManagedStaticToken {
+        worker_id: 7,
+        slot: 9,
+        request_seq: 11,
+        stream_id: 13,
+        worker_generation: 17,
+        generation: 19,
+    };
+    let server_token = veylor_runtime::ConnectionToken {
+        worker_id: 7,
+        slot: 9,
+        request_seq: 11,
+        stream_id: 13,
+        worker_generation: 17,
+        generation: 19,
+    };
+    let body = super::dispatch::event_from_slot(veylor_server::EventSlot {
+        kind: veylor_server::HostEventKind::BodyAvailable,
+        token: server_token,
+        route_id: 0,
+        method_len: 5,
+        path_len: 1,
+        method_offset: 0,
+        path_offset: 0,
+    });
+    assert_eq!(body.kind, VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE);
+    assert_eq!(body.token, token);
+    assert_eq!(body.route_id, 0);
+    assert_eq!(body.method_len, 5);
+    assert_eq!(body.path_len, 1);
+    assert_eq!((body.method_offset, body.path_offset), (0, 0));
+    // NOTE: the writable mapping is pinned end to end: the stream re-arm seam stages it once
+    // per release (see the WRITABLE emission sites), so this event arrives on the wire below.
+    let writable = super::dispatch::event_from_slot(veylor_server::EventSlot {
+        kind: veylor_server::HostEventKind::Writable,
+        token: server_token,
+        route_id: 0,
+        method_len: 0,
+        path_len: 0,
+        method_offset: 0,
+        path_offset: 0,
+    });
+    assert_eq!(writable.kind, VYL_MANAGED_STATIC_EVENT_WRITABLE);
+    assert_eq!(writable.token, token);
+    assert_eq!(writable.route_id, 0);
+    assert_eq!((writable.method_len, writable.path_len), (0, 0));
+    assert_eq!((writable.method_offset, writable.path_offset), (0, 0));
+}
+
+unsafe fn wait_writable_event(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+) -> VylManagedStaticEvent {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut events = [VylManagedStaticEvent::default(); 8];
+        let mut methods = [0u8; 256];
+        let mut paths = [0u8; 4096];
+        let report =
+            unsafe { poll_into(server, 100_000_000, &mut events, &mut methods, &mut paths) };
+        for event in events.iter().take(report.copied) {
+            if event.kind == VYL_MANAGED_STATIC_EVENT_WRITABLE && event.token == token {
+                return *event;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writable signal stalls"
+        );
+    }
+}
+
+// NOTE: WRITABLE dispatch pin: the flushed head and each consumed write queue exactly one
+// coalesced event with zeroed fields, and each event admits exactly one write. The waiter
+// keeps advisory signals instead of assuming batch shape, so REQUEST-only polls stay exact.
+#[test]
+fn dispatch_writable_event_per_release_with_zero_fields() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"GET", b"/s", u64::MAX) };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    stream
+        .write_all(b"GET /s HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write request");
+    let token = unsafe { poll_one(server) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_begin_stream(server, token, 200, bytes(b"OK")) },
+        VylResult::Ok
+    );
+    let first = unsafe { wait_writable_event(server, token) };
+    assert_eq!(first.kind, VYL_MANAGED_STATIC_EVENT_WRITABLE);
+    assert_eq!(first.token, token);
+    assert_eq!(first.route_id, 0);
+    assert_eq!((first.method_len, first.path_len), (0, 0));
+    assert_eq!((first.method_offset, first.path_offset), (0, 0));
+    assert_eq!(
+        unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"hello ")) },
+        VylResult::Ok
+    );
+    let second = unsafe { wait_writable_event(server, token) };
+    assert_eq!(second.token, token);
+    assert_eq!(second.route_id, 0);
+    assert_eq!((second.method_len, second.path_len), (0, 0));
+    assert_eq!(
+        unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"world")) },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_end_stream(server, token) },
+        VylResult::Ok
+    );
+    let (status, raw, body) = read_streamed(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello world");
+    assert_eq!(
+        raw,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"
+    );
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+fn h2_send_headers_open(stream: &mut TcpStream, id: u32, fields: &[HpackFieldToEncode<'_>]) {
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 512];
+    let len = encode_header_block(fields, &mut encoder, &mut block).expect("encode block");
+    h2_write_frame(
+        stream,
+        FrameType::Headers,
+        HEADERS_FLAG_END_HEADERS,
+        id,
+        &block[..len],
+    );
+}
+
+fn h2_write_data(stream: &mut TcpStream, id: u32, bytes: &[u8], end: bool) {
+    let flags = if end { DATA_FLAG_END_STREAM } else { 0 };
+    h2_write_frame(stream, FrameType::Data, flags, id, bytes);
+}
+
+fn h2_next_non_grant(stream: &mut TcpStream) -> (FrameHeader, Vec<u8>) {
+    loop {
+        let (header, payload) = h2_read_frame(stream);
+        if header.frame_type == FrameType::WindowUpdate {
+            continue;
+        }
+        return (header, payload);
+    }
+}
+
+// NOTE: H2 BODY_AVAILABLE dispatch pin through the managed C ABI: staged DATA carries ready
+// bytes with the end flag in the reused length fields like H1, so the host observes the full
+// window before pulling. Grant frames interleave freely and are skipped, never asserted.
+#[test]
+fn h2c_managed_body_available_signals_ready_and_end() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h2c = unsafe { h2c_port_of(server) };
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let fields = [
+        h2_field(b":method", b"POST"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", b"/upload"),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"5"),
+    ];
+    h2_send_headers_open(&mut stream, 1, &fields);
+    h2_write_data(&mut stream, 1, b"hello", true);
+    let (token, mut signals) = unsafe { poll_request_with_signals(server) };
+    assert_eq!(token.stream_id, 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let signal = loop {
+        if let Some(done) = signals.iter().find(|event| {
+            event.kind == VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE
+                && event.token == token
+                && event.path_len == 1
+        }) {
+            break *done;
+        }
+        unsafe { gather_signals(server, &mut signals) };
+        signals.retain(|event| {
+            event.kind != VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE || event.token == token
+        });
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal body signal stalls"
+        );
+    };
+    assert_eq!(signal.token, token);
+    assert_eq!(signal.route_id, 0);
+    assert_eq!(signal.method_len, 5);
+    assert_eq!((signal.method_offset, signal.path_offset), (0, 0));
+    assert_eq!(unsafe { drain_body(server, token) }, b"hello");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"done"))
+        },
+        VylResult::Ok
+    );
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    let (header, payload) = h2_next_non_grant(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(header.stream_id, 1);
+    let (count, _) = decode_header_block(&payload, &mut decoder, &mut decoded).expect("decode");
+    let mut status = 0;
+    for header in decoded.iter().take(count) {
+        let name = decoder.resolve(header.field.name).expect("name");
+        let value = decoder.resolve(header.field.value).expect("value");
+        if name == b":status" {
+            status = std::str::from_utf8(value)
+                .expect("status utf8")
+                .parse()
+                .expect("status int");
+        }
+    }
+    assert_eq!(status, 200);
+    let (header, body) = h2_next_non_grant(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Data);
+    assert_eq!(header.stream_id, 1);
+    assert_eq!(header.flags & DATA_FLAG_END_STREAM, DATA_FLAG_END_STREAM);
+    assert_eq!(body, b"done");
+    let counts = unsafe { stop_join(server) };
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }

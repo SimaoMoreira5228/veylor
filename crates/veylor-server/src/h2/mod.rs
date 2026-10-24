@@ -8,6 +8,7 @@ use veylor_http2::{
 use veylor_runtime::ConnectionToken;
 
 use crate::host::{HostShared, StagedWork};
+use crate::static_files::FilePlan;
 
 // NOTE: worker-turn hook (slot state plus accept/pump/close dispatch). The
 // step driver above stays transport-neutral; turn.rs owns the sockets,
@@ -133,6 +134,19 @@ pub struct H2Conn<'a> {
     pub(crate) phase: Phase<'a>,
     settings_sent: bool,
     terminal: bool,
+    // NOTE: file-mount streaming state beside the driver (projection-adjacent, not a third
+    // route table): one entry per servable stream at most, plus a single OUTPUT_CAP chunk
+    // scratch reused every turn, so file bytes frame in bounded slices and never stage whole.
+    file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
+    file_scratch: Box<[u8; crate::connection::OUTPUT_CAP]>,
+}
+
+// NOTE: per-stream file progress: the plan owns its fs path, offset counts plan-relative
+// bytes already framed, and the entry drops on completion, peer reset, or conn close.
+pub(crate) struct H2FileTransfer {
+    pub(crate) stream: u32,
+    pub(crate) plan: FilePlan,
+    pub(crate) offset: u64,
 }
 
 impl<'a> H2Conn<'a> {
@@ -156,6 +170,8 @@ impl<'a> H2Conn<'a> {
             phase,
             settings_sent: false,
             terminal,
+            file_transfers: Box::new(std::array::from_fn(|_| None)),
+            file_scratch: Box::new([0; crate::connection::OUTPUT_CAP]),
         }
     }
 
@@ -345,12 +361,20 @@ impl<'a> H2Conn<'a> {
             output,
             used: &mut used,
             outcome: &mut outcome,
+            files: &mut self.file_transfers,
+            scratch: &mut self.file_scratch[..],
         };
         for event in events.iter().take(event_len).flatten() {
             serve.serve_one(*event);
             if serve.outcome.closed {
                 break;
             }
+        }
+        // NOTE: file DATA resumes here every step (not only on new HEADERS), so a transfer
+        // wider than one output buffer streams across steps and turns through the same
+        // turn budgets as static DATA, with no new flow-control machinery.
+        if !serve.outcome.closed {
+            serve.pump_files();
         }
         outcome.written = used;
         if outcome.closed {
