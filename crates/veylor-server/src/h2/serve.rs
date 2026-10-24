@@ -14,7 +14,7 @@ use crate::static_routes::{
 };
 
 use super::file::FileDecision;
-use super::routes::{FrozenRoutesView, NOT_FOUND_BODY, field, send_full};
+use super::routes::{FrozenRoutesView, NOT_FOUND_BODY, field, send_begin, send_full};
 use super::turn;
 use super::{
     H2_BODY_CAP, H2Conn, H2FileTransfer, H2HostCtx, Phase, STREAM_SLOTS, StepOutcome, StreamEvent,
@@ -638,7 +638,7 @@ pub(crate) fn apply_h2_streams(
                 abort_stream(server, host, token, fail, spare)
             } else {
                 let mut used = 0;
-                match send_full(server, stream, status, b"", false, false, spare, &mut used) {
+                match send_begin(server, stream, status, spare, &mut used) {
                     Ok(()) => StreamStep::Done {
                         used,
                         served: false,

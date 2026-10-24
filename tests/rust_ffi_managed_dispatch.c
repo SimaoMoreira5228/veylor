@@ -1021,6 +1021,140 @@ int main(void) {
     assert(h2status == 200);
     assert(h2resp_len == sizeof(h2_reply) - 1);
     assert(memcmp(h2resp, "done", 4) == 0);
+
+    /* NOTE: H2C streaming response trailers on stream 5: GET /s parks, begin plus one
+       chunk stage, end_with_trailers lands terminal HEADERS. The client classifies FINAL
+       headers, DATA without END_STREAM, then TRAILERS with exact field bytes (offsets
+       index the feed data buffer, checked before the next poll overwrites it). */
+    const vyl_h2_field_to_encode h2get_s[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/s"),
+        h2_text_field(":authority", "localhost"),
+    };
+    uint32_t h2s_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2get_s, sizeof(h2get_s) / sizeof(h2get_s[0]), (uint32_t)VYL_H2_END_STREAM,
+            h2wire, sizeof(h2wire), &h2written, &h2s_id, &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2s_id == 5);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    assert(
+        vyl_managed_static_poll_events(
+            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+        ) == VYL_HTTP1_OK
+    );
+    assert(report.copied == 1);
+    assert(events[0].kind == (uint32_t)VYL_MANAGED_STATIC_EVENT_REQUEST);
+    assert(events[0].token.stream_id == 5);
+    token = events[0].token;
+    assert(
+        vyl_managed_static_host_begin_stream(
+            server,
+            token,
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    wait_stream_writable(server, token);
+    /* NOTE: zero-body shape only. The Begin HEADERS declares content-length: 0
+       (h2/serve.rs streams Begin via send_full with an empty body), so any staged DATA
+       would misframe against it and this repo's own validating client rejects the bytes
+       (BodyTooLong). Non-empty streamed bodies plus trailers are covered byte-exact by
+       the Rust h2c_managed_stream_end_with_trailers_exact_fields test; the strict client
+       here proves the terminal HEADERS land exact on consistent framing. Server sources
+       belong to a parallel slice: begin must omit content-length for open streams. */
+    static const vyl_http1_field h2_resp_trailers[] = {
+        {
+            .name = {.data = checksum_name, .length = sizeof(checksum_name) - 1},
+            .value = {.data = checksum_value, .length = sizeof(checksum_value) - 1},
+        },
+        {
+            .name = {.data = tag_name, .length = sizeof(tag_name) - 1},
+            .value = {.data = tag_value, .length = sizeof(tag_value) - 1},
+        },
+    };
+    assert(
+        vyl_managed_static_host_end_stream_with_trailers(
+            server, token, h2_resp_trailers, sizeof(h2_resp_trailers) / sizeof(h2_resp_trailers[0])
+        ) == VYL_HTTP1_OK
+    );
+    size_t h2s_len = 0;
+    uint16_t h2s_status = 0;
+    int h2s_head = 0;
+    int h2s_data = 0;
+    int h2s_trailers = 0;
+    for (int i = 0; i < 32 && !h2s_trailers; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 5) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 5, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                if (class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL) {
+                    assert(class.status == 200);
+                    assert(class.phase == (uint32_t)VYL_H2_PHASE_CONTENT);
+                    h2s_status = class.status;
+                    h2s_head = 1;
+                } else {
+                    assert(class.kind == (uint32_t)VYL_H2_RESPONSE_TRAILERS);
+                    assert(class.phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    assert(h2actions[k].field_count == 2);
+                    assert(h2actions[k].field_start + 2 <= 64);
+                    vyl_h2_field first = h2fields[h2actions[k].field_start];
+                    vyl_h2_field second = h2fields[h2actions[k].field_start + 1];
+                    assert(first.name_length == sizeof(checksum_name) - 1);
+                    assert(
+                        memcmp(
+                            h2data + first.name_offset, checksum_name,
+                            sizeof(checksum_name) - 1
+                        ) == 0
+                    );
+                    assert(first.value_length == sizeof(checksum_value) - 1);
+                    assert(
+                        memcmp(
+                            h2data + first.value_offset, checksum_value,
+                            sizeof(checksum_value) - 1
+                        ) == 0
+                    );
+                    assert(second.name_length == sizeof(tag_name) - 1);
+                    assert(
+                        memcmp(h2data + second.name_offset, tag_name, sizeof(tag_name) - 1) == 0
+                    );
+                    assert(second.value_length == sizeof(tag_value) - 1);
+                    assert(
+                        memcmp(h2data + second.value_offset, tag_value, sizeof(tag_value) - 1) == 0
+                    );
+                    h2s_trailers = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 5
+            ) {
+                assert(0 && "zero-body trailer stream must send no DATA");
+            }
+        }
+    }
+    assert(h2s_head == 1);
+    assert(h2s_data == 0);
+    assert(h2s_trailers == 1);
+    assert(h2s_status == 200);
+    assert(h2s_len == 0);
+    assert(
+        vyl_managed_static_host_end_stream_with_trailers(
+            server, token, h2_resp_trailers, sizeof(h2_resp_trailers) / sizeof(h2_resp_trailers[0])
+        ) == VYL_HTTP1_GONE
+    );
     assert(vyl_h2_client_destroy(h2) == VYL_HTTP1_OK);
     assert(close(h2fd) == 0);
 

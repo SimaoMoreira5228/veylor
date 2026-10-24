@@ -1794,14 +1794,33 @@ fn decode_fields(block: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-fn read_response_with_trailers(stream: &mut TcpStream, id: u32) -> (Response, TrailerFields) {
-    let (block, mut ended) = loop {
+// NOTE: RFC 9113 section 8.2.2 length-match pin: a length-unknown Begin must ride :status-only
+// HEADERS with END_STREAM clear; a content-length: 0 would turn the first DATA into a real-client
+// PROTOCOL_ERROR, so every streaming test reads its head through here and the absence is asserted.
+fn read_begin_block(stream: &mut TcpStream, id: u32) -> Vec<u8> {
+    let first = loop {
         let frame = read_frame(stream);
         if frame.0.frame_type == FrameType::WindowUpdate {
             continue;
         }
-        break read_block(stream, id, frame);
+        break frame;
     };
+    let (block, ended) = read_block(stream, id, first);
+    assert!(!ended, "streaming Begin HEADERS must leave the stream open");
+    let fields = decode_fields(&block);
+    assert!(fields.iter().any(|(name, _)| name.as_slice() == b":status"));
+    assert!(
+        fields
+            .iter()
+            .all(|(name, _)| name.as_slice() != b"content-length"),
+        "length-unknown Begin omits content-length"
+    );
+    block
+}
+
+fn read_response_with_trailers(stream: &mut TcpStream, id: u32) -> (Response, TrailerFields) {
+    let block = read_begin_block(stream, id);
+    let mut ended = false;
     let mut response = decode_response(&block);
     let mut body = Vec::new();
     let mut trailers = Vec::new();
@@ -2029,9 +2048,10 @@ fn h2_managed_stream_writable_event_per_release() {
     );
     spin_until(|| host.is_writable(event.token));
     assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
-    let response = read_response(&mut stream, 1);
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"chunk-onechunk-two");
+    assert!(trailers.is_empty());
     send_headers(&mut stream, 3, b"GET", b"/hello", true);
     let sibling = read_response(&mut stream, 3);
     assert_eq!(sibling.status, 200);
@@ -2140,6 +2160,14 @@ fn read_trailer_pair(stream: &mut TcpStream, ids: [u32; 2]) -> [(Response, Trail
                 let block = std::mem::take(&mut blocks[index]);
                 if heads[index].is_none() {
                     assert!(!end, "response HEADERS must not end a trailered stream");
+                    let fields = decode_fields(&block);
+                    assert!(fields.iter().any(|(name, _)| name.as_slice() == b":status"));
+                    assert!(
+                        fields
+                            .iter()
+                            .all(|(name, _)| name.as_slice() != b"content-length"),
+                        "length-unknown Begin omits content-length"
+                    );
                     heads[index] = Some(decode_response(&block));
                 } else {
                     trailers[index].extend(decode_fields(&block));
@@ -3402,4 +3430,31 @@ fn h2_file_mount_multipart_subset_and_overcap_rules() {
     assert_eq!(counts.h2_served, 5, "counts: {counts:?}");
     assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// NOTE: gap pin, fail-closed today: allowlist-registered managed routes push no H2
+// mirror, so H2C answers 404 (mirroring without allowlist enforcement would bless a
+// hole). Flip to positive coverage when the mirror lands together with H2 staging/park
+// enforcement via the shared trailer_allowed predicate; that turn must also adjudicate
+// h2_managed_request_trailers_stage_and_pull, which pins currently-divergent acceptance.
+#[test]
+fn h2c_managed_with_trailers_route_unprojected_documents_gap() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_managed_with_trailers(b"POST", b"/t", MAX_STATIC_BODY_BYTES, &[b"x-sum"])
+        .expect("register trailer route");
+    let server = server.start().expect("start server");
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"POST", b"/t", true);
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 404);
+    assert_eq!(response.body, b"Not Found");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1);
 }

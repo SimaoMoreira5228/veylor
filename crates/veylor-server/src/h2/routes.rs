@@ -331,6 +331,35 @@ pub(crate) fn send_status_only(
     Ok(())
 }
 
+// NOTE: RFC 9113 section 8.2.2 length-match pin: a length-unknown Begin carries :status
+// only with END_STREAM clear, so the DATA that follows never contradicts a declared length
+// (a content-length: 0 would make the first DATA a client-side PROTOCOL_ERROR). H1 Begin
+// mirrors this field-for-field: chunked framing with status+reason and no content-length,
+// and H2 has no reason phrase, so :status alone is the whole head.
+pub(crate) fn send_begin(
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    stream: u32,
+    status: u16,
+    output: &mut [u8],
+    used: &mut usize,
+) -> Result<(), ErrorCode> {
+    let mut status_buf = [0; DECIMAL_CAP];
+    let status_len = push_decimal(&mut status_buf, u64::from(status));
+    let response_fields = [field(b":status", &status_buf[..status_len])];
+    let mut block = [0; HPACK_BLOCK_CAP];
+    let sent = server
+        .send_response(
+            stream,
+            &response_fields,
+            &mut block,
+            &mut output[*used..],
+            false,
+        )
+        .map_err(|_| ErrorCode::InternalError)?;
+    *used += sent.writer.pending_bytes().len();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_full(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,

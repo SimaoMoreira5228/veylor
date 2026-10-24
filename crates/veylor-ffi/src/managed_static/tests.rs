@@ -3304,10 +3304,11 @@ fn native_handler_catches_own_panic_and_fails_closed() {
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use veylor_http2::{
-    CLIENT_CONNECTION_PREFACE, DATA_FLAG_END_STREAM, DEFAULT_MAX_FRAME_SIZE, FrameHeader,
-    FrameType, HEADERS_FLAG_END_HEADERS, HEADERS_FLAG_END_STREAM, HpackEntrySlot,
-    HpackFieldToEncode, HpackHeader, HpackRepresentation, HpackTable, SETTINGS_ACK,
-    decode_frame_header, decode_header_block, encode_frame_header, encode_header_block,
+    CLIENT_CONNECTION_PREFACE, CONTINUATION_FLAG_END_HEADERS, DATA_FLAG_END_STREAM,
+    DEFAULT_MAX_FRAME_SIZE, FrameHeader, FrameType, HEADERS_FLAG_END_HEADERS,
+    HEADERS_FLAG_END_STREAM, HpackEntrySlot, HpackFieldToEncode, HpackHeader, HpackRepresentation,
+    HpackTable, SETTINGS_ACK, decode_frame_header, decode_header_block, encode_frame_header,
+    encode_header_block,
 };
 use veylor_server::MAX_WORKERS;
 
@@ -4373,6 +4374,423 @@ fn h2c_data_staged_body_available_wakes_blocked_poll() {
     assert_eq!(header.stream_id, 1);
     assert_eq!(header.flags & DATA_FLAG_END_STREAM, DATA_FLAG_END_STREAM);
     assert_eq!(body, b"done");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+fn h2_send_trailers(stream: &mut TcpStream, id: u32, fields: &[HpackFieldToEncode<'_>]) {
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 512];
+    let len = encode_header_block(fields, &mut encoder, &mut block).expect("encode block");
+    h2_write_frame(
+        stream,
+        FrameType::Headers,
+        HEADERS_FLAG_END_HEADERS | HEADERS_FLAG_END_STREAM,
+        id,
+        &block[..len],
+    );
+}
+
+fn h2_decode_status(
+    decoder: &mut HpackTable<'_>,
+    decoded: &mut [HpackHeader; 32],
+    block: &[u8],
+) -> u16 {
+    let (count, _) = decode_header_block(block, decoder, decoded).expect("decode block");
+    let mut status = 0;
+    for header in decoded.iter().take(count) {
+        let name = decoder.resolve(header.field.name).expect("name");
+        let value = decoder.resolve(header.field.value).expect("value");
+        if name == b":status" {
+            status = std::str::from_utf8(value)
+                .expect("status utf8")
+                .parse()
+                .expect("status int");
+        }
+    }
+    status
+}
+
+fn h2_decode_pairs(
+    decoder: &mut HpackTable<'_>,
+    decoded: &mut [HpackHeader; 32],
+    block: &[u8],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (count, _) = decode_header_block(block, decoder, decoded).expect("decode block");
+    decoded
+        .iter()
+        .take(count)
+        .map(|header| {
+            let name = decoder.resolve(header.field.name).expect("name").to_vec();
+            let value = decoder.resolve(header.field.value).expect("value").to_vec();
+            (name, value)
+        })
+        .collect()
+}
+
+fn h2_read_block_skipping_grants(stream: &mut TcpStream, id: u32) -> (Vec<u8>, bool) {
+    let (header, payload) = h2_next_non_grant(stream);
+    assert_eq!(header.frame_type, FrameType::Headers);
+    assert_eq!(header.stream_id, id);
+    let mut block = payload;
+    let ended = header.flags & HEADERS_FLAG_END_STREAM != 0;
+    let mut flags = header.flags;
+    while flags & HEADERS_FLAG_END_HEADERS == 0 {
+        let (next, payload) = h2_next_non_grant(stream);
+        assert_eq!(next.frame_type, FrameType::Continuation);
+        assert_eq!(next.stream_id, id);
+        flags = next.flags;
+        block.extend_from_slice(&payload);
+        if flags & CONTINUATION_FLAG_END_HEADERS != 0 {
+            break;
+        }
+    }
+    (block, ended)
+}
+
+fn h2c_read_simple(
+    stream: &mut TcpStream,
+    decoder: &mut HpackTable<'_>,
+    decoded: &mut [HpackHeader; 32],
+    id: u32,
+) -> (u16, Vec<u8>) {
+    let (block, ended) = h2_read_block_skipping_grants(stream, id);
+    let status = h2_decode_status(decoder, decoded, &block);
+    let mut body = Vec::new();
+    if !ended {
+        loop {
+            let (header, payload) = h2_next_non_grant(stream);
+            assert_eq!(header.stream_id, id);
+            assert_eq!(header.frame_type, FrameType::Data);
+            body.extend_from_slice(&payload);
+            if header.flags & DATA_FLAG_END_STREAM != 0 {
+                break;
+            }
+        }
+    }
+    (status, body)
+}
+
+fn h2c_read_streamed_with_trailers(
+    stream: &mut TcpStream,
+    decoder: &mut HpackTable<'_>,
+    decoded: &mut [HpackHeader; 32],
+    id: u32,
+) -> H2TraileredResponse {
+    let (block, ended) = h2_read_block_skipping_grants(stream, id);
+    assert!(!ended, "response HEADERS must not end a trailered stream");
+    let status = h2_decode_status(decoder, decoded, &block);
+    let mut body = Vec::new();
+    let mut trailers = Vec::new();
+    loop {
+        let (header, payload) = h2_next_non_grant(stream);
+        assert_eq!(header.stream_id, id);
+        match header.frame_type {
+            FrameType::Data => {
+                body.extend_from_slice(&payload);
+                if header.flags & DATA_FLAG_END_STREAM != 0 {
+                    panic!("DATA must not end a trailered stream");
+                }
+            }
+            FrameType::Headers => {
+                let mut block = payload;
+                let mut flags = header.flags;
+                while flags & HEADERS_FLAG_END_HEADERS == 0 {
+                    let (next, payload) = h2_next_non_grant(stream);
+                    assert_eq!(next.frame_type, FrameType::Continuation);
+                    assert_eq!(next.stream_id, id);
+                    flags = next.flags;
+                    block.extend_from_slice(&payload);
+                }
+                let end = header.flags & HEADERS_FLAG_END_STREAM != 0;
+                trailers.extend(h2_decode_pairs(decoder, decoded, &block));
+                assert!(end, "terminal HEADERS must end the stream");
+                break;
+            }
+            found => panic!("unexpected frame: {found:?}"),
+        }
+    }
+    (status, body, trailers)
+}
+
+type H2TraileredResponse = (u16, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+
+fn h2_expect_rst_h2(stream: &mut TcpStream, id: u32, code: u32) {
+    loop {
+        let (header, payload) = h2_read_frame(stream);
+        if header.frame_type == FrameType::WindowUpdate {
+            continue;
+        }
+        assert_eq!(header.frame_type, FrameType::RstStream);
+        assert_eq!(header.stream_id, id);
+        assert_eq!(payload, code.to_be_bytes(), "unexpected RST code");
+        return;
+    }
+}
+
+// NOTE: H2C response-trailer pin through the managed C ABI: HEADERS-open POST plus DATA-end
+// stages the body, the empty-set trailer pull proves the staged whole-set discipline over
+// H2C, and end-with-trailers lands terminal HEADERS with exact fields while the conn
+// survives for a sibling. Plain managed registration: see the unprojected-allowlist test
+// below for why trailer-allowlist routes cannot serve H2C yet.
+#[test]
+fn h2c_managed_stream_end_with_trailers_exact_fields() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h2c = unsafe { h2c_port_of(server) };
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    let fields = [
+        h2_field(b":method", b"POST"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", b"/upload"),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"5"),
+    ];
+    h2_send_headers_open(&mut stream, 1, &fields);
+    h2_write_data(&mut stream, 1, b"hello", true);
+    let token = unsafe { poll_one(server) };
+    assert_eq!(token.stream_id, 1);
+    assert_eq!(unsafe { drain_body(server, token) }, b"hello");
+    // NOTE: no request trailers were sent, so no pull: only the H1 chunked terminal path
+    // initializes the staged set (mark_chunked_done); a DATA-ended body stays NotReady
+    // engine-wide. Whole-set request-trailer discipline is pinned by the next test.
+    assert_eq!(
+        unsafe { vyl_managed_static_host_begin_stream(server, token, 200, bytes(b"OK")) },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"chunk-one")) },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"chunk-two")) },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    let trailers = [field(b"x-checksum", b"abc"), field(b"x-tag", b"v1")];
+    assert_eq!(
+        unsafe { end_with_trailers(server, token, &trailers) },
+        VylResult::Ok
+    );
+    let (status, body, got) =
+        h2c_read_streamed_with_trailers(&mut stream, &mut decoder, &mut decoded, 1);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"chunk-onechunk-two");
+    assert_eq!(
+        got,
+        vec![
+            (b"x-checksum".to_vec(), b"abc".to_vec()),
+            (b"x-tag".to_vec(), b"v1".to_vec()),
+        ]
+    );
+    assert_eq!(
+        unsafe { end_with_trailers(server, token, &trailers) },
+        VylResult::Gone
+    );
+    h2_send_get(&mut stream, 3, b"/hello");
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 3);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+// NOTE: H2C request-trailer pin through the managed C ABI: open POST plus DATA stages ready
+// bytes without completion, the trailer HEADERS completes the set for a whole-set pull with
+// capacity retry, and a prohibited set on the next stream RSTs while the conn survives for
+// a sibling. Plain managed registration (the engine H2 trailer tests stage without an
+// allowlist; the allowlist gate lives on the H1 park path only).
+#[test]
+fn h2c_managed_request_trailers_stage_and_pull() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"POST", b"/upload", u64::MAX) };
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h2c = unsafe { h2c_port_of(server) };
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    let fields = [
+        h2_field(b":method", b"POST"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", b"/upload"),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"4"),
+    ];
+    h2_send_headers_open(&mut stream, 1, &fields);
+    h2_write_data(&mut stream, 1, b"data", false);
+    let token = unsafe { poll_one(server) };
+    assert_eq!(token.stream_id, 1);
+    let mut names = [0xAAu8; 32];
+    let mut values = [0xAAu8; 16];
+    let (early, report) = unsafe { pull_trailers_into(server, token, &mut names, &mut values) };
+    assert_eq!(early, VylResult::WouldBlock);
+    assert_eq!(report, VylManagedStaticTrailerReport::default());
+    h2_send_trailers(
+        &mut stream,
+        1,
+        &[h2_field(b"x-checksum", b"abc"), h2_field(b"x-count", b"2")],
+    );
+    assert_eq!(unsafe { drain_body(server, token) }, b"data");
+    // NOTE: trailer readiness can lag body-end by a turn (the engine pin spins too), so
+    // the short-buffer probe retries WouldBlock until the whole set stages at once.
+    let report = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut names = [0u8; 2];
+            let mut values = [0u8; 2];
+            let (short, report) =
+                unsafe { pull_trailers_into(server, token, &mut names, &mut values) };
+            assert_eq!((names, values), ([0u8; 2], [0u8; 2]));
+            if short == VylResult::Ok {
+                break report;
+            }
+            assert_eq!(short, VylResult::WouldBlock);
+            assert_eq!(report, VylManagedStaticTrailerReport::default());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged trailer set never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_eq!(report.fields, 2);
+    assert_eq!((report.names_copied, report.values_copied), (0, 0));
+    assert_eq!((report.names_required, report.values_required), (18, 5));
+    let mut names = [0u8; 18];
+    let mut values = [0u8; 5];
+    let (full, report) = unsafe { pull_trailers_into(server, token, &mut names, &mut values) };
+    assert_eq!(full, VylResult::Ok);
+    assert_eq!(report.fields, 2);
+    assert_eq!((report.names_copied, report.values_copied), (18, 5));
+    assert_eq!((report.names_required, report.values_required), (0, 0));
+    assert_eq!(&names, b"x-checksum\x00x-count");
+    assert_eq!(&values, b"abc\x002");
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(b"done"))
+        },
+        VylResult::Ok
+    );
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 1);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"done");
+    let fields = [
+        h2_field(b":method", b"POST"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", b"/upload"),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"4"),
+    ];
+    h2_send_headers_open(&mut stream, 3, &fields);
+    let refused = unsafe { poll_one(server) };
+    assert_eq!(refused.stream_id, 3);
+    h2_write_data(&mut stream, 3, b"data", false);
+    h2_send_trailers(&mut stream, 3, &[h2_field(b"connection", b"close")]);
+    h2_expect_rst_h2(&mut stream, 3, 1);
+    h2_send_get(&mut stream, 5, b"/hello");
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 5);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+// NOTE: gap pin (server sources owned by a parallel slice — do NOT fix here): a route
+// registered ONLY via vyl_managed_static_register_managed_route_with_trailers never parks
+// over H2C. Server::register_managed_with_trailers
+// (crates/veylor-server/src/static_server/mod.rs) pushes no H2StaticRoute mirror into
+// h2_routes, unlike register_managed/register_route/register_file_mount/register_native,
+// so the H2 projection (h2/turn.rs project_routes, h2/routes.rs is_managed) misses it and
+// the Headers !end arm (h2/serve.rs) answers 404, RSTs RefusedStream, and closes the conn
+// (deny close=true). The H1 park path still stages (connection/mod.rs park_or_respond
+// reads routes.managed_trailers), and the H2 stage path (h2/serve.rs stage_request_trailers)
+// never consults the allowlist anyway. Update this test when the mirror lands: the POST
+// must park and pull the staged set.
+#[test]
+fn h2c_managed_with_trailers_route_unprojected_documents_gap() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    let allow = trailer_bytes(&[b"x-tag"]);
+    assert_eq!(
+        unsafe { register_managed_with_trailers(server, b"POST", b"/upload", u64::MAX, &allow) },
+        VylResult::Ok
+    );
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(
+        unsafe { vyl_managed_static_enable_h2c(server, 0) },
+        VylResult::Ok
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let h2c = unsafe { h2c_port_of(server) };
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = h2_decoder(&mut entries, &mut scratch);
+    let mut decoded = [HpackHeader::EMPTY; 32];
+    let fields = [
+        h2_field(b":method", b"POST"),
+        h2_field(b":scheme", b"http"),
+        h2_field(b":path", b"/upload"),
+        h2_field(b":authority", b"localhost"),
+        h2_field(b"content-length", b"4"),
+    ];
+    h2_send_headers_open(&mut stream, 1, &fields);
+    let (block, ended) = h2_read_block_skipping_grants(&mut stream, 1);
+    assert!(!ended);
+    assert_eq!(h2_decode_status(&mut decoder, &mut decoded, &block), 404);
+    h2_expect_rst_h2(&mut stream, 1, 7);
+    let mut events = [VylManagedStaticEvent::default(); 8];
+    let mut methods = [0u8; 256];
+    let mut paths = [0u8; 4096];
+    for _ in 0..5 {
+        let report =
+            unsafe { poll_into(server, 100_000_000, &mut events, &mut methods, &mut paths) };
+        assert!(
+            events
+                .iter()
+                .take(report.copied)
+                .all(|event| event.kind != VYL_MANAGED_STATIC_EVENT_REQUEST),
+            "allowlist route must not park over H2C until mirrored"
+        );
+    }
+    // NOTE: the refusal closes the conn too (deny close=true), so the sibling reconnects
+    // fresh: the listener survives and serves it, proving only the refused conn died.
+    drop(stream);
+    let mut stream = connect_loopback(h2c);
+    h2_handshake(&mut stream);
+    h2_send_get(&mut stream, 3, b"/hello");
+    let (status, body) = h2c_read_simple(&mut stream, &mut decoder, &mut decoded, 3);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
     let counts = unsafe { stop_join(server) };
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
