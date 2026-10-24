@@ -10,6 +10,9 @@ use crate::host::{
     TombCause, find_tomb, valid_reason,
 };
 
+use crate::static_files::HTTP_DATE_BYTES;
+use crate::static_routes::now_http_date;
+
 use super::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use super::{
     ConnClose, ConnPhase, ConnState, OUTPUT_CAP, PumpOutcome, PumpProgress, StagedTrailer, field,
@@ -375,12 +378,18 @@ pub(crate) fn apply_stream_cmd(
             } else {
                 ConnectionHeader::Close
             };
+            let mut now = [0u8; HTTP_DATE_BYTES];
+            let now_len = now_http_date(&mut now);
+            let date = [Field {
+                name: b"Date",
+                value: &now[..now_len],
+            }];
             let response = ResponseToWrite {
                 request_method: &method[..usize::from(method_len)],
                 requested_upgrade: b"",
                 status,
                 reason: &reason,
-                fields: &[],
+                fields: &date,
                 framing: ResponseFraming::Chunked,
                 content_length: 0,
                 connection,

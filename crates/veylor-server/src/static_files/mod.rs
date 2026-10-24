@@ -152,6 +152,11 @@ impl FilePlan {
             &mut out[len..],
         )
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -4,13 +4,14 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use veylor_http1::{
-    ConnectionHeader, RequestHead, ResponseFraming, ResponseToWrite,
+    ConnectionHeader, Field, RequestHead, ResponseFraming, ResponseToWrite,
     connection_header_for_response, encode_response_head,
 };
 
 use crate::host::HOST_MAX_REASON_BYTES;
+use crate::static_files::HTTP_DATE_BYTES;
 
-use super::{EncodedStaticResponse, encode_continue, reject_payload};
+use super::{EncodedStaticResponse, encode_continue, now_http_date, reject_payload};
 use super::{
     IN_NATIVE, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
     NativeResponseOut, RouteBuildError, valid_reason,
@@ -83,12 +84,18 @@ pub(super) fn respond_native(
         true,
         response_close,
     );
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
     let response = ResponseToWrite {
         request_method: method,
         requested_upgrade: b"",
         status,
         reason,
-        fields: &[],
+        fields: &date,
         framing: ResponseFraming::FixedLength,
         content_length: body.len() as u64,
         connection,

@@ -395,6 +395,15 @@ pub(crate) fn route_cap(body: RouteBodyPolicy<'_>) -> u64 {
     }
 }
 
+// NOTE: one response-instant read per H1 assembly: SystemTime::now truncated to seconds like
+// mtime, formatted as 29-byte IMF-fixdate into caller stack scratch; no allocs, one vDSO call.
+// NOTE: host-dispatched (managed) responses assemble on the host-owned path, not here — Date
+// there is a recorded follow-up, not this slice.
+pub(crate) fn now_http_date(out: &mut [u8; crate::static_files::HTTP_DATE_BYTES]) -> usize {
+    let instant = crate::static_files::system_time_secs(Some(std::time::SystemTime::now()));
+    crate::static_files::write_http_date(instant, out)
+}
+
 pub(crate) fn valid_reason(reason: &[u8]) -> bool {
     !reason.is_empty()
         && !reason.iter().any(|byte| {

@@ -2269,3 +2269,82 @@ fn native_user_data_passes_through_verbatim() {
     let counts = server.join().expect("join server");
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
+
+fn date_shape(response: &ClientResponse) -> String {
+    let seen = header(response, "date").to_string();
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    let count = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("date"))
+        .count();
+    assert_eq!(count, 1, "exactly one Date");
+    seen
+}
+
+#[test]
+fn h1_date_present_and_shaped_across_static_paths() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    date_shape(&first);
+    get(&mut stream, "/hello");
+    let reuse = read_response(&mut stream);
+    assert_eq!(reuse.status, 200);
+    assert_eq!(reuse.body, b"hello");
+    date_shape(&reuse);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+
+    let missing = test_server();
+    let mut stream = connect(&missing);
+    get(&mut stream, "/missing");
+    let not_found = read_response(&mut stream);
+    assert_eq!(not_found.status, 404);
+    assert_eq!(not_found.body, b"Not Found");
+    date_shape(&not_found);
+    read_eof(&mut stream);
+    missing.stop_accepting();
+    let _ = missing.join().expect("join server");
+
+    let rejected = test_server();
+    let mut stream = connect(&rejected);
+    let head = format!(
+        "POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        MAX_STATIC_BODY_BYTES + 1024
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    let too_large = read_response(&mut stream);
+    assert_eq!(too_large.status, 413);
+    assert_eq!(too_large.body, b"Payload Too Large");
+    date_shape(&too_large);
+    read_closed(&mut stream);
+    rejected.stop_accepting();
+    let _ = rejected.join().expect("join server");
+
+    let (files, _fixture) = file_server();
+    let mut stream = connect(&files);
+    get(&mut stream, "/assets/hello.txt");
+    let file = read_response(&mut stream);
+    assert_eq!(file.status, 200);
+    assert_eq!(file.body, b"hello file");
+    date_shape(&file);
+    files.stop_accepting();
+    let _ = files.join().expect("join server");
+
+    let native = native_server();
+    let mut stream = connect(&native);
+    get(&mut stream, "/fixed");
+    let served = read_response(&mut stream);
+    assert_eq!(served.status, 200);
+    assert_eq!(served.body, b"native-hello");
+    date_shape(&served);
+    native.stop_accepting();
+    let _ = native.join().expect("join server");
+}

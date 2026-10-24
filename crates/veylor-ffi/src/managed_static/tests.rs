@@ -598,6 +598,38 @@ unsafe fn wait_stream_writable(server: *mut VylManagedStaticServer, token: VylMa
     panic!("stream never armed writable");
 }
 
+fn split_head(raw: &[u8]) -> (&[u8], &[u8]) {
+    let end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("head terminator")
+        + 4;
+    raw.split_at(end)
+}
+
+fn head_with_date(head: &[u8], status_line: &[u8], rest: &[u8]) {
+    let mut prefix = Vec::from(status_line);
+    prefix.extend_from_slice(b"\r\nDate: ");
+    let after = head
+        .strip_prefix(prefix.as_slice())
+        .expect("status plus Date first");
+    let value = after.get(..29).expect("29-byte IMF-fixdate");
+    let seen = std::str::from_utf8(value).expect("date utf8");
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    assert_eq!(&after[29..], rest, "framing exact past Date");
+    let text = std::str::from_utf8(head).expect("head utf8");
+    let count = text
+        .lines()
+        .filter(|line| {
+            line.get(..5)
+                .is_some_and(|name| name.eq_ignore_ascii_case("date:"))
+        })
+        .count();
+    assert_eq!(count, 1, "exactly one Date: {text}");
+}
+
 fn read_streamed(stream: &mut TcpStream) -> (u16, Vec<u8>, Vec<u8>) {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
@@ -742,10 +774,13 @@ fn stream_begin_writes_end_exact_framing() {
     let (status, raw, body) = read_streamed(&mut stream);
     assert_eq!(status, 200);
     assert_eq!(body, b"hello world");
-    assert_eq!(
-        raw,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"
+    let (head, tail) = split_head(&raw);
+    head_with_date(
+        head,
+        b"HTTP/1.1 200 OK",
+        b"\r\nTransfer-Encoding: chunked\r\n\r\n",
     );
+    assert_eq!(tail, b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n");
     assert_eq!(
         unsafe { vyl_managed_static_host_end_stream(server, token) },
         VylResult::Gone,
@@ -2276,9 +2311,15 @@ fn stream_end_with_trailers_exact_framing_and_reuse() {
     assert_eq!(status, 200);
     assert_eq!(body, b"hello world");
     assert_eq!(terminal, b"x-checksum: abc\r\nx-tag: v1\r\n");
+    let (head, tail) = split_head(&raw);
+    head_with_date(
+        head,
+        b"HTTP/1.1 200 OK",
+        b"\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
     assert_eq!(
-        raw,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\nx-checksum: abc\r\nx-tag: v1\r\n\r\n"
+        tail,
+        b"6\r\nhello \r\n5\r\nworld\r\n0\r\nx-checksum: abc\r\nx-tag: v1\r\n\r\n"
     );
     assert_eq!(
         unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"late")) },
@@ -4157,10 +4198,13 @@ fn dispatch_writable_event_per_release_with_zero_fields() {
     let (status, raw, body) = read_streamed(&mut stream);
     assert_eq!(status, 200);
     assert_eq!(body, b"hello world");
-    assert_eq!(
-        raw,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"
+    let (head, tail) = split_head(&raw);
+    head_with_date(
+        head,
+        b"HTTP/1.1 200 OK",
+        b"\r\nTransfer-Encoding: chunked\r\n\r\n",
     );
+    assert_eq!(tail, b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n");
     let counts = unsafe { stop_join(server) };
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);

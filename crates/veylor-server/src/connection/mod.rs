@@ -110,8 +110,9 @@ pub struct FdCache {
 
 #[cfg(target_os = "linux")]
 impl FdCache {
-    // NOTE: TOCTOU honesty: plan-time validation stays the boundary; stat/open races can swap
-    // the leaf, so this is freshness-only. Mismatch closes + reopens; shrink fails closed below.
+    // NOTE: TOCTOU honesty: plan-time validation stays the boundary; the fresh fd's dev+ino must match the plan's
+    // resolve-time pair, so a stat/open swap fails closed (drop + error) instead of serving unapproved bytes. Hit path
+    // serves the held fd on path-stat match alone; same-inode mutation keeps the clamp/short-read rules below.
     pub fn opens(&self) -> u64 {
         self.opens
     }
@@ -122,6 +123,12 @@ impl FdCache {
         if !hit {
             let file = std::fs::File::open(&plan.fs_path)?;
             let fresh = file.metadata()?;
+            if file_key(&fresh) != plan.identity() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "file replaced underfoot",
+                ));
+            }
             (self.dev, self.ino) = file_key(&fresh);
             self.size = fresh.len();
             self.mtime = fresh.modified().ok();

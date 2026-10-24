@@ -12,7 +12,10 @@ use crate::static_files::{
 };
 
 use super::native::respond_native;
-use super::{MAX_STATIC_BODY_BYTES, RouteBuildError, StaticRoutes, in_native_handler, route_cap};
+use super::{
+    MAX_STATIC_BODY_BYTES, RouteBuildError, StaticRoutes, in_native_handler, now_http_date,
+    route_cap,
+};
 
 const CAPTURE_SLOTS: usize = 8;
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
@@ -123,12 +126,20 @@ pub fn respond_to_head(
         true,
         response_close,
     );
+    // NOTE: Date rides first on every H1 assembly below (static/file/native/reject), one
+    // response-instant read per response; 1xx interims carry no Date by RFC 9110 10.2.1.
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
     let response = ResponseToWrite {
         request_method: method,
         requested_upgrade: b"",
         status,
         reason,
-        fields: &[],
+        fields: &date,
         framing: ResponseFraming::FixedLength,
         content_length: body.len() as u64,
         connection,
@@ -250,6 +261,8 @@ fn respond_file(
     let mut value = [0u8; MULTIPART_CTYPE_BYTES];
     let mut date = [0u8; HTTP_DATE_BYTES];
     let date_len = write_http_date(plan.mtime, &mut date);
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
     let range_len = if plan.partial && !multipart {
         write_content_range(
             &mut value,
@@ -270,25 +283,29 @@ fn respond_file(
         plan.content_type.as_bytes()
     };
     let mut fields = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }; 5];
+    fields[1] = Field {
         name: b"Content-Type",
         value: ctype_value,
-    }; 4];
-    fields[1] = Field {
+    };
+    fields[2] = Field {
         name: b"Accept-Ranges",
         value: b"bytes",
     };
-    fields[2] = Field {
+    fields[3] = Field {
         name: b"Last-Modified",
         value: &date[..date_len],
     };
     let field_len = if plan.partial && !multipart {
-        fields[3] = Field {
+        fields[4] = Field {
             name: b"Content-Range",
             value: &value[..range_len],
         };
-        4
+        5
     } else {
-        3
+        4
     };
     let response = ResponseToWrite {
         request_method: method,
@@ -359,10 +376,18 @@ fn respond_not_modified(
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
     let mut date = [0u8; HTTP_DATE_BYTES];
     let date_len = write_http_date(plan.mtime, &mut date);
-    let fields = [Field {
-        name: b"Last-Modified",
-        value: &date[..date_len],
-    }];
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let fields = [
+        Field {
+            name: b"Date",
+            value: &now[..now_len],
+        },
+        Field {
+            name: b"Last-Modified",
+            value: &date[..date_len],
+        },
+    ];
     let connection =
         connection_header_for_response(head, input, 304, ResponseFraming::FixedLength, true, false);
     let response = ResponseToWrite {
@@ -400,10 +425,18 @@ fn respond_range_unsatisfiable(
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
     let mut value = [0u8; CONTENT_RANGE_BYTES];
     let value_len = write_content_range(&mut value, None, plan.total);
-    let fields = [Field {
-        name: b"Content-Range",
-        value: &value[..value_len],
-    }];
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let fields = [
+        Field {
+            name: b"Date",
+            value: &now[..now_len],
+        },
+        Field {
+            name: b"Content-Range",
+            value: &value[..value_len],
+        },
+    ];
     let connection =
         connection_header_for_response(head, input, 416, ResponseFraming::FixedLength, true, true);
     let response = ResponseToWrite {
@@ -516,12 +549,18 @@ pub fn respond_payload_too_large(
     output: &mut [u8],
     method: &[u8],
 ) -> Result<usize, RouteBuildError> {
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
     let response = ResponseToWrite {
         request_method: method,
         requested_upgrade: b"",
         status: 413,
         reason: b"Payload Too Large",
-        fields: &[],
+        fields: &date,
         framing: ResponseFraming::FixedLength,
         content_length: PAYLOAD_TOO_LARGE_BODY.len() as u64,
         connection: ConnectionHeader::Close,
@@ -540,12 +579,18 @@ pub fn respond_payload_too_large(
 }
 
 pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
     let response = ResponseToWrite {
         request_method: b"GET",
         requested_upgrade: b"",
         status: 417,
         reason: b"Expectation Failed",
-        fields: &[],
+        fields: &date,
         framing: ResponseFraming::FixedLength,
         content_length: EXPECTATION_FAILED_BODY.len() as u64,
         connection: ConnectionHeader::Close,
@@ -564,12 +609,18 @@ pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuild
 }
 
 pub fn respond_bad_request(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
     let response = ResponseToWrite {
         request_method: b"GET",
         requested_upgrade: b"",
         status: 400,
         reason: b"Bad Request",
-        fields: &[],
+        fields: &date,
         framing: ResponseFraming::FixedLength,
         content_length: BAD_REQUEST_BODY.len() as u64,
         connection: ConnectionHeader::Close,

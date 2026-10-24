@@ -76,6 +76,7 @@ fn get(stream: &mut TcpStream, path: &str) {
 
 struct ClientResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -100,6 +101,7 @@ fn read_response(stream: &mut TcpStream) -> ClientResponse {
         .parse()
         .expect("status int");
     let mut content_length = 0;
+    let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
@@ -108,10 +110,15 @@ fn read_response(stream: &mut TcpStream) -> ClientResponse {
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value.trim().parse().expect("content length int");
         }
+        headers.push((name.to_string(), value.trim().to_string()));
     }
     let mut body = vec![0; content_length];
     stream.read_exact(&mut body).expect("read body");
-    ClientResponse { status, body }
+    ClientResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 fn read_head(stream: &mut TcpStream) -> (u16, usize) {
@@ -159,6 +166,63 @@ fn expect_eof(stream: &mut TcpStream) {
         Ok(0) => {}
         other => panic!("expected EOF, got {other:?}"),
     }
+}
+
+fn header<'a>(response: &'a ClientResponse, name: &str) -> &'a str {
+    response
+        .headers
+        .iter()
+        .find(|(field, _)| field.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .expect("header present")
+}
+
+fn date_shape(response: &ClientResponse) -> String {
+    let seen = header(response, "date").to_string();
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    let count = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("date"))
+        .count();
+    assert_eq!(count, 1, "exactly one Date");
+    assert!(
+        response
+            .headers
+            .first()
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("date")),
+        "Date rides first"
+    );
+    seen
+}
+
+fn stream_head_exact(head: &[u8], status_line: &str) -> String {
+    let prefix = format!("{status_line}\r\nDate: ");
+    let rest = head
+        .strip_prefix(prefix.as_bytes())
+        .expect("status plus Date first");
+    let value = rest.get(..29).expect("29-byte IMF-fixdate");
+    let seen = std::str::from_utf8(value).expect("date utf8").to_string();
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    assert_eq!(
+        &rest[29..],
+        b"\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "framing exact past Date"
+    );
+    let text = std::str::from_utf8(head).expect("head utf8");
+    let count = text
+        .lines()
+        .filter(|line| {
+            line.get(..5)
+                .is_some_and(|name| name.eq_ignore_ascii_case("date:"))
+        })
+        .count();
+    assert_eq!(count, 1, "exactly one Date: {text}");
+    seen
 }
 
 fn spin_until(mut ready: impl FnMut() -> bool) -> bool {
@@ -272,6 +336,48 @@ fn managed_park_poll_respond_keep_alive_reusable() {
     let counts = server.join().expect("join server");
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(counts.completed, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn managed_date_present_and_shaped_one_shot_stream_and_reuse() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"done");
+    date_shape(&first);
+    get(&mut stream, "/work");
+    let (missing, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(missing.token, 404, b"Not Found", b"nope"),
+        RespondOutcome::Ok
+    );
+    let not_found = read_response(&mut stream);
+    assert_eq!(not_found.status, 404);
+    assert_eq!(not_found.body, b"nope");
+    date_shape(&not_found);
+    get(&mut stream, "/work");
+    let (begun, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream(begun.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, begun.token);
+    assert_eq!(host.end_stream(begun.token), RespondOutcome::Ok);
+    let head = read_raw_head(&mut stream);
+    stream_head_exact(&head, "HTTP/1.1 200 OK");
+    let mut terminal = [0; 5];
+    stream.read_exact(&mut terminal).expect("terminal");
+    assert_eq!(&terminal, b"0\r\n\r\n", "bare end carries no trailer block");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
 }
 
 #[test]
@@ -1150,10 +1256,13 @@ fn managed_stream_begin_writes_end_exact_and_reuses() {
     let (status, raw, body) = read_chunked(&mut stream);
     assert_eq!(status, 200);
     assert_eq!(body, b"hello world");
-    assert_eq!(
-        raw,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"
-    );
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head end")
+        + 4;
+    stream_head_exact(&raw[..split], "HTTP/1.1 200 OK");
+    assert_eq!(&raw[split..], b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n");
     assert_eq!(
         host.end_stream(event.token),
         RespondOutcome::Gone,
@@ -1398,10 +1507,7 @@ fn managed_stream_end_with_trailers_exact_and_reuses() {
         RespondOutcome::Ok
     );
     let head = read_raw_head(&mut stream);
-    assert_eq!(
-        head,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-    );
+    stream_head_exact(&head, "HTTP/1.1 200 OK");
     assert_eq!(read_chunk_frame(&mut stream), Some(b"foo".to_vec()));
     let mut size = [0; 3];
     stream.read_exact(&mut size).expect("terminal size");
@@ -1509,8 +1615,15 @@ fn managed_stream_end_with_trailers_invalid_stages_nothing() {
     let (status, raw, body) = read_chunked(&mut stream);
     assert_eq!(status, 200);
     assert_eq!(body, b"recovered");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head end")
+        + 4;
+    stream_head_exact(&raw[..split], "HTTP/1.1 200 OK");
     assert_eq!(
-        raw, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nrecovered\r\n0\r\n\r\n",
+        &raw[split..],
+        b"9\r\nrecovered\r\n0\r\n\r\n",
         "bare end unchanged after rejected trailers"
     );
     server.stop_accepting();
@@ -1557,10 +1670,7 @@ fn managed_stream_write_after_trailers_fails_closed() {
         assert!(spins < 1_000_000, "staged terminal never applied");
     }
     let head = read_raw_head(&mut stream);
-    assert_eq!(
-        head,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-    );
+    stream_head_exact(&head, "HTTP/1.1 200 OK");
     assert_eq!(read_chunk_frame(&mut stream), Some(b"a".to_vec()));
     let mut size = [0; 3];
     stream.read_exact(&mut size).expect("terminal size");
@@ -1598,10 +1708,7 @@ fn managed_stream_end_then_trailers_fails_closed() {
         assert!(spins < 1_000_000, "staged end never applied");
     }
     let head = read_raw_head(&mut stream);
-    assert_eq!(
-        head,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-    );
+    stream_head_exact(&head, "HTTP/1.1 200 OK");
     let mut terminal = [0; 5];
     stream.read_exact(&mut terminal).expect("terminal");
     assert_eq!(&terminal, b"0\r\n\r\n", "bare end carries no trailer block");
@@ -1936,10 +2043,13 @@ fn managed_stream_writable_event_signals_each_release() {
     let (status, raw, body) = read_chunked(&mut stream);
     assert_eq!(status, 200);
     assert_eq!(body, b"hello world");
-    assert_eq!(
-        raw,
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"
-    );
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head end")
+        + 4;
+    stream_head_exact(&raw[..split], "HTTP/1.1 200 OK");
+    assert_eq!(&raw[split..], b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n");
     server.stop_accepting();
     let _ = server.join().expect("join server");
 }

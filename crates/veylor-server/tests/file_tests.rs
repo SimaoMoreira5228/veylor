@@ -556,6 +556,33 @@ fn fd_cache_revalidates_replaced_file_between_transfers() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn fd_cache_swapped_leaf_between_resolve_and_open_fails_closed() {
+    let fixture = Fixture::build();
+    let mounts = fixture.mounts();
+    let victim = fixture.root.join("victim_cache.txt");
+    fs::write(&victim, b"victim-bytes-1234").expect("victim");
+    let plan = mounts
+        .resolve(b"GET", b"/assets/victim_cache.txt")
+        .expect("victim plan");
+    fs::remove_file(&victim).expect("remove victim");
+    fs::write(&victim, b"strang-bytes-1234").expect("stranger");
+    assert_eq!(
+        fs::metadata(&victim).expect("stranger stat").len(),
+        plan.size,
+        "same size pins the identity check, not the length"
+    );
+    let mut cache = FdCache::default();
+    // NOTE: deterministic TOCTOU stage: resolve, swap on disk, then cache on the stale plan.
+    let error = cache.cached(&plan).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(cache.opens(), 0, "stranger never caches");
+    let error = cache.cached(&plan).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(cache.opens(), 0, "retry still fails closed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn fd_cache_churn_across_more_files_than_entries_stays_exact() {
     let fixture = Fixture::build();
     let mounts = fixture.mounts();

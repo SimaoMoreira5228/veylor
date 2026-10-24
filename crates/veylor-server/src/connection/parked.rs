@@ -1,5 +1,5 @@
 use veylor_http1::{
-    BodyDecoder, BodyLimits, ConnectionHeader, Header, ResponseBody, ResponseFraming,
+    BodyDecoder, BodyLimits, ConnectionHeader, Field, Header, ResponseBody, ResponseFraming,
     ResponseToWrite, connection_header_for_response, encode_response_head,
 };
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
@@ -8,7 +8,8 @@ use crate::host::{
     HOST_MAX_METHOD_BYTES, HostInner, HostShared, ParkError, ParkedEntry, RespondOutcome,
     TombCause, find_tomb,
 };
-use crate::static_routes::{encode_continue, respond_payload_too_large};
+use crate::static_files::HTTP_DATE_BYTES;
+use crate::static_routes::{encode_continue, now_http_date, respond_payload_too_large};
 
 use super::streams::{apply_stream_cmd, decode_chunked, take_stream_cmd};
 use super::{
@@ -52,12 +53,19 @@ impl ConnState {
         } else {
             ConnectionHeader::Close
         };
+        // NOTE: H2 managed Date is the recorded follow-up (h2/serve.rs Begin/send_full), not this slice.
+        let mut now = [0u8; HTTP_DATE_BYTES];
+        let now_len = now_http_date(&mut now);
+        let date = [Field {
+            name: b"Date",
+            value: &now[..now_len],
+        }];
         let response = ResponseToWrite {
             request_method,
             requested_upgrade: b"",
             status,
             reason,
-            fields: &[],
+            fields: &date,
             framing: ResponseFraming::FixedLength,
             content_length: body.len() as u64,
             connection,
