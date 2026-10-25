@@ -15,11 +15,15 @@ use crate::static_files::read_chunk;
 use crate::static_routes::{
     EncodedStaticResponse, RouteBuildError, StaticRoutes, respond_bad_request,
     respond_expectation_failed, respond_request_header_fields_too_large, respond_to_head,
+    respond_uri_too_long,
 };
 
 pub const INPUT_CAP: usize = 8192;
 pub const OUTPUT_CAP: usize = 8192;
 pub const HEADER_SLOTS: usize = 100;
+// NOTE: minimal request-line frame around a target (1-byte method + 2 spaces + 8-byte version);
+// a target side longer than the line limit behind this frame is target-caused (RFC 9110 15.5.15).
+const MIN_REQUEST_LINE_FRAME: usize = 11;
 pub const FD_CACHE_ENTRIES: usize = 1;
 // NOTE: single-entry fd cache (Linux); one handle per conn bounds fds, replace evicts.
 
@@ -543,11 +547,21 @@ fn parse_exchange(
             send_request_header_fields_too_large(conn);
             ExchangeOutcome::Responded
         }
-        // NOTE: RequestLineTooLarge stays 400 here: RFC 9110 15.5.15 scopes 414 to a long
-        // target URI specifically, and the variant fires on any request-line overflow
-        // (method/target/version undifferentiated). A target-length-specific parser error
-        // would unlock a precise 414 mapping; until then the undifferentiated line stays 400.
-        Ok(None) | Err(_) => {
+        // NOTE: RFC 9110 15.5.15 scopes 414 to a long target URI specifically, so an over-long
+        // request line attributes by component lengths below: target-side overflow answers 414 with
+        // Date and close exactly like 400/431, while method/version overflows stay 400. The parser
+        // keeps its undifferentiated RequestLineTooLarge (a new variant would break three exhaustive
+        // ParseError matches outside this slice), and a full input buffer surfaces as NeedMore, so
+        // this arm attributes the buffered line itself; the hot scan is unaffected (error path only).
+        Ok(None) | Err(ParseError::RequestLineTooLarge) => {
+            if request_target_too_long(conn) {
+                send_uri_too_long(conn);
+            } else {
+                send_bad_request(conn);
+            }
+            ExchangeOutcome::Responded
+        }
+        Err(_) => {
             send_bad_request(conn);
             ExchangeOutcome::Responded
         }
@@ -761,6 +775,45 @@ fn send_request_header_fields_too_large(conn: &mut ConnState) {
     ConnState::materialize_output(&mut conn.output);
     let staged = match conn.output.as_mut() {
         Some(output) => respond_request_header_fields_too_large(&mut output[..]).ok(),
+        None => None,
+    };
+    finish_simple(conn, ConnClose::ProtocolError, staged);
+}
+
+// NOTE: RFC 9110 15.5.15 blames only the target URI: with no newline the buffer is still on the
+// request line, so a missing or leading space reads as method overflow (400) while a target side
+// longer than the line limit behind the minimal frame reads as 414; a second space pins a short
+// target, so version-side overflow stays 400.
+fn request_target_too_long(conn: &ConnState) -> bool {
+    let Some(input) = conn.input.as_ref() else {
+        return false;
+    };
+    let buffered = &input[..conn.len];
+    if buffered.contains(&b'\n') {
+        return false;
+    }
+    let Some(method_end) = buffered.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    if method_end == 0 {
+        return false;
+    }
+    let target_start = method_end + 1;
+    if target_start >= buffered.len() {
+        return false;
+    }
+    let rest = &buffered[target_start..];
+    let target_len = rest
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(rest.len());
+    target_len + MIN_REQUEST_LINE_FRAME > Limits::default().request_line_bytes
+}
+
+fn send_uri_too_long(conn: &mut ConnState) {
+    ConnState::materialize_output(&mut conn.output);
+    let staged = match conn.output.as_mut() {
+        Some(output) => respond_uri_too_long(&mut output[..]).ok(),
         None => None,
     };
     finish_simple(conn, ConnClose::ProtocolError, staged);

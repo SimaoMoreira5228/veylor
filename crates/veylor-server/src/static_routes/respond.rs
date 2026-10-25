@@ -30,6 +30,7 @@ const MULTIPART_CTYPE_BYTES: usize = 128;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"Method Not Allowed";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
+const URI_TOO_LONG_BODY: &[u8] = b"URI Too Long";
 const REQUEST_HEADER_FIELDS_TOO_LARGE_BODY: &[u8] = b"Request Header Fields Too Large";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
 const EXPECTATION_FAILED_BODY: &[u8] = b"Expectation Failed";
@@ -800,5 +801,34 @@ pub fn respond_request_header_fields_too_large(
         .get_mut(encoded.length..end)
         .ok_or(RouteBuildError::Invalid)?
         .copy_from_slice(REQUEST_HEADER_FIELDS_TOO_LARGE_BODY);
+    Ok(end)
+}
+
+// NOTE: RFC 9110 15.5.15 scopes 414 to a long target URI specifically; Date-first with close
+// mirrors the 431 sibling exactly (same error family, no keep-alive), method/version overflows
+// stay on the 400 responder above.
+pub fn respond_uri_too_long(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
+    let response = ResponseToWrite {
+        request_method: b"GET",
+        requested_upgrade: b"",
+        status: 414,
+        reason: b"URI Too Long",
+        fields: &date,
+        framing: ResponseFraming::FixedLength,
+        content_length: URI_TOO_LONG_BODY.len() as u64,
+        connection: ConnectionHeader::Close,
+    };
+    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let end = encoded.length + URI_TOO_LONG_BODY.len();
+    output
+        .get_mut(encoded.length..end)
+        .ok_or(RouteBuildError::Invalid)?
+        .copy_from_slice(URI_TOO_LONG_BODY);
     Ok(end)
 }

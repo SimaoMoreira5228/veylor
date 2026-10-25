@@ -686,6 +686,80 @@ int main(void) {
         ) == VYL_HTTP1_GONE
     );
 
+    {
+        static const char mismatch_request[] =
+            "GET /u HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n";
+        int mfd = connect_loopback(port);
+        const struct timeval mismatch_timeout = {.tv_sec = 5, .tv_usec = 0};
+        assert(setsockopt(mfd, SOL_SOCKET, SO_RCVTIMEO, &mismatch_timeout, sizeof(mismatch_timeout)) == 0);
+        h2_send_all(mfd, (const uint8_t*)mismatch_request, sizeof(mismatch_request) - 1);
+        read_to_end(mfd, response, sizeof(response));
+        assert(close(mfd) == 0);
+        assert(strstr(response, "HTTP/1.1 405 Method Not Allowed\r\n") != NULL);
+        assert(strstr(response, "Connection: close\r\n") != NULL);
+        assert_h1_date_shape(response);
+        {
+            const char* head_end = strstr(response, "\r\n\r\n");
+            assert(head_end != NULL);
+            size_t allow_lines = 0;
+            const char* line = response;
+            for (;;) {
+                const char* next = strstr(line, "\r\n");
+                assert(next != NULL);
+                size_t len = (size_t)(next - line);
+                if (len >= 6 && memcmp(line, "Allow:", 6) == 0) {
+                    allow_lines++;
+                    assert(len == sizeof("Allow: POST") - 1);
+                    assert(memcmp(line, "Allow: POST", sizeof("Allow: POST") - 1) == 0);
+                }
+                if (next >= head_end) {
+                    break;
+                }
+                line = next + 2;
+            }
+            assert(allow_lines == 1);
+            assert(strcmp(head_end + 4, "Method Not Allowed") == 0);
+        }
+        assert(
+            vyl_managed_static_poll_events(
+                server, 0, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            ) == VYL_HTTP1_OK
+        );
+        assert(report.copied == 0);
+    }
+
+    {
+        static char oversized[5120] = {0};
+        int ofd = connect_loopback(port);
+        const struct timeval oversized_timeout = {.tv_sec = 5, .tv_usec = 0};
+        assert(setsockopt(ofd, SOL_SOCKET, SO_RCVTIMEO, &oversized_timeout, sizeof(oversized_timeout)) == 0);
+        size_t used = (size_t)snprintf(oversized, sizeof(oversized), "GET /hello HTTP/1.1\r\nHost: test\r\n");
+        assert(used > 0 && used < sizeof(oversized));
+        for (int i = 0; i < 120; i++) {
+            int n = snprintf(
+                oversized + used, sizeof(oversized) - used, "X-Pad-%03d: abcdefgh\r\n", i
+            );
+            assert(n > 0 && used + (size_t)n < sizeof(oversized));
+            used += (size_t)n;
+        }
+        {
+            int n = snprintf(oversized + used, sizeof(oversized) - used, "\r\n");
+            assert(n > 0 && used + (size_t)n < sizeof(oversized));
+            used += (size_t)n;
+        }
+        h2_send_all(ofd, (const uint8_t*)oversized, used);
+        read_to_end(ofd, response, sizeof(response));
+        assert(close(ofd) == 0);
+        assert(strstr(response, "HTTP/1.1 431") != NULL);
+        assert(strstr(response, "Connection: close\r\n") != NULL);
+        assert_h1_date_shape(response);
+        {
+            const char* split = strstr(response, "\r\n\r\n");
+            assert(split != NULL);
+            assert(strcmp(split + 4, "Request Header Fields Too Large") == 0);
+        }
+    }
+
     /* NOTE: H2C managed-body flow through the h2c_addr port: handshake, HEADERS-open POST,
        DATA end, BODY_AVAILABLE with ready bytes plus the end flag, exact pull_body, then
        exact response bytes classified through the client handle. Grant frames interleave
@@ -1650,12 +1724,13 @@ int main(void) {
 
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 5);
+    assert(counts.completed == 6);
     assert(counts.peer_closed == 1);
+    assert(counts.protocol_error == 1);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 6
+            counts.shutdown == 8
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

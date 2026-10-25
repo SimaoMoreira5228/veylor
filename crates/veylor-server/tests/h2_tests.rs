@@ -1972,6 +1972,294 @@ fn h2_managed_short_body_reset_stream_survives() {
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
 
+// NOTE: adversarial flow-control wire pins (RFC 9113 Phase 5 exit): every violation below
+// drives raw frames at a live server and asserts the exact wire outcome plus the fail-closed
+// tail (a clean sibling 200 on a surviving connection, or GOAWAY plus EOF where the RFC
+// mandates connection teardown). No partial state may linger: the follow-up proves it.
+
+// NOTE: RFC 9113 section 6.9 receiver MAY (stream FLOW_CONTROL_ERROR when unable to accept)
+// plus section 8.1.1 (length mismatch is stream-only): DATA past the admitted body window
+// RSTs only its stream and the sibling serves cleanly on the surviving connection.
+#[test]
+fn h2_adversarial_data_over_body_resets_flow_control() {
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers_len(&mut stream, 1, b"POST", b"/upload", Some(4), false);
+    write_frame(
+        &mut stream,
+        FrameType::Data,
+        DATA_FLAG_END_STREAM,
+        1,
+        b"12345678",
+    );
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::FlowControlError);
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+// NOTE: RFC 9113 section 6.9 connection accounting (every flow-controlled octet counts even
+// in error) with section 5.4.1 teardown: two max-body uploads total 65536 octets against the
+// 65535-octet connection window, so the second upload trips a connection FLOW_CONTROL_ERROR.
+#[test]
+fn h2_adversarial_conn_window_exceeded_goes_away() {
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    let first: Vec<u8> = (0..H2_BODY_CAP as u32)
+        .map(|value| (value % 251) as u8)
+        .collect();
+    post_upload(&mut stream, 1, &first);
+    let second: Vec<u8> = (0..H2_BODY_CAP as u32)
+        .map(|value| (value * 3 % 251) as u8)
+        .collect();
+    post_upload(&mut stream, 3, &second);
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::FlowControlError);
+    assert_eq!(last, 3);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 6.9.1 (stream window past 2^31-1 RSTs FLOW_CONTROL_ERROR): the parked
+// upload holds stream 1 open with a 65535-octet send window, so one maximal increment trips
+// only that stream while the sibling serves on the surviving connection.
+#[test]
+fn h2_adversarial_window_update_overflow_stream_resets() {
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers_len(&mut stream, 1, b"POST", b"/upload", Some(4), false);
+    write_frame(
+        &mut stream,
+        FrameType::WindowUpdate,
+        0,
+        1,
+        &[0x7F, 0xFF, 0xFF, 0xFF],
+    );
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::FlowControlError);
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+// NOTE: RFC 9113 section 6.9.1 (connection window past 2^31-1 GOAWAYs FLOW_CONTROL_ERROR):
+// one maximal increment on stream 0 tears the connection down with no half-served state.
+#[test]
+fn h2_adversarial_window_update_overflow_conn_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(
+        &mut stream,
+        FrameType::WindowUpdate,
+        0,
+        0,
+        &[0x7F, 0xFF, 0xFF, 0xFF],
+    );
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::FlowControlError);
+    assert_eq!(last, 0);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 5.1 idle (any frame but HEADERS/PRIORITY is a PROTOCOL_ERROR
+// connection error): WINDOW_UPDATE on never-opened stream 9 GOAWAYs with last 0, proving no
+// stream was half-created by the violation.
+#[test]
+fn h2_adversarial_window_update_idle_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(&mut stream, FrameType::WindowUpdate, 0, 9, &[0, 0, 0, 100]);
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    assert_eq!(last, 0);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 6.9 (WINDOW_UPDATE on closed MUST NOT be an error): the grant for
+// the answered stream is silently absorbed, the sibling serves, and graceful shutdown still
+// reports NoError with the right last-stream id.
+#[test]
+fn h2_adversarial_window_update_closed_ignored() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/hello", true);
+    let first = read_response(&mut stream, 1);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    write_frame(&mut stream, FrameType::WindowUpdate, 0, 1, &[0, 0, 0, 100]);
+    send_headers(&mut stream, 3, b"GET", b"/empty", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert!(sibling.body.is_empty());
+    server.stop_accepting();
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::NoError);
+    assert_eq!(last, 3);
+    read_eof(&mut stream);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 2);
+    assert_eq!(counts.shutdown, 1);
+}
+
+// NOTE: RFC 9113 section 4.3 (a field block the endpoint does not decompress is a
+// COMPRESSION_ERROR connection error): 12000 plus 5000 fragment octets breach the 16384
+// assembler cap before completion, so the connection dies with nothing served (last 1 names
+// the fragment-opened stream, which never reaches serving).
+#[test]
+fn h2_adversarial_oversized_header_block_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    let first = vec![0x82; 12_000];
+    write_frame(&mut stream, FrameType::Headers, 0, 1, &first);
+    let second = vec![0x84; 5_000];
+    write_frame(
+        &mut stream,
+        FrameType::Continuation,
+        CONTINUATION_FLAG_END_HEADERS,
+        1,
+        &second,
+    );
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::CompressionError);
+    assert_eq!(last, 1);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 6.10 (stray CONTINUATION is a PROTOCOL_ERROR connection error):
+// no HEADERS opened any block, so the connection dies with nothing served.
+#[test]
+fn h2_adversarial_stray_continuation_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(
+        &mut stream,
+        FrameType::Continuation,
+        CONTINUATION_FLAG_END_HEADERS,
+        1,
+        &[0x82],
+    );
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    assert_eq!(last, 0);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 sections 6.10 and 4.3 (field blocks are contiguous; any other frame or
+// stream mid-block is a PROTOCOL_ERROR connection error): stream 3 HEADERS interrupts the
+// stream 1 fragments and tears the connection down.
+#[test]
+fn h2_adversarial_continuation_out_of_order_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(&mut stream, FrameType::Headers, 0, 1, &[0x82]);
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    assert_eq!(last, 1);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 5.1.1 (client streams are odd; an unexpected id is a PROTOCOL_ERROR
+// connection error): HEADERS on server-initiated stream 2 dies with last 0, so no stream was
+// half-created by the violation.
+#[test]
+fn h2_adversarial_even_stream_id_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 2, b"GET", b"/hello", true);
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    assert_eq!(last, 0);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 6.1 (DATA on stream 0 is a PROTOCOL_ERROR connection error): the
+// connection dies before any stream exists.
+#[test]
+fn h2_adversarial_zero_stream_data_goes_away() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(&mut stream, FrameType::Data, 0, 0, b"junk");
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    assert_eq!(last, 0);
+    read_eof(&mut stream);
+    stop_join(server);
+}
+
+// NOTE: RFC 9113 section 5.1 (PRIORITY may ride any stream state, creating none): the frame
+// on idle stream 5 is a no-op, the sibling serves, and graceful shutdown stays NoError.
+#[test]
+fn h2_adversarial_priority_idle_is_noop() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(&mut stream, FrameType::Priority, 0, 5, &[0, 0, 0, 0, 16]);
+    send_headers(&mut stream, 1, b"GET", b"/hello", true);
+    let response = read_response(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hello");
+    server.stop_accepting();
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::NoError);
+    assert_eq!(last, 1);
+    read_eof(&mut stream);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 1);
+    assert_eq!(counts.shutdown, 1);
+}
+
+// NOTE: RFC 9113 section 5.1 half-closed(remote) (frames past END_STREAM answer stream error
+// STREAM_CLOSED) with section 8.1 trailer shape: the late HEADERS RSTs only its stream and
+// the sibling serves on the surviving connection.
+#[test]
+fn h2_adversarial_trailer_after_close_resets_stream_closed() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/hello", true);
+    let first = read_response(&mut stream, 1);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    send_trailers(&mut stream, 1, &[(b"x-checksum", b"yes")]);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::StreamClosed);
+    send_headers(&mut stream, 3, b"GET", b"/empty", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert!(sibling.body.is_empty());
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+}
+
 fn spin_until(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + DEADLINE;
     while !ready() {

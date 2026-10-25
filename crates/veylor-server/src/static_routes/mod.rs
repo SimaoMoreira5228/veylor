@@ -419,4 +419,5 @@ pub(crate) use respond::reject_payload;
 pub use respond::{
     EncodedStaticResponse, respond_bad_request, respond_expectation_failed,
     respond_payload_too_large, respond_request_header_fields_too_large, respond_to_head,
+    respond_uri_too_long,
 };

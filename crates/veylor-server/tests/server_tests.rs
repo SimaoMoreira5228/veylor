@@ -340,7 +340,7 @@ fn oversized_header_section_closes_with_431() {
 }
 
 #[test]
-fn oversized_request_line_stays_400() {
+fn oversized_request_target_answers_414() {
     let server = test_server();
     let mut stream = connect(&server);
     let target = format!("/{}", "a".repeat(9000));
@@ -348,6 +348,26 @@ fn oversized_request_line_stays_400() {
     stream
         .write_all(request.as_bytes())
         .expect("write long target");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 414);
+    assert_eq!(response.body, b"URI Too Long");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn oversized_request_method_stays_400() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let method = "A".repeat(9000);
+    let request = format!("{method} /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write long method");
     let response = read_response(&mut stream);
     assert_eq!(response.status, 400);
     assert_eq!(response.body, b"Bad Request");
