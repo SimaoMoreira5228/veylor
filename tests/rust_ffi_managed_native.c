@@ -178,6 +178,60 @@ static void h2_feed_client(
     assert(rc == VYL_HTTP1_OK || rc == VYL_HTTP1_NEED_MORE);
 }
 
+static void assert_h1_date_shape(const char* response) {
+    const char* eol = strstr(response, "\r\n");
+    assert(eol != NULL);
+    assert(strncmp(eol + 2, "Date: ", 6) == 0);
+    const char* value = eol + 8;
+    assert(strlen(value) >= 31);
+    assert(value[3] == ',');
+    assert(memcmp(value + 25, " GMT", 4) == 0);
+    assert(memcmp(value + 29, "\r\n", 2) == 0);
+    const char* head_end = strstr(response, "\r\n\r\n");
+    assert(head_end != NULL);
+    size_t count = 0;
+    const char* line = response;
+    for (;;) {
+        const char* next = strstr(line, "\r\n");
+        size_t len = next != NULL ? (size_t)(next - line) : strlen(line);
+        if (len >= 5 && (line[0] == 'D' || line[0] == 'd') &&
+            (line[1] == 'A' || line[1] == 'a') && (line[2] == 'T' || line[2] == 't') &&
+            (line[3] == 'E' || line[3] == 'e') && line[4] == ':') {
+            count++;
+        }
+        if (next == NULL || next >= head_end) {
+            break;
+        }
+        line = next + 2;
+    }
+    assert(count == 1);
+}
+
+static void assert_h2_date_shape(
+    const vyl_h2_field* fields,
+    size_t field_start,
+    size_t field_count,
+    const uint8_t* data
+) {
+    assert(field_count >= 2);
+    assert(fields[field_start].name_length == 7);
+    assert(memcmp(data + fields[field_start].name_offset, ":status", 7) == 0);
+    assert(fields[field_start + 1].name_length == 4);
+    assert(memcmp(data + fields[field_start + 1].name_offset, "date", 4) == 0);
+    size_t count = 0;
+    for (size_t i = field_start; i < field_start + field_count; i++) {
+        if (fields[i].name_length == 4 &&
+            memcmp(data + fields[i].name_offset, "date", 4) == 0) {
+            assert(fields[i].value_length == 29);
+            const uint8_t* value = data + fields[i].value_offset;
+            assert(value[3] == ',');
+            assert(memcmp(value + 25, " GMT", 4) == 0);
+            count++;
+        }
+    }
+    assert(count == 1);
+}
+
 int main(void) {
     static const uint8_t method[] = "GET";
     static const uint8_t path[] = "/native";
@@ -263,6 +317,7 @@ int main(void) {
     assert(close(fd) == 0);
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "native-hello") != NULL);
+    assert_h1_date_shape(response);
 
     fd = connect_loopback(port);
     assert(send(fd, echo_request, sizeof(echo_request) - 1, 0) == (ssize_t)(sizeof(echo_request) - 1));
@@ -375,6 +430,9 @@ int main(void) {
                 h2status = class.status;
                 h2content_length = class.content_length;
                 assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
                 h2_got_head = 1;
             } else if (
                 h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&

@@ -70,12 +70,16 @@ impl ConnState {
             content_length: body.len() as u64,
             connection,
         };
-        let encoded = encode_response_head(&response, &mut self.output[..])
+        ConnState::materialize_output(&mut self.output);
+        let Some(output) = self.output.as_mut() else {
+            return Err(ConnClose::TransportError);
+        };
+        let encoded = encode_response_head(&response, &mut output[..])
             .map_err(|_| ConnClose::TransportError)?;
         let mut length = encoded.length;
         if encoded.body_allowed && !body.is_empty() {
             let end = length + body.len();
-            self.output
+            output
                 .get_mut(length..end)
                 .ok_or(ConnClose::ResponseOverflow)?
                 .copy_from_slice(body);
@@ -134,12 +138,16 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
         let out_sent = conn.out_sent;
         let out_len = conn.out_len;
         let write_ready = !conn.write_blocked;
+        let Some(output) = conn.output.as_ref() else {
+            conn.out_sent = conn.out_len;
+            return PumpOutcome::Keep(progress);
+        };
         let mut batch = [IoBatch::new(
             token,
             &mut conn.stream,
             &mut [],
             false,
-            &conn.output[out_sent..out_len],
+            &output[out_sent..out_len],
             write_ready,
         )];
         dispatch(u64::MAX, &mut batch);
@@ -182,10 +190,13 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
         host.stage_writable(event_token);
     }
     let read_ready = conn.read_ready;
-    let read_scratch = if conn.len < INPUT_CAP {
-        &mut conn.input[conn.len..]
-    } else {
-        &mut [] as &mut [u8]
+    if conn.len < INPUT_CAP {
+        ConnState::materialize_input(&mut conn.input);
+    }
+    let len = conn.len;
+    let read_scratch: &mut [u8] = match conn.input.as_mut() {
+        Some(input) => &mut input[len..],
+        None => &mut [],
     };
     let mut batch = [IoBatch::new(
         token,
@@ -239,7 +250,9 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
                 return PumpOutcome::Close(ConnClose::TransportError);
             }
             if feed.consumed > 0 {
-                conn.input.copy_within(feed.consumed..conn.len, 0);
+                if let Some(input) = conn.input.as_mut() {
+                    input.copy_within(feed.consumed..conn.len, 0);
+                }
                 conn.len -= feed.consumed;
             }
             if feed.decoded > 0 {
@@ -256,8 +269,15 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
         return PumpOutcome::Keep(progress);
     }
     let take = (conn.len as u64).min(body_total.saturating_sub(body_received)) as usize;
-    if take > 0 && host.push_body(event_token, &conn.input[..take]) {
-        conn.input.copy_within(take..conn.len, 0);
+    let staged = take > 0
+        && match conn.input.as_ref() {
+            Some(input) => host.push_body(event_token, &input[..take]),
+            None => false,
+        };
+    if staged {
+        if let Some(input) = conn.input.as_mut() {
+            input.copy_within(take..conn.len, 0);
+        }
         conn.len -= take;
         if let ConnPhase::Parked { body_received, .. } = &mut conn.phase {
             *body_received += take as u64;
@@ -284,7 +304,10 @@ pub(crate) fn park_request(
         return ExchangeOutcome::Close(ConnClose::Shutdown);
     }
     let len = conn.len;
-    let input = &conn.input[..len];
+    let Some(input) = conn.input.as_ref() else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    let input = &input[..len];
     let method_len = head.method(input).map(|method| method.len()).unwrap_or(0);
     let target_len = head.target(input).map(|target| target.len()).unwrap_or(0);
     if method_len > HOST_MAX_METHOD_BYTES || method_len == 0 || target_len == 0 {
@@ -324,7 +347,7 @@ pub(crate) fn park_request(
         token,
         route_id,
         &snapshot[..method_len],
-        &conn.input[target_start..target_start + target_len],
+        &input[target_start..target_start + target_len],
         body_total,
         &[],
     ) {
@@ -339,12 +362,17 @@ pub(crate) fn park_request(
     // A chunked park also arms its worker-side incremental decoder now; buffered framing bytes
     // decode on the following parked turns, never staged raw.
     if head.expect_continue {
-        match encode_continue(&mut conn.output[..]) {
-            Ok(interim_len) => {
+        ConnState::materialize_output(&mut conn.output);
+        let interim = match conn.output.as_mut() {
+            Some(output) => encode_continue(&mut output[..]).ok(),
+            None => None,
+        };
+        match interim {
+            Some(interim_len) => {
                 conn.out_len = interim_len;
                 conn.out_sent = 0;
             }
-            Err(_) => {
+            None => {
                 host.unpark_closed(token.worker_id, token.slot);
                 return ExchangeOutcome::Close(ConnClose::ResponseOverflow);
             }
@@ -356,7 +384,11 @@ pub(crate) fn park_request(
     conn.write_blocked = false;
     conn.pending_len = 0;
     conn.trailer_allow = trailers.to_vec();
-    conn.trailer_conn = connection_value(&conn.headers[..], head, &conn.input[..len]).to_vec();
+    let Some(headers) = conn.headers.as_ref() else {
+        host.unpark_closed(token.worker_id, token.slot);
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    conn.trailer_conn = connection_value(&headers[..], head, input).to_vec();
     conn.trailer_slots = [Header::default(); TRAILER_SLOTS];
     conn.trailer_staged = 0;
     let buffered = (conn.len - conn.head_len) as u64;
@@ -371,10 +403,7 @@ pub(crate) fn park_request(
         // reason the flake hunt chased): Answered means the bytes were never staged, so count
         // them as drain-skipped here and let the normal drain publish the held response.
         // Only a genuinely unusable entry still fails closed.
-        match host.push_body_or_answered(
-            event_token,
-            &conn.input[conn.head_len..conn.head_len + take],
-        ) {
+        match host.push_body_or_answered(event_token, &input[conn.head_len..conn.head_len + take]) {
             BodyPushOutcome::Refused => {
                 host.unpark_closed(token.worker_id, token.slot);
                 return ExchangeOutcome::Close(ConnClose::TransportError);
@@ -384,7 +413,9 @@ pub(crate) fn park_request(
             }
         }
     }
-    conn.input.copy_within(conn.head_len + take..conn.len, 0);
+    if let Some(buffer) = conn.input.as_mut() {
+        buffer.copy_within(conn.head_len + take..conn.len, 0);
+    }
     conn.len -= conn.head_len + take;
     conn.head_len = 0;
     if chunked {
@@ -412,9 +443,17 @@ pub(crate) fn park_request(
 
 fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) -> ExchangeOutcome {
     let len = conn.len;
-    let method = head.method(&conn.input[..len]).unwrap_or_default();
-    match respond_payload_too_large(&mut conn.output[..], method) {
-        Ok(length) => {
+    let Some(input) = conn.input.as_ref() else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    let method = head.method(&input[..len]).unwrap_or_default();
+    ConnState::materialize_output(&mut conn.output);
+    let length = match conn.output.as_mut() {
+        Some(output) => respond_payload_too_large(&mut output[..], method).ok(),
+        None => None,
+    };
+    match length {
+        Some(length) => {
             conn.out_len = length;
             conn.out_sent = 0;
             conn.write_blocked = false;
@@ -424,7 +463,7 @@ fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) ->
             conn.phase = ConnPhase::SendingResponse;
             ExchangeOutcome::Responded
         }
-        Err(_) => ExchangeOutcome::Close(ConnClose::ResponseOverflow),
+        None => ExchangeOutcome::Close(ConnClose::ResponseOverflow),
     }
 }
 

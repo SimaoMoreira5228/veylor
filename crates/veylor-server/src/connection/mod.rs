@@ -151,8 +151,8 @@ pub struct ConnState {
     pub(crate) token: ConnectionToken,
     pub(crate) stream: TcpStream,
     pub(crate) parser: Parser,
-    pub(crate) headers: Box<[Header; HEADER_SLOTS]>,
-    pub(crate) input: Box<[u8; INPUT_CAP]>,
+    pub(crate) headers: Option<Box<[Header; HEADER_SLOTS]>>,
+    pub(crate) input: Option<Box<[u8; INPUT_CAP]>>,
     pub(crate) chunked_decoder: Option<BodyDecoder>,
     pub(crate) trailer_allow: Vec<Vec<u8>>,
     pub(crate) trailer_conn: Vec<u8>,
@@ -160,7 +160,7 @@ pub struct ConnState {
     pub(crate) trailer_staged: usize,
     pub(crate) len: usize,
     pub(crate) head_len: usize,
-    pub(crate) output: Box<[u8; OUTPUT_CAP]>,
+    pub(crate) output: Option<Box<[u8; OUTPUT_CAP]>>,
     pub(crate) out_len: usize,
     pub(crate) out_sent: usize,
     pub(crate) pending_len: usize,
@@ -181,8 +181,8 @@ impl ConnState {
             token,
             stream,
             parser: Parser::new(),
-            headers: Box::new([Header::default(); HEADER_SLOTS]),
-            input: Box::new([0; INPUT_CAP]),
+            headers: None,
+            input: None,
             chunked_decoder: None,
             trailer_allow: Vec::new(),
             trailer_conn: Vec::new(),
@@ -190,7 +190,7 @@ impl ConnState {
             trailer_staged: 0,
             len: 0,
             head_len: 0,
-            output: Box::new([0; OUTPUT_CAP]),
+            output: None,
             out_len: 0,
             out_sent: 0,
             pending_len: 0,
@@ -248,6 +248,39 @@ impl ConnState {
 
     pub fn into_stream(self) -> TcpStream {
         self.stream
+    }
+
+    // NOTE: laziness invariant: a new or fully idle conn holds no slabs; first readable
+    // activity materializes input, first parse headers, first encode output. A present slab
+    // always covers its scalar window (len/head_len/out_*), so an absent slab is an empty
+    // window and every miss path heals to idle or fails closed, never panics.
+    pub(crate) fn materialize_input(
+        slot: &mut Option<Box<[u8; INPUT_CAP]>>,
+    ) -> &mut [u8; INPUT_CAP] {
+        slot.get_or_insert_with(|| Box::new([0; INPUT_CAP]))
+    }
+
+    pub(crate) fn materialize_headers(
+        slot: &mut Option<Box<[Header; HEADER_SLOTS]>>,
+    ) -> &mut [Header; HEADER_SLOTS] {
+        slot.get_or_insert_with(|| Box::new([Header::default(); HEADER_SLOTS]))
+    }
+
+    pub(crate) fn materialize_output(
+        slot: &mut Option<Box<[u8; OUTPUT_CAP]>>,
+    ) -> &mut [u8; OUTPUT_CAP] {
+        slot.get_or_insert_with(|| Box::new([0; OUTPUT_CAP]))
+    }
+
+    // NOTE: exchange-boundary trim: the head is consumed and the response flushed, so
+    // headers/output always drop; input drops only with no pipelined tail left to keep.
+    // Slot reuse cannot leak bytes: close drops the whole ConnState with its slabs.
+    pub(crate) fn release_exchange_slabs(&mut self) {
+        self.headers = None;
+        self.output = None;
+        if self.len == 0 {
+            self.input = None;
+        }
     }
 }
 
@@ -322,17 +355,32 @@ pub fn pump_connection(
     let flushing_interim =
         matches!(conn.phase, ConnPhase::DrainingBody { .. }) && out_sent < out_len;
     let write_ready = (sending || flushing_interim) && out_sent < out_len && !conn.write_blocked;
-    let read_scratch = if reading {
-        &mut conn.input[conn.len..]
-    } else {
-        &mut [] as &mut [u8]
+    // NOTE: slabs materialize on activity, not on phase: a quiet conn (reads wanted but
+    // nothing signaled) keeps zero slabs through pump turns; the empty scratch dispatches
+    // an Idle read that attempts nothing.
+    if reading && read_ready {
+        ConnState::materialize_input(&mut conn.input);
+    } else if conn.len == 0 {
+        // NOTE: converse of the laziness invariant: a turn with nothing signaled and
+        // nothing buffered drops a previously materialized input (accept-turn optimism),
+        // so virgin-idle conns settle back to zero slabs; len > 0 always keeps its slab.
+        conn.input = None;
+    }
+    let len = conn.len;
+    let read_scratch: &mut [u8] = match conn.input.as_mut() {
+        Some(input) => &mut input[len..],
+        None => &mut [],
+    };
+    let write_src: &[u8] = match conn.output.as_ref() {
+        Some(output) => &output[out_sent..out_len],
+        None => &[],
     };
     let mut batch = [IoBatch::new(
         token,
         &mut conn.stream,
         read_scratch,
         read_ready,
-        &conn.output[out_sent..out_len],
+        write_src,
         write_ready,
     )];
     dispatch(byte_budget, &mut batch);
@@ -401,7 +449,9 @@ pub fn pump_connection(
     } = conn.phase
     {
         let skip = (conn.len as u64).min(remaining) as usize;
-        conn.input.copy_within(skip..conn.len, 0);
+        if let Some(input) = conn.input.as_mut() {
+            input.copy_within(skip..conn.len, 0);
+        }
         conn.len -= skip;
         let left = remaining - skip as u64;
         if left == 0 {
@@ -479,11 +529,16 @@ fn parse_exchange(
     host: &HostShared,
     draining: bool,
 ) -> ExchangeOutcome {
-    let parsed = conn.parser.parse(
-        &conn.input[..conn.len],
-        &mut conn.headers[..],
-        Limits::default(),
-    );
+    // NOTE: parsing empty input can only yield NeedMore, so quiet turns skip the parse
+    // (and its header materialization) outright; behavior-identical, zero slabs when idle.
+    if conn.len == 0 {
+        return ExchangeOutcome::NeedMore;
+    }
+    let input = ConnState::materialize_input(&mut conn.input);
+    let headers = ConnState::materialize_headers(&mut conn.headers);
+    let parsed = conn
+        .parser
+        .parse(&input[..conn.len], &mut headers[..], Limits::default());
     match parsed {
         Ok(Some(head)) => {
             conn.head_len = head.length;
@@ -511,10 +566,14 @@ fn park_or_respond(
     draining: bool,
 ) -> ExchangeOutcome {
     let mut captures = [veylor_router::RouteCapture::default(); 8];
-    match table.find_request(head, &conn.input[..conn.len], &mut captures) {
+    let Some(input) = conn.input.as_ref() else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    let input = &input[..conn.len];
+    match table.find_request(head, input, &mut captures) {
         Ok(found) if found.kind == RouteKind::Managed => {
             let cap = crate::static_routes::route_cap(found.body);
-            let method = head.method(&conn.input[..conn.len]).unwrap_or_default();
+            let method = head.method(input).unwrap_or_default();
             let mut snapshot = [0u8; HOST_MAX_METHOD_BYTES];
             let take = method.len().min(HOST_MAX_METHOD_BYTES);
             snapshot[..take].copy_from_slice(&method[..take]);
@@ -540,9 +599,21 @@ fn encode_static(
     table: &RouteTable<'_, '_>,
     head: veylor_http1::RequestHead,
 ) -> ExchangeOutcome {
-    let headers = &conn.headers[..];
-    let input = &conn.input[..conn.len];
-    match respond_to_head(routes, table, head, headers, input, &mut conn.output[..]) {
+    let Some(headers) = conn.headers.as_ref() else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    let Some(input) = conn.input.as_ref() else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    let output = ConnState::materialize_output(&mut conn.output);
+    match respond_to_head(
+        routes,
+        table,
+        head,
+        &headers[..],
+        &input[..conn.len],
+        &mut output[..],
+    ) {
         Ok(EncodedStaticResponse {
             length,
             keep_open,
@@ -561,7 +632,9 @@ fn encode_static(
             // drain waits on poll instead of spinning the worker turn.
             let buffered = (conn.len - conn.head_len) as u64;
             let skip = buffered.min(drain_total) as usize;
-            conn.input.copy_within(conn.head_len + skip..conn.len, 0);
+            if let Some(input) = conn.input.as_mut() {
+                input.copy_within(conn.head_len + skip..conn.len, 0);
+            }
             conn.len -= conn.head_len + skip;
             conn.head_len = 0;
             let remaining = drain_total - skip as u64;
@@ -611,7 +684,10 @@ fn stage_file_chunk(conn: &mut ConnState) -> Result<(), ConnClose> {
         return Ok(());
     }
     let width = (transfer.plan.size - transfer.offset).min(OUTPUT_CAP as u64) as usize;
-    match read_chunk(&transfer.plan, transfer.offset, &mut conn.output[..width]) {
+    let Some(output) = conn.output.as_mut() else {
+        return Err(ConnClose::TransportError);
+    };
+    match read_chunk(&transfer.plan, transfer.offset, &mut output[..width]) {
         Ok(0) => Err(ConnClose::TransportError),
         Ok(staged) => {
             transfer.offset += staged as u64;
@@ -675,13 +751,21 @@ fn sendfile_file_chunk(conn: &mut ConnState, byte_budget: u64) -> Result<u64, Co
 }
 
 fn send_bad_request(conn: &mut ConnState) {
-    let staged = respond_bad_request(&mut conn.output[..]);
-    finish_simple(conn, ConnClose::ProtocolError, staged.ok());
+    ConnState::materialize_output(&mut conn.output);
+    let staged = match conn.output.as_mut() {
+        Some(output) => respond_bad_request(&mut output[..]).ok(),
+        None => None,
+    };
+    finish_simple(conn, ConnClose::ProtocolError, staged);
 }
 
 fn send_expectation_failed(conn: &mut ConnState) {
-    let staged = respond_expectation_failed(&mut conn.output[..]);
-    finish_simple(conn, ConnClose::Completed, staged.ok());
+    ConnState::materialize_output(&mut conn.output);
+    let staged = match conn.output.as_mut() {
+        Some(output) => respond_expectation_failed(&mut output[..]).ok(),
+        None => None,
+    };
+    finish_simple(conn, ConnClose::Completed, staged);
 }
 
 fn finish_simple(conn: &mut ConnState, reason: ConnClose, staged: Option<usize>) {
@@ -697,7 +781,9 @@ fn finish_simple(conn: &mut ConnState, reason: ConnClose, staged: Option<usize>)
 
 fn reuse_keep_alive(conn: &mut ConnState) {
     let tail = conn.len - conn.head_len;
-    conn.input.copy_within(conn.head_len..conn.len, 0);
+    if let Some(input) = conn.input.as_mut() {
+        input.copy_within(conn.head_len..conn.len, 0);
+    }
     conn.len = tail;
     conn.head_len = 0;
     conn.out_len = 0;
@@ -705,6 +791,7 @@ fn reuse_keep_alive(conn: &mut ConnState) {
     conn.phase = ConnPhase::ReadingHead;
     conn.parser.reset();
     conn.read_ready = tail > 0;
+    conn.release_exchange_slabs();
 }
 
 // NOTE: the worker-side decoder runs the response trailer policy, which permits keep-alive and
@@ -772,4 +859,66 @@ fn trim_ows(value: &[u8]) -> &[u8] {
 
 pub(crate) fn field(input: &[u8], span: Span) -> Option<&[u8]> {
     input.get(span.offset..span.offset.checked_add(span.length)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veylor_router::RouteSlot;
+
+    fn test_token() -> ConnectionToken {
+        ConnectionToken {
+            worker_id: 0,
+            slot: 0,
+            request_seq: 0,
+            stream_id: 0,
+            worker_generation: 1,
+            generation: 1,
+        }
+    }
+
+    fn test_conn() -> ConnState {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rig");
+        let addr = listener.local_addr().expect("rig addr");
+        let stream = TcpStream::connect(addr).expect("rig connect");
+        ConnState::new(test_token(), stream)
+    }
+
+    #[test]
+    fn new_conn_holds_no_slabs() {
+        let conn = test_conn();
+        assert!(conn.input.is_none());
+        assert!(conn.headers.is_none());
+        assert!(conn.output.is_none());
+        assert!(conn.is_idle());
+    }
+
+    #[test]
+    fn first_exchange_materializes_and_release_drops() {
+        let mut conn = test_conn();
+        let request = b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let input = ConnState::materialize_input(&mut conn.input);
+        input[..request.len()].copy_from_slice(request);
+        conn.len = request.len();
+        let routes = StaticRoutes::new();
+        let mut slots = [RouteSlot::EMPTY; 8];
+        let table = routes.build_table(&mut slots).expect("empty table");
+        let host = HostShared::new(1);
+        match parse_exchange(&mut conn, &routes, &table, 0, &host, false) {
+            ExchangeOutcome::Responded => {}
+            ExchangeOutcome::NeedMore => panic!("full head must parse"),
+            ExchangeOutcome::Parked => panic!("no managed routes registered"),
+            ExchangeOutcome::Close(_) => panic!("unknown path must encode, not close"),
+        }
+        assert!(conn.input.is_some());
+        assert!(conn.headers.is_some());
+        assert!(conn.output.is_some());
+        assert!(conn.out_len > 0);
+        conn.out_sent = conn.out_len;
+        reuse_keep_alive(&mut conn);
+        assert!(conn.input.is_none());
+        assert!(conn.headers.is_none());
+        assert!(conn.output.is_none());
+        assert!(conn.is_idle());
+    }
 }

@@ -1,7 +1,9 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use veylor_runtime::{ConnectionTimeouts, ConnectionToken};
@@ -2347,4 +2349,74 @@ fn h1_date_present_and_shaped_across_static_paths() {
     date_shape(&served);
     native.stop_accepting();
     let _ = native.join().expect("join server");
+}
+
+
+
+
+
+
+#[test]
+fn hot_keep_alive_connection_does_not_starve_probe() {
+    const HOT_EXCHANGES: u64 = 3000;
+    const PROBES: usize = 25;
+    const PROBE_INTERVAL: Duration = Duration::from_millis(2);
+    const PROBE_LATENCY_BOUND: Duration = Duration::from_millis(500);
+
+    let server = test_server();
+    let addr = server.addr();
+
+    let hot_done = Arc::new(AtomicU64::new(0));
+    let hot = {
+        let hot_done = Arc::clone(&hot_done);
+        thread::spawn(move || {
+            let mut stream = connect_addr(addr);
+            
+
+            let request =
+                "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+            stream.write_all(request.as_bytes()).expect("hot prime");
+            stream.write_all(request.as_bytes()).expect("hot prime");
+            for _ in 0..HOT_EXCHANGES {
+                let response = read_response(&mut stream);
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, b"hello");
+                stream.write_all(request.as_bytes()).expect("hot request");
+                hot_done.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    let mut probe = connect(&server);
+    let mut worst = Duration::ZERO;
+    for _ in 0..PROBES {
+        
+        thread::sleep(PROBE_INTERVAL);
+        let start = Instant::now();
+        get(&mut probe, "/hello");
+        let response = read_response(&mut probe);
+        worst = worst.max(start.elapsed());
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+    }
+
+    hot.join().expect("hot thread");
+    assert_eq!(hot_done.load(Ordering::Relaxed), HOT_EXCHANGES);
+    assert!(
+        worst < PROBE_LATENCY_BOUND,
+        "probe tail {worst:?} exceeds bound"
+    );
+    server.stop_accepting();
+    server.join().expect("join server");
+}
+
+fn connect_addr(addr: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(addr).expect("connect loopback");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(DEADLINE))
+        .expect("write timeout");
+    stream
 }

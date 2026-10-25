@@ -359,6 +359,7 @@ pub(crate) fn apply_stream_cmd(
     let ConnPhase::Parked { keep_open, .. } = conn.phase else {
         return PumpOutcome::Close(ConnClose::TransportError);
     };
+    ConnState::materialize_output(&mut conn.output);
     let length = match cmd {
         StreamCmd::Begin { status, reason } => {
             // NOTE: the entry holds no method snapshot, so HEAD cannot reject at stage; the
@@ -394,7 +395,11 @@ pub(crate) fn apply_stream_cmd(
                 content_length: 0,
                 connection,
             };
-            let Ok(encoded) = encode_response_head(&response, &mut conn.output[..]) else {
+            let Some(output) = conn.output.as_mut() else {
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Close(ConnClose::TransportError);
+            };
+            let Ok(encoded) = encode_response_head(&response, &mut output[..]) else {
                 host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
@@ -404,7 +409,11 @@ pub(crate) fn apply_stream_cmd(
         StreamCmd::Write { chunk } => {
             // NOTE: the stage probe guarantees fit, so BufferTooSmall here is unreachable and
             // permanent: close and tomb Gone instead of wedging the stream.
-            let Ok(length) = encode_response_chunk(&chunk, &mut conn.output[..]) else {
+            let Some(output) = conn.output.as_mut() else {
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Close(ConnClose::TransportError);
+            };
+            let Ok(length) = encode_response_chunk(&chunk, &mut output[..]) else {
                 host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
@@ -425,9 +434,13 @@ pub(crate) fn apply_stream_cmd(
                 _ => Vec::new(),
             };
             let mut required = 0usize;
+            let Some(output) = conn.output.as_mut() else {
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Close(ConnClose::TransportError);
+            };
             let Ok(length) = encode_response_final_chunk_with_required_length(
                 &trailers,
-                &mut conn.output[..],
+                &mut output[..],
                 &mut required,
             ) else {
                 host.unpark_closed(token.worker_id, token.slot);
@@ -599,7 +612,10 @@ fn stage_new_trailers(
         if header.name.length == 0 {
             break;
         }
-        let input = &conn.input[base..end];
+        let Some(input) = conn.input.as_ref() else {
+            return false;
+        };
+        let input = &input[base..end];
         let (Some(name), Some(value)) = (field(input, header.name), field(input, header.value))
         else {
             return false;
@@ -645,8 +661,12 @@ pub(crate) fn decode_chunked(
         };
         let base = feed.consumed;
         let end = conn.len;
+        let Some(input) = conn.input.as_ref() else {
+            feed.failed = true;
+            break;
+        };
         let next = match decoder.next(
-            &conn.input[base..end],
+            &input[base..end],
             false,
             &mut conn.trailer_slots,
             Limits::default(),
@@ -664,7 +684,10 @@ pub(crate) fn decode_chunked(
         match next.event {
             Some(BodyEvent::Data(span)) => {
                 let start = base + span.offset;
-                if !host.push_body(event_token, &conn.input[start..start + span.length]) {
+                let Some(input) = conn.input.as_ref() else {
+                    break;
+                };
+                if !host.push_body(event_token, &input[start..start + span.length]) {
                     break;
                 }
                 feed.decoded += span.length as u64;

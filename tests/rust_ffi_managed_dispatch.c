@@ -85,6 +85,35 @@ static size_t read_head(int fd, char* out, size_t capacity) {
     return total;
 }
 
+static void assert_h1_date_shape(const char* response) {
+    const char* eol = strstr(response, "\r\n");
+    assert(eol != NULL);
+    assert(strncmp(eol + 2, "Date: ", 6) == 0);
+    const char* value = eol + 8;
+    assert(strlen(value) >= 31);
+    assert(value[3] == ',');
+    assert(memcmp(value + 25, " GMT", 4) == 0);
+    assert(memcmp(value + 29, "\r\n", 2) == 0);
+    const char* head_end = strstr(response, "\r\n\r\n");
+    assert(head_end != NULL);
+    size_t count = 0;
+    const char* line = response;
+    for (;;) {
+        const char* next = strstr(line, "\r\n");
+        size_t len = next != NULL ? (size_t)(next - line) : strlen(line);
+        if (len >= 5 && (line[0] == 'D' || line[0] == 'd') &&
+            (line[1] == 'A' || line[1] == 'a') && (line[2] == 'T' || line[2] == 't') &&
+            (line[3] == 'E' || line[3] == 'e') && line[4] == ':') {
+            count++;
+        }
+        if (next == NULL || next >= head_end) {
+            break;
+        }
+        line = next + 2;
+    }
+    assert(count == 1);
+}
+
  
 static vyl_h2_field_to_encode h2_text_field(const char* name, const char* value) {
     vyl_h2_field_to_encode field = {0};
@@ -335,6 +364,7 @@ int main(void) {
     assert(close(fd) == 0);
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "managed-hi") != NULL);
+    assert_h1_date_shape(response);
     assert(
         vyl_managed_static_host_respond(
             server,
@@ -550,6 +580,7 @@ int main(void) {
         read_head(fd, head, sizeof(head));
         assert(strstr(head, "HTTP/1.1 200 OK") != NULL);
         assert(strstr(head, "Transfer-Encoding: chunked") != NULL);
+        assert_h1_date_shape(head);
         char frame[8] = {0};
         recv_exact(fd, frame, 3);
         assert(memcmp(frame, "2\r\n", 3) == 0);
