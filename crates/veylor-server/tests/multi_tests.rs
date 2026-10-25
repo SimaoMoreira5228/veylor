@@ -3,12 +3,22 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use veylor_server::{
-    CloseCounts, MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig, ServerError,
+    CloseCounts, MAX_CONNECTIONS, MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig,
+    ServerError,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
+const EXTRA_DEADLINE: Duration = Duration::from_millis(1000);
+const IDLE_HOLD: Duration = Duration::from_millis(500);
 const FANOUT_CLIENTS: usize = 32;
 const MAX_ABSURD: usize = 17;
+const SCALE_IDLE: usize = 1000;
+const SCALE_THREADS: usize = 8;
+const BURST_CAP: usize = 64;
+const BURST_TOTAL: usize = 128;
+const SMALL_CAP: usize = 32;
+const SMALL_EXTRA: usize = 4;
+const BURST_THREADS: usize = 4;
 
 fn multi_config(worker_count: usize) -> ServerConfig {
     ServerConfig {
@@ -20,6 +30,29 @@ fn multi_config(worker_count: usize) -> ServerConfig {
 fn test_multi_server(worker_count: usize) -> RunningServer {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = Server::bind(addr, multi_config(worker_count)).expect("bind loopback");
+    server
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register hello");
+    server.start().expect("start server")
+}
+
+fn scale_config(max_connections: usize) -> ServerConfig {
+    let mut config = multi_config(1);
+    config.max_connections = max_connections;
+    config.turn.max_accepts_per_turn = BURST_CAP;
+    config
+}
+
+fn test_scale_server(max_connections: usize) -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, scale_config(max_connections)).expect("bind loopback");
     server
         .register_route(
             b"GET",
@@ -310,5 +343,144 @@ fn reuse_port_conflict_semantics() {
     assert_eq!(
         total, 2,
         "second: {second_counts:?} first: {first_counts:?}"
+    );
+}
+
+#[test]
+fn default_preserves_historical_ceiling() {
+    let default = ServerConfig::default().max_connections;
+    assert!(default >= 1, "default must admit: {default}");
+    assert!(
+        default < MAX_CONNECTIONS,
+        "default stays opt-in below ceiling: {default}"
+    );
+}
+
+#[test]
+fn invalid_connection_counts_rejected() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    for count in [0, MAX_CONNECTIONS + 1, usize::MAX] {
+        let mut config = multi_config(1);
+        config.max_connections = count;
+        let err = Server::bind(addr, config).err().expect("bind must fail");
+        assert!(
+            matches!(err, ServerError::InvalidConfig),
+            "count {count}: {err:?}"
+        );
+    }
+}
+
+fn serve_hold(addr: SocketAddr, count: usize) -> Vec<TcpStream> {
+    let mut held = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut stream = TcpStream::connect(addr).expect("connect loopback");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(DEADLINE))
+            .expect("write timeout");
+        get(&mut stream, "/hello");
+        let (status, body) = read_response(&mut stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        held.push(stream);
+    }
+    held
+}
+
+#[test]
+fn thousand_idle_hold_single_worker() {
+    const PER_THREAD: usize = SCALE_IDLE / SCALE_THREADS;
+    let server = test_scale_server(MAX_CONNECTIONS);
+    let addr = server.addr();
+    let mut handles = Vec::with_capacity(SCALE_THREADS);
+    for _ in 0..SCALE_THREADS {
+        handles.push(std::thread::spawn(move || serve_hold(addr, PER_THREAD)));
+    }
+    let mut held = Vec::with_capacity(SCALE_IDLE);
+    for handle in handles {
+        held.extend(handle.join().expect("client thread"));
+    }
+    assert_eq!(held.len(), SCALE_IDLE);
+    std::thread::sleep(IDLE_HOLD);
+    for stream in held.iter_mut() {
+        get(stream, "/hello");
+    }
+    for stream in held.iter_mut() {
+        let (status, body) = read_response(stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+    }
+    server.stop_accepting();
+    for stream in held.iter_mut() {
+        read_eof(stream);
+    }
+    let counts = server.join().expect("join server");
+    assert_eq!(
+        total_closes(&counts),
+        SCALE_IDLE as u64,
+        "counts: {counts:?}"
+    );
+    assert_eq!(counts.shutdown, SCALE_IDLE as u64, "counts: {counts:?}");
+}
+
+#[test]
+fn burst_drain_past_staging() {
+    const PER_THREAD: usize = BURST_TOTAL / BURST_THREADS;
+    let server = test_scale_server(BURST_CAP);
+    let addr = server.addr();
+    let mut handles = Vec::with_capacity(BURST_THREADS);
+    for _ in 0..BURST_THREADS {
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..PER_THREAD {
+                close_client(addr);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("client thread");
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(
+        total_closes(&counts),
+        BURST_TOTAL as u64,
+        "counts: {counts:?}"
+    );
+    assert_eq!(counts.completed, BURST_TOTAL as u64, "counts: {counts:?}");
+}
+
+#[test]
+fn over_cap_gets_zero_service() {
+    let server = test_scale_server(SMALL_CAP);
+    let mut held = Vec::with_capacity(SMALL_CAP);
+    for _ in 0..SMALL_CAP {
+        let mut stream = connect(&server);
+        get(&mut stream, "/hello");
+        let (status, body) = read_response(&mut stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        held.push(stream);
+    }
+    for _ in 0..SMALL_EXTRA {
+        let mut stream = connect(&server);
+        stream
+            .set_read_timeout(Some(EXTRA_DEADLINE))
+            .expect("extra timeout");
+        get(&mut stream, "/hello");
+        let mut byte = [0; 1];
+        let outcome = stream.read(&mut byte);
+        assert!(outcome.is_err(), "over-cap conn got service: {outcome:?}");
+    }
+    server.stop_accepting();
+    for stream in held.iter_mut() {
+        read_eof(stream);
+    }
+    let counts = server.join().expect("join server");
+    assert_eq!(
+        total_closes(&counts),
+        SMALL_CAP as u64,
+        "counts: {counts:?}"
     );
 }

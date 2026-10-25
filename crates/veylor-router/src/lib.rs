@@ -13,5 +13,6 @@ pub enum RouteError {
     NotFrozen,
     Duplicate,
     NotFound,
+    MethodNotAllowed,
     CaptureCapacity,
 }

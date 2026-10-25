@@ -45,7 +45,11 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         counts: CloseCounts::default(),
         error: None,
     };
-    let mut stream_poller = match Poller::new(MAX_CONNECTIONS * 2) {
+    // NOTE: every H1 table below scales from this one value; the H2/host slot space
+    // keeps riding MAX_CONNECTIONS (their slice owns that math) and stays sufficient
+    // because validate_config pins max_connections <= MAX_CONNECTIONS.
+    let max_conns = config.max_connections;
+    let mut stream_poller = match Poller::new(max_conns * 2) {
         Ok(poller) => poller,
         Err(error) => {
             result.error = Some(error.to_string());
@@ -82,14 +86,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         .and_then(|view| view.with_natives(&h2_natives).ok());
     let h2_enabled = h2c_listener.is_some() && h2_view.is_some();
 
-    let mut slots = vec![ConnectionSlot::EMPTY; MAX_CONNECTIONS];
-    let mut free_stack = vec![0u32; MAX_CONNECTIONS];
-    let timer_cap = MAX_CONNECTIONS + 2;
+    let mut slots = vec![ConnectionSlot::EMPTY; max_conns];
+    let mut free_stack = vec![0u32; max_conns];
+    let timer_cap = max_conns + 2;
     let mut timer_storage = vec![TimerExpiration::default(); timer_cap];
     let mut timer_index = vec![0u32; timer_cap * TIMER_INDEX_STORAGE_FACTOR];
     let staging_cap = config.turn.max_accepts_per_turn.max(1);
     let mut staging: Vec<Option<AcceptedConnection>> = (0..staging_cap).map(|_| None).collect();
-    let mut live: Vec<Option<ConnectionToken>> = (0..MAX_CONNECTIONS).map(|_| None).collect();
+    let mut live: Vec<Option<ConnectionToken>> = (0..max_conns).map(|_| None).collect();
     let mut shutdown = ShutdownState::new();
     let storage = WorkerStorage {
         slots: &mut slots,
@@ -115,7 +119,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         }
     };
 
-    let mut conns: Vec<Option<ConnState>> = (0..MAX_CONNECTIONS).map(|_| None).collect();
+    let mut conns: Vec<Option<ConnState>> = (0..max_conns).map(|_| None).collect();
     let mut events: Vec<Readiness> = (0..MAX_EVENTS_PER_TURN)
         .map(|_| Readiness {
             token: WAKE_TOKEN,
@@ -221,7 +225,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             let poll_error: Option<io::Error> =
                 match stream_poller.poll(Some(Duration::from_millis(stream_wait_ms as u64))) {
                     Ok(readiness) => {
-                        ready.extend(readiness.take(MAX_CONNECTIONS * 2));
+                        ready.extend(readiness.take(max_conns * 2));
                         None
                     }
                     Err(error) => Some(error),
@@ -292,6 +296,9 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // NOTE: one take per turn: H1 slots drain below, H2 stream-keyed slots ride the H2
         // pump dispatch; either side drops divergent work silently (already tombed).
         let staged = host.take_staged(worker_id);
+        // NOTE: H1/H2 slot-space boundary rides the const ceiling, not max_conns: H2
+        // slots start at MAX_CONNECTIONS in the h2/host slice, and every H1 slot
+        // stays below max_conns <= MAX_CONNECTIONS, so the partition is exact.
         let (h1_staged, mut h2_staged): (Vec<_>, Vec<_>) = staged
             .into_iter()
             .partition(|work| work.slot < MAX_CONNECTIONS);
@@ -396,8 +403,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // one turn's bytes split fairly instead of each family taking a full share.
         let live_count = (worker.live_count() + h2_turn::occupied(&h2_meta)).max(1) as u64;
         let per_conn_budget = config.turn.byte_budget_per_turn.div_ceil(live_count).max(1);
-        for step in 0..MAX_CONNECTIONS {
-            let index = (turn_offset + step) % MAX_CONNECTIONS;
+        for step in 0..max_conns {
+            let index = (turn_offset + step) % max_conns;
             let Some(conn) = conns[index].as_mut() else {
                 continue;
             };
@@ -431,7 +438,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 );
             }
         }
-        turn_offset = (turn_offset + 1) % MAX_CONNECTIONS;
+        turn_offset = (turn_offset + 1) % max_conns;
         drive_h2_pumps!(
             h2_enabled,
             h2_view,
@@ -663,6 +670,8 @@ pub(crate) fn apply_h2_staged(
         return false;
     }
     let index = meta.token.saturating_sub(h2_turn::H2_STREAM_TOKEN_BASE);
+    // NOTE: H2 base mirrors the h2/host slice arithmetic, which keys H2 slots from the
+    // const ceiling; max_conns never moves this line, so H1/H2 slot ids cannot collide.
     let base = MAX_CONNECTIONS + index * crate::h2::STREAM_SLOTS;
     let mut slot = 0;
     let mut applied = false;

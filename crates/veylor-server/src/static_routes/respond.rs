@@ -18,12 +18,17 @@ use super::{
 };
 
 const CAPTURE_SLOTS: usize = 8;
+// NOTE: at most this many distinct methods list in Allow; more truncate the tail, so size
+// it at the route cap and the 405 below reports Invalid past the value buffer instead.
+const ALLOW_METHODS: usize = 16;
+const ALLOW_BYTES: usize = 320;
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
 const CONTENT_RANGE_BYTES: usize = 80;
 // NOTE: "multipart/byteranges; boundary=" plus the fixed token and three hex fields tops out near 91 bytes;
 // 128 leaves margin, and the same buffer doubles as the Content-Range scratch since the two never coexist.
 const MULTIPART_CTYPE_BYTES: usize = 128;
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
+const METHOD_NOT_ALLOWED_BODY: &[u8] = b"Method Not Allowed";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
 const REQUEST_HEADER_FIELDS_TOO_LARGE_BODY: &[u8] = b"Request Header Fields Too Large";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
@@ -72,6 +77,9 @@ pub fn respond_to_head(
     }
     // NOTE: exact static routes win; file mounts serve only table misses, so existing
     // routes never change behavior when mounts are added.
+    if matches!(found, Err(RouteError::MethodNotAllowed)) {
+        return respond_method_not_allowed(table, head, input, output);
+    }
     if matches!(found, Err(RouteError::NotFound)) {
         if let Some(file) = respond_file(routes, head, headers, input, output)? {
             return Ok(file);
@@ -168,6 +176,118 @@ pub fn respond_to_head(
     })
 }
 
+// NOTE: RFC 9110 15.5.6 mandates Allow on 405 and says nothing about connection, so this
+// mirrors the 404 shape exactly (default drain cap, 413 on framing overflow, interim,
+// Date-first, fixed body) with one added Allow field, and closes like a 404.
+fn respond_method_not_allowed(
+    table: &RouteTable<'_, '_>,
+    head: RequestHead,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let method = head.method(input).unwrap_or_default();
+    if head.is_chunked {
+        return reject_payload(output, method);
+    }
+    let drain_total = match head.content_length {
+        Some(length) if length > MAX_STATIC_BODY_BYTES => return reject_payload(output, method),
+        Some(length) => length,
+        None => 0,
+    };
+    let interim_len = if head.expect_continue {
+        encode_continue(output)?
+    } else {
+        0
+    };
+    let mut methods: [&[u8]; ALLOW_METHODS] = [&[]; ALLOW_METHODS];
+    let count = table
+        .allowed_methods_for_request(head, input, &mut methods)
+        .map_err(|_| RouteBuildError::Invalid)?;
+    let mut allow = [0u8; ALLOW_BYTES];
+    let mut allow_len = 0;
+    for (index, name) in methods[..count].iter().enumerate() {
+        if index > 0 {
+            let end = allow_len + 2;
+            if end > allow.len() {
+                return Err(RouteBuildError::Invalid);
+            }
+            allow[allow_len..end].copy_from_slice(b", ");
+            allow_len = end;
+        }
+        let end = allow_len + name.len();
+        if end > allow.len() {
+            return Err(RouteBuildError::Invalid);
+        }
+        allow[allow_len..end].copy_from_slice(name);
+        allow_len = end;
+    }
+    encode_method_not_allowed(
+        head,
+        input,
+        method,
+        &allow[..allow_len],
+        drain_total,
+        interim_len,
+        output,
+    )
+}
+
+fn encode_method_not_allowed(
+    head: RequestHead,
+    input: &[u8],
+    method: &[u8],
+    allow: &[u8],
+    drain_total: u64,
+    interim_len: usize,
+    output: &mut [u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let connection =
+        connection_header_for_response(head, input, 405, ResponseFraming::FixedLength, true, true);
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let fields = [
+        Field {
+            name: b"Date",
+            value: &now[..now_len],
+        },
+        Field {
+            name: b"Allow",
+            value: allow,
+        },
+    ];
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade: b"",
+        status: 405,
+        reason: b"Method Not Allowed",
+        fields: &fields,
+        framing: ResponseFraming::FixedLength,
+        content_length: METHOD_NOT_ALLOWED_BODY.len() as u64,
+        connection,
+    };
+    let final_buf = output
+        .get_mut(interim_len..)
+        .ok_or(RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+    let mut length = interim_len + encoded.length;
+    if encoded.body_allowed && !METHOD_NOT_ALLOWED_BODY.is_empty() {
+        let end = length + METHOD_NOT_ALLOWED_BODY.len();
+        output
+            .get_mut(length..end)
+            .ok_or(RouteBuildError::Invalid)?
+            .copy_from_slice(METHOD_NOT_ALLOWED_BODY);
+        length = end;
+    }
+    Ok(EncodedStaticResponse {
+        length,
+        keep_open: connection != ConnectionHeader::Close,
+        drain_total,
+        interim_len,
+        file: None,
+    })
+}
+
 // NOTE: rejection mapping stays inside the static path's 404/400+close and 413+close
 // families: NotFound/Forbidden/NotAFile all read as 404+close (traversal gets no
 // existence oracle), TooLarge reads as 413+close like any over-cap body. No new status.
@@ -197,6 +317,26 @@ fn respond_file(
     } else {
         0
     };
+    // NOTE: resolve reads non-GET/HEAD as no match without touching the fs; a GET probe
+    // reuses the mount logic (prefix, trailing slash, decoding), so only a real file
+    // resource answers 405 with Allow: GET, HEAD while traversal, directories, and
+    // misses stay 404 with no existence oracle.
+    if method != b"GET" && method != b"HEAD" {
+        let probe = routes.files.resolve(b"GET", path);
+        if matches!(probe, Ok(_) | Err(FileReject::TooLarge)) {
+            let denied = encode_method_not_allowed(
+                head,
+                input,
+                method,
+                b"GET, HEAD",
+                drain_total,
+                interim_len,
+                output,
+            )?;
+            return Ok(Some(denied));
+        }
+        return Ok(None);
+    }
     let mut plan = match routes.files.resolve(method, path) {
         Ok(plan) => plan,
         Err(FileReject::TooLarge) => return Ok(Some(reject_payload(output, method)?)),

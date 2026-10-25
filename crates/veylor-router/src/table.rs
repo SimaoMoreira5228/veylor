@@ -206,10 +206,71 @@ impl<'slots, 'data> RouteTable<'slots, 'data> {
                 capture_storage,
             )?,
             None => None,
-        }
-        .ok_or(RouteError::NotFound)?;
+        };
+        let Some(found) = found else {
+            // NOTE: miss-only path scan, so hits return with no extra work: one bounded
+            // O(n) pass over the frozen slots distinguishes a wrong method from a miss.
+            if self.has_path_match(path.bytes, path.input_offset) {
+                return Err(RouteError::MethodNotAllowed);
+            }
+            return Err(RouteError::NotFound);
+        };
         let route = &self.slots[found.0];
         Ok(route_match(route, &capture_storage[..found.1]))
+    }
+
+    // NOTE: Allow companion to find_request for 405 assembly: same frozen slots and match
+    // rules (exact compare_paths plus dynamic match_pattern), no alloc, miss-path only.
+    // Fills unique methods in table order and truncates at out capacity; Ok(0) names no
+    // resource. Exact registered methods only, never synthesized (HEAD fallback and any
+    // other fallback stay dispatch-only, like unregistered OPTIONS).
+    pub fn allowed_methods_for_request(
+        &self,
+        request: RequestHead,
+        input: &[u8],
+        out: &mut [&'data [u8]],
+    ) -> Result<usize, RouteError> {
+        if self.state != State::Frozen {
+            return Err(RouteError::NotFrozen);
+        }
+        let Some(path) = request_path(request, input)? else {
+            return Ok(0);
+        };
+        let mut scratch = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+        let mut count = 0;
+        for route in self.slots[..self.count].iter() {
+            let matched = if route.dynamic_segments == 0 {
+                compare_paths(route.path, path.bytes) == Ordering::Equal
+            } else {
+                match_pattern(route.path, path.bytes, path.input_offset, &mut scratch).is_some()
+            };
+            if !matched {
+                continue;
+            }
+            if out[..count].contains(&route.method) {
+                continue;
+            }
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = route.method;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn has_path_match(&self, path: &[u8], input_offset: usize) -> bool {
+        let mut scratch = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+        for route in self.slots[..self.count].iter() {
+            if route.dynamic_segments == 0 {
+                if compare_paths(route.path, path) == Ordering::Equal {
+                    return true;
+                }
+            } else if match_pattern(route.path, path, input_offset, &mut scratch).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     fn find_method_path(

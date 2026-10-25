@@ -19,7 +19,17 @@ pub(crate) mod turn;
 
 pub(crate) use turn::worker_main;
 
-pub const MAX_CONNECTIONS: usize = 128;
+// NOTE: per-worker connection ceiling: 1024 makes the 10k-idle ladder reachable
+// via fan-out (10 workers x 1024) within MAX_WORKERS. Beyond it the first breaks
+// are fd limits (one fd per conn plus pollers), then the const-sized host park
+// tables, then per-worker memory (~1 KiB fixed per slot, ~16 KiB slabs per active
+// conn once input/output materialize). H1 tables ride ServerConfig::max_connections
+// (1..=MAX_CONNECTIONS); the H2/host slot space still rides this const, so the
+// config value can never index out of range there.
+pub const MAX_CONNECTIONS: usize = 1024;
+// NOTE: default() keeps the historical 128-conn behavior; opt in per worker via
+// ServerConfig::max_connections. A named const keeps the literal in one place.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 pub const MAX_WORKERS: usize = 16;
 pub const LISTENER_TOKEN: usize = 0;
 pub const SHUTDOWN_TIMER_ID: u64 = 0xFFFF_FFFE;
@@ -74,6 +84,7 @@ pub struct ServerConfig {
     pub turn: TurnConfig,
     pub poll_wait_ms: i32,
     pub worker_count: usize,
+    pub max_connections: usize,
     // NOTE: paired-port h2c: None disables the cleartext HTTP/2 listener, Some(0)
     // binds an ephemeral loopback port, Some(port) binds that port on the H1
     // bind address IP. One extra port (not ALPN/upgrades) keeps the H1 path
@@ -95,6 +106,7 @@ impl Default for ServerConfig {
             turn: TurnConfig::DEFAULT,
             poll_wait_ms: 10,
             worker_count: 1,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             h2c_port: None,
         }
     }
@@ -468,6 +480,9 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         .validate()
         .map_err(|_| ServerError::InvalidConfig)?;
     if config.worker_count == 0 || config.worker_count > MAX_WORKERS {
+        return Err(ServerError::InvalidConfig);
+    }
+    if config.max_connections == 0 || config.max_connections > MAX_CONNECTIONS {
         return Err(ServerError::InvalidConfig);
     }
     if config.poll_wait_ms <= 0 {

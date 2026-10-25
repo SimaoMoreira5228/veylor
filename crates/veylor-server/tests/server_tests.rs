@@ -200,6 +200,110 @@ fn unknown_path_returns_404_then_closes() {
 }
 
 #[test]
+fn method_mismatch_answers_405_with_allow_then_closes() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 405);
+    assert_eq!(response.body, b"Method Not Allowed");
+    assert_eq!(header(&response, "allow"), "GET");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn head_on_post_only_answers_405_without_body() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "HEAD /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write HEAD");
+    let text = read_head(&mut stream);
+    assert!(
+        text.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "status: {text}"
+    );
+    assert!(text.contains("Allow: POST"), "allow: {text}");
+    assert!(text.contains("Content-Length: 18"), "length: {text}");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn native_method_mismatch_answers_405_with_allow() {
+    let server = native_server();
+    let mut stream = connect(&server);
+    let request = "POST /fixed HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 405);
+    assert_eq!(response.body, b"Method Not Allowed");
+    assert_eq!(header(&response, "allow"), "GET");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn managed_method_mismatch_answers_405_without_parking() {
+    let server = capped_server();
+    let mut stream = connect(&server);
+    let request = "GET /mupload HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write GET");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 405);
+    assert_eq!(response.body, b"Method Not Allowed");
+    assert_eq!(header(&response, "allow"), "POST");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_eof(&mut stream);
+    // NOTE: a parked managed request would surface a host event, so an empty nonblocking
+    // poll proves the 405 rejected at dispatch instead of racing a late park.
+    let report = server.host().poll(0, &mut [], &mut [], &mut []);
+    assert_eq!(report.copied, 0);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn file_method_mismatch_answers_405_with_allow() {
+    let (server, _fixture) = file_server();
+    let mut stream = connect(&server);
+    let request = "POST /assets/hello.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write POST");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 405);
+    assert_eq!(response.body, b"Method Not Allowed");
+    assert_eq!(header(&response, "allow"), "GET, HEAD");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_eof(&mut stream);
+    let mut other = connect(&server);
+    let missing = "POST /assets/nope.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+    other
+        .write_all(missing.as_bytes())
+        .expect("write missing POST");
+    let not_found = read_response(&mut other);
+    assert_eq!(not_found.status, 404);
+    assert_eq!(not_found.body, b"Not Found");
+    read_eof(&mut other);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed, 2, "counts: {counts:?}");
+}
+
+#[test]
 fn malformed_request_line_closes_with_400() {
     let server = test_server();
     let mut stream = connect(&server);
@@ -264,8 +368,11 @@ fn request_body_on_static_route_closes_after_response() {
         .write_all(request.as_bytes())
         .expect("write body request");
     let response = read_response(&mut stream);
-    assert_eq!(response.status, 404, "static POST has no route");
-    assert_eq!(response.body, b"Not Found");
+    assert_eq!(response.status, 405, "static POST on GET-only is 405");
+    assert_eq!(response.body, b"Method Not Allowed");
+    assert_eq!(header(&response, "allow"), "GET");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
     read_eof(&mut stream);
     server.stop_accepting();
     let _ = server.join().expect("join server");

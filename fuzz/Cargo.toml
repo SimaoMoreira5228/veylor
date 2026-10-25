@@ -37,3 +37,9 @@ name = "fuzz_hpack_roundtrip"
 path = "fuzz_targets/fuzz_hpack_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_chunked_body"
+path = "fuzz_targets/fuzz_chunked_body.rs"
+test = false
+doc = false
