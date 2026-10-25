@@ -31,3 +31,9 @@ name = "fuzz_hpack_decode"
 path = "fuzz_targets/fuzz_hpack_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_hpack_roundtrip"
+path = "fuzz_targets/fuzz_hpack_roundtrip.rs"
+test = false
+doc = false

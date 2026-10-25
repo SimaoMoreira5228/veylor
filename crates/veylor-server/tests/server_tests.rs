@@ -215,6 +215,47 @@ fn malformed_request_line_closes_with_400() {
 }
 
 #[test]
+fn oversized_header_section_closes_with_431() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let mut request = String::from("GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    for index in 0..120 {
+        request.push_str(&format!("X-Pad-{index:03}: abcdefgh\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("write headers");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 431);
+    assert_eq!(response.body, b"Request Header Fields Too Large");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn oversized_request_line_stays_400() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let target = format!("/{}", "a".repeat(9000));
+    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write long target");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 400);
+    assert_eq!(response.body, b"Bad Request");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}
+
+#[test]
 fn request_body_on_static_route_closes_after_response() {
     let server = test_server();
     let mut stream = connect(&server);

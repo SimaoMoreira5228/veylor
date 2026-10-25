@@ -14,7 +14,7 @@ use crate::static_files::FilePlan;
 use crate::static_files::read_chunk;
 use crate::static_routes::{
     EncodedStaticResponse, RouteBuildError, StaticRoutes, respond_bad_request,
-    respond_expectation_failed, respond_to_head,
+    respond_expectation_failed, respond_request_header_fields_too_large, respond_to_head,
 };
 
 pub const INPUT_CAP: usize = 8192;
@@ -271,17 +271,6 @@ impl ConnState {
     ) -> &mut [u8; OUTPUT_CAP] {
         slot.get_or_insert_with(|| Box::new([0; OUTPUT_CAP]))
     }
-
-    // NOTE: exchange-boundary trim: the head is consumed and the response flushed, so
-    // headers/output always drop; input drops only with no pipelined tail left to keep.
-    // Slot reuse cannot leak bytes: close drops the whole ConnState with its slabs.
-    pub(crate) fn release_exchange_slabs(&mut self) {
-        self.headers = None;
-        self.output = None;
-        if self.len == 0 {
-            self.input = None;
-        }
-    }
 }
 
 pub enum PumpOutcome {
@@ -360,11 +349,12 @@ pub fn pump_connection(
     // an Idle read that attempts nothing.
     if reading && read_ready {
         ConnState::materialize_input(&mut conn.input);
-    } else if conn.len == 0 {
-        // NOTE: converse of the laziness invariant: a turn with nothing signaled and
-        // nothing buffered drops a previously materialized input (accept-turn optimism),
-        // so virgin-idle conns settle back to zero slabs; len > 0 always keeps its slab.
+    } else if conn.is_idle() {
+        // NOTE: retain-vs-reclaim invariant: keep-alive exchanges retain every slab so the
+        // hot loop never reallocs; only this idle-gated reclaim drops input+headers+output.
         conn.input = None;
+        conn.headers = None;
+        conn.output = None;
     }
     let len = conn.len;
     let read_scratch: &mut [u8] = match conn.input.as_mut() {
@@ -549,6 +539,14 @@ fn parse_exchange(
             send_expectation_failed(conn);
             ExchangeOutcome::Responded
         }
+        Err(ParseError::HeaderSectionTooLarge) => {
+            send_request_header_fields_too_large(conn);
+            ExchangeOutcome::Responded
+        }
+        // NOTE: RequestLineTooLarge stays 400 here: RFC 9110 15.5.15 scopes 414 to a long
+        // target URI specifically, and the variant fires on any request-line overflow
+        // (method/target/version undifferentiated). A target-length-specific parser error
+        // would unlock a precise 414 mapping; until then the undifferentiated line stays 400.
         Ok(None) | Err(_) => {
             send_bad_request(conn);
             ExchangeOutcome::Responded
@@ -759,6 +757,15 @@ fn send_bad_request(conn: &mut ConnState) {
     finish_simple(conn, ConnClose::ProtocolError, staged);
 }
 
+fn send_request_header_fields_too_large(conn: &mut ConnState) {
+    ConnState::materialize_output(&mut conn.output);
+    let staged = match conn.output.as_mut() {
+        Some(output) => respond_request_header_fields_too_large(&mut output[..]).ok(),
+        None => None,
+    };
+    finish_simple(conn, ConnClose::ProtocolError, staged);
+}
+
 fn send_expectation_failed(conn: &mut ConnState) {
     ConnState::materialize_output(&mut conn.output);
     let staged = match conn.output.as_mut() {
@@ -791,7 +798,6 @@ fn reuse_keep_alive(conn: &mut ConnState) {
     conn.phase = ConnPhase::ReadingHead;
     conn.parser.reset();
     conn.read_ready = tail > 0;
-    conn.release_exchange_slabs();
 }
 
 // NOTE: the worker-side decoder runs the response trailer policy, which permits keep-alive and
@@ -894,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn first_exchange_materializes_and_release_drops() {
+    fn first_exchange_materializes_and_reuse_retains_until_quiet_reclaim() {
         let mut conn = test_conn();
         let request = b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let input = ConnState::materialize_input(&mut conn.input);
@@ -916,9 +922,62 @@ mod tests {
         assert!(conn.out_len > 0);
         conn.out_sent = conn.out_len;
         reuse_keep_alive(&mut conn);
+        assert!(conn.input.is_some());
+        assert!(conn.headers.is_some());
+        assert!(conn.output.is_some());
+        assert!(conn.is_idle());
+        assert!(!conn.read_ready);
+        let _ = pump_connection(&mut conn, &routes, &table, u64::MAX, 0, &host, false);
         assert!(conn.input.is_none());
         assert!(conn.headers.is_none());
         assert!(conn.output.is_none());
         assert!(conn.is_idle());
+    }
+
+    #[test]
+    fn hot_reuse_cycles_never_realloc_slabs() {
+        let mut conn = test_conn();
+        let request = b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+        let routes = StaticRoutes::new();
+        let mut slots = [RouteSlot::EMPTY; 8];
+        let table = routes.build_table(&mut slots).expect("empty table");
+        let host = HostShared::new(1);
+        for _ in 0..8 {
+            let input = ConnState::materialize_input(&mut conn.input);
+            input[..request.len()].copy_from_slice(request);
+            conn.len = request.len();
+            conn.read_ready = true;
+            match parse_exchange(&mut conn, &routes, &table, 0, &host, false) {
+                ExchangeOutcome::Responded => {}
+                ExchangeOutcome::NeedMore => panic!("full head must parse"),
+                ExchangeOutcome::Parked => panic!("no managed routes registered"),
+                ExchangeOutcome::Close(_) => panic!("unknown path must encode, not close"),
+            }
+            conn.out_sent = conn.out_len;
+            reuse_keep_alive(&mut conn);
+        }
+        let input_ptr = conn.input.as_ref().map(|slab| slab.as_ptr());
+        let headers_ptr = conn.headers.as_ref().map(|slab| slab.as_ptr());
+        let output_ptr = conn.output.as_ref().map(|slab| slab.as_ptr());
+        assert!(input_ptr.is_some());
+        assert!(headers_ptr.is_some());
+        assert!(output_ptr.is_some());
+        for _ in 0..8 {
+            let input = ConnState::materialize_input(&mut conn.input);
+            input[..request.len()].copy_from_slice(request);
+            conn.len = request.len();
+            conn.read_ready = true;
+            match parse_exchange(&mut conn, &routes, &table, 0, &host, false) {
+                ExchangeOutcome::Responded => {}
+                ExchangeOutcome::NeedMore => panic!("full head must parse"),
+                ExchangeOutcome::Parked => panic!("no managed routes registered"),
+                ExchangeOutcome::Close(_) => panic!("unknown path must encode, not close"),
+            }
+            conn.out_sent = conn.out_len;
+            reuse_keep_alive(&mut conn);
+            assert_eq!(conn.input.as_ref().map(|slab| slab.as_ptr()), input_ptr);
+            assert_eq!(conn.headers.as_ref().map(|slab| slab.as_ptr()), headers_ptr);
+            assert_eq!(conn.output.as_ref().map(|slab| slab.as_ptr()), output_ptr);
+        }
     }
 }
