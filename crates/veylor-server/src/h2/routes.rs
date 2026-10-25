@@ -4,7 +4,9 @@ use veylor_http1::is_token;
 use veylor_http2::{ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackRepresentation};
 
 use crate::static_files::{FileMounts, FilePlan, FileReject, HTTP_DATE_BYTES, write_http_date};
-use crate::static_routes::{MAX_RESPONSE_BODY, MAX_ROUTES, NativeHandler, RouteBuildError};
+use crate::static_routes::{
+    MAX_RESPONSE_BODY, MAX_ROUTES, NativeHandler, RouteBuildError, now_http_date,
+};
 
 use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 
@@ -219,9 +221,10 @@ impl<'a> FrozenRoutesView<'a> {
     }
 }
 
-// NOTE: file HEADERS assembly next to send_full: 200/206 carry content-length, content-
-// type, accept-ranges, and last-modified; 304 carries content-length 0 plus last-modified
-// (H1 emits both); 416 carries content-length 0 plus content-range */total. Single-range
+// NOTE: file HEADERS assembly next to send_full: every status carries Date first (H1 parity:
+// respond_file 200/206, respond_not_modified 304, respond_range_unsatisfiable 416 all emit
+// Date first); 200/206 add content-length, content-type, accept-ranges, and last-modified;
+// 304 carries content-length 0 plus last-modified (H1 emits both); 416 carries content-length 0 plus content-range */total. Single-range
 // 206 adds content-range; multipart 206 carries the dynamic boundary content-type instead
 // of the file type and no top-level content-range (H1 parity, body pages via read_chunk).
 pub(crate) struct FileHead {
@@ -248,11 +251,13 @@ pub(crate) fn send_file_head(
     let status_len = push_decimal(&mut status_buf, u64::from(head.status));
     let mut length_buf = [0; DECIMAL_CAP];
     let length_len = push_decimal(&mut length_buf, head.content_length);
-    let mut date_buf = [0; HTTP_DATE_BYTES];
-    let date_len = head
+    let mut mtime_buf = [0; HTTP_DATE_BYTES];
+    let mtime_len = head
         .mtime
-        .map(|mtime| write_http_date(mtime, &mut date_buf))
+        .map(|mtime| write_http_date(mtime, &mut mtime_buf))
         .unwrap_or(0);
+    let mut now_buf = [0; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now_buf);
     let mut range_buf = [0; CONTENT_RANGE_BYTES];
     let range_len = if head.status == 416 || head.window.is_some() {
         write_file_content_range(&mut range_buf, head.window, head.total)
@@ -265,10 +270,11 @@ pub(crate) fn send_file_head(
     } else {
         0
     };
-    let mut fields = [field(b"", b""); 6];
+    let mut fields = [field(b"", b""); 7];
     fields[0] = field(b":status", &status_buf[..status_len]);
-    fields[1] = field(b"content-length", &length_buf[..length_len]);
-    let mut count = 2;
+    fields[1] = field(b"date", &now_buf[..now_len]);
+    fields[2] = field(b"content-length", &length_buf[..length_len]);
+    let mut count = 3;
     if head.multipart {
         fields[count] = field(b"content-type", &ctype_buf[..ctype_len]);
         count += 1;
@@ -281,7 +287,7 @@ pub(crate) fn send_file_head(
         count += 1;
     }
     if head.mtime.is_some() {
-        fields[count] = field(b"last-modified", &date_buf[..date_len]);
+        fields[count] = field(b"last-modified", &mtime_buf[..mtime_len]);
         count += 1;
     }
     if head.status == 416 || head.window.is_some() {
@@ -327,8 +333,8 @@ fn strip_file_query(path: &[u8]) -> &[u8] {
 }
 
 // NOTE: RFC 9113 forbids content-length on 1xx/204 responses and the driver rejects it
-// at send_response time, so bodyless statuses emit :status-only HEADERS with END_STREAM
-// and never DATA; H1 drops the 204 body the same way (body_allowed gates it out).
+// at send_response time, so 204 emits :status plus Date with END_STREAM and never DATA;
+// H1 carries Date on 204 the same way (body_allowed gates the body, never the Date).
 pub(crate) fn send_status_only(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
@@ -338,7 +344,12 @@ pub(crate) fn send_status_only(
 ) -> Result<(), ErrorCode> {
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
-    let response_fields = [field(b":status", &status_buf[..status_len])];
+    let mut now_buf = [0; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now_buf);
+    let response_fields = [
+        field(b":status", &status_buf[..status_len]),
+        field(b"date", &now_buf[..now_len]),
+    ];
     let mut block = [0; HPACK_BLOCK_CAP];
     let sent = server
         .send_response(
@@ -354,10 +365,10 @@ pub(crate) fn send_status_only(
 }
 
 // NOTE: RFC 9113 section 8.2.2 length-match pin: a length-unknown Begin carries :status
-// only with END_STREAM clear, so the DATA that follows never contradicts a declared length
-// (a content-length: 0 would make the first DATA a client-side PROTOCOL_ERROR). H1 Begin
-// mirrors this field-for-field: chunked framing with status+reason and no content-length,
-// and H2 has no reason phrase, so :status alone is the whole head.
+// plus Date with END_STREAM clear, so the DATA that follows never contradicts a declared
+// length (a content-length: 0 would make the first DATA a client-side PROTOCOL_ERROR).
+// H1 Begin mirrors this with chunked framing plus Date (streams.rs Begin arm), and H2
+// has no reason phrase, so :status plus Date is the whole head.
 pub(crate) fn send_begin(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
@@ -367,7 +378,12 @@ pub(crate) fn send_begin(
 ) -> Result<(), ErrorCode> {
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
-    let response_fields = [field(b":status", &status_buf[..status_len])];
+    let mut now_buf = [0; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now_buf);
+    let response_fields = [
+        field(b":status", &status_buf[..status_len]),
+        field(b"date", &now_buf[..now_len]),
+    ];
     let mut block = [0; HPACK_BLOCK_CAP];
     let sent = server
         .send_response(
@@ -400,8 +416,11 @@ pub(crate) fn send_full(
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut length_buf = [0; DECIMAL_CAP];
     let length_len = push_decimal(&mut length_buf, body.len() as u64);
+    let mut now_buf = [0; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now_buf);
     let response_fields = [
         field(b":status", &status_buf[..status_len]),
+        field(b"date", &now_buf[..now_len]),
         field(b"content-length", &length_buf[..length_len]),
     ];
     let mut block = [0; HPACK_BLOCK_CAP];

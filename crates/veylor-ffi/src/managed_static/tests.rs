@@ -333,8 +333,12 @@ fn post_exchange(stream: &mut TcpStream, path: &str, body: &[u8]) -> (u16, Vec<u
         "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).expect("write head");
-    stream.write_all(body).expect("write body");
+    // NOTE: one write_all for head+body: native handlers invoke at head-parse time, so a
+    // head/body syscall split lets the worker parse between the two and invoke framing-only.
+    // A single small loopback write arrives coalesced; split writes flaked ~1/5.
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).expect("write request");
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -3781,10 +3785,7 @@ fn h2_expect_rst(stream: &mut TcpStream, id: u32) {
     );
 }
 
-fn h2_decoder<'a>(
-    entries: &'a mut [HpackEntrySlot; 8],
-    scratch: &'a mut [u8; 512],
-) -> HpackTable<'a> {
+fn h2_decoder<'a>(entries: &'a mut [HpackEntrySlot; 8], scratch: &'a mut [u8]) -> HpackTable<'a> {
     HpackTable::new(entries, scratch, 4_096)
 }
 
@@ -4877,7 +4878,8 @@ fn file_mount_h2c_serves_full_range_conditional_matrix() {
     let mut stream = connect_loopback(h2c);
     h2_handshake(&mut stream);
     let mut entries = [HpackEntrySlot::EMPTY; 8];
-    let mut scratch = [0; 512];
+    // NOTE: 9 date-carrying responses need 521 scratch bytes; 512 predates H2 Date.
+    let mut scratch = [0; 1024];
     let mut decoder = h2_decoder(&mut entries, &mut scratch);
     let mut decoded = [HpackHeader::EMPTY; 32];
 

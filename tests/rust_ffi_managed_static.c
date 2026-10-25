@@ -440,6 +440,308 @@ int main(void) {
     assert(h2content_length == sizeof(mount_file_body) - 1);
     assert(h2resp_len == sizeof(mount_file_body) - 1);
     assert(memcmp(h2resp, mount_file_body, sizeof(mount_file_body) - 1) == 0);
+
+    /* NOTE: multi-range over the same H2C conn frames one 206 multipart body
+       byte-identical to H1: boundary echoes from content-type, parts carry
+       exact slices, framed length matches. Subset (one survivor) collapses to
+       single 206; a plain sibling after proves the conn survives. */
+    const vyl_h2_field_to_encode h2multi_get[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/assets/hello.txt"),
+        h2_text_field(":authority", "localhost"),
+        h2_text_field("range", "bytes=0-4,6-10"),
+    };
+    uint32_t h2multi_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2multi_get, sizeof(h2multi_get) / sizeof(h2multi_get[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2multi_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2multi_id == 3);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    static uint8_t h2multi[2048] = {0};
+    size_t h2multi_len = 0;
+    uint16_t h2multi_status = 0;
+    uint64_t h2multi_framed = 0;
+    int h2multi_head = 0;
+    int h2multi_end = 0;
+    static uint8_t h2ctype[128] = {0};
+    size_t h2ctype_len = 0;
+    int h2multi_crange = 0;
+    for (int i = 0; i < 32 && !h2multi_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 3) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 3, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2multi_status = class.status;
+                h2multi_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                for (size_t f = h2actions[k].field_start;
+                     f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                    assert(f < 64);
+                    if (h2fields[f].name_length == 12 &&
+                        memcmp(h2data + h2fields[f].name_offset, "content-type", 12) == 0) {
+                        assert(h2fields[f].value_length < sizeof(h2ctype));
+                        memcpy(
+                            h2ctype, h2data + h2fields[f].value_offset,
+                            h2fields[f].value_length
+                        );
+                        h2ctype_len = h2fields[f].value_length;
+                    }
+                    if (h2fields[f].name_length == 13 &&
+                        memcmp(h2data + h2fields[f].name_offset, "content-range", 13) == 0) {
+                        h2multi_crange = 1;
+                    }
+                }
+                h2multi_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2multi_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 3
+            ) {
+                assert(h2multi_len + h2actions[k].data_length <= sizeof(h2multi));
+                assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
+                memcpy(
+                    h2multi + h2multi_len, h2data + h2actions[k].data_offset,
+                    h2actions[k].data_length
+                );
+                h2multi_len += h2actions[k].data_length;
+                uint32_t phase = 0;
+                assert(
+                    vyl_h2_client_account_data(
+                        h2, 3, h2actions[k].data_length, h2actions[k].flags, &phase
+                    ) == VYL_HTTP1_OK
+                );
+                if ((h2actions[k].flags & 1u) != 0) {
+                    assert(phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    h2multi_end = 1;
+                }
+            }
+        }
+    }
+    assert(h2multi_head == 1);
+    assert(h2multi_end == 1);
+    assert(h2multi_status == 206);
+    assert(h2multi_crange == 0);
+    static const char h2multi_prefix[] = "multipart/byteranges; boundary=";
+    assert(h2ctype_len > sizeof(h2multi_prefix) - 1);
+    assert(memcmp(h2ctype, h2multi_prefix, sizeof(h2multi_prefix) - 1) == 0);
+    const uint8_t* h2boundary = h2ctype + sizeof(h2multi_prefix) - 1;
+    size_t h2boundary_len = h2ctype_len - (sizeof(h2multi_prefix) - 1);
+    static const char h2veyor_prefix[] = "VEYLOR_";
+    assert(h2boundary_len > sizeof(h2veyor_prefix) - 1);
+    assert(memcmp(h2boundary, h2veyor_prefix, sizeof(h2veyor_prefix) - 1) == 0);
+    static uint8_t h2expected[2048] = {0};
+    int h2expected_len = snprintf(
+        (char*)h2expected, sizeof(h2expected),
+        "--%.*s\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-4/11\r\n\r\n"
+        "mount\r\n--%.*s\r\nContent-Type: text/plain\r\nContent-Range: bytes 6-10/11\r\n\r\n"
+        "bytes\r\n--%.*s--\r\n",
+        (int)h2boundary_len, (const char*)h2boundary, (int)h2boundary_len,
+        (const char*)h2boundary, (int)h2boundary_len, (const char*)h2boundary
+    );
+    assert(h2expected_len > 0 && (size_t)h2expected_len < sizeof(h2expected));
+    assert(h2multi_framed == (uint64_t)h2expected_len);
+    assert(h2multi_len == (size_t)h2expected_len);
+    assert(memcmp(h2multi, h2expected, h2multi_len) == 0);
+
+    const vyl_h2_field_to_encode h2subset_get[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/assets/hello.txt"),
+        h2_text_field(":authority", "localhost"),
+        h2_text_field("range", "bytes=0-4,99-"),
+    };
+    uint32_t h2subset_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2subset_get, sizeof(h2subset_get) / sizeof(h2subset_get[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2subset_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2subset_id == 5);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint8_t h2subset[16] = {0};
+    size_t h2subset_len = 0;
+    uint16_t h2subset_status = 0;
+    uint64_t h2subset_framed = 0;
+    int h2subset_head = 0;
+    int h2subset_end = 0;
+    static uint8_t h2subset_ctype[32] = {0};
+    size_t h2subset_ctype_len = 0;
+    static uint8_t h2subset_crange[32] = {0};
+    size_t h2subset_crange_len = 0;
+    for (int i = 0; i < 32 && !h2subset_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 5) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 5, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2subset_status = class.status;
+                h2subset_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                for (size_t f = h2actions[k].field_start;
+                     f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                    assert(f < 64);
+                    if (h2fields[f].name_length == 12 &&
+                        memcmp(h2data + h2fields[f].name_offset, "content-type", 12) == 0) {
+                        assert(h2fields[f].value_length < sizeof(h2subset_ctype));
+                        memcpy(
+                            h2subset_ctype, h2data + h2fields[f].value_offset,
+                            h2fields[f].value_length
+                        );
+                        h2subset_ctype_len = h2fields[f].value_length;
+                    }
+                    if (h2fields[f].name_length == 13 &&
+                        memcmp(h2data + h2fields[f].name_offset, "content-range", 13) == 0) {
+                        assert(h2fields[f].value_length < sizeof(h2subset_crange));
+                        memcpy(
+                            h2subset_crange, h2data + h2fields[f].value_offset,
+                            h2fields[f].value_length
+                        );
+                        h2subset_crange_len = h2fields[f].value_length;
+                    }
+                }
+                h2subset_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2subset_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 5
+            ) {
+                assert(h2subset_len + h2actions[k].data_length <= sizeof(h2subset));
+                assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
+                memcpy(
+                    h2subset + h2subset_len, h2data + h2actions[k].data_offset,
+                    h2actions[k].data_length
+                );
+                h2subset_len += h2actions[k].data_length;
+                uint32_t phase = 0;
+                assert(
+                    vyl_h2_client_account_data(
+                        h2, 5, h2actions[k].data_length, h2actions[k].flags, &phase
+                    ) == VYL_HTTP1_OK
+                );
+                if ((h2actions[k].flags & 1u) != 0) {
+                    assert(phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    h2subset_end = 1;
+                }
+            }
+        }
+    }
+    assert(h2subset_head == 1);
+    assert(h2subset_end == 1);
+    assert(h2subset_status == 206);
+    assert(h2subset_framed == 5);
+    assert(h2subset_len == 5);
+    assert(memcmp(h2subset, "mount", 5) == 0);
+    assert(h2subset_ctype_len == sizeof("text/plain") - 1);
+    assert(memcmp(h2subset_ctype, "text/plain", sizeof("text/plain") - 1) == 0);
+    assert(h2subset_crange_len == sizeof("bytes 0-4/11") - 1);
+    assert(memcmp(h2subset_crange, "bytes 0-4/11", sizeof("bytes 0-4/11") - 1) == 0);
+
+    const vyl_h2_field_to_encode h2sib_get[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/assets/hello.txt"),
+        h2_text_field(":authority", "localhost"),
+    };
+    uint32_t h2sib_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2sib_get, sizeof(h2sib_get) / sizeof(h2sib_get[0]), (uint32_t)VYL_H2_END_STREAM,
+            h2wire, sizeof(h2wire), &h2written, &h2sib_id, &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2sib_id == 7);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint8_t h2sib[16] = {0};
+    size_t h2sib_len = 0;
+    uint16_t h2sib_status = 0;
+    uint64_t h2sib_framed = 0;
+    int h2sib_head = 0;
+    int h2sib_end = 0;
+    for (int i = 0; i < 32 && !h2sib_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 7) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 7, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2sib_status = class.status;
+                h2sib_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                h2sib_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2sib_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 7
+            ) {
+                assert(h2sib_len + h2actions[k].data_length <= sizeof(h2sib));
+                assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
+                memcpy(
+                    h2sib + h2sib_len, h2data + h2actions[k].data_offset,
+                    h2actions[k].data_length
+                );
+                h2sib_len += h2actions[k].data_length;
+                uint32_t phase = 0;
+                assert(
+                    vyl_h2_client_account_data(
+                        h2, 7, h2actions[k].data_length, h2actions[k].flags, &phase
+                    ) == VYL_HTTP1_OK
+                );
+                if ((h2actions[k].flags & 1u) != 0) {
+                    assert(phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    h2sib_end = 1;
+                }
+            }
+        }
+    }
+    assert(h2sib_head == 1);
+    assert(h2sib_end == 1);
+    assert(h2sib_status == 200);
+    assert(h2sib_framed == sizeof(mount_file_body) - 1);
+    assert(h2sib_len == sizeof(mount_file_body) - 1);
+    assert(memcmp(h2sib, mount_file_body, sizeof(mount_file_body) - 1) == 0);
     assert(vyl_h2_client_destroy(h2) == VYL_HTTP1_OK);
     assert(close(h2fd) == 0);
 

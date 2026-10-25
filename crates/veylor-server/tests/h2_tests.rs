@@ -189,6 +189,8 @@ struct Response {
     content_type: Vec<u8>,
     last_modified: Vec<u8>,
     content_range: Vec<u8>,
+    date: Vec<u8>,
+    order: Vec<Vec<u8>>,
     body: Vec<u8>,
 }
 
@@ -250,9 +252,12 @@ fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
     let mut content_type = Vec::new();
     let mut last_modified = Vec::new();
     let mut content_range = Vec::new();
+    let mut date = Vec::new();
+    let mut order = Vec::new();
     for header in decoded.iter().take(count) {
         let name = decoder.resolve(header.field.name).expect("name");
         let value = decoder.resolve(header.field.value).expect("value");
+        order.push(name.to_vec());
         if name == b":status" {
             status = std::str::from_utf8(value)
                 .expect("status utf8")
@@ -269,6 +274,8 @@ fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
             last_modified = value.to_vec();
         } else if name == b"content-range" {
             content_range = value.to_vec();
+        } else if name == b"date" {
+            date = value.to_vec();
         }
     }
     assert_ne!(status, 0, "response carries :status");
@@ -278,8 +285,55 @@ fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
         content_type,
         last_modified,
         content_range,
+        date,
+        order,
         body: Vec::new(),
     }
+}
+
+// NOTE: H1 date_shape mirror (server_tests.rs): 29-byte IMF-fixdate, GMT only, weekday
+// comma, exactly one Date per HEADERS emission.
+fn date_shape(response: &Response) -> String {
+    let seen = std::str::from_utf8(&response.date)
+        .expect("date utf8")
+        .to_string();
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    let count = response
+        .order
+        .iter()
+        .filter(|name| name.as_slice() == b"date")
+        .count();
+    assert_eq!(count, 1, "exactly one date");
+    seen
+}
+
+// NOTE: Date-first pin mirroring H1 (Date rides first on every H1 assembly): :status then
+// date, then the length pin per shape (length-unknown Begin/204 omit content-length).
+fn assert_date_first(order: &[Vec<u8>], with_length: bool) {
+    assert!(order.len() >= 2, "status plus date: {order:?}");
+    assert_eq!(order[0], b":status", "status first: {order:?}");
+    assert_eq!(order[1], b"date", "date first after :status: {order:?}");
+    let lengths = order
+        .iter()
+        .filter(|name| name.as_slice() == b"content-length")
+        .count();
+    assert_eq!(
+        lengths,
+        usize::from(with_length),
+        "content-length pin: {order:?}"
+    );
+}
+
+// NOTE: raw field-list Date shape for :status-plus-date-only emissions (204/Begin), where
+// the block decodes through decode_fields instead of the Response struct.
+fn date_value_shape(value: &[u8]) -> String {
+    let seen = std::str::from_utf8(value).expect("date utf8").to_string();
+    assert_eq!(seen.len(), 29, "IMF-fixdate width: {seen}");
+    assert!(seen.ends_with(" GMT"), "GMT only: {seen}");
+    assert_eq!(seen.as_bytes()[3], b',', "weekday comma: {seen}");
+    seen
 }
 
 fn read_response_stateful(
@@ -520,8 +574,10 @@ fn second_stream_reuses_connection() {
     assert_eq!(counts.shutdown, 1);
 }
 
-// NOTE: policy-adoption golden: :status resolves to the static-table indexed form while
-// content-length stays a 5-byte literal, so the repeat response costs the same 5 bytes.
+// NOTE: policy-adoption golden with Date: :status stays the static-table indexed form (0x88),
+// date rides a 32-byte literal without indexing (name index 33, 29-byte value, zero table
+// insertions since date is not a stable name), content-length stays the 4-byte literal, so
+// the repeat response costs the same 37 bytes and the dynamic table stays untouched.
 #[test]
 fn h2_policy_indexed_status_wire_golden() {
     let server = h2_server();
@@ -530,20 +586,30 @@ fn h2_policy_indexed_status_wire_golden() {
     send_headers(&mut client, 1, b"GET", b"/hello", true);
     let (header, first) = read_frame(&mut client);
     assert_eq!(header.frame_type, FrameType::Headers);
-    assert_eq!(first, vec![0x88, 0x0f, 0x0d, 0x01, b'5']);
+    assert_eq!(first.len(), 37);
+    assert_eq!(&first[..4], &[0x88, 0x0f, 0x12, 0x1d]);
+    date_value_shape(&first[4..33]);
+    assert_eq!(&first[33..], &[0x0f, 0x0d, 0x01, b'5']);
     let response = decode_response(&first);
     assert_eq!(response.status, 200);
     assert_eq!(response.content_length, 5);
+    date_shape(&response);
+    assert_date_first(&response.order, true);
     let (header, body) = read_frame(&mut client);
     assert_eq!(header.frame_type, FrameType::Data);
     assert_eq!(body, b"hello");
     send_headers(&mut client, 3, b"GET", b"/empty", true);
     let (header, second) = read_frame(&mut client);
     assert_eq!(header.frame_type, FrameType::Headers);
-    assert_eq!(second, vec![0x88, 0x0f, 0x0d, 0x01, b'0']);
+    assert_eq!(second.len(), 37);
+    assert_eq!(&second[..4], &[0x88, 0x0f, 0x12, 0x1d]);
+    date_value_shape(&second[4..33]);
+    assert_eq!(&second[33..], &[0x0f, 0x0d, 0x01, b'0']);
     let response = decode_response(&second);
     assert_eq!(response.status, 200);
     assert_eq!(response.content_length, 0);
+    date_shape(&response);
+    assert_date_first(&response.order, true);
     server.stop_accepting();
     let counts = server.join().expect("join server");
     assert_eq!(counts.h2_served, 2);
@@ -588,6 +654,182 @@ fn h2_explicit_literal_bypasses_policy() {
     let len = encode_header_block(&policy, &mut encoder, &mut block).expect("encode policy");
     assert_eq!(len, 5);
     assert_eq!(&block[..len], &[0x88, 0x0f, 0x0d, 0x01, b'5']);
+}
+
+// NOTE: H2 Date parity pin (H1 h1_date_present_and_shaped_across_static_paths mirror): every
+// HEADERS emission carries exactly one IMF-fixdate Date first after :status; bodies, lengths,
+// and statuses stay byte-exact, and multiplexed siblings each carry their own Date.
+#[test]
+fn h2_date_static_200_first_shaped_exact_elsewhere() {
+    let server = h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"GET", b"/hello", true);
+    let first = read_response(&mut client, 1);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.content_length, 5);
+    assert_eq!(first.body, b"hello");
+    date_shape(&first);
+    assert_date_first(&first.order, true);
+    send_headers(&mut client, 3, b"GET", b"/empty", true);
+    let second = read_response(&mut client, 3);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.content_length, 0);
+    assert!(second.body.is_empty());
+    date_shape(&second);
+    assert_date_first(&second.order, true);
+    send_headers(&mut client, 5, b"GET", b"/missing", true);
+    let missing = read_response(&mut client, 5);
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.content_length, 9);
+    assert_eq!(missing.body, b"Not Found");
+    date_shape(&missing);
+    assert_date_first(&missing.order, true);
+    server.stop_accepting();
+    let (last, code) = read_goaway(&mut client);
+    assert_eq!(code, ErrorCode::NoError);
+    assert_eq!(last, 5);
+    read_eof(&mut client);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 3);
+    assert_eq!(counts.shutdown, 1);
+}
+
+// NOTE: native Date pin through the transport-neutral rig: handler 200 carries Date first
+// after :status with the handler body and length byte-exact.
+#[test]
+fn h2_date_native_200_first_shaped() {
+    let view = h2n_view(&H2N_OK);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"GET", b"/native", true);
+        let outcome = pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        assert_eq!(outcome.served, 1);
+        let response = read_response(client, 1);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_length, 12);
+        assert_eq!(response.body, b"native-hello");
+        date_shape(&response);
+        assert_date_first(&response.order, true);
+    });
+}
+
+// NOTE: file Date pin over one multiplexed connection with a stateful decoder (dynamic-table
+// continuity proves the 32-byte literal Date inserts nothing): 200/304/416 all carry Date
+// first after :status, Last-Modified/Content-Range stay exact, bodies stay byte-exact.
+#[test]
+fn h2_date_file_200_304_416_first_shaped() {
+    let root = file_mount_root("date");
+    std::fs::write(root.join("hello.txt"), b"file-content").expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    send_headers(&mut client, 1, b"GET", b"/assets/hello.txt", true);
+    let got = read_response_stateful(&mut client, 1, &mut dec);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.content_length, 12);
+    assert_eq!(got.body, b"file-content");
+    assert_eq!(got.content_type, b"text/plain");
+    assert!(!got.last_modified.is_empty());
+    date_shape(&got);
+    assert_date_first(&got.order, true);
+    assert_eq!(
+        got.order,
+        vec![
+            b":status".to_vec(),
+            b"date".to_vec(),
+            b"content-length".to_vec(),
+            b"content-type".to_vec(),
+            b"accept-ranges".to_vec(),
+            b"last-modified".to_vec()
+        ]
+    );
+    let since: &[u8] = &got.last_modified;
+    send_headers_extra(
+        &mut client,
+        3,
+        b"GET",
+        b"/assets/hello.txt",
+        &[(b"if-modified-since".as_slice(), since)],
+        true,
+    );
+    let fresh = read_response_stateful(&mut client, 3, &mut dec);
+    assert_eq!(fresh.status, 304);
+    assert_eq!(fresh.content_length, 0);
+    assert!(fresh.body.is_empty());
+    assert_eq!(fresh.last_modified, got.last_modified);
+    date_shape(&fresh);
+    assert_date_first(&fresh.order, true);
+    assert_eq!(
+        fresh.order,
+        vec![
+            b":status".to_vec(),
+            b"date".to_vec(),
+            b"content-length".to_vec(),
+            b"last-modified".to_vec()
+        ]
+    );
+    send_headers_extra(
+        &mut client,
+        5,
+        b"GET",
+        b"/assets/hello.txt",
+        &[(b"range".as_slice(), b"bytes=5000-6000".as_slice())],
+        true,
+    );
+    let bad = read_response_stateful(&mut client, 5, &mut dec);
+    assert_eq!(bad.status, 416);
+    assert!(bad.body.is_empty());
+    assert_eq!(bad.content_range, b"bytes */12");
+    date_shape(&bad);
+    assert_date_first(&bad.order, true);
+    assert_eq!(
+        bad.order,
+        vec![
+            b":status".to_vec(),
+            b"date".to_vec(),
+            b"content-length".to_vec(),
+            b"content-range".to_vec()
+        ]
+    );
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 3, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// NOTE: managed-Begin Date pin (H1 streams.rs Begin-arm parity): the length-unknown Begin
+// HEADERS carries :status plus a shaped Date only, END_STREAM stays clear, and the DATA
+// that follows still frames the host bytes byte-exact.
+#[test]
+fn h2_date_managed_begin_first_shaped() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.write_stream(event.token, b"managed-work"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"managed-work");
+    assert!(trailers.is_empty());
+    date_shape(&response);
+    assert_date_first(&response.order, false);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
 
 #[test]
@@ -1805,6 +2047,7 @@ fn decode_fields(block: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 // NOTE: RFC 9113 section 8.2.2 length-match pin: a length-unknown Begin must ride :status-only
 // HEADERS with END_STREAM clear; a content-length: 0 would turn the first DATA into a real-client
 // PROTOCOL_ERROR, so every streaming test reads its head through here and the absence is asserted.
+// Date rides first after :status here too (H1 Begin parity), shaped and exactly once.
 fn read_begin_block(stream: &mut TcpStream, id: u32) -> Vec<u8> {
     let first = loop {
         let frame = read_frame(stream);
@@ -1823,6 +2066,10 @@ fn read_begin_block(stream: &mut TcpStream, id: u32) -> Vec<u8> {
             .all(|(name, _)| name.as_slice() != b"content-length"),
         "length-unknown Begin omits content-length"
     );
+    assert_eq!(fields[0].0, b":status", "status first on Begin");
+    assert_eq!(fields[1].0, b"date", "date first after :status on Begin");
+    assert_eq!(fields.len(), 2, "Begin carries status plus date only");
+    date_value_shape(&fields[1].1);
     block
 }
 
@@ -2172,6 +2419,9 @@ fn read_trailer_pair(stream: &mut TcpStream, ids: [u32; 2]) -> [(Response, Trail
                             .all(|(name, _)| name.as_slice() != b"content-length"),
                         "length-unknown Begin omits content-length"
                     );
+                    assert_eq!(fields[0].0, b":status", "status first on Begin");
+                    assert_eq!(fields[1].0, b"date", "date first after :status on Begin");
+                    date_value_shape(&fields[1].1);
                     heads[index] = Some(decode_response(&block));
                 } else {
                     trailers[index].extend(decode_fields(&block));
@@ -2846,9 +3096,10 @@ fn h2_native_handler_failures_rst_without_headers() {
     h2n_failure_rsts(&H2N_BAD_REASON);
 }
 
-// NOTE: 204 serves :status-only HEADERS with END_STREAM (RFC 9113 forbids content-length on
-// 204): the exact field list proves no length rides the wire, and the sibling read proves no
-// DATA follows (a stray DATA frame would misroute the sibling's stream assertion).
+// NOTE: 204 serves :status plus Date with END_STREAM (RFC 9113 forbids content-length on
+// 204, never Date): the exact field-name list proves no length rides the wire, the Date value
+// proves IMF-fixdate shape, and the sibling read proves no DATA follows (a stray DATA frame
+// would misroute the sibling's stream assertion).
 fn h2n_204_serves(natives: &'static [FrozenNativeRoute<'static>]) {
     let view = h2n_view(natives);
     with_rig(|conn, _shared, client, server| {
@@ -2861,10 +3112,11 @@ fn h2n_204_serves(natives: &'static [FrozenNativeRoute<'static>]) {
         assert_eq!(header.frame_type, FrameType::Headers);
         assert_eq!(header.stream_id, 1);
         assert_ne!(header.flags & HEADERS_FLAG_END_STREAM, 0);
-        assert_eq!(
-            decode_fields(&payload),
-            vec![(b":status".to_vec(), b"204".to_vec())]
-        );
+        let fields = decode_fields(&payload);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], (b":status".to_vec(), b"204".to_vec()));
+        assert_eq!(fields[1].0, b"date");
+        date_value_shape(&fields[1].1);
         send_headers(client, 3, b"GET", b"/empty", true);
         pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
         let sibling = read_response(client, 3);
@@ -2916,10 +3168,11 @@ fn h2_managed_respond_204_serves_status_only() {
         assert_eq!(header.frame_type, FrameType::Headers);
         assert_eq!(header.stream_id, 1);
         assert_ne!(header.flags & HEADERS_FLAG_END_STREAM, 0);
-        assert_eq!(
-            decode_fields(&payload),
-            vec![(b":status".to_vec(), b"204".to_vec())]
-        );
+        let fields = decode_fields(&payload);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], (b":status".to_vec(), b"204".to_vec()));
+        assert_eq!(fields[1].0, b"date");
+        date_value_shape(&fields[1].1);
         send_headers(client, 3, b"GET", b"/missing", true);
         pump_until(conn, server, &view, Some(ctx), |outcome| outcome.served > 0);
         let sibling = read_response(client, 3);
