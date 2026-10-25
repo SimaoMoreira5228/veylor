@@ -170,3 +170,33 @@ fn parses_http_1_1_expectations() {
     );
     assert!(parse_all(b"POST / HTTP/1.0\r\nExpect: magic\r\n\r\n").is_ok());
 }
+#[test]
+fn colon_less_line_past_caller_capacity_fails_instead_of_livelocking_resume() {
+    
+
+
+
+
+    let input = b"GET / HTTP/1.1\r\nHost: x\r\nNoColonLine\r\n\r\n";
+    let mut parser = Parser::new();
+    let mut storage = [Header::default(); 1];
+    assert_eq!(
+        parser.parse(input, &mut storage, Limits::default()),
+        Err(ParseError::Invalid)
+    );
+
+    
+
+    let input = b"GET / HTTP/1.1\r\n*Host: x\r\nX-A: \t  value withHTTP/0.1\r\n*Host: xx\r\nX-A: \t  value withHTTP/0\r\nX-A spaces\t \r\n\r\n";
+    let mut parser = Parser::new();
+    let mut small = [Header::default(); 4];
+    let _ = parser.parse(&input[..input.len() / 2], &mut small, Limits::default());
+    let result = parser.parse(input, &mut small, Limits::default());
+    match result {
+        Err(ParseError::HeaderCapacity) => {
+            assert!(parser.required_header_capacity() > small.len());
+        }
+        Err(_) => {}
+        Ok(_) => panic!("colon-less line must not parse successfully"),
+    }
+}

@@ -226,14 +226,20 @@ impl<'a> ResponseParser<'a> {
                     if self.header_count == limits.header_count {
                         return self.fail(ParseError::HeaderSectionTooLarge);
                     }
-                    if self.header_count >= headers.len() {
-                        self.scan_offset = self.line_start;
-                        return Err(ParseError::HeaderCapacity);
-                    }
+                    
+
+
+
+
+
                     let line = &input[self.line_start..line_end];
                     let Some(colon) = line.iter().position(|byte| *byte == b':') else {
                         return self.fail(ParseError::Invalid);
                     };
+                    if self.header_count >= headers.len() {
+                        self.scan_offset = self.line_start;
+                        return Err(ParseError::HeaderCapacity);
+                    }
                     let name = &line[..colon];
                     if name.is_empty()
                         || name.len() > limits.field_name_bytes

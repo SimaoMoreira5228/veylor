@@ -54,6 +54,9 @@ integration-rust-ffi-linux:
     clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_managed_native.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
         -o build/test-rust-ffi-managed-native
+    clang {{ ABI_CFLAGS }} -pthread -Iinclude tests/foreign_threads.c \
+        -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug -pthread \
+        -o build/test-foreign-threads
     build/test-rust-ffi-http1
     build/test-rust-ffi-client-response
     build/test-rust-ffi-server-body
@@ -63,3 +66,4 @@ integration-rust-ffi-linux:
     build/test-rust-ffi-managed-static
     build/test-rust-ffi-managed-dispatch
     build/test-rust-ffi-managed-native
+    build/test-foreign-threads

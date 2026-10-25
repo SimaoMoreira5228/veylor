@@ -1,0 +1,6 @@
+HTTP/1.1 103 Early Hints
+Link: </s.css>
+
+HTTP/1.1 200 OK
+Content-Length: 0
+

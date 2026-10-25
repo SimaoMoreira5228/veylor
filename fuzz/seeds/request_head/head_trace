@@ -1,0 +1,3 @@
+HEAD /i HTTP/1.1
+Host: x
+

@@ -73,6 +73,22 @@ fn resumes_after_caller_header_storage_grows() {
 }
 
 #[test]
+fn colon_less_line_past_caller_capacity_fails_instead_of_livelocking_resume() {
+    
+
+
+
+
+    let input = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nNoColonLine\r\n\r\n";
+    let mut parser = ResponseParser::new(RequestMethod::Other, b"");
+    let mut storage = [Header::default(); 1];
+    assert_eq!(
+        parser.parse(input, &mut storage, Limits::default()),
+        Err(ParseError::Invalid)
+    );
+}
+
+#[test]
 fn honors_no_body_and_upgrade_response_rules() {
     let (head, _) = parse_all(
         b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n",

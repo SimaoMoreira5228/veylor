@@ -1,0 +1,4 @@
+# Fuzz seed inputs are byte-exact HTTP wire shapes (CRLF significant).
+# Keep them binary so core.autocrlf never normalizes line endings.
+fuzz/seeds/** -text
+fuzz/corpus/** -text

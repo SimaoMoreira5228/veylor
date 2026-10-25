@@ -1,0 +1,33 @@
+[package]
+name = "veylor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+veylor-http1 = { path = "../crates/veylor-http1" }
+veylor-http2 = { path = "../crates/veylor-http2" }
+
+[[bin]]
+name = "fuzz_request_head"
+path = "fuzz_targets/fuzz_request_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_client_response"
+path = "fuzz_targets/fuzz_client_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_hpack_decode"
+path = "fuzz_targets/fuzz_hpack_decode.rs"
+test = false
+doc = false

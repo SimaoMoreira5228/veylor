@@ -16,6 +16,7 @@ default-members = [
     "crates/veylor-runtime",
     "crates/veylor-server",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
