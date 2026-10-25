@@ -178,6 +178,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let base = Instant::now();
     let mut turn_offset = 0usize;
     let mut stop_seen = false;
+    let mut h1_quiet = false;
+    let mut parked_live = false;
     let mut drain_start_ns = 0u64;
     let mut h2_force_ns = 0u64;
 
@@ -217,9 +219,15 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // only worker-poller wakers, so a stop sleeping in the stream poll is observed at
         // loop top within one stream cadence; new accepts likewise wait out one cadence.
         let live_streams = worker.live_count() + h2_turn::occupied(&h2_meta);
-        let pending = work_pending(&conns, h2_turn::wants_pump(&h2_meta));
+        let h2_want = h2_turn::wants_pump(&h2_meta);
+        let pending = if h1_quiet {
+            h2_want
+        } else {
+            work_pending(&conns, h2_want)
+        };
         let stream_wait_ms = if pending { 0 } else { config.poll_wait_ms };
         let worker_wait_ms = if live_streams == 0 { stream_wait_ms } else { 0 };
+        let mut stream_touched = false;
         if live_streams > 0 {
             ready.clear();
             let poll_error: Option<io::Error> =
@@ -231,9 +239,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     Err(error) => Some(error),
                 };
             for event in ready.drain(..) {
-                if event.token == LISTENER_TOKEN || event.token == WAKE_TOKEN {
+                if event.token == WAKE_TOKEN {
+                    stream_touched = true;
                     continue;
                 }
+                if event.token == LISTENER_TOKEN {
+                    continue;
+                }
+                stream_touched = true;
                 if h2_turn::note_readiness(&mut h2_meta, &event) {
                     continue;
                 }
@@ -277,6 +290,9 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             admitted: &mut admitted,
         };
         let turn_result = worker.turn(&mut listener, input);
+        let turn_failed = turn_result.is_err();
+        let admitted_any = admitted.iter().any(|entry| entry.is_some());
+        let expired_any = expired[0].token.slot != SENTINEL_SLOT;
         drain_admitted(
             &mut admitted,
             &mut conns,
@@ -302,6 +318,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         let (h1_staged, mut h2_staged): (Vec<_>, Vec<_>) = staged
             .into_iter()
             .partition(|work| work.slot < MAX_CONNECTIONS);
+        let h1_staged_empty = h1_staged.is_empty();
         drain_host_staged(
             &host,
             h1_staged,
@@ -403,7 +420,23 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // one turn's bytes split fairly instead of each family taking a full share.
         let live_count = (worker.live_count() + h2_turn::occupied(&h2_meta)).max(1) as u64;
         let per_conn_budget = config.turn.byte_budget_per_turn.div_ceil(live_count).max(1);
-        for step in 0..max_conns {
+        // NOTE: idle-turn skip: with no arrivals, admits, expiries, staged host work, H1
+        // backlog, parks, or shutdown signal the sweep would repeat last turn's no-ops, so
+        // it is skipped. Read claims persist in conn flags across skipped turns; deadlines
+        // still fire in worker.turn above and H2 keeps its own dispatch below.
+        let skip_pump = !draining
+            && !stop.load(Ordering::Acquire)
+            && !force.load(Ordering::Acquire)
+            && !turn_failed
+            && !pending
+            && !stream_touched
+            && !admitted_any
+            && !expired_any
+            && h1_staged_empty
+            && !parked_live;
+        h1_quiet = skip_pump;
+        let sweep_steps = if skip_pump { 0 } else { max_conns };
+        for step in 0..sweep_steps {
             let index = (turn_offset + step) % max_conns;
             let Some(conn) = conns[index].as_mut() else {
                 continue;
@@ -438,7 +471,10 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 );
             }
         }
-        turn_offset = (turn_offset + 1) % max_conns;
+        if !skip_pump {
+            parked_live = conns.iter().flatten().any(|conn| conn.is_parked());
+            turn_offset = (turn_offset + 1) % max_conns;
+        }
         drive_h2_pumps!(
             h2_enabled,
             h2_view,

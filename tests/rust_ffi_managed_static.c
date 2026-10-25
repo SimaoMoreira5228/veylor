@@ -137,6 +137,31 @@ static void assert_h1_date_shape(const char* response) {
     assert(count == 1);
 }
 
+static void assert_h2_date_shape(
+    const vyl_h2_field* fields,
+    size_t field_start,
+    size_t field_count,
+    const uint8_t* data
+) {
+    assert(field_count >= 2);
+    assert(fields[field_start].name_length == 7);
+    assert(memcmp(data + fields[field_start].name_offset, ":status", 7) == 0);
+    assert(fields[field_start + 1].name_length == 4);
+    assert(memcmp(data + fields[field_start + 1].name_offset, "date", 4) == 0);
+    size_t count = 0;
+    for (size_t i = field_start; i < field_start + field_count; i++) {
+        if (fields[i].name_length == 4 &&
+            memcmp(data + fields[i].name_offset, "date", 4) == 0) {
+            assert(fields[i].value_length == 29);
+            const uint8_t* value = data + fields[i].value_offset;
+            assert(value[3] == ',');
+            assert(memcmp(value + 25, " GMT", 4) == 0);
+            count++;
+        }
+    }
+    assert(count == 1);
+}
+
 int main(void) {
     static const uint8_t method[] = "GET";
     static const uint8_t path[] = "/hello";
@@ -440,6 +465,21 @@ int main(void) {
                 h2status = class.status;
                 h2content_length = class.content_length;
                 assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                {
+                    int h2_has_lm = 0;
+                    for (size_t f = h2actions[k].field_start;
+                         f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                        assert(f < 64);
+                        if (h2fields[f].name_length == 13 &&
+                            memcmp(h2data + h2fields[f].name_offset, "last-modified", 13) == 0) {
+                            h2_has_lm = 1;
+                        }
+                    }
+                    assert(h2_has_lm == 1);
+                }
                 h2_got_head = 1;
             } else if (
                 h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
@@ -521,6 +561,9 @@ int main(void) {
                 h2multi_status = class.status;
                 h2multi_framed = class.content_length;
                 assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
                 for (size_t f = h2actions[k].field_start;
                      f < h2actions[k].field_start + h2actions[k].field_count; f++) {
                     assert(f < 64);
@@ -638,6 +681,9 @@ int main(void) {
                 h2subset_status = class.status;
                 h2subset_framed = class.content_length;
                 assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
                 for (size_t f = h2actions[k].field_start;
                      f < h2actions[k].field_start + h2actions[k].field_count; f++) {
                     assert(f < 64);
@@ -739,6 +785,21 @@ int main(void) {
                 h2sib_status = class.status;
                 h2sib_framed = class.content_length;
                 assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                {
+                    int h2sib_has_lm = 0;
+                    for (size_t f = h2actions[k].field_start;
+                         f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                        assert(f < 64);
+                        if (h2fields[f].name_length == 13 &&
+                            memcmp(h2data + h2fields[f].name_offset, "last-modified", 13) == 0) {
+                            h2sib_has_lm = 1;
+                        }
+                    }
+                    assert(h2sib_has_lm == 1);
+                }
                 h2sib_head = 1;
                 if ((h2actions[k].flags & 1u) != 0) {
                     h2sib_end = 1;
@@ -773,6 +834,236 @@ int main(void) {
     assert(h2sib_framed == sizeof(mount_file_body) - 1);
     assert(h2sib_len == sizeof(mount_file_body) - 1);
     assert(memcmp(h2sib, mount_file_body, sizeof(mount_file_body) - 1) == 0);
+
+    /* NOTE: static GET over the same H2C conn pins Date first + 29-byte IMF-fixdate
+       shape on a non-file HEADERS (send_full emits :status, date, content-length). */
+    const vyl_h2_field_to_encode h2static_get[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/hello"),
+        h2_text_field(":authority", "localhost"),
+    };
+    uint32_t h2static_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2static_get, sizeof(h2static_get) / sizeof(h2static_get[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2static_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2static_id == 9);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint8_t h2static_resp[8] = {0};
+    size_t h2static_len = 0;
+    uint16_t h2static_status = 0;
+    uint64_t h2static_framed = 0;
+    int h2static_head = 0;
+    int h2static_end = 0;
+    for (int i = 0; i < 32 && !h2static_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 9) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 9, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2static_status = class.status;
+                h2static_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                h2static_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2static_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 9
+            ) {
+                assert(h2static_len + h2actions[k].data_length <= sizeof(h2static_resp));
+                assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
+                memcpy(
+                    h2static_resp + h2static_len, h2data + h2actions[k].data_offset,
+                    h2actions[k].data_length
+                );
+                h2static_len += h2actions[k].data_length;
+                uint32_t phase = 0;
+                assert(
+                    vyl_h2_client_account_data(
+                        h2, 9, h2actions[k].data_length, h2actions[k].flags, &phase
+                    ) == VYL_HTTP1_OK
+                );
+                if ((h2actions[k].flags & 1u) != 0) {
+                    assert(phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    h2static_end = 1;
+                }
+            }
+        }
+    }
+    assert(h2static_head == 1);
+    assert(h2static_end == 1);
+    assert(h2static_status == 200);
+    assert(h2static_framed == sizeof(body) - 1);
+    assert(h2static_len == sizeof(body) - 1);
+    assert(memcmp(h2static_resp, body, sizeof(body) - 1) == 0);
+
+    /* NOTE: conditional GET over the same conn reuses the H1 last-modified: 304
+       completes with HEADERS alone (date + last-modified, no body). */
+    const vyl_h2_field_to_encode h2cond_get[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/assets/hello.txt"),
+        h2_text_field(":authority", "localhost"),
+        h2_text_field("if-modified-since", last_modified),
+    };
+    uint32_t h2cond_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2cond_get, sizeof(h2cond_get) / sizeof(h2cond_get[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2cond_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2cond_id == 11);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint16_t h2cond_status = 0;
+    int h2cond_head = 0;
+    int h2cond_end = 0;
+    for (int i = 0; i < 32 && !h2cond_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 11) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 11, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2cond_status = class.status;
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                {
+                    int h2cond_has_lm = 0;
+                    for (size_t f = h2actions[k].field_start;
+                         f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                        assert(f < 64);
+                        if (h2fields[f].name_length == 13 &&
+                            memcmp(h2data + h2fields[f].name_offset, "last-modified", 13) == 0) {
+                            h2cond_has_lm = 1;
+                        }
+                    }
+                    assert(h2cond_has_lm == 1);
+                }
+                h2cond_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2cond_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 11
+            ) {
+                assert(0 && "304 carries no body");
+            }
+        }
+    }
+    assert(h2cond_head == 1);
+    assert(h2cond_end == 1);
+    assert(h2cond_status == 304);
+
+    /* NOTE: unsatisfiable range over the same conn fails closed as 416 with HEADERS
+       alone (date plus content-range bytes-star/11, no body). */
+    const vyl_h2_field_to_encode h2unsat_get[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/assets/hello.txt"),
+        h2_text_field(":authority", "localhost"),
+        h2_text_field("range", "bytes=99-"),
+    };
+    uint32_t h2unsat_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2unsat_get, sizeof(h2unsat_get) / sizeof(h2unsat_get[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2unsat_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2unsat_id == 13);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint16_t h2unsat_status = 0;
+    uint64_t h2unsat_framed = 0;
+    int h2unsat_head = 0;
+    int h2unsat_end = 0;
+    static uint8_t h2unsat_crange[32] = {0};
+    size_t h2unsat_crange_len = 0;
+    for (int i = 0; i < 32 && !h2unsat_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 13) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 13, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2unsat_status = class.status;
+                h2unsat_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                for (size_t f = h2actions[k].field_start;
+                     f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                    assert(f < 64);
+                    if (h2fields[f].name_length == 13 &&
+                        memcmp(h2data + h2fields[f].name_offset, "content-range", 13) == 0) {
+                        assert(h2fields[f].value_length < sizeof(h2unsat_crange));
+                        memcpy(
+                            h2unsat_crange, h2data + h2fields[f].value_offset,
+                            h2fields[f].value_length
+                        );
+                        h2unsat_crange_len = h2fields[f].value_length;
+                    }
+                }
+                h2unsat_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2unsat_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 13
+            ) {
+                assert(0 && "416 carries no body");
+            }
+        }
+    }
+    assert(h2unsat_head == 1);
+    assert(h2unsat_end == 1);
+    assert(h2unsat_status == 416);
+    assert(h2unsat_framed == 0);
+    assert(h2unsat_crange_len == sizeof("bytes */11") - 1);
+    assert(memcmp(h2unsat_crange, "bytes */11", sizeof("bytes */11") - 1) == 0);
     assert(vyl_h2_client_destroy(h2) == VYL_HTTP1_OK);
     assert(close(h2fd) == 0);
 

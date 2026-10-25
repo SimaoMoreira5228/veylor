@@ -11,6 +11,11 @@ use crate::static_routes::{
 use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 
 pub(crate) const NOT_FOUND_BODY: &[u8] = b"Not Found";
+pub(crate) const METHOD_NOT_ALLOWED_BODY: &[u8] = b"Method Not Allowed";
+// NOTE: at most this many distinct methods list in Allow; more truncate the tail, so size
+// it at the route cap and the 405 below RSTs past the value buffer instead.
+const ALLOW_METHODS: usize = 16;
+pub(crate) const ALLOW_BYTES: usize = 320;
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
 const CONTENT_RANGE_BYTES: usize = 80;
 // NOTE: "multipart/byteranges; boundary=" plus token and hex fields tops out near 91 bytes;
@@ -161,6 +166,87 @@ impl<'a> FrozenRoutesView<'a> {
             direct
         };
         found.map(|native| (native.handler, native.user_data))
+    }
+
+    // NOTE: miss-only path scan, so hits return with no extra work: one bounded pass
+    // over statics then natives distinguishes a wrong method from a miss. File entries
+    // never match here (exact routes win over mounts, same as H1), and HEAD fallback
+    // stays dispatch-only (unregistered HEAD never lists, like unregistered OPTIONS).
+    pub(crate) fn has_path_match(&self, path: &[u8]) -> bool {
+        let statics = self
+            .routes
+            .iter()
+            .any(|route| route.file_root.is_none() && route.path == path);
+        if statics {
+            return true;
+        }
+        self.natives.iter().any(|native| native.path == path)
+    }
+
+    // NOTE: Allow companion to has_path_match for 405 assembly: same frozen slots and
+    // match rules (exact path equality, file entries skipped), no alloc, miss-path only.
+    // Fills unique methods in table order (statics then natives) and truncates at out
+    // capacity. Exact registered methods only, never synthesized.
+    pub(crate) fn allowed_methods(&self, path: &[u8], out: &mut [&'a [u8]]) -> usize {
+        let mut count = 0;
+        for route in self.routes.iter() {
+            if route.file_root.is_some() {
+                continue;
+            }
+            if route.path != path {
+                continue;
+            }
+            if out[..count].contains(&route.method) {
+                continue;
+            }
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = route.method;
+            count += 1;
+        }
+        for native in self.natives.iter() {
+            if native.path != path {
+                continue;
+            }
+            if out[..count].contains(&native.method) {
+                continue;
+            }
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = native.method;
+            count += 1;
+        }
+        count
+    }
+
+    // NOTE: comma-joined Allow value into one literal field (H1 respond_method_not_allowed
+    // shape): ", " separators, None past the value buffer so the caller RSTs fail-closed.
+    pub(crate) fn write_allow(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
+        let mut methods: [&[u8]; ALLOW_METHODS] = [&[]; ALLOW_METHODS];
+        let count = self.allowed_methods(path, &mut methods);
+        if count == 0 {
+            return None;
+        }
+        let mut len = 0;
+        for (index, name) in methods[..count].iter().enumerate() {
+            if index > 0 {
+                let end = len + 2;
+                if end > out.len() {
+                    return None;
+                }
+                out[len..end].copy_from_slice(b", ");
+                len = end;
+            }
+            let end = len + name.len();
+            if end > out.len() {
+                return None;
+            }
+            out[len..end].copy_from_slice(name);
+            len = end;
+        }
+        Some(len)
     }
 
     pub(crate) fn is_managed(&self, method: &[u8], path: &[u8]) -> bool {
@@ -462,6 +548,72 @@ pub(crate) fn send_full(
     Ok(())
 }
 
+// NOTE: 405 HEADERS assembly beside send_full: :status plus Date plus content-length
+// plus one comma-joined Allow literal (H1 encode_method_not_allowed shape). Date rides
+// the existing now_http_date sender, no new Date machinery; per-stream fail-closed like
+// send_full (HEADERS errors read InternalError, DATA errors FlowControlError, never GOAWAY
+// here — the caller maps those to stream RSTs and the conn survives).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_method_not_allowed(
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    stream: u32,
+    allow: &[u8],
+    end_stream: bool,
+    send_body: bool,
+    output: &mut [u8],
+    used: &mut usize,
+) -> Result<(), ErrorCode> {
+    let mut status_buf = [0; DECIMAL_CAP];
+    let status_len = push_decimal(&mut status_buf, 405);
+    let mut length_buf = [0; DECIMAL_CAP];
+    let length_len = push_decimal(&mut length_buf, METHOD_NOT_ALLOWED_BODY.len() as u64);
+    let mut now_buf = [0; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now_buf);
+    let response_fields = [
+        field(b":status", &status_buf[..status_len]),
+        field(b"date", &now_buf[..now_len]),
+        field(b"content-length", &length_buf[..length_len]),
+        field(b"allow", allow),
+    ];
+    let mut block = [0; HPACK_BLOCK_CAP];
+    let sent = server
+        .send_response(
+            stream,
+            &response_fields,
+            &mut block,
+            &mut output[*used..],
+            end_stream,
+        )
+        .map_err(|_| ErrorCode::InternalError)?;
+    *used += sent.writer.pending_bytes().len();
+    if end_stream || !send_body {
+        return Ok(());
+    }
+    let mut offset = 0;
+    while offset < METHOD_NOT_ALLOWED_BODY.len() {
+        let room = output.len() - *used;
+        if room < 10 {
+            return Err(ErrorCode::EnhanceYourCalm);
+        }
+        let take = (METHOD_NOT_ALLOWED_BODY.len() - offset).min(room - 9);
+        let last = offset + take == METHOD_NOT_ALLOWED_BODY.len();
+        let sent = server
+            .send_data(
+                stream,
+                &METHOD_NOT_ALLOWED_BODY[offset..offset + take],
+                last,
+                &mut output[*used..],
+            )
+            .map_err(|_| ErrorCode::FlowControlError)?;
+        if sent.frame.payload_length == 0 {
+            return Err(ErrorCode::FlowControlError);
+        }
+        *used += sent.writer.pending_bytes().len();
+        offset += sent.frame.payload_length;
+    }
+    Ok(())
+}
+
 pub(crate) fn field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
     HpackFieldToEncode {
         name,
@@ -485,4 +637,97 @@ fn push_decimal(buf: &mut [u8; DECIMAL_CAP], mut value: u64) -> usize {
     let len = DECIMAL_CAP - end;
     buf.copy_within(end.., 0);
     len
+}
+
+// NOTE: view-level Allow contract without I/O: statics scan before natives in table order,
+// duplicates collapse, file-mirror entries never match, HEAD stays dispatch-only (a GET-only
+// path lists exactly GET), and unknown paths report no match for the 404 tail.
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use crate::static_routes::{NativeRequestView, NativeResponseOut};
+
+    use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
+
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn probe(
+        _user_data: *mut c_void,
+        _request: *const NativeRequestView,
+        _response: *mut NativeResponseOut,
+    ) -> i32 {
+        0
+    }
+
+    #[test]
+    fn allow_lists_exact_methods_in_table_order() {
+        let file_root = std::path::Path::new("/tmp");
+        let routes = [
+            FrozenRoute {
+                method: b"GET",
+                path: b"/a",
+                status: 200,
+                body: b"a",
+                managed: false,
+                file_root: None,
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"POST",
+                path: b"/a",
+                status: 200,
+                body: b"b",
+                managed: false,
+                file_root: None,
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"GET",
+                path: b"/b",
+                status: 200,
+                body: b"c",
+                managed: false,
+                file_root: None,
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"GET",
+                path: b"/files/",
+                status: 200,
+                body: b"",
+                managed: false,
+                file_root: Some(file_root),
+                trailers: &[],
+            },
+        ];
+        let natives = [FrozenNativeRoute {
+            method: b"PUT",
+            path: b"/a",
+            handler: probe,
+            user_data: 0,
+        }];
+        let view = FrozenRoutesView::new(&routes)
+            .expect("frozen routes")
+            .with_natives(&natives)
+            .expect("natives");
+        assert!(view.has_path_match(b"/a"));
+        assert!(view.has_path_match(b"/b"));
+        assert!(!view.has_path_match(b"/missing"));
+        assert!(!view.has_path_match(b"/files/"));
+        let mut methods: [&[u8]; 4] = [&[]; 4];
+        assert_eq!(view.allowed_methods(b"/a", &mut methods), 3);
+        assert_eq!(
+            &methods[..3],
+            &[b"GET".as_slice(), b"POST".as_slice(), b"PUT".as_slice()]
+        );
+        assert_eq!(view.allowed_methods(b"/b", &mut methods), 1);
+        assert_eq!(&methods[..1], &[b"GET".as_slice()]);
+        assert_eq!(view.allowed_methods(b"/missing", &mut methods), 0);
+        let mut allow = [0u8; 64];
+        let len = view.write_allow(b"/a", &mut allow).expect("allow value");
+        assert_eq!(&allow[..len], b"GET, POST, PUT");
+        assert!(view.write_allow(b"/missing", &mut allow).is_none());
+        let mut tiny = [0u8; 3];
+        assert!(view.write_allow(b"/a", &mut tiny).is_none());
+    }
 }

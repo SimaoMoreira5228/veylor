@@ -426,6 +426,64 @@ fn thousand_idle_hold_single_worker() {
 }
 
 #[test]
+fn idle_skip_serves_after_quiet_turns() {
+    let server = test_multi_server(1);
+    let mut stream = connect(&server);
+    get(&mut stream, "/hello");
+    let (status, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+    std::thread::sleep(IDLE_HOLD);
+    get(&mut stream, "/hello");
+    let (status, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+    std::thread::sleep(IDLE_HOLD);
+    get(&mut stream, "/hello");
+    get(&mut stream, "/hello");
+    for _ in 0..2 {
+        let (status, body) = read_response(&mut stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+    }
+    server.stop_accepting();
+    read_eof(&mut stream);
+    let counts = server.join().expect("join server");
+    assert_eq!(total_closes(&counts), 1, "counts: {counts:?}");
+}
+
+#[test]
+fn idle_skip_reuse_many_conns() {
+    const CONNS: usize = 64;
+    let server = test_multi_server(2);
+    let mut held = Vec::with_capacity(CONNS);
+    for _ in 0..CONNS {
+        let mut stream = connect(&server);
+        get(&mut stream, "/hello");
+        let (status, body) = read_response(&mut stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        held.push(stream);
+    }
+    std::thread::sleep(IDLE_HOLD);
+    for stream in held.iter_mut() {
+        get(stream, "/hello");
+    }
+    for stream in held.iter_mut() {
+        let (status, body) = read_response(stream);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+    }
+    server.stop_accepting();
+    for stream in held.iter_mut() {
+        read_eof(stream);
+    }
+    let per_worker = server.join_per_worker().expect("join server");
+    let total: u64 = per_worker.iter().map(total_closes).sum();
+    assert_eq!(total, CONNS as u64, "counts: {per_worker:?}");
+}
+
+#[test]
 fn burst_drain_past_staging() {
     const PER_THREAD: usize = BURST_TOTAL / BURST_THREADS;
     let server = test_scale_server(BURST_CAP);

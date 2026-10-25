@@ -10,12 +10,16 @@ use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::streams::{StreamCmd, take_stream_cmd};
 use crate::connection::trailer_allowed;
 use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
+use crate::static_files::FileReject;
 use crate::static_routes::{
     MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
 };
 
 use super::file::FileDecision;
-use super::routes::{FrozenRoutesView, NOT_FOUND_BODY, field, send_begin, send_full};
+use super::routes::{
+    ALLOW_BYTES, FrozenRoutesView, NOT_FOUND_BODY, field, send_begin, send_full,
+    send_method_not_allowed,
+};
 use super::turn;
 use super::{
     H2_BODY_CAP, H2Conn, H2FileTransfer, H2HostCtx, Phase, STREAM_SLOTS, StepOutcome, StreamEvent,
@@ -135,6 +139,43 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             invoked.status,
             invoked.body,
             is_head || invoked.body.is_empty(),
+            true,
+            self.output,
+            self.used,
+        ) {
+            Ok(()) => self.outcome.served += 1,
+            Err(code) => self.fail(code),
+        }
+    }
+
+    // NOTE: 405 assembly beside the static 404 tail: the caller joins the exact registered
+    // methods for the path (write_allow) before this call so no request borrow crosses the
+    // mutable dispatch; overflow RSTs the stream fail-closed with the conn surviving (never
+    // GOAWAY for a 405), and the !end refusal mirrors the static tail exactly (HEADERS-open
+    // then RST plus the same close). Date rides the shared 405 sender first after :status
+    // (H1 Date-first parity); HEAD answers headers-only with the 405 length like any static HEAD.
+    fn serve_allow_value(&mut self, stream: u32, end: bool, is_head: bool, allow: &[u8]) {
+        if !end {
+            if send_method_not_allowed(
+                self.server,
+                stream,
+                allow,
+                false,
+                false,
+                self.output,
+                self.used,
+            )
+            .is_err()
+            {
+                return self.fail(ErrorCode::InternalError);
+            }
+            return self.deny(stream, ErrorCode::RefusedStream, true);
+        }
+        match send_method_not_allowed(
+            self.server,
+            stream,
+            allow,
+            is_head,
             true,
             self.output,
             self.used,
@@ -282,11 +323,45 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 }
                 // NOTE: exact statics win; file mounts serve only table misses, so existing
                 // routes never change behavior when mounts are added (H1 respond_to_head parity).
+                // NOTE: method-mismatch 405 beside the 404 below (H1 MethodNotAllowed parity):
+                // a path match with no method match answers 405 with the exact registered
+                // methods, never synthesized; managed parks and native dispatch already missed
+                // above, so this covers static, managed, and native kinds together. File
+                // entries never match the scan, so file 405 probes only after plan_file below
+                // reports Miss. Unknown paths fall through to the 404 tail untouched.
                 let found = self.routes.lookup(request.method, path);
+                if found.is_none() {
+                    let routes = self.routes;
+                    if routes.has_path_match(path) {
+                        let mut allow = [0u8; ALLOW_BYTES];
+                        let Some(len) = routes.write_allow(path, &mut allow) else {
+                            self.deny(stream, ErrorCode::InternalError, false);
+                            return;
+                        };
+                        self.serve_allow_value(stream, end, is_head, &allow[..len]);
+                        return;
+                    }
+                }
                 if found.is_none() {
                     let declared = request.content_length.unwrap_or(0);
                     match self.plan_file(request.method, path, declared, fields) {
-                        FileDecision::Miss => {}
+                        FileDecision::Miss => {
+                            // NOTE: file GET-probe mirror of H1 respond_file: non-GET/HEAD over
+                            // an existing file resource answers 405 with Allow: GET, HEAD while
+                            // traversal, directories, and misses stay 404 with no existence
+                            // oracle. The GET probe reuses resolve_file (prefix, decoding, and
+                            // stat stay single-sourced), so only a real file (Ok) or an
+                            // over-cap file (TooLarge) reports a resource; the static 405 scan
+                            // above already missed, so no exact route shadows this probe.
+                            if request.method != b"GET" && request.method != b"HEAD" {
+                                let probe = self.routes.resolve_file(b"GET", path);
+                                let exists = matches!(probe, Ok(_) | Err(FileReject::TooLarge));
+                                if exists {
+                                    self.serve_allow_value(stream, end, is_head, b"GET, HEAD");
+                                    return;
+                                }
+                            }
+                        }
                         FileDecision::TooLarge => {
                             match send_full(
                                 self.server,
