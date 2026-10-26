@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -211,6 +212,7 @@ fn directories_reject_not_a_file() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinks_reject_in_every_component() {
     let fixture = Fixture::build();
@@ -438,6 +440,7 @@ fn read_chunk_swapped_leaf_dir_fails_closed() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
+#[cfg(unix)]
 #[test]
 fn read_chunk_swapped_leaf_symlink_fails_closed() {
     let fixture = Fixture::build();

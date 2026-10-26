@@ -145,6 +145,31 @@ pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_body_cap(
 
 
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_gzip(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    status: u16,
+    reason: VylBytes,
+    body: VylBytes,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        register_gzip_route(
+            server,
+            method,
+            path,
+            status,
+            reason,
+            body,
+            MAX_STATIC_BODY_BYTES,
+        )
+    })
+}
+
+
+
+
 
 
 
@@ -198,6 +223,57 @@ unsafe fn register_static_route(
     {
         Ok(()) => {
             ready.ops.push(ReadyRouteOp::Static {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                status,
+                reason: reason.to_vec(),
+                body: body.to_vec(),
+                max_body_bytes,
+            });
+            VylResult::Ok
+        }
+        Err(error) => server_error_to_result(error),
+    }
+}
+
+unsafe fn register_gzip_route(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    status: u16,
+    reason: VylBytes,
+    body: VylBytes,
+    max_body_bytes: u64,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    let method = match unsafe { read_bytes(method) } {
+        Ok(method) => method,
+        Err(error) => return error,
+    };
+    let path = match unsafe { read_bytes(path) } {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let reason = match unsafe { read_bytes(reason) } {
+        Ok(reason) => reason,
+        Err(error) => return error,
+    };
+    let body = match unsafe { read_bytes(body) } {
+        Ok(body) => body,
+        Err(error) => return error,
+    };
+    match ready
+        .server
+        .register_gzip_route(method, path, status, reason, body, max_body_bytes)
+    {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::Gzip {
                 method: method.to_vec(),
                 path: path.to_vec(),
                 status,

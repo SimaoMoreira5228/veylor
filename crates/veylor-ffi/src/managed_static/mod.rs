@@ -16,7 +16,8 @@ pub use api::{
     vyl_managed_static_register_managed_route,
     vyl_managed_static_register_managed_route_with_trailers,
     vyl_managed_static_register_static_route,
-    vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_set_worker_count,
+    vyl_managed_static_register_static_route_with_body_cap,
+    vyl_managed_static_register_static_route_with_gzip, vyl_managed_static_set_worker_count,
     vyl_managed_static_start, vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
@@ -126,6 +127,14 @@ pub(super) enum ReadyRouteOp {
         body: Vec<u8>,
         max_body_bytes: u64,
     },
+    Gzip {
+        method: Vec<u8>,
+        path: Vec<u8>,
+        status: u16,
+        reason: Vec<u8>,
+        body: Vec<u8>,
+        max_body_bytes: u64,
+    },
     Managed {
         method: Vec<u8>,
         path: Vec<u8>,
@@ -160,6 +169,14 @@ impl ReadyRouteOp {
                 body,
                 max_body_bytes,
             } => server.register_route(method, path, *status, reason, body, *max_body_bytes),
+            Self::Gzip {
+                method,
+                path,
+                status,
+                reason,
+                body,
+                max_body_bytes,
+            } => server.register_gzip_route(method, path, *status, reason, body, *max_body_bytes),
             Self::Managed {
                 method,
                 path,

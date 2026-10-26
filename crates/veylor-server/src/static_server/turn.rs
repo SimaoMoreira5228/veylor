@@ -11,9 +11,11 @@ use veylor_runtime::{
     WAKE_TOKEN, Worker, WorkerError, WorkerStorage,
 };
 
-use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
+use crate::connection::{
+    ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection, tls_alpn_is_h2,
+};
 use crate::h2::H2Conn;
-use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps};
+use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps, move_h2_tls_slot};
 use crate::host::{HostShared, StagedWork};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::MAX_ROUTES;
@@ -84,7 +86,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let h2_view = crate::h2::FrozenRoutesView::new(&h2_flat)
         .ok()
         .and_then(|view| view.with_natives(&h2_natives).ok());
-    let h2_enabled = h2c_listener.is_some() && h2_view.is_some();
+    let h2_enabled = h2_view.is_some();
     let mut tls_acceptor: Option<veylor_tls::TlsAcceptor> = match config.tls.as_ref() {
         None => None,
         Some(tls) => {
@@ -288,7 +290,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut result.counts,
                     &mut tls_acceptor,
                 );
-                h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
+                h2_turn::abandon_slots(
+                    &mut h2_meta,
+                    &host,
+                    worker_id,
+                    &mut result.counts,
+                    &mut tls_acceptor,
+                );
                 worker.destroy();
                 host.push_shutdown(worker_id);
                 break;
@@ -365,7 +373,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         &mut result.counts,
                         &mut tls_acceptor,
                     );
-                    h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
+                    h2_turn::abandon_slots(
+                        &mut h2_meta,
+                        &host,
+                        worker_id,
+                        &mut result.counts,
+                        &mut tls_acceptor,
+                    );
                     worker.destroy();
                     host.push_shutdown(worker_id);
                     break;
@@ -382,7 +396,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut result.counts,
                     &mut tls_acceptor,
                 );
-                h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
+                h2_turn::abandon_slots(
+                    &mut h2_meta,
+                    &host,
+                    worker_id,
+                    &mut result.counts,
+                    &mut tls_acceptor,
+                );
                 worker.destroy();
                 host.push_shutdown(worker_id);
                 break;
@@ -472,8 +492,206 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 draining,
             ) {
                 PumpOutcome::Keep(progress) => {
-                    let token = conn.token();
-                    apply_pump_hooks(&mut worker, token, progress, now_ns)
+                    if !tls_alpn_is_h2(conn) {
+                        let token = conn.token();
+                        apply_pump_hooks(&mut worker, token, progress, now_ns)
+                    } else if !h2_enabled {
+                        Some(ConnClose::TransportError)
+                    } else if let Some(h1) = conns[index].take() {
+                        let token = h1.token();
+                        let mut h1 = h1;
+                        let tls = h1.tls.take();
+                        let prefix = match h1.input.as_ref() {
+                            Some(input) => input[..h1.len].to_vec(),
+                            None => Vec::new(),
+                        };
+                        let mut stream = h1.into_stream();
+                        let _ = stream_poller.deregister(&mut stream);
+                        let slot = h2_turn::free_slot(&h2_meta);
+                        match (slot, tls) {
+                            (Some(0), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    0,
+                                    h2_meta,
+                                    m0,
+                                    h2_bufs,
+                                    b0,
+                                    h2_ts0,
+                                    h2_dec0,
+                                    h2_enc0,
+                                    h2_c0,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(1), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    1,
+                                    h2_meta,
+                                    m1,
+                                    h2_bufs,
+                                    b1,
+                                    h2_ts1,
+                                    h2_dec1,
+                                    h2_enc1,
+                                    h2_c1,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(2), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    2,
+                                    h2_meta,
+                                    m2,
+                                    h2_bufs,
+                                    b2,
+                                    h2_ts2,
+                                    h2_dec2,
+                                    h2_enc2,
+                                    h2_c2,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(3), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    3,
+                                    h2_meta,
+                                    m3,
+                                    h2_bufs,
+                                    b3,
+                                    h2_ts3,
+                                    h2_dec3,
+                                    h2_enc3,
+                                    h2_c3,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(4), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    4,
+                                    h2_meta,
+                                    m4,
+                                    h2_bufs,
+                                    b4,
+                                    h2_ts4,
+                                    h2_dec4,
+                                    h2_enc4,
+                                    h2_c4,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(5), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    5,
+                                    h2_meta,
+                                    m5,
+                                    h2_bufs,
+                                    b5,
+                                    h2_ts5,
+                                    h2_dec5,
+                                    h2_enc5,
+                                    h2_c5,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(6), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    6,
+                                    h2_meta,
+                                    m6,
+                                    h2_bufs,
+                                    b6,
+                                    h2_ts6,
+                                    h2_dec6,
+                                    h2_enc6,
+                                    h2_c6,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (Some(7), Some(tls)) => {
+                                move_h2_tls_slot!(
+                                    7,
+                                    h2_meta,
+                                    m7,
+                                    h2_bufs,
+                                    b7,
+                                    h2_ts7,
+                                    h2_dec7,
+                                    h2_enc7,
+                                    h2_c7,
+                                    stream,
+                                    tls,
+                                    prefix,
+                                    now_ns,
+                                    config,
+                                    stream_poller,
+                                    result,
+                                    tls_acceptor
+                                );
+                            }
+                            (_, tls_opt) => {
+                                drop(stream);
+                                if tls_opt.is_some() {
+                                    if let Some(acceptor) = tls_acceptor.as_mut() {
+                                        acceptor.release();
+                                    }
+                                }
+                                result.counts.add(ConnClose::TransportError);
+                            }
+                        };
+                        let _ = worker.close(token);
+                        None
+                    } else {
+                        Some(ConnClose::TransportError)
+                    }
                 }
                 PumpOutcome::Close(reason) => Some(reason),
             };
@@ -542,7 +760,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             h2_c7,
             host,
             worker_id,
-            h2_staged
+            h2_staged,
+            tls_acceptor
         );
 
         // NOTE: drain serves in-flight exchanges to completion (each conn closes

@@ -262,6 +262,46 @@ int main(void) {
         ) == VYL_HTTP1_OK
     );
     assert(
+        vyl_managed_static_register_static_route_with_gzip(
+            NULL,
+            (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = body, .length = sizeof(body) - 1}
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_register_static_route_with_gzip(
+            server,
+            (vyl_http1_bytes){.data = NULL, .length = 1},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = body, .length = sizeof(body) - 1}
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_register_static_route_with_gzip(
+            server,
+            (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = NULL, .length = 1}
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_register_static_route_with_gzip(
+            server,
+            (vyl_http1_bytes){.data = method, .length = 0},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = body, .length = sizeof(body) - 1}
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
         vyl_managed_static_register_file_mount(
             server,
             (vyl_http1_bytes){.data = mount_prefix, .length = sizeof(mount_prefix) - 1},
@@ -272,6 +312,16 @@ int main(void) {
     assert(vyl_managed_static_set_worker_count(server, 1) == VYL_HTTP1_BAD_STATE);
     assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_BAD_STATE);
     assert(vyl_managed_static_enable_tls(server, method, sizeof(method) - 1, method, sizeof(method) - 1, 1) == VYL_HTTP1_BAD_STATE);
+    assert(
+        vyl_managed_static_register_static_route_with_gzip(
+            server,
+            (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            (vyl_http1_bytes){.data = body, .length = sizeof(body) - 1}
+        ) == VYL_HTTP1_BAD_STATE
+    );
     assert(vyl_managed_static_local_addr(server, &port) == VYL_HTTP1_OK);
     assert(port != 0);
     uint16_t h2c_port = 0;

@@ -5,13 +5,16 @@ use veylor_runtime::{
     AcceptedConnection, ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness,
     TcpListener, TcpStream,
 };
+use veylor_tls::{TlsAcceptor, TlsConn};
 
 use super::{
     ACK_SLOTS, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES, FrozenNativeRoute,
     FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP,
     STREAM_SLOTS,
 };
-use crate::connection::ConnClose;
+use crate::connection::{
+    ConnClose, TlsWriteOutcome, tls_encrypt_bytes, tls_read_decrypted, tls_write_once,
+};
 use crate::host::{HostShared, StagedWork};
 use crate::static_routes::MAX_RESPONSE_BODY;
 use crate::static_server::turn::apply_h2_staged;
@@ -68,6 +71,10 @@ impl Default for H2Buffers {
 #[derive(Default)]
 pub(crate) struct H2Meta {
     stream: Option<TcpStream>,
+    pub(crate) tls: Option<TlsConn>,
+    tls_pending: Vec<u8>,
+    tls_pending_sent: usize,
+    tls_plain: Vec<u8>,
     pub(crate) occupied: bool,
     readable: bool,
     write_blocked: bool,
@@ -89,8 +96,14 @@ impl H2Meta {
         self.pending_len > self.pending_sent
     }
 
+    fn tls_unflushed(&self) -> bool {
+        self.tls_pending.len() > self.tls_pending_sent
+    }
+
     fn wants_pump(&self) -> bool {
-        self.readable || self.staged || (self.pending_unflushed() && !self.write_blocked)
+        self.readable
+            || self.staged
+            || ((self.pending_unflushed() || self.tls_unflushed()) && !self.write_blocked)
     }
 }
 
@@ -134,6 +147,7 @@ pub(crate) struct H2Turn<'a> {
     pub(crate) linger_due: bool,
     pub(crate) forcing: bool,
     pub(crate) counts: &'a mut CloseCounts,
+    pub(crate) tls_acceptor: Option<&'a mut TlsAcceptor>,
 }
 
 pub(crate) fn occupied(metas: &H2MetaSlots) -> usize {
@@ -200,6 +214,7 @@ pub(crate) fn sweep_deadlines(metas: &mut H2MetaSlots, now_ns: u64, timeouts: Co
 fn idle_for_drain(meta: &H2Meta, conn: Option<&H2Conn<'_>>) -> bool {
     conn.is_some_and(|active| active.handshake_complete() && active.staged_len() == 0)
         && !meta.pending_unflushed()
+        && !meta.tls_unflushed()
 }
 
 pub(crate) fn pending_spare(meta: &mut H2Meta) -> &mut [u8] {
@@ -346,6 +361,104 @@ fn flush_pending(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64
     }
 }
 
+fn flush_h2(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64) -> H2Flush {
+    if meta.tls.is_some() {
+        tls_flush_h2(meta, stream_poller, budget)
+    } else {
+        flush_pending(meta, stream_poller, budget)
+    }
+}
+
+fn tls_flush_h2(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64) -> H2Flush {
+    if meta.tls_pending.len() <= meta.tls_pending_sent && meta.pending_len > meta.pending_sent {
+        let Some(staged) = meta.pending.as_deref() else {
+            return H2Flush::Closed(ConnClose::TransportError);
+        };
+        let plain_end = meta.pending_len.min(staged.len());
+        let plain_start = meta.pending_sent.min(plain_end);
+        meta.tls_pending.clear();
+        meta.tls_pending_sent = 0;
+        let Some(tls) = meta.tls.as_mut() else {
+            return H2Flush::Closed(ConnClose::TransportError);
+        };
+        if tls_encrypt_bytes(tls, &staged[plain_start..plain_end], &mut meta.tls_pending).is_err() {
+            return H2Flush::Closed(ConnClose::TransportError);
+        }
+        meta.pending_sent = meta.pending_len;
+    }
+    let Some(stream) = meta.stream.as_mut() else {
+        return H2Flush::Closed(ConnClose::TransportError);
+    };
+    let staged_end = meta.tls_pending.len();
+    let mut sent = meta.tls_pending_sent;
+    let mut allowance = *budget;
+    let mut outcome = H2Flush::Done;
+    let mut attempts = 0;
+    while sent < staged_end {
+        if allowance == 0 {
+            outcome = H2Flush::Blocked;
+            break;
+        }
+        let end = (staged_end - sent).min(allowance as usize) + sent;
+        let width = end - sent;
+        match tls_write_once(stream, &meta.tls_pending[sent..end]) {
+            TlsWriteOutcome::Accepted(accepted) => {
+                sent += accepted;
+                allowance -= accepted as u64;
+                if accepted == 0 {
+                    outcome = H2Flush::Blocked;
+                    break;
+                }
+                if accepted < width {
+                    outcome = H2Flush::Blocked;
+                    break;
+                }
+            }
+            TlsWriteOutcome::Blocked => {
+                outcome = H2Flush::Blocked;
+                break;
+            }
+            TlsWriteOutcome::Interrupted => {
+                attempts += 1;
+                if attempts >= 2 {
+                    break;
+                }
+            }
+            TlsWriteOutcome::Closed(reason) => {
+                outcome = H2Flush::Closed(reason);
+                break;
+            }
+        }
+    }
+    *budget = allowance;
+    meta.tls_pending_sent = sent;
+    match outcome {
+        H2Flush::Done => {
+            meta.tls_pending.clear();
+            meta.tls_pending_sent = 0;
+            meta.write_blocked = false;
+            if meta.watching_write {
+                meta.watching_write = false;
+                if meta.token != 0 {
+                    let _ = stream_poller.reregister(stream, meta.token, PollInterest::Readable);
+                }
+            }
+            H2Flush::Done
+        }
+        H2Flush::Blocked => {
+            meta.write_blocked = true;
+            if !meta.watching_write {
+                meta.watching_write = true;
+                if meta.token != 0 {
+                    let _ = stream_poller.reregister(stream, meta.token, PollInterest::ReadWrite);
+                }
+            }
+            H2Flush::Blocked
+        }
+        H2Flush::Retry | H2Flush::Closed(_) => outcome,
+    }
+}
+
 pub(crate) fn open_slot(
     meta: &mut H2Meta,
     stream: TcpStream,
@@ -440,10 +553,29 @@ fn unpark_conn(host: &HostShared, worker: u32, meta: &H2Meta) {
     }
 }
 
+pub(crate) fn abort_tls_slot(
+    meta: &mut H2Meta,
+    stream_poller: &mut Poller,
+    counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<TlsAcceptor>,
+) {
+    if meta.tls.take().is_some() {
+        if let Some(acceptor) = tls_acceptor.as_mut() {
+            acceptor.release();
+        }
+    }
+    abort_slot(meta, stream_poller, counts);
+}
+
 fn shut_slot(meta: &mut H2Meta, poller: &mut Poller, reason: ConnClose, turn: &mut H2Turn<'_>) {
     unpark_conn(turn.host, turn.worker_id, meta);
     if let Some(mut stream) = meta.stream.take() {
         let _ = poller.deregister(&mut stream);
+    }
+    if meta.tls.take().is_some() {
+        if let Some(acceptor) = turn.tls_acceptor.as_mut() {
+            acceptor.release();
+        }
     }
     // NOTE: the caller clears the conn visibly; stale tables keep dead borrows only.
     meta.occupied = false;
@@ -463,7 +595,7 @@ fn goaway_close(
         let staged = active.drain(pending_spare(meta));
         meta.pending_len += staged.written;
     }
-    let fatal = match flush_pending(meta, stream_poller, &mut turn.budget) {
+    let fatal = match flush_h2(meta, stream_poller, &mut turn.budget) {
         H2Flush::Closed(fatal) => fatal,
         H2Flush::Done | H2Flush::Blocked | H2Flush::Retry => reason,
     };
@@ -503,27 +635,55 @@ pub(crate) fn pump_slot(
     let mut eof = false;
     let mut progressed = apply_h2_staged(meta, conn, turn);
     progressed |= super::apply_h2_streams(meta, conn, turn);
-    if let H2Flush::Closed(reason) = flush_pending(meta, stream_poller, &mut turn.budget) {
+    if let H2Flush::Closed(reason) = flush_h2(meta, stream_poller, &mut turn.budget) {
         close_reason = Some(reason);
     }
     // NOTE: reads pause while output is pending: bytes behind a saturated socket only grow work.
     let wants_read = meta.readable && close_reason.is_none() && !meta.pending_unflushed();
     if wants_read {
-        let (Some(live), Some(stream)) = (conn.as_mut(), meta.stream.as_mut()) else {
-            shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
-            return Some(ConnClose::TransportError);
-        };
-        let room = live.spare_mut().len().min(turn.budget as usize);
-        if room > 0 {
-            match read_once(stream, &mut live.spare_mut()[..room]) {
-                H2Read::Progress(read) => {
-                    live.commit_staged(read);
-                    turn.budget -= read as u64;
-                    progressed = true;
+        if meta.tls.is_some() {
+            let Some(live) = conn.as_mut() else {
+                shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
+                return Some(ConnClose::TransportError);
+            };
+            let room = live.spare_mut().len().min(turn.budget as usize);
+            if room > 0 {
+                let spare = &mut live.spare_mut()[..room];
+                let (Some(stream), Some(tls)) = (meta.stream.as_mut(), meta.tls.as_mut()) else {
+                    shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
+                    return Some(ConnClose::TransportError);
+                };
+                match tls_read_decrypted(stream, tls, spare, turn.budget, &mut meta.tls_plain) {
+                    Ok((wire, plain, blocked)) => {
+                        live.commit_staged(plain);
+                        turn.budget = turn.budget.saturating_sub(wire);
+                        if blocked {
+                            meta.readable = false;
+                        }
+                        if wire > 0 || plain > 0 {
+                            progressed = true;
+                        }
+                    }
+                    Err(reason) => close_reason = Some(reason),
                 }
-                H2Read::Blocked => meta.readable = false,
-                H2Read::Eof => eof = true,
-                H2Read::Closed(reason) => close_reason = Some(reason),
+            }
+        } else {
+            let (Some(live), Some(stream)) = (conn.as_mut(), meta.stream.as_mut()) else {
+                shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
+                return Some(ConnClose::TransportError);
+            };
+            let room = live.spare_mut().len().min(turn.budget as usize);
+            if room > 0 {
+                match read_once(stream, &mut live.spare_mut()[..room]) {
+                    H2Read::Progress(read) => {
+                        live.commit_staged(read);
+                        turn.budget -= read as u64;
+                        progressed = true;
+                    }
+                    H2Read::Blocked => meta.readable = false,
+                    H2Read::Eof => eof = true,
+                    H2Read::Closed(reason) => close_reason = Some(reason),
+                }
             }
         }
     }
@@ -537,7 +697,7 @@ pub(crate) fn pump_slot(
     let mut steps = 0;
     while close_reason.is_none() && !eof && steps < MAX_H2_STEPS_PER_TURN && turn.budget > 0 {
         if pending_spare(meta).len() < H2_FLUSH_THRESHOLD && meta.pending_unflushed() {
-            if let H2Flush::Closed(reason) = flush_pending(meta, stream_poller, &mut turn.budget) {
+            if let H2Flush::Closed(reason) = flush_h2(meta, stream_poller, &mut turn.budget) {
                 close_reason = Some(reason);
                 break;
             }
@@ -582,8 +742,8 @@ pub(crate) fn pump_slot(
     }
     // NOTE: closed means flush-then-close: staged bytes go best-effort before the FIN.
     // Flush failure reports transport truth; a blocked remainder drops with the slot.
-    if meta.pending_unflushed() {
-        if let H2Flush::Closed(fatal) = flush_pending(meta, stream_poller, &mut turn.budget) {
+    if meta.pending_unflushed() || meta.tls_unflushed() {
+        if let H2Flush::Closed(fatal) = flush_h2(meta, stream_poller, &mut turn.budget) {
             close_reason = Some(fatal);
         }
     }
@@ -616,6 +776,7 @@ pub(crate) fn abandon_slots(
     host: &HostShared,
     worker: u32,
     counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<TlsAcceptor>,
 ) {
     for index in 0..MAX_H2_CONNS {
         let meta = meta_at(metas, index);
@@ -623,6 +784,11 @@ pub(crate) fn abandon_slots(
             unpark_conn(host, worker, meta);
             meta.occupied = false;
             meta.stream.take();
+            if meta.tls.take().is_some() {
+                if let Some(acceptor) = tls_acceptor.as_mut() {
+                    acceptor.release();
+                }
+            }
             counts.add(ConnClose::Shutdown);
         }
     }
@@ -731,6 +897,46 @@ macro_rules! accept_h2_slot {
 
 pub(crate) use accept_h2_slot;
 
+macro_rules! move_h2_tls_slot {
+    ($slot:literal, $metas:ident, $meta:ident, $bufs:ident, $buf:ident, $ts:ident, $dec:ident, $enc:ident, $conn:ident, $stream:ident, $tls:ident, $prefix:ident, $now:ident, $config:ident, $poller:ident, $result:ident, $tlsacc:ident) => {{
+        let mut moved = false;
+        if $crate::h2::turn::open_slot(
+            &mut $metas.$meta,
+            $stream,
+            $slot,
+            $now,
+            $config.timeouts.request_head_ns,
+            &mut $poller,
+            &mut $result.counts,
+        ) {
+            if $crate::h2::turn::build_h2_conn!($bufs, $buf, $ts, $dec, $enc, $conn) {
+                $crate::h2::turn::meta_at(&mut $metas, $slot).tls = Some($tls);
+                moved = $conn
+                    .as_mut()
+                    .is_some_and(|live| live.push_input(&$prefix).is_ok());
+                if !moved {
+                    $crate::h2::turn::abort_tls_slot(
+                        &mut $metas.$meta,
+                        &mut $poller,
+                        &mut $result.counts,
+                        &mut $tlsacc,
+                    );
+                }
+            } else {
+                $crate::h2::turn::abort_slot(&mut $metas.$meta, &mut $poller, &mut $result.counts);
+                if let Some(acceptor) = $tlsacc.as_mut() {
+                    acceptor.release();
+                }
+            }
+        } else if let Some(acceptor) = $tlsacc.as_mut() {
+            acceptor.release();
+        }
+        moved
+    }};
+}
+
+pub(crate) use move_h2_tls_slot;
+
 // NOTE: per-turn h2c accept dispatch in `worker_main`. h2c shares the H1 accept budget;
 // on an H1-error turn the budget is unknown, so h2c skips (fail closed).
 macro_rules! drive_h2_accepts {
@@ -809,7 +1015,7 @@ pub(crate) use pump_h2_one;
 
 // NOTE: per-turn h2c pump dispatch in `worker_main`; arms invoke pump_h2_one!.
 macro_rules! drive_h2_pumps {
-    ($enabled:ident, $view:ident, $draining:ident, $budget:ident, $now:ident, $metas:ident, $poller:ident, $config:ident, $result:ident, $worker:ident, $force:ident, $h2force:ident, $drainstart:ident, $ts0:ident, $ts1:ident, $ts2:ident, $ts3:ident, $ts4:ident, $ts5:ident, $ts6:ident, $ts7:ident, $dec0:ident, $dec1:ident, $dec2:ident, $dec3:ident, $dec4:ident, $dec5:ident, $dec6:ident, $dec7:ident, $enc0:ident, $enc1:ident, $enc2:ident, $enc3:ident, $enc4:ident, $enc5:ident, $enc6:ident, $enc7:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $host:ident, $wid:ident, $h2staged:ident) => {
+    ($enabled:ident, $view:ident, $draining:ident, $budget:ident, $now:ident, $metas:ident, $poller:ident, $config:ident, $result:ident, $worker:ident, $force:ident, $h2force:ident, $drainstart:ident, $ts0:ident, $ts1:ident, $ts2:ident, $ts3:ident, $ts4:ident, $ts5:ident, $ts6:ident, $ts7:ident, $dec0:ident, $dec1:ident, $dec2:ident, $dec3:ident, $dec4:ident, $dec5:ident, $dec6:ident, $dec7:ident, $enc0:ident, $enc1:ident, $enc2:ident, $enc3:ident, $enc4:ident, $enc5:ident, $enc6:ident, $enc7:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $host:ident, $wid:ident, $h2staged:ident, $tlsacc:ident) => {
         if $enabled {
             $crate::h2::turn::sweep_deadlines(&mut $metas, $now, $config.timeouts);
             if let Some(view) = $view.as_ref() {
@@ -829,6 +1035,7 @@ macro_rules! drive_h2_pumps {
                         || $force.load(std::sync::atomic::Ordering::Acquire)
                         || ($h2force > 0 && $now >= $h2force),
                     counts: &mut $result.counts,
+                    tls_acceptor: $tlsacc.as_mut(),
                 };
                 for index in 0..$crate::h2::turn::MAX_H2_CONNS {
                     turn.budget = $budget;

@@ -25,7 +25,7 @@ impl TlsAcceptor {
                 .with_single_cert(vec![cert], key)
                 .map_err(|_| TlsError::InvalidInput)?;
 
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         debug_assert_eq!(config.max_early_data_size, 0);
 

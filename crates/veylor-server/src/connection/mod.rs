@@ -8,7 +8,7 @@ use veylor_router::{RouteKind, RouteTable};
 use veylor_runtime::{
     CloseReason, ConnectionToken, IoBatch, ReadStatus, TcpStream, WriteStatus, dispatch,
 };
-use veylor_tls::{TlsConn, drain_plaintext, feed_ciphertext};
+use veylor_tls::{TlsConn, alpn, drain_plaintext, feed_ciphertext};
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_files::FilePlan;
@@ -567,14 +567,85 @@ pub(crate) fn tls_read_available(
     Ok((got as u64, decrypted as u64))
 }
 
-enum TlsWriteOutcome {
+pub(crate) fn tls_alpn_is_h2(conn: &ConnState) -> bool {
+    conn.tls
+        .as_ref()
+        .is_some_and(|tls| !tls.is_handshaking() && alpn(tls) == Some(b"h2".as_slice()))
+}
+
+pub(crate) fn tls_encrypt_bytes(
+    tls: &mut TlsConn,
+    plain: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ConnClose> {
+    drain_plaintext(tls, plain, out).map_err(|_| ConnClose::TransportError)
+}
+
+pub(crate) fn tls_read_decrypted(
+    stream: &mut TcpStream,
+    tls: &mut TlsConn,
+    spare: &mut [u8],
+    budget: u64,
+    scratch: &mut Vec<u8>,
+) -> Result<(u64, usize, bool), ConnClose> {
+    if budget == 0 || spare.is_empty() {
+        return Ok((0, 0, false));
+    }
+    let limit = spare.len().min(4096).min(budget as usize);
+    if limit == 0 {
+        return Ok((0, 0, false));
+    }
+    let mut raw = [0u8; 4096];
+    let mut wire = 0usize;
+    let mut attempts = 0;
+    let blocked = loop {
+        match tls_read_once(stream, &mut raw[wire..limit]) {
+            TlsReadOutcome::Progress(n) => {
+                wire += n;
+                break false;
+            }
+            TlsReadOutcome::Blocked => {
+                if wire > 0 {
+                    break false;
+                }
+                break true;
+            }
+            TlsReadOutcome::Interrupted => {
+                attempts += 1;
+                if attempts >= 2 {
+                    break false;
+                }
+            }
+            TlsReadOutcome::Eof => return Err(ConnClose::PeerClosed),
+            TlsReadOutcome::Closed(reason) => return Err(reason),
+        }
+    };
+    if wire == 0 {
+        return Ok((0, 0, blocked));
+    }
+    scratch.clear();
+    let consumed =
+        feed_ciphertext(tls, &raw[..wire], scratch).map_err(|_| ConnClose::TransportError)?;
+    if consumed != wire {
+        return Err(ConnClose::TransportError);
+    }
+    if scratch.len() > spare.len() {
+        return Err(ConnClose::TransportError);
+    }
+    spare[..scratch.len()].copy_from_slice(scratch);
+    let plain = scratch.len();
+    scratch.clear();
+    Ok((wire as u64, plain, blocked))
+}
+
+pub(crate) enum TlsWriteOutcome {
     Accepted(usize),
     Blocked,
     Interrupted,
     Closed(ConnClose),
 }
 
-enum TlsReadOutcome {
+pub(crate) enum TlsReadOutcome {
     Progress(usize),
     Blocked,
     Interrupted,
@@ -582,7 +653,7 @@ enum TlsReadOutcome {
     Closed(ConnClose),
 }
 
-fn tls_write_once(stream: &mut TcpStream, chunk: &[u8]) -> TlsWriteOutcome {
+pub(crate) fn tls_write_once(stream: &mut TcpStream, chunk: &[u8]) -> TlsWriteOutcome {
     use std::io::Write as _;
 
     if chunk.is_empty() {
@@ -615,7 +686,7 @@ fn tls_write_once(stream: &mut TcpStream, chunk: &[u8]) -> TlsWriteOutcome {
     }
 }
 
-fn tls_read_once(stream: &mut TcpStream, scratch: &mut [u8]) -> TlsReadOutcome {
+pub(crate) fn tls_read_once(stream: &mut TcpStream, scratch: &mut [u8]) -> TlsReadOutcome {
     use std::io::Read as _;
 
     if scratch.is_empty() {
@@ -1010,6 +1081,10 @@ fn pump_tls_full(
                 responded,
             };
         }
+    }
+
+    if tls_alpn_is_h2(conn) {
+        return PumpOutcome::Keep(progress);
     }
 
     if conn.phase == ConnPhase::ReadingHead {

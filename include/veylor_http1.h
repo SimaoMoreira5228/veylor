@@ -772,6 +772,15 @@ vyl_http1_result vyl_managed_static_register_static_route_with_body_cap(
     vyl_http1_bytes body,
     uint64_t max_body_bytes
 );
+/* NOTE: Same copy rule as above; the body precompresses once and serves gzip by Accept-Encoding. */
+vyl_http1_result vyl_managed_static_register_static_route_with_gzip(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    vyl_http1_bytes body
+);
 /* NOTE: File mounts serve regular files beneath an absolute root at a slash-bounded prefix
    (e.g. "/assets/"); GET/HEAD only, exact static routes win on overlap. Prefix bytes are
    copied and the root path is converted to owned storage before return; the root crosses
