@@ -159,6 +159,7 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
         addr,
         h2c_addr,
         host: crate::host::HostHandle::new(host),
+        tls: config.tls.is_some(),
     })
 }
 

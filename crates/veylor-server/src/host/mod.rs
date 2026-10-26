@@ -1,8 +1,12 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use veylor_runtime::{ConnectionToken, WakeHandle};
+use veylor_tls::{CertificateDer, PrivateKeyDer, TlsAcceptor, TlsError};
 
 use crate::connection::parked::BodyPushOutcome;
 use crate::connection::{pull_staged_body, push_staged_body};
@@ -177,11 +181,14 @@ pub(crate) struct HostInner {
     pub(crate) wakers: Vec<Option<WakeHandle>>,
     next_poll: usize,
     pub(crate) counters: HostCounters,
+    tls_rotation: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    tls_rotation_epoch: u64,
 }
 
 pub struct HostShared {
     inner: Mutex<HostInner>,
     wake: Condvar,
+    tls_rotation_epoch: AtomicU64,
 }
 
 impl HostShared {
@@ -208,8 +215,11 @@ impl HostShared {
                 wakers,
                 next_poll: 0,
                 counters: HostCounters::default(),
+                tls_rotation: None,
+                tls_rotation_epoch: 0,
             }),
             wake: Condvar::new(),
+            tls_rotation_epoch: AtomicU64::new(0),
         }
     }
 
@@ -566,6 +576,56 @@ impl HostShared {
             (staged, None)
         });
         taken.map(|(staged, _)| staged).unwrap_or_default()
+    }
+
+    pub(crate) fn tls_rotation_epoch(&self) -> u64 {
+        self.tls_rotation_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stage_tls_rotation(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<u64, TlsError> {
+        TlsAcceptor::from_chain(chain.clone(), key.clone_key(), 1)?;
+
+        let epoch = self
+            .with_inner(|inner| {
+                inner.tls_rotation_epoch += 1;
+                inner.tls_rotation = Some((chain, key));
+
+                (inner.tls_rotation_epoch, None)
+            })
+            .map(|(epoch, _)| epoch)
+            .ok_or(TlsError::InvalidInput)?;
+
+        self.tls_rotation_epoch.store(epoch, Ordering::Release);
+
+        Ok(epoch)
+    }
+
+    pub(crate) fn take_tls_rotation(
+        &self,
+        seen_epoch: u64,
+    ) -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, u64)> {
+        if self.tls_rotation_epoch() <= seen_epoch {
+            return None;
+        }
+
+        self.with_inner(|inner| {
+            let epoch = inner.tls_rotation_epoch;
+            let rotation = if epoch > seen_epoch {
+                inner
+                    .tls_rotation
+                    .as_ref()
+                    .map(|(chain, key)| (chain.clone(), key.clone_key(), epoch))
+            } else {
+                None
+            };
+
+            (rotation, None)
+        })
+        .and_then(|(rotation, _)| rotation)
     }
 
     // NOTE: whole-event dequeue: the first unfitting event reports required capacities

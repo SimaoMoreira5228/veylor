@@ -10,10 +10,20 @@ use veylor_http2::{
     HpackHeader, HpackRepresentation, HpackTable, SETTINGS_ACK, decode_frame_header,
     decode_goaway_payload, decode_header_block, encode_frame_header, encode_header_block,
 };
-use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig, TlsConfig};
+use veylor_runtime::ConnectionToken;
+use veylor_server::{
+    EventSlot, HostEventKind, HostHandle, MAX_STATIC_BODY_BYTES, RespondOutcome, RunningServer,
+    Server, ServerConfig, TlsConfig,
+};
 
 const CERT_DER: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_cert.der");
 const KEY_DER: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_key.der");
+const CERT2_DER: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_cert2.der");
+const KEY2_DER: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_key2.der");
+const CERT2_PEM: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_cert2.pem");
+const KEY2_PEM: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_key2.pem");
+const CERT_PEM: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_cert.pem");
+const KEY_PEM: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_key.pem");
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -84,7 +94,11 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
 }
 
 fn client_config() -> Arc<rustls::ClientConfig> {
-    let verifier = Arc::new(PinVerifier::new(CERT_DER));
+    client_config_for(CERT_DER)
+}
+
+fn client_config_for(cert: &[u8]) -> Arc<rustls::ClientConfig> {
+    let verifier = Arc::new(PinVerifier::new(cert));
 
     let mut config =
         rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -99,8 +113,8 @@ fn client_config() -> Arc<rustls::ClientConfig> {
 
 fn tls_config() -> TlsConfig {
     TlsConfig {
-        cert_der: CERT_DER.to_vec(),
-        key_der: KEY_DER.to_vec(),
+        cert_chain: vec![veylor_server::CertificateDer::from(CERT_DER.to_vec())],
+        key: veylor_server::PrivateKeyDer::Pkcs8(KEY_DER.to_vec().into()),
         max_handshakes: 16,
     }
 }
@@ -145,9 +159,16 @@ fn connect_raw(addr: SocketAddr) -> TcpStream {
 }
 
 fn handshake(
-    mut sock: TcpStream,
+    sock: TcpStream,
     config: &Arc<rustls::ClientConfig>,
 ) -> (TcpStream, rustls::ClientConnection) {
+    try_handshake(sock, config).expect("handshake succeeds")
+}
+
+fn try_handshake(
+    mut sock: TcpStream,
+    config: &Arc<rustls::ClientConfig>,
+) -> Result<(TcpStream, rustls::ClientConnection), String> {
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("dns name");
 
     let mut client =
@@ -155,7 +176,9 @@ fn handshake(
 
     for _ in 0..100 {
         if client.wants_write() {
-            client.write_tls(&mut sock).expect("client flight");
+            client
+                .write_tls(&mut sock)
+                .map_err(|error| format!("client flight: {error:?}"))?;
         }
 
         if !client.is_handshaking() {
@@ -163,11 +186,13 @@ fn handshake(
         }
 
         match client.read_tls(&mut sock) {
-            Ok(0) => panic!("eof during handshake"),
+            Ok(0) => return Err("eof during handshake".to_string()),
             Ok(_) => {
-                client.process_new_packets().expect("client processes");
+                client
+                    .process_new_packets()
+                    .map_err(|error| format!("client processes: {error:?}"))?;
             }
-            Err(error) => panic!("read during handshake: {error:?}"),
+            Err(error) => return Err(format!("read during handshake: {error:?}")),
         }
 
         if !client.is_handshaking() {
@@ -175,9 +200,11 @@ fn handshake(
         }
     }
 
-    assert!(!client.is_handshaking(), "client handshake done");
+    if client.is_handshaking() {
+        return Err("client handshake incomplete".to_string());
+    }
 
-    (sock, client)
+    Ok((sock, client))
 }
 
 fn tls_write(sock: &mut TcpStream, client: &mut rustls::ClientConnection, plain: &[u8]) {
@@ -723,4 +750,327 @@ fn tls_h2_missing_preface_goes_away_and_closes() {
     running.stop_accepting();
     let counts = running.join().expect("join clean");
     assert_eq!(counts.protocol_error, 1);
+}
+
+fn poll_tls_request(host: &HostHandle) -> EventSlot {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let mut events = vec![empty_tls_slot(); 8];
+        let mut methods = vec![0; 64];
+        let mut paths = vec![0; 4096];
+        let report = host.poll(100_000_000, &mut events, &mut methods, &mut paths);
+        for event in events.iter().take(report.copied) {
+            if event.kind == HostEventKind::Request {
+                return *event;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for request"
+        );
+    }
+}
+
+fn empty_tls_slot() -> EventSlot {
+    EventSlot {
+        kind: HostEventKind::Shutdown,
+        token: ConnectionToken {
+            worker_id: 0,
+            slot: 0,
+            request_seq: 0,
+            stream_id: 0,
+            worker_generation: 0,
+            generation: 0,
+        },
+        route_id: 0,
+        method_len: 0,
+        path_len: 0,
+        method_offset: 0,
+        path_offset: 0,
+    }
+}
+
+fn tls_managed_server() -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, server_config_tls()).expect("bind tls");
+    server
+        .register_managed(b"GET", b"/work", MAX_STATIC_BODY_BYTES)
+        .expect("register managed");
+    server.start().expect("start tls")
+}
+
+#[test]
+fn tls_managed_park_respond_round_trip() {
+    let running = tls_managed_server();
+    let host = running.host();
+    let config = client_config();
+    let (mut sock, mut client) = handshake(connect_raw(running.addr()), &config);
+
+    tls_write(
+        &mut sock,
+        &mut client,
+        b"GET /work HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n",
+    );
+
+    let event = poll_tls_request(&host);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"managed-tls"),
+        RespondOutcome::Ok
+    );
+
+    let raw = tls_read_response(&mut sock, &mut client);
+    let (status, _, body) = split_response(&raw);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"managed-tls");
+
+    running.stop_accepting();
+    let counts = running.join().expect("join clean");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(counts.completed, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn tls_h2_managed_park_respond_round_trip() {
+    let running = tls_managed_server();
+    let host = running.host();
+    let config = h2_client_config();
+    let (mut sock, mut client) = handshake(connect_raw(running.addr()), &config);
+
+    assert_eq!(
+        client.alpn_protocol(),
+        Some(b"h2".as_slice()),
+        "client observes h2"
+    );
+
+    let mut stash = Vec::new();
+    client
+        .writer()
+        .write_all(CLIENT_CONNECTION_PREFACE)
+        .expect("queue preface");
+    client.write_tls(&mut sock).expect("emit preface");
+    h2_tls_write_frame(&mut sock, &mut client, FrameType::Settings, 0, 0, &[]);
+
+    let (header, _) = h2_tls_read_frame(&mut sock, &mut client, &mut stash);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_eq!(header.stream_id, 0);
+
+    h2_tls_write_frame(
+        &mut sock,
+        &mut client,
+        FrameType::Settings,
+        SETTINGS_ACK,
+        0,
+        &[],
+    );
+    let (header, _) = h2_tls_read_frame(&mut sock, &mut client, &mut stash);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_eq!(header.flags & SETTINGS_ACK, SETTINGS_ACK);
+
+    h2_tls_send_headers(&mut sock, &mut client, 1, b"GET", b"/work");
+
+    let event = poll_tls_request(&host);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"managed-h2-tls"),
+        RespondOutcome::Ok
+    );
+
+    let (status, body) = h2_tls_read_response(&mut sock, &mut client, &mut stash, 1);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"managed-h2-tls");
+
+    running.stop_accepting();
+    let counts = running.join().expect("join clean");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+fn write_pem_fixtures() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("veylor-tls-pem-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("cert.pem"), CERT_PEM).expect("write cert pem");
+    std::fs::write(dir.join("key.pem"), KEY_PEM).expect("write key pem");
+    dir
+}
+
+#[test]
+fn tls_config_from_pem_files_serves_static() {
+    use veylor_server::TlsConfigError;
+
+    let dir = write_pem_fixtures();
+    let config = TlsConfig::from_files(&dir.join("cert.pem"), &dir.join("key.pem"), 16)
+        .expect("load pem files");
+    assert_eq!(config.cert_chain.len(), 1);
+    assert_eq!(config.cert_chain[0].as_ref(), CERT_DER);
+
+    let missing = TlsConfig::from_files(&dir.join("nope.pem"), &dir.join("key.pem"), 16);
+    assert!(
+        matches!(missing, Err(TlsConfigError::Io(_))),
+        "missing file is Io"
+    );
+
+    std::fs::write(dir.join("junk.pem"), b"not pem at all").expect("write junk");
+    let junk = TlsConfig::from_files(&dir.join("cert.pem"), &dir.join("junk.pem"), 16);
+    assert!(
+        matches!(junk, Err(TlsConfigError::InvalidInput)),
+        "junk key is InvalidInput"
+    );
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(
+        addr,
+        ServerConfig {
+            tls: Some(config),
+            ..ServerConfig::default()
+        },
+    )
+    .expect("bind tls");
+    server
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register hello");
+    let running = server.start().expect("start tls");
+
+    let client_config = client_config();
+    let (mut sock, mut client) = handshake(connect_raw(running.addr()), &client_config);
+    assert_eq!(
+        client.alpn_protocol(),
+        Some(b"http/1.1".as_slice()),
+        "client observes http/1.1"
+    );
+    tls_write(
+        &mut sock,
+        &mut client,
+        b"GET /hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    );
+
+    let raw = tls_read_response(&mut sock, &mut client);
+    let (status, _, body) = split_response(&raw);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    running.stop_accepting();
+    running.join().expect("join clean");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn tls_hello_server() -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut server = Server::bind(addr, server_config_tls()).expect("bind tls");
+    server
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register hello");
+    server.start().expect("start tls")
+}
+
+fn tls_get_hello(
+    sock: &mut TcpStream,
+    client: &mut rustls::ClientConnection,
+    close: bool,
+) -> (u16, Vec<u8>) {
+    let connection = if close { "close" } else { "keep-alive" };
+    tls_write(
+        sock,
+        client,
+        format!("GET /hello HTTP/1.1\r\nHost: test\r\nConnection: {connection}\r\n\r\n").as_bytes(),
+    );
+
+    let raw = tls_read_response(sock, client);
+    let (status, _, body) = split_response(&raw);
+
+    (status, body)
+}
+
+#[test]
+fn tls_rotate_serves_new_cert_on_new_conns_and_keeps_old_ones() {
+    let running = tls_hello_server();
+
+    let (mut sock1, mut client1) = handshake(connect_raw(running.addr()), &client_config());
+    let (status, body) = tls_get_hello(&mut sock1, &mut client1, false);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    running
+        .rotate_tls(CERT2_DER, KEY2_DER)
+        .expect("rotate to second cert");
+
+    let config2 = client_config_for(CERT2_DER);
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let (mut sock2, mut client2) = loop {
+        match try_handshake(connect_raw(running.addr()), &config2) {
+            Ok(pair) => break pair,
+            Err(_) if std::time::Instant::now() < deadline => continue,
+            Err(error) => panic!("rotated handshake never landed: {error}"),
+        }
+    };
+    assert_eq!(
+        client2.alpn_protocol(),
+        Some(b"http/1.1".as_slice()),
+        "rotated conn negotiates http/1.1"
+    );
+    let (status, body) = tls_get_hello(&mut sock2, &mut client2, true);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    let (status, body) = tls_get_hello(&mut sock1, &mut client1, true);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    running
+        .rotate_tls(CERT2_PEM, KEY2_PEM)
+        .expect("rotate with pem inputs");
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let (mut sock3, mut client3) = loop {
+        match try_handshake(connect_raw(running.addr()), &client_config_for(CERT2_DER)) {
+            Ok(pair) => break pair,
+            Err(_) if std::time::Instant::now() < deadline => continue,
+            Err(error) => panic!("pem-rotated handshake never landed: {error}"),
+        }
+    };
+    let (status, body) = tls_get_hello(&mut sock3, &mut client3, true);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    running.stop_accepting();
+    running.join().expect("join clean");
+}
+
+#[test]
+fn tls_rotate_rejects_garbage_and_non_tls() {
+    let running = tls_hello_server();
+
+    let (mut sock, mut client) = handshake(connect_raw(running.addr()), &client_config());
+    let (status, body) = tls_get_hello(&mut sock, &mut client, false);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    assert!(running.rotate_tls(b"not a cert", b"not a key").is_err());
+    assert!(running.rotate_tls(&[], &[]).is_err());
+
+    let (status, body) = tls_get_hello(&mut sock, &mut client, true);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello");
+
+    let plain_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let plain = Server::bind(plain_addr, ServerConfig::default())
+        .expect("bind plain")
+        .start()
+        .expect("start plain");
+    assert!(plain.rotate_tls(CERT2_DER, KEY2_DER).is_err());
+    plain.stop_accepting();
+    plain.join().expect("join clean");
+
+    running.stop_accepting();
+    running.join().expect("join clean");
 }

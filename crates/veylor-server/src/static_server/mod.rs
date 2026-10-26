@@ -76,11 +76,55 @@ impl CloseCounts {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TlsConfig {
-    pub cert_der: Vec<u8>,
-    pub key_der: Vec<u8>,
+    pub cert_chain: Vec<veylor_tls::CertificateDer<'static>>,
+    pub key: veylor_tls::PrivateKeyDer<'static>,
     pub max_handshakes: usize,
+}
+
+impl Clone for TlsConfig {
+    fn clone(&self) -> Self {
+        Self {
+            cert_chain: self.cert_chain.clone(),
+            key: self.key.clone_key(),
+            max_handshakes: self.max_handshakes,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TlsConfigError {
+    Io(std::io::Error),
+    InvalidInput,
+}
+
+impl TlsConfig {
+    pub fn from_files(
+        cert: &std::path::Path,
+        key: &std::path::Path,
+        max_handshakes: usize,
+    ) -> Result<Self, TlsConfigError> {
+        let cert_bytes = std::fs::read(cert).map_err(TlsConfigError::Io)?;
+        let key_bytes = std::fs::read(key).map_err(TlsConfigError::Io)?;
+        let chain =
+            veylor_tls::load_cert_chain(&cert_bytes).map_err(|_| TlsConfigError::InvalidInput)?;
+        let key =
+            veylor_tls::load_private_key(&key_bytes).map_err(|_| TlsConfigError::InvalidInput)?;
+
+        if chain.is_empty() {
+            return Err(TlsConfigError::InvalidInput);
+        }
+
+        veylor_tls::TlsAcceptor::from_chain(chain.clone(), key.clone_key(), max_handshakes)
+            .map_err(|_| TlsConfigError::InvalidInput)?;
+
+        Ok(Self {
+            cert_chain: chain,
+            key,
+            max_handshakes,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -177,12 +221,15 @@ impl Server {
     pub fn bind(addr: SocketAddr, config: ServerConfig) -> Result<Self, ServerError> {
         validate_config(&config)?;
         if let Some(tls) = config.tls.as_ref() {
-            let max = tls.max_handshakes;
-            if max == 0 || tls.cert_der.is_empty() || tls.key_der.is_empty() {
+            if tls.max_handshakes == 0 || tls.cert_chain.is_empty() {
                 return Err(ServerError::InvalidConfig);
             }
-            veylor_tls::TlsAcceptor::new(&tls.cert_der, &tls.key_der, max)
-                .map_err(|_| ServerError::InvalidConfig)?;
+            veylor_tls::TlsAcceptor::from_chain(
+                tls.cert_chain.clone(),
+                tls.key.clone_key(),
+                tls.max_handshakes,
+            )
+            .map_err(|_| ServerError::InvalidConfig)?;
         }
         let worker_count = config.worker_count;
         let h2c_port = config.h2c_port;
@@ -421,6 +468,7 @@ impl Server {
             .as_mut()
             .map(|bound| bound.local_addr().map_err(ServerError::Bind))
             .transpose()?;
+        let tls = config.tls.is_some();
         let stop = Arc::new(AtomicBool::new(false));
         let force = Arc::new(AtomicBool::new(false));
         let ctx = ThreadCtx {
@@ -448,6 +496,7 @@ impl Server {
             addr,
             h2c_addr,
             host: HostHandle::new(host),
+            tls,
         })
     }
 }
@@ -460,6 +509,7 @@ pub struct RunningServer {
     pub(crate) addr: SocketAddr,
     pub(crate) h2c_addr: Option<SocketAddr>,
     pub(crate) host: HostHandle,
+    pub(crate) tls: bool,
 }
 
 impl RunningServer {
@@ -480,6 +530,23 @@ impl RunningServer {
         for waker in &self.wakers {
             let _ = waker.wake();
         }
+    }
+
+    pub fn rotate_tls(&self, cert: &[u8], key: &[u8]) -> Result<(), veylor_tls::TlsError> {
+        if !self.tls {
+            return Err(veylor_tls::TlsError::InvalidInput);
+        }
+
+        let chain = veylor_tls::load_cert_chain(cert)?;
+        let key = veylor_tls::load_private_key(key)?;
+
+        self.host.shared.stage_tls_rotation(chain, key)?;
+
+        for waker in &self.wakers {
+            let _ = waker.wake();
+        }
+
+        Ok(())
     }
 
     pub fn stop_force(&self) {

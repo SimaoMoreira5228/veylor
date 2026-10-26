@@ -90,7 +90,11 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let mut tls_acceptor: Option<veylor_tls::TlsAcceptor> = match config.tls.as_ref() {
         None => None,
         Some(tls) => {
-            match veylor_tls::TlsAcceptor::new(&tls.cert_der, &tls.key_der, tls.max_handshakes) {
+            match veylor_tls::TlsAcceptor::from_chain(
+                tls.cert_chain.clone(),
+                tls.key.clone_key(),
+                tls.max_handshakes,
+            ) {
                 Ok(acceptor) => Some(acceptor),
                 Err(_) => {
                     result.error = Some("tls acceptor build failed".to_string());
@@ -196,6 +200,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let mut parked_live = false;
     let mut drain_start_ns = 0u64;
     let mut h2_force_ns = 0u64;
+    let mut tls_epoch_seen = 0u64;
 
     loop {
         let now_ns = base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -335,6 +340,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // NOTE: one take per turn: H1 slots drain below, H2 stream-keyed slots ride the H2
         // pump dispatch; either side drops divergent work silently (already tombed).
         let staged = host.take_staged(worker_id);
+        if host.tls_rotation_epoch() != tls_epoch_seen {
+            if let Some((chain, key, epoch)) = host.take_tls_rotation(tls_epoch_seen) {
+                if let Some(acceptor) = tls_acceptor.as_mut() {
+                    let _ = acceptor.rotate(chain, key);
+                }
+                tls_epoch_seen = epoch;
+            }
+        }
         // NOTE: H1/H2 slot-space boundary rides the const ceiling, not max_conns: H2
         // slots start at MAX_CONNECTIONS in the h2/host slice, and every H1 slot
         // stays below max_conns <= MAX_CONNECTIONS, so the partition is exact.

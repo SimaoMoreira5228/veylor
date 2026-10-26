@@ -1,6 +1,9 @@
+mod pem;
 mod pump;
 
+pub use pem::{load_cert_chain, load_private_key};
 pub use pump::{drain_plaintext, feed_ciphertext};
+pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use std::io;
 use std::sync::Arc;
@@ -15,25 +18,61 @@ pub struct TlsAcceptor {
 
 impl TlsAcceptor {
     pub fn new(cert_der: &[u8], key_der: &[u8], max_handshakes: usize) -> Result<Self, TlsError> {
-        let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
+        let cert = CertificateDer::from(cert_der.to_vec());
+        let key = PrivateKeyDer::Pkcs8(key_der.to_vec().into());
 
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.to_vec().into());
+        Self::from_chain(vec![cert], key, max_handshakes)
+    }
 
+    pub fn from_pem(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        max_handshakes: usize,
+    ) -> Result<Self, TlsError> {
+        Self::from_chain(
+            load_cert_chain(cert_pem)?,
+            load_private_key(key_pem)?,
+            max_handshakes,
+        )
+    }
+
+    pub fn from_chain(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        max_handshakes: usize,
+    ) -> Result<Self, TlsError> {
+        Ok(Self {
+            config: Arc::new(Self::build_config(chain, key)?),
+            max_handshakes,
+            active: 0,
+        })
+    }
+
+    pub fn rotate(
+        &mut self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<(), TlsError> {
+        self.config = Arc::new(Self::build_config(chain, key)?);
+
+        Ok(())
+    }
+
+    fn build_config(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<rustls::ServerConfig, TlsError> {
         let mut config =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_no_client_auth()
-                .with_single_cert(vec![cert], key)
+                .with_single_cert(chain, key)
                 .map_err(|_| TlsError::InvalidInput)?;
 
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         debug_assert_eq!(config.max_early_data_size, 0);
 
-        Ok(Self {
-            config: Arc::new(config),
-            max_handshakes,
-            active: 0,
-        })
+        Ok(config)
     }
 
     pub fn admit(&mut self) -> Result<TlsConn, TlsError> {

@@ -32,5 +32,7 @@ pub use static_routes::{
 };
 pub use static_server::{
     CloseCounts, MAX_WORKERS, RunningServer, Server, ServerConfig, ServerError, TlsConfig,
+    TlsConfigError,
 };
 pub use static_server::{LISTENER_TOKEN, MAX_CONNECTIONS, SHUTDOWN_TIMER_ID};
+pub use veylor_tls::{CertificateDer, PrivateKeyDer};
