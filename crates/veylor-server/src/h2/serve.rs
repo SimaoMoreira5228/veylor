@@ -17,8 +17,8 @@ use crate::static_routes::{
 
 use super::file::FileDecision;
 use super::routes::{
-    ALLOW_BYTES, FrozenRoutesView, NOT_FOUND_BODY, field, send_begin, send_full,
-    send_method_not_allowed,
+    ALLOW_BYTES, FrozenRoutesView, MAX_REQUEST_TARGET_BYTES, NOT_FOUND_BODY, URI_TOO_LONG_BODY,
+    field, send_begin, send_full, send_method_not_allowed,
 };
 use super::turn;
 use super::{
@@ -290,6 +290,44 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     _ => return self.deny(stream, ErrorCode::RefusedStream, false),
                 };
                 let is_head = request.method == b"HEAD";
+                // NOTE: 414 before every dispatch (static, native, managed, file): the decoded
+                // :path length is known exactly, so an over-long target answers here instead of
+                // missing to 404. Per-stream fail-closed like the 404 tail below (HEADERS+DATA
+                // with Date through send_full, never GOAWAY for a per-stream verdict); the !end
+                // refusal matches the 404 tail too (HEADERS-open then RST plus the same close).
+                if path.len() > MAX_REQUEST_TARGET_BYTES {
+                    if !end {
+                        if send_full(
+                            self.server,
+                            stream,
+                            414,
+                            URI_TOO_LONG_BODY,
+                            false,
+                            false,
+                            self.output,
+                            self.used,
+                        )
+                        .is_err()
+                        {
+                            return self.fail(ErrorCode::InternalError);
+                        }
+                        return self.deny(stream, ErrorCode::RefusedStream, true);
+                    }
+                    match send_full(
+                        self.server,
+                        stream,
+                        414,
+                        URI_TOO_LONG_BODY,
+                        is_head,
+                        true,
+                        self.output,
+                        self.used,
+                    ) {
+                        Ok(()) => self.outcome.served += 1,
+                        Err(code) => self.fail(code),
+                    }
+                    return;
+                }
                 if self.routes.is_managed(request.method, path) {
                     if let Some(ctx) = self.host {
                         let declared = request.content_length;

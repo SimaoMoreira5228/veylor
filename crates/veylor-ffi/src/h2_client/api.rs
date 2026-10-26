@@ -22,6 +22,13 @@ fn ensure_writable(handle: &VylH2Client) -> Result<(), VylResult> {
     if handle.pending.kind != PendingKind::None {
         return Err(VylResult::WouldBlock);
     }
+    let failed = handle
+        .driver
+        .as_ref()
+        .is_some_and(|driver| driver.driver().failed().is_some());
+    if failed {
+        return Err(VylResult::BadState);
+    }
     if handle.driver.is_none() {
         return Err(VylResult::InternalError);
     }

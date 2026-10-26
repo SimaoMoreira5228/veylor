@@ -12,6 +12,12 @@ use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 
 pub(crate) const NOT_FOUND_BODY: &[u8] = b"Not Found";
 pub(crate) const METHOD_NOT_ALLOWED_BODY: &[u8] = b"Method Not Allowed";
+pub(crate) const URI_TOO_LONG_BODY: &[u8] = b"URI Too Long";
+// NOTE: one target limit for both protocols, same 8 KiB number as the H1 request-line cap
+// (Limits::default().request_line_bytes): H1 attributes buffered-line overflow minus the
+// minimal framing, while H2 checks the decoded :path directly since its length is known
+// exactly — no buffered-line attribution needed.
+pub(crate) const MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
 // NOTE: at most this many distinct methods list in Allow; more truncate the tail, so size
 // it at the route cap and the 405 below RSTs past the value buffer instead.
 const ALLOW_METHODS: usize = 16;

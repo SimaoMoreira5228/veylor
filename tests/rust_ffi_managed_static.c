@@ -291,6 +291,93 @@ int main(void) {
     assert(strstr(response, "HTTP/1.1 413") != NULL);
     assert(strstr(response, "Payload Too Large") != NULL);
 
+    {
+        static const char nomatch_request[] =
+            "POST /hello HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        int nfd = connect_loopback(port);
+        const struct timeval nomatch_timeout = {.tv_sec = 5, .tv_usec = 0};
+        assert(setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &nomatch_timeout, sizeof(nomatch_timeout)) == 0);
+        assert(send(nfd, nomatch_request, sizeof(nomatch_request) - 1, 0) == (ssize_t)(sizeof(nomatch_request) - 1));
+        total = 0;
+        for (;;) {
+            received = recv(nfd, response + total, sizeof(response) - 1 - total, 0);
+            assert(received >= 0);
+            if (received == 0) {
+                break;
+            }
+            total += (size_t)received;
+            assert(total < sizeof(response) - 1);
+        }
+        assert(close(nfd) == 0);
+        response[total] = '\0';
+        assert(strstr(response, "HTTP/1.1 405 Method Not Allowed\r\n") != NULL);
+        assert(strstr(response, "Connection: close\r\n") != NULL);
+        assert_h1_date_shape(response);
+        {
+            const char* head_end = strstr(response, "\r\n\r\n");
+            assert(head_end != NULL);
+            size_t allow_lines = 0;
+            const char* line = response;
+            for (;;) {
+                const char* next = strstr(line, "\r\n");
+                assert(next != NULL);
+                size_t len = (size_t)(next - line);
+                if (len >= 6 && memcmp(line, "Allow:", 6) == 0) {
+                    allow_lines++;
+                    assert(len == sizeof("Allow: GET") - 1);
+                    assert(memcmp(line, "Allow: GET", sizeof("Allow: GET") - 1) == 0);
+                }
+                if (next >= head_end) {
+                    break;
+                }
+                line = next + 2;
+            }
+            assert(allow_lines == 1);
+            assert(strcmp(head_end + 4, "Method Not Allowed") == 0);
+        }
+    }
+
+    /* NOTE: exactly one 8192-byte input cap of bare request line (no headers yet):
+       the full buffer with no newline pins the overflow to the target side for a
+       414; the server consumes every byte sent, so the close reads back clean EOF
+       instead of racing the unread-tail RST a full-send form risks. */
+    {
+        static char long_req[8192] = {0};
+        int lhead = snprintf(long_req, sizeof(long_req), "GET /");
+        assert(lhead > 0);
+        size_t lfill = sizeof(long_req) - (size_t)lhead;
+        memset(long_req + lhead, 'a', lfill);
+        int lfd = connect_loopback(port);
+        const struct timeval long_timeout = {.tv_sec = 5, .tv_usec = 0};
+        assert(setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, &long_timeout, sizeof(long_timeout)) == 0);
+        size_t lsent = 0;
+        while (lsent < sizeof(long_req)) {
+            ssize_t written = send(lfd, long_req + lsent, sizeof(long_req) - lsent, 0);
+            assert(written > 0);
+            lsent += (size_t)written;
+        }
+        total = 0;
+        for (;;) {
+            received = recv(lfd, response + total, sizeof(response) - 1 - total, 0);
+            assert(received >= 0);
+            if (received == 0) {
+                break;
+            }
+            total += (size_t)received;
+            assert(total < sizeof(response) - 1);
+        }
+        assert(close(lfd) == 0);
+        response[total] = '\0';
+        assert(strstr(response, "HTTP/1.1 414 URI Too Long\r\n") != NULL);
+        assert(strstr(response, "Connection: close\r\n") != NULL);
+        assert_h1_date_shape(response);
+        {
+            const char* head_end = strstr(response, "\r\n\r\n");
+            assert(head_end != NULL);
+            assert(strcmp(head_end + 4, "URI Too Long") == 0);
+        }
+    }
+
     fd = connect_loopback(port);
     assert(send(fd, mount_request, sizeof(mount_request) - 1, 0) == (ssize_t)(sizeof(mount_request) - 1));
     total = 0;
@@ -1064,17 +1151,199 @@ int main(void) {
     assert(h2unsat_framed == 0);
     assert(h2unsat_crange_len == sizeof("bytes */11") - 1);
     assert(memcmp(h2unsat_crange, "bytes */11", sizeof("bytes */11") - 1) == 0);
+
+    /* NOTE: POST on the GET-only static answers 405 with the exact registered methods
+       in one allow field plus the 18-byte body; a sibling GET after proves the conn
+       survives the per-stream refusal. */
+    const vyl_h2_field_to_encode h2deny_post[] = {
+        h2_text_field(":method", "POST"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/hello"),
+        h2_text_field(":authority", "localhost"),
+    };
+    uint32_t h2deny_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2deny_post, sizeof(h2deny_post) / sizeof(h2deny_post[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2deny_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2deny_id == 15);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint8_t h2deny_resp[32] = {0};
+    size_t h2deny_len = 0;
+    uint16_t h2deny_status = 0;
+    uint64_t h2deny_framed = 0;
+    int h2deny_head = 0;
+    int h2deny_end = 0;
+    for (int i = 0; i < 32 && !h2deny_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 15) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 15, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2deny_status = class.status;
+                h2deny_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                {
+                    int h2deny_allow = 0;
+                    for (size_t f = h2actions[k].field_start;
+                         f < h2actions[k].field_start + h2actions[k].field_count; f++) {
+                        assert(f < 64);
+                        if (h2fields[f].name_length == 5 &&
+                            memcmp(h2data + h2fields[f].name_offset, "allow", 5) == 0) {
+                            assert(h2fields[f].value_length == sizeof("GET") - 1);
+                            assert(
+                                memcmp(
+                                    h2data + h2fields[f].value_offset, "GET",
+                                    sizeof("GET") - 1
+                                ) == 0
+                            );
+                            h2deny_allow++;
+                        }
+                    }
+                    assert(h2deny_allow == 1);
+                }
+                h2deny_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2deny_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 15
+            ) {
+                assert(h2deny_len + h2actions[k].data_length <= sizeof(h2deny_resp));
+                assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
+                memcpy(
+                    h2deny_resp + h2deny_len, h2data + h2actions[k].data_offset,
+                    h2actions[k].data_length
+                );
+                h2deny_len += h2actions[k].data_length;
+                uint32_t phase = 0;
+                assert(
+                    vyl_h2_client_account_data(
+                        h2, 15, h2actions[k].data_length, h2actions[k].flags, &phase
+                    ) == VYL_HTTP1_OK
+                );
+                if ((h2actions[k].flags & 1u) != 0) {
+                    assert(phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    h2deny_end = 1;
+                }
+            }
+        }
+    }
+    assert(h2deny_head == 1);
+    assert(h2deny_end == 1);
+    assert(h2deny_status == 405);
+    assert(h2deny_framed == sizeof("Method Not Allowed") - 1);
+    assert(h2deny_len == sizeof("Method Not Allowed") - 1);
+    assert(memcmp(h2deny_resp, "Method Not Allowed", sizeof("Method Not Allowed") - 1) == 0);
+
+    const vyl_h2_field_to_encode h2deny_sib[] = {
+        h2_text_field(":method", "GET"),
+        h2_text_field(":scheme", "http"),
+        h2_text_field(":path", "/hello"),
+        h2_text_field(":authority", "localhost"),
+    };
+    uint32_t h2deny_sib_id = 0;
+    assert(
+        vyl_h2_client_start_request(
+            h2, h2deny_sib, sizeof(h2deny_sib) / sizeof(h2deny_sib[0]),
+            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2written, &h2deny_sib_id,
+            &h2required
+        ) == VYL_HTTP1_OK
+    );
+    assert(h2deny_sib_id == 17);
+    h2_send_all(h2fd, h2wire, h2written);
+    h2_ack_client(h2, h2written);
+    uint8_t h2deny_sib_resp[8] = {0};
+    size_t h2deny_sib_len = 0;
+    uint16_t h2deny_sib_status = 0;
+    uint64_t h2deny_sib_framed = 0;
+    int h2deny_sib_head = 0;
+    int h2deny_sib_end = 0;
+    for (int i = 0; i < 32 && !h2deny_sib_end; i++) {
+        size_t frame_length =
+            h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
+        h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
+        for (size_t k = 0; k < h2got; k++) {
+            if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_HEADERS &&
+                h2actions[k].stream_id == 17) {
+                vyl_h2_response_class class = {0};
+                assert(
+                    vyl_h2_client_classify_headers(
+                        h2, 17, h2actions[k].field_start, h2actions[k].field_count,
+                        h2actions[k].flags, &class
+                    ) == VYL_HTTP1_OK
+                );
+                assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
+                h2deny_sib_status = class.status;
+                h2deny_sib_framed = class.content_length;
+                assert(class.has_content_length == 1);
+                assert_h2_date_shape(
+                    h2fields, h2actions[k].field_start, h2actions[k].field_count, h2data
+                );
+                h2deny_sib_head = 1;
+                if ((h2actions[k].flags & 1u) != 0) {
+                    h2deny_sib_end = 1;
+                }
+            } else if (
+                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                h2actions[k].stream_id == 17
+            ) {
+                assert(h2deny_sib_len + h2actions[k].data_length <= sizeof(h2deny_sib_resp));
+                assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
+                memcpy(
+                    h2deny_sib_resp + h2deny_sib_len, h2data + h2actions[k].data_offset,
+                    h2actions[k].data_length
+                );
+                h2deny_sib_len += h2actions[k].data_length;
+                uint32_t phase = 0;
+                assert(
+                    vyl_h2_client_account_data(
+                        h2, 17, h2actions[k].data_length, h2actions[k].flags, &phase
+                    ) == VYL_HTTP1_OK
+                );
+                if ((h2actions[k].flags & 1u) != 0) {
+                    assert(phase == (uint32_t)VYL_H2_PHASE_COMPLETE);
+                    h2deny_sib_end = 1;
+                }
+            }
+        }
+    }
+    assert(h2deny_sib_head == 1);
+    assert(h2deny_sib_end == 1);
+    assert(h2deny_sib_status == 200);
+    assert(h2deny_sib_framed == sizeof(body) - 1);
+    assert(h2deny_sib_len == sizeof(body) - 1);
+    assert(memcmp(h2deny_sib_resp, body, sizeof(body) - 1) == 0);
+
     assert(vyl_h2_client_destroy(h2) == VYL_HTTP1_OK);
     assert(close(h2fd) == 0);
 
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 5);
+    assert(counts.completed == 6);
     assert(counts.peer_closed == 1);
+    assert(counts.protocol_error == 1);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 6
+            counts.shutdown == 8
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     assert(remove(mount_path) == 0);
