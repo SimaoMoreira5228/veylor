@@ -242,6 +242,55 @@ fn concurrent_limits_are_directional_and_reserved_streams_do_not_count() {
 }
 
 #[test]
+fn slot_capacity_bounds_concurrent_opens_regardless_of_advertised_max() {
+    let mut slots = [StreamSlot::EMPTY; 4];
+    let mut table_header_storage = [0; 256];
+    let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut table_header_storage, 0);
+    establish(&mut table);
+    assert_eq!(table.slot_capacity(), 4);
+    assert_eq!(table.local_max_concurrent(), u32::MAX);
+    for id in [1, 3, 5, 7] {
+        assert_eq!(
+            table.on_frame(
+                header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, id, 0),
+                FrameDirection::Received,
+                &[]
+            ),
+            StreamAction::ACCEPT
+        );
+    }
+    assert_eq!(table.active_count(), 4);
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 9, 0),
+            FrameDirection::Received,
+            &[]
+        ),
+        StreamAction::send_rst(ErrorCode::RefusedStream)
+    );
+    assert_eq!(table.highest_remote(), 9);
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::RstStream, 0, 1, 4),
+            FrameDirection::Received,
+            &[]
+        ),
+        StreamAction::ACCEPT
+    );
+    assert_eq!(table.active_count(), 3);
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::Headers, HEADERS_FLAG_END_HEADERS, 11, 0),
+            FrameDirection::Received,
+            &[]
+        ),
+        StreamAction::ACCEPT
+    );
+    assert_eq!(table.find(1), None);
+    assert_eq!(table.active_count(), 4);
+}
+
+#[test]
 fn client_and_server_stream_opening_respects_initiator_role() {
     let mut client_slots = [StreamSlot::EMPTY; 2];
     let mut client_header_storage = [0; 256];

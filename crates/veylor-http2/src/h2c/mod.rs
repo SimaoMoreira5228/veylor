@@ -18,21 +18,6 @@ pub const H2C_MAX_CONCURRENT_STREAMS: u32 = 100;
 pub const H2C_SERVER_SETTINGS_LEN: usize = FRAME_HEADER_LEN + 3 * SETTINGS_ENTRY_LEN;
 pub const H2C_GOAWAY_LEN: usize = FRAME_HEADER_LEN + GOAWAY_FIXED_LEN;
 
-const H2C_LOCAL_SETTINGS: [SettingsParameter; 3] = [
-    SettingsParameter {
-        id: SETTINGS_HEADER_TABLE_SIZE,
-        value: H2C_HEADER_TABLE_SIZE,
-    },
-    SettingsParameter {
-        id: SETTINGS_MAX_FRAME_SIZE,
-        value: H2C_MAX_FRAME_SIZE,
-    },
-    SettingsParameter {
-        id: SETTINGS_MAX_CONCURRENT_STREAMS,
-        value: H2C_MAX_CONCURRENT_STREAMS,
-    },
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum H2cError {
     WrongRole,
@@ -115,10 +100,30 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
             .remote_settings()
             .max_frame_size;
         let mut writer = ControlFrameWriter::new(output, max_frame_size);
-        writer.queue_settings(&H2C_LOCAL_SETTINGS)?;
+        let capacity = u32::try_from(self.server.driver().streams().slot_capacity());
+        let capacity = capacity.unwrap_or(u32::MAX);
+        let max_concurrent = H2C_MAX_CONCURRENT_STREAMS.min(capacity);
+        // NOTE: advertise the table-sized ceiling, never the configured default alone: the slot
+        // slice is the single source (STREAM_SLOTS at the live server), so a peer-legitimate open
+        // under RFC 9113 §5.1.2 always fits and excess fails per stream with REFUSED_STREAM.
+        let local = [
+            SettingsParameter {
+                id: SETTINGS_HEADER_TABLE_SIZE,
+                value: H2C_HEADER_TABLE_SIZE,
+            },
+            SettingsParameter {
+                id: SETTINGS_MAX_FRAME_SIZE,
+                value: H2C_MAX_FRAME_SIZE,
+            },
+            SettingsParameter {
+                id: SETTINGS_MAX_CONCURRENT_STREAMS,
+                value: max_concurrent,
+            },
+        ];
+        writer.queue_settings(&local)?;
         self.server
             .driver_mut()
-            .register_fully_written_local_settings(&H2C_LOCAL_SETTINGS)?;
+            .register_fully_written_local_settings(&local)?;
         Ok(writer)
     }
 

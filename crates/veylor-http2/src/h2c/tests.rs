@@ -127,7 +127,7 @@ fn exact_magic_plus_empty_settings_completes() {
                 },
                 SettingsParameter {
                     id: crate::frame::SETTINGS_MAX_CONCURRENT_STREAMS,
-                    value: H2C_MAX_CONCURRENT_STREAMS
+                    value: H2C_MAX_CONCURRENT_STREAMS.min(4)
                 },
             ]
         );

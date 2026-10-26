@@ -8,9 +8,10 @@ use veylor_http2::{
     CLIENT_CONNECTION_PREFACE, CONTINUATION_FLAG_END_HEADERS, DATA_FLAG_END_STREAM,
     DEFAULT_MAX_FRAME_SIZE, ErrorCode, FRAME_HEADER_LEN, FrameHeader, FrameType, H2Role,
     HEADERS_FLAG_END_HEADERS, HEADERS_FLAG_END_STREAM, HpackEntrySlot, HpackFieldToEncode,
-    HpackHeader, HpackRepresentation, HpackTable, SETTINGS_ACK, StreamSlot, StreamTable,
-    decode_frame_header, decode_goaway_payload, decode_header_block, decode_rst_stream_payload,
-    encode_frame_header, encode_header_block,
+    HpackHeader, HpackRepresentation, HpackTable, SETTINGS_ACK, SETTINGS_ENTRY_LEN,
+    SETTINGS_MAX_CONCURRENT_STREAMS, StreamSlot, StreamTable, decode_frame_header,
+    decode_goaway_payload, decode_header_block, decode_rst_stream_payload, encode_frame_header,
+    encode_header_block,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -142,6 +143,40 @@ fn handshake(stream: &mut TcpStream) {
     let (header, _) = read_frame(stream);
     assert_eq!(header.frame_type, FrameType::Settings);
     assert_eq!(header.flags & SETTINGS_ACK, SETTINGS_ACK);
+}
+
+fn try_read_frame(stream: &mut TcpStream) -> Option<(FrameHeader, Vec<u8>)> {
+    let mut encoded = [0; FRAME_HEADER_LEN];
+    stream.read_exact(&mut encoded).ok()?;
+    let header = decode_frame_header(&encoded, DEFAULT_MAX_FRAME_SIZE).ok()?;
+    let mut payload = vec![0; header.payload_length as usize];
+    stream.read_exact(&mut payload).ok()?;
+    Some((header, payload))
+}
+
+// NOTE: settings-capturing handshake beside handshake(): the ceiling pin asserts the advertised
+// SETTINGS_MAX_CONCURRENT_STREAMS wire value, so the preface exchange returns it to the caller.
+fn handshake_advertised_max(stream: &mut TcpStream) -> u32 {
+    stream
+        .write_all(CLIENT_CONNECTION_PREFACE)
+        .expect("write magic");
+    write_frame(stream, FrameType::Settings, 0, 0, &[]);
+    let (header, payload) = read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_eq!(header.stream_id, 0);
+    let mut advertised = None;
+    for entry in payload.chunks_exact(SETTINGS_ENTRY_LEN) {
+        let id = u16::from_be_bytes([entry[0], entry[1]]);
+        let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
+        if id == SETTINGS_MAX_CONCURRENT_STREAMS {
+            advertised = Some(value);
+        }
+    }
+    write_frame(stream, FrameType::Settings, SETTINGS_ACK, 0, &[]);
+    let (header, _) = read_frame(stream);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_eq!(header.flags & SETTINGS_ACK, SETTINGS_ACK);
+    advertised.expect("server advertises max_concurrent_streams")
 }
 
 fn send_headers(
@@ -1742,6 +1777,105 @@ fn h2_managed_concurrent_parks_share_conn() {
     assert_eq!(three.body, b"two");
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+}
+
+// NOTE: stream-ceiling pin (RFC 9113 §5.1.2): the server advertises exactly STREAM_SLOTS, fills
+// all 32 with parked managed streams, and the 33rd concurrent open fails per stream with RST
+// RefusedStream (safe retry) while the connection survives; closing one recycles its slot for a
+// follow-up stream, so table accounting never corrupts and nothing stalls silently.
+#[test]
+fn h2_stream_ceiling_refuses_33rd_and_recycles() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut client = h2_connect(&server);
+    let advertised = handshake_advertised_max(&mut client);
+    assert_eq!(advertised, STREAM_SLOTS as u32);
+    for n in 0..STREAM_SLOTS {
+        send_headers(&mut client, (2 * n + 1) as u32, b"GET", b"/work", true);
+    }
+    let last = (2 * STREAM_SLOTS + 1) as u32;
+    send_headers(&mut client, last, b"GET", b"/work", true);
+    let parked: Vec<EventSlot> = poll_h2_requests(&host, STREAM_SLOTS)
+        .into_iter()
+        .map(|event| event.0)
+        .collect();
+    assert_eq!(host.parked_count(), STREAM_SLOTS);
+    let mut ids: Vec<u32> = parked.iter().map(|event| event.token.stream_id).collect();
+    ids.sort_unstable();
+    let expected: Vec<u32> = (0..STREAM_SLOTS).map(|n| (2 * n + 1) as u32).collect();
+    assert_eq!(ids, expected);
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("short timeout");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut refused = false;
+    while Instant::now() < deadline && !refused {
+        match try_read_frame(&mut client) {
+            Some((header, _)) if header.frame_type == FrameType::GoAway => {
+                panic!("ceiling never goes away: {header:?}");
+            }
+            Some((header, payload))
+                if header.frame_type == FrameType::RstStream && header.stream_id == last =>
+            {
+                let code = decode_rst_stream_payload(header, &payload).expect("decode rst");
+                assert_eq!(code, ErrorCode::RefusedStream);
+                refused = true;
+            }
+            Some(_) | None => {}
+        }
+    }
+    assert!(refused, "33rd concurrent stream is refused");
+    client
+        .set_read_timeout(Some(DEADLINE))
+        .expect("read timeout");
+    let first = parked
+        .iter()
+        .find(|event| event.token.stream_id == 1)
+        .expect("park 1");
+    assert_eq!(
+        host.respond(first.token, 200, b"OK", b"one"),
+        RespondOutcome::Ok
+    );
+    let one = read_response(&mut client, 1);
+    assert_eq!(one.status, 200);
+    assert_eq!(one.body, b"one");
+    let follow = 129;
+    // NOTE: follow-up reuses stream 1's host park sub-slot ((129 >> 1) % STREAM_SLOTS == 0), so
+    // the recycle proof isolates H2 table accounting from host slot collisions on live siblings.
+    send_headers(&mut client, follow, b"GET", b"/work", true);
+    let next: Vec<EventSlot> = poll_h2_requests(&host, 1)
+        .into_iter()
+        .map(|event| event.0)
+        .collect();
+    assert_eq!(next[0].token.stream_id, follow);
+    assert_eq!(
+        host.respond(next[0].token, 200, b"OK", b"recycled"),
+        RespondOutcome::Ok
+    );
+    let recycled = read_response(&mut client, follow);
+    assert_eq!(recycled.status, 200);
+    assert_eq!(recycled.body, b"recycled");
+    for event in &parked {
+        if event.token.stream_id == 1 {
+            continue;
+        }
+        assert_eq!(
+            host.respond(event.token, 200, b"OK", b"rest"),
+            RespondOutcome::Ok
+        );
+    }
+    for id in expected.iter().skip(1) {
+        let response = read_response(&mut client, *id);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"rest");
+    }
+    let counts = stop_join(server);
+    assert_eq!(
+        counts.h2_served,
+        (STREAM_SLOTS + 1) as u64,
+        "counts: {counts:?}"
+    );
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
 
 #[test]

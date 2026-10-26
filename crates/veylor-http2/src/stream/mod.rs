@@ -232,6 +232,10 @@ impl<'a> StreamTable<'a> {
         self.used
     }
 
+    pub const fn slot_capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     pub const fn is_assembling_headers(&self) -> bool {
         self.assembler.active
     }
