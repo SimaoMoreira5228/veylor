@@ -40,8 +40,8 @@ use crate::abi::VylResult;
 pub const VYL_MANAGED_STATIC_ABI_VERSION: u32 = 1;
 pub const VYL_MANAGED_STATIC_EVENT_REQUEST: u32 = 0;
 pub const VYL_MANAGED_STATIC_EVENT_SHUTDOWN: u32 = 1;
-// NOTE: legacy-parity signal kinds numbering 2/3 like the old C ABI. V1 structs stay size-pinned:
-// both reuse VylManagedStaticEvent fields (see the struct docs), never grow it.
+// NOTE: V1 structs stay size-pinned: both reuse VylManagedStaticEvent fields (see the
+// struct docs), never grow it.
 pub const VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE: u32 = 2;
 pub const VYL_MANAGED_STATIC_EVENT_WRITABLE: u32 = 3;
 

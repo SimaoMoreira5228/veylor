@@ -2788,3 +2788,45 @@ fn gzip_native_identity_fallback_without_accept_encoding() {
     let counts = server.join().expect("join server");
     assert_eq!(counts.completed + counts.shutdown, 1, "counts: {counts:?}");
 }
+
+#[test]
+fn options_asterisk_answers_server_capabilities() {
+    let server = test_server();
+    let mut stream = connect(&server);
+    let request = "OPTIONS * HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write OPTIONS");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    let allow = header(&response, "allow");
+    assert!(allow.contains("GET"), "allow: {allow}");
+    assert!(allow.contains("POST"), "allow: {allow}");
+    date_shape(&response);
+    get(&mut stream, "/hello");
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed + counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn options_asterisk_ignores_accept_encoding() {
+    let server = gzip_server();
+    let mut stream = connect(&server);
+    let request = "OPTIONS * HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write OPTIONS");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    assert!(
+        response
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("content-encoding")),
+        "no content-encoding"
+    );
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}

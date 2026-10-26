@@ -230,11 +230,29 @@ fn send_headers_extra(
     for (name, value) in extra {
         fields.push(field(name, value));
     }
+    send_header_fields(stream, id, &fields, end);
+}
+
+fn send_headers_no_authority(stream: &mut TcpStream, id: u32, method: &[u8], path: &[u8]) {
+    let fields = vec![
+        field(b":method", method),
+        field(b":scheme", b"http"),
+        field(b":path", path),
+    ];
+    send_header_fields(stream, id, &fields, true);
+}
+
+fn send_header_fields(
+    stream: &mut TcpStream,
+    id: u32,
+    fields: &[HpackFieldToEncode<'_>],
+    end: bool,
+) {
     let mut entries = [HpackEntrySlot::EMPTY; 8];
     let mut scratch = [0; 512];
     let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
     let mut block = [0; 2048];
-    let len = encode_header_block(&fields, &mut encoder, &mut block).expect("encode block");
+    let len = encode_header_block(fields, &mut encoder, &mut block).expect("encode block");
     let mut flags = HEADERS_FLAG_END_HEADERS;
     if end {
         flags |= HEADERS_FLAG_END_STREAM;
@@ -1500,7 +1518,7 @@ fn host_park_poll_respond_round_trip() {
         assert_eq!(event.token.stream_id, 1);
         assert_eq!(event.route_id, 0);
         assert_eq!(
-            shared.stage_respond(event.token, 200, b"OK", b"host-hello"),
+            shared.stage_respond(event.token, 200, b"OK", &[], b"host-hello"),
             RespondOutcome::Ok
         );
         let (staged, _) = shared.take_staged(0);
@@ -1573,11 +1591,11 @@ fn host_stale_replay_and_duplicate_fail_closed() {
             ..event.token
         };
         assert_eq!(
-            shared.stage_respond(stale, 200, b"OK", b"hijack"),
+            shared.stage_respond(stale, 200, b"OK", &[], b"hijack"),
             RespondOutcome::Stale
         );
         assert_eq!(
-            shared.stage_respond(event.token, 200, b"OK", b"live"),
+            shared.stage_respond(event.token, 200, b"OK", &[], b"live"),
             RespondOutcome::Ok
         );
         let (staged, _) = shared.take_staged(0);
@@ -1591,7 +1609,7 @@ fn host_stale_replay_and_duplicate_fail_closed() {
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"live");
         assert_eq!(
-            shared.stage_respond(event.token, 200, b"OK", b"again"),
+            shared.stage_respond(event.token, 200, b"OK", &[], b"again"),
             RespondOutcome::Duplicate
         );
     });
@@ -3782,7 +3800,7 @@ fn h2_managed_respond_204_serves_status_only() {
         let (event, _, _) = poll_request_event(shared);
         assert_eq!(event.token.stream_id, 1);
         assert_eq!(
-            shared.stage_respond(event.token, 204, b"No Content", b"stray"),
+            shared.stage_respond(event.token, 204, b"No Content", &[], b"stray"),
             RespondOutcome::Ok
         );
         let (staged, _) = shared.take_staged(0);
@@ -4821,4 +4839,59 @@ fn gzip_native_route_identity_without_accept_encoding_over_h2c() {
     let counts = server.join().expect("join server");
     assert_eq!(counts.h2_served, 1);
     assert_eq!(counts.shutdown, 1);
+}
+
+#[test]
+fn options_asterisk_answers_server_capabilities_over_h2c() {
+    let server = h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers_no_authority(&mut client, 1, b"OPTIONS", b"*");
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert!(response.body.is_empty());
+    let allow = std::str::from_utf8(&response.allow).expect("allow utf8");
+    assert!(allow.contains("GET"), "allow: {allow}");
+    date_shape(&response);
+    assert_date_first(&response.order, true);
+    send_headers(&mut client, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut client, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    server.stop_accepting();
+    let (_, code) = read_goaway(&mut client);
+    assert_eq!(code, ErrorCode::NoError);
+    read_eof(&mut client);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 2);
+    assert_eq!(counts.shutdown, 1);
+}
+
+#[test]
+fn h2_managed_respond_with_headers_sends_them_after_pseudo() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.respond_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"content-type".as_slice(), b"text/plain".as_slice())],
+            b"managed-h2",
+        ),
+        RespondOutcome::Ok
+    );
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"managed-h2");
+    assert_eq!(response.content_type, b"text/plain");
+    assert_date_first(&response.order, true);
+    let names: Vec<&[u8]> = response.order.iter().map(Vec::as_slice).collect();
+    assert_eq!(names[..2], [b":status".as_slice(), b"date".as_slice()]);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }

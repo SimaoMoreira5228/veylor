@@ -1866,7 +1866,7 @@ fn host_body_available_retired_on_respond_and_close() {
     assert_eq!(report.copied, 1);
     assert_eq!(events[0].kind, HostEventKind::Request);
     assert_eq!(
-        shared.stage_respond(token, 200, b"OK", b"x"),
+        shared.stage_respond(token, 200, b"OK", &[], b"x"),
         RespondOutcome::Ok
     );
     assert!(
@@ -2126,4 +2126,139 @@ fn host_writable_retired_on_cancel_and_close() {
         unit_poll(&shared).is_empty(),
         "close retires the pending signal"
     );
+}
+
+#[test]
+fn managed_respond_with_headers_sends_them_after_date() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[
+                (b"content-type".as_slice(), b"text/plain".as_slice()),
+                (b"x-custom".as_slice(), b"yes".as_slice()),
+            ],
+            b"done",
+        ),
+        RespondOutcome::Ok
+    );
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"done");
+    assert_eq!(header(&first, "content-type"), "text/plain");
+    assert_eq!(header(&first, "x-custom"), "yes");
+    date_shape(&first);
+    let names: Vec<&str> = first
+        .headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["Date", "content-type", "x-custom", "Content-Length"]
+    );
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed + counts.shutdown, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn managed_gzip_body_passes_through_with_declared_encoding() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    let plain = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
+    let gzipped = {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).expect("gzip body");
+        encoder.finish().expect("finish gzip")
+    };
+    assert_eq!(
+        host.respond_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"content-encoding".as_slice(), b"gzip".as_slice())],
+            &gzipped,
+        ),
+        RespondOutcome::Ok
+    );
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, gzipped);
+    assert_eq!(header(&first, "content-encoding"), "gzip");
+    assert_eq!(
+        first
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+            .count(),
+        0
+    );
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_respond_with_headers_rejects_bad_fields() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"x bad".as_slice(), b"yes".as_slice())],
+            b"done",
+        ),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.respond_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"x-ok".as_slice(), b"a\r\nb".as_slice())],
+            b"done",
+        ),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.respond_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"content-length".as_slice(), b"4".as_slice())],
+            b"done",
+        ),
+        RespondOutcome::Invalid
+    );
+    let many: Vec<(&[u8], &[u8])> = (0..9)
+        .map(|_| (b"x-a".as_slice(), b"b".as_slice()))
+        .collect();
+    assert_eq!(
+        host.respond_with_headers(event.token, 200, b"OK", &many, b"done"),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"done");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
 }

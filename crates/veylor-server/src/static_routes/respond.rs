@@ -55,6 +55,14 @@ pub fn respond_to_head(
     if in_native_handler() {
         return Err(RouteBuildError::Invalid);
     }
+    if head.target_form == TargetForm::Asterisk
+        && matches!(head.method(input), Some(m) if m == b"OPTIONS")
+        && head.content_length.unwrap_or(0) == 0
+        && !head.is_chunked
+        && !head.expect_continue
+    {
+        return respond_server_options(table, head, input, output);
+    }
     let mut captures = [RouteCapture::default(); CAPTURE_SLOTS];
     let found = table.find_request(head, input, &mut captures);
     // NOTE: natives dispatch before statics on the same Static slot (same method+path can
@@ -234,23 +242,7 @@ fn respond_method_not_allowed(
         .allowed_methods_for_request(head, input, &mut methods)
         .map_err(|_| RouteBuildError::Invalid)?;
     let mut allow = [0u8; ALLOW_BYTES];
-    let mut allow_len = 0;
-    for (index, name) in methods[..count].iter().enumerate() {
-        if index > 0 {
-            let end = allow_len + 2;
-            if end > allow.len() {
-                return Err(RouteBuildError::Invalid);
-            }
-            allow[allow_len..end].copy_from_slice(b", ");
-            allow_len = end;
-        }
-        let end = allow_len + name.len();
-        if end > allow.len() {
-            return Err(RouteBuildError::Invalid);
-        }
-        allow[allow_len..end].copy_from_slice(name);
-        allow_len = end;
-    }
+    let allow_len = join_allow(&methods[..count], &mut allow).ok_or(RouteBuildError::Invalid)?;
     encode_method_not_allowed(
         head,
         input,
@@ -260,6 +252,27 @@ fn respond_method_not_allowed(
         interim_len,
         output,
     )
+}
+
+fn join_allow(methods: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    let mut len = 0;
+    for (index, name) in methods.iter().enumerate() {
+        if index > 0 {
+            let end = len + 2;
+            if end > out.len() {
+                return None;
+            }
+            out[len..end].copy_from_slice(b", ");
+            len = end;
+        }
+        let end = len + name.len();
+        if end > out.len() {
+            return None;
+        }
+        out[len..end].copy_from_slice(name);
+        len = end;
+    }
+    Some(len)
 }
 
 fn encode_method_not_allowed(
@@ -314,6 +327,53 @@ fn encode_method_not_allowed(
         keep_open: connection != ConnectionHeader::Close,
         drain_total,
         interim_len,
+        file: None,
+    })
+}
+
+fn respond_server_options(
+    table: &RouteTable<'_, '_>,
+    head: RequestHead,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let method = head.method(input).unwrap_or_default();
+    let mut methods: [&[u8]; ALLOW_METHODS] = [&[]; ALLOW_METHODS];
+    let count = table
+        .server_allow_methods(&mut methods)
+        .map_err(|_| RouteBuildError::Invalid)?;
+    let mut allow = [0u8; ALLOW_BYTES];
+    let allow_len = join_allow(&methods[..count], &mut allow).ok_or(RouteBuildError::Invalid)?;
+    let connection =
+        connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let fields = [
+        Field {
+            name: b"Date",
+            value: &now[..now_len],
+        },
+        Field {
+            name: b"Allow",
+            value: &allow[..allow_len],
+        },
+    ];
+    let response = ResponseToWrite {
+        request_method: method,
+        requested_upgrade: b"",
+        status: 200,
+        reason: b"OK",
+        fields: &fields,
+        framing: ResponseFraming::FixedLength,
+        content_length: 0,
+        connection,
+    };
+    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    Ok(EncodedStaticResponse {
+        length: encoded.length,
+        keep_open: connection != ConnectionHeader::Close,
+        drain_total: 0,
+        interim_len: 0,
         file: None,
     })
 }

@@ -19,7 +19,7 @@ use crate::static_routes::{
 use super::file::FileDecision;
 use super::routes::{
     ALLOW_BYTES, FrozenRoutesView, MAX_REQUEST_TARGET_BYTES, NOT_FOUND_BODY, URI_TOO_LONG_BODY,
-    field, send_begin, send_full, send_method_not_allowed,
+    field, send_begin, send_full, send_method_not_allowed, send_options,
 };
 use super::turn;
 use super::{
@@ -141,6 +141,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 body,
                 content_encoding,
                 vary,
+                &[],
                 false,
                 false,
                 self.output,
@@ -158,6 +159,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             body,
             content_encoding,
             vary,
+            &[],
             is_head || body.is_empty(),
             true,
             self.output,
@@ -174,6 +176,19 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
     // GOAWAY for a 405), and the !end refusal mirrors the static tail exactly (HEADERS-open
     // then RST plus the same close). Date rides the shared 405 sender first after :status
     // (H1 Date-first parity); HEAD answers headers-only with the 405 length like any static HEAD.
+    fn serve_server_options(&mut self, stream: u32, end: bool, allow: &[u8]) {
+        if !end {
+            if send_options(self.server, stream, allow, false, self.output, self.used).is_err() {
+                return self.fail(ErrorCode::InternalError);
+            }
+            return self.deny(stream, ErrorCode::RefusedStream, true);
+        }
+        match send_options(self.server, stream, allow, true, self.output, self.used) {
+            Ok(()) => self.outcome.served += 1,
+            Err(code) => self.fail(code),
+        }
+    }
+
     fn serve_allow_value(&mut self, stream: u32, end: bool, is_head: bool, allow: &[u8]) {
         if !end {
             if send_method_not_allowed(
@@ -305,6 +320,16 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     }
                     Err(_) => return self.fail(ErrorCode::InternalError),
                 };
+                let asterisk = matches!(request.path, Some(path) if path == b"*");
+                if request.method == b"OPTIONS" && asterisk {
+                    let mut allow = [0u8; ALLOW_BYTES];
+                    let Some(len) = self.routes.write_server_allow(&mut allow) else {
+                        self.deny(stream, ErrorCode::InternalError, false);
+                        return;
+                    };
+                    self.serve_server_options(stream, end, &allow[..len]);
+                    return;
+                }
                 let path = match request.path {
                     Some(path) if path.first() == Some(&b'/') => path,
                     _ => return self.deny(stream, ErrorCode::RefusedStream, false),
@@ -324,6 +349,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                             URI_TOO_LONG_BODY,
                             None,
                             false,
+                            &[],
                             false,
                             false,
                             self.output,
@@ -342,6 +368,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         URI_TOO_LONG_BODY,
                         None,
                         false,
+                        &[],
                         is_head,
                         true,
                         self.output,
@@ -436,6 +463,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                                 b"Payload Too Large",
                                 None,
                                 false,
+                                &[],
                                 false,
                                 true,
                                 self.output,
@@ -469,6 +497,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         body,
                         encoding,
                         vary,
+                        &[],
                         false,
                         false,
                         self.output,
@@ -487,6 +516,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     body,
                     encoding,
                     vary,
+                    &[],
                     is_head || body.is_empty(),
                     true,
                     self.output,

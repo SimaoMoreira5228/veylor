@@ -259,6 +259,24 @@ impl<'slots, 'data> RouteTable<'slots, 'data> {
         Ok(count)
     }
 
+    pub fn server_allow_methods(&self, out: &mut [&'data [u8]]) -> Result<usize, RouteError> {
+        if self.state != State::Frozen {
+            return Err(RouteError::NotFrozen);
+        }
+        let mut count = 0;
+        for route in self.slots[..self.count].iter() {
+            if out[..count].contains(&route.method) {
+                continue;
+            }
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = route.method;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn has_path_match(&self, path: &[u8], input_offset: usize) -> bool {
         let mut scratch = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
         for route in self.slots[..self.count].iter() {

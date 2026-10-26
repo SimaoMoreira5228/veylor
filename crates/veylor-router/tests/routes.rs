@@ -285,3 +285,31 @@ fn freezes_and_searches_exact_tables_at_8_100_and_10000_routes() {
         assert_eq!(matched.pattern, target);
     }
 }
+
+#[test]
+fn server_allow_lists_distinct_methods_across_routes() {
+    let mut slots = [RouteSlot::EMPTY; 4];
+    let mut routes = RouteTable::new(&mut slots);
+    routes
+        .register(b"GET", b"/a", route_config(RouteKind::Static))
+        .unwrap();
+    routes
+        .register(b"POST", b"/b", route_config(RouteKind::Static))
+        .unwrap();
+    routes
+        .register(b"GET", b"/c", route_config(RouteKind::Static))
+        .unwrap();
+    routes
+        .register(b"DELETE", b"/d", route_config(RouteKind::Managed))
+        .unwrap();
+    routes.freeze().unwrap();
+    let mut out = [&[][..]; 8];
+    let count = routes.server_allow_methods(&mut out).unwrap();
+    assert_eq!(count, 3);
+    for want in [b"GET".as_slice(), b"POST".as_slice(), b"DELETE".as_slice()] {
+        assert!(out[..count].contains(&want), "missing {want:?}");
+    }
+    let mut tiny = [&[][..]; 2];
+    let capped = routes.server_allow_methods(&mut tiny).unwrap();
+    assert_eq!(capped, 2);
+}

@@ -958,7 +958,7 @@ fn drain_host_staged(
         let encoded = conns
             .get_mut(work.slot)
             .and_then(|entry| entry.as_mut())
-            .map(|conn| conn.complete_parked(work.status, &work.reason, &work.body));
+            .map(|conn| conn.complete_parked(work.status, &work.reason, &work.body, &work.headers));
         match encoded {
             Some(Ok(())) => {
                 if worker

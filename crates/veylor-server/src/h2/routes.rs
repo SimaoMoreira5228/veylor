@@ -25,11 +25,33 @@ pub(crate) const MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
 // it at the route cap and the 405 below RSTs past the value buffer instead.
 const ALLOW_METHODS: usize = 16;
 pub(crate) const ALLOW_BYTES: usize = 320;
+const MAX_RESPONSE_FIELDS: usize = 5 + crate::host::MAX_STAGED_RESPONSE_HEADERS;
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
 const CONTENT_RANGE_BYTES: usize = 80;
 // NOTE: "multipart/byteranges; boundary=" plus token and hex fields tops out near 91 bytes;
 // 128 leaves margin, mirroring the H1 multipart scratch.
 const MULTIPART_CTYPE_BYTES: usize = 128;
+
+fn join_allow_value(methods: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    let mut len = 0;
+    for (index, name) in methods.iter().enumerate() {
+        if index > 0 {
+            let end = len + 2;
+            if end > out.len() {
+                return None;
+            }
+            out[len..end].copy_from_slice(b", ");
+            len = end;
+        }
+        let end = len + name.len();
+        if end > out.len() {
+            return None;
+        }
+        out[len..end].copy_from_slice(name);
+        len = end;
+    }
+    Some(len)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrozenRoute<'a> {
@@ -262,24 +284,44 @@ impl<'a> FrozenRoutesView<'a> {
         if count == 0 {
             return None;
         }
-        let mut len = 0;
-        for (index, name) in methods[..count].iter().enumerate() {
-            if index > 0 {
-                let end = len + 2;
-                if end > out.len() {
-                    return None;
-                }
-                out[len..end].copy_from_slice(b", ");
-                len = end;
+        join_allow_value(&methods[..count], out)
+    }
+
+    pub(crate) fn server_methods(&self, out: &mut [&'a [u8]]) -> usize {
+        let mut count = 0;
+        for route in self.routes.iter() {
+            if route.file_root.is_some() {
+                continue;
             }
-            let end = len + name.len();
-            if end > out.len() {
-                return None;
+            if out[..count].contains(&route.method) {
+                continue;
             }
-            out[len..end].copy_from_slice(name);
-            len = end;
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = route.method;
+            count += 1;
         }
-        Some(len)
+        for native in self.natives.iter() {
+            if out[..count].contains(&native.method) {
+                continue;
+            }
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = native.method;
+            count += 1;
+        }
+        count
+    }
+
+    pub(crate) fn write_server_allow(&self, out: &mut [u8]) -> Option<usize> {
+        let mut methods: [&[u8]; ALLOW_METHODS] = [&[]; ALLOW_METHODS];
+        let count = self.server_methods(&mut methods);
+        if count == 0 {
+            return None;
+        }
+        join_allow_value(&methods[..count], out)
     }
 
     pub(crate) fn is_managed(&self, method: &[u8], path: &[u8]) -> bool {
@@ -525,6 +567,7 @@ pub(crate) fn send_full(
     body: &[u8],
     content_encoding: Option<&[u8]>,
     vary: bool,
+    extra: &[(&[u8], &[u8])],
     end_stream: bool,
     send_body: bool,
     output: &mut [u8],
@@ -539,13 +582,10 @@ pub(crate) fn send_full(
     let length_len = push_decimal(&mut length_buf, body.len() as u64);
     let mut now_buf = [0; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now_buf);
-    let mut response_fields = [
-        field(b":status", &status_buf[..status_len]),
-        field(b"date", &now_buf[..now_len]),
-        field(b"content-length", &length_buf[..length_len]),
-        field(b"content-encoding", b""),
-        field(b"vary", b""),
-    ];
+    let mut response_fields = [field(b"", b""); MAX_RESPONSE_FIELDS];
+    response_fields[0] = field(b":status", &status_buf[..status_len]);
+    response_fields[1] = field(b"date", &now_buf[..now_len]);
+    response_fields[2] = field(b"content-length", &length_buf[..length_len]);
     let mut field_count = 3;
     if let Some(encoding) = content_encoding {
         response_fields[field_count] = field(b"content-encoding", encoding);
@@ -553,6 +593,13 @@ pub(crate) fn send_full(
     }
     if vary {
         response_fields[field_count] = field(b"vary", b"Accept-Encoding");
+        field_count += 1;
+    }
+    if extra.len() > response_fields.len() - field_count {
+        return Err(ErrorCode::InternalError);
+    }
+    for (name, value) in extra {
+        response_fields[field_count] = field(name, value);
         field_count += 1;
     }
     let mut block = [0; HPACK_BLOCK_CAP];
@@ -657,6 +704,40 @@ pub(crate) fn send_method_not_allowed(
         *used += sent.writer.pending_bytes().len();
         offset += sent.frame.payload_length;
     }
+    Ok(())
+}
+
+pub(crate) fn send_options(
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    stream: u32,
+    allow: &[u8],
+    end_stream: bool,
+    output: &mut [u8],
+    used: &mut usize,
+) -> Result<(), ErrorCode> {
+    let mut status_buf = [0; DECIMAL_CAP];
+    let status_len = push_decimal(&mut status_buf, 200);
+    let mut length_buf = [0; DECIMAL_CAP];
+    let length_len = push_decimal(&mut length_buf, 0);
+    let mut now_buf = [0; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now_buf);
+    let response_fields = [
+        field(b":status", &status_buf[..status_len]),
+        field(b"date", &now_buf[..now_len]),
+        field(b"content-length", &length_buf[..length_len]),
+        field(b"allow", allow),
+    ];
+    let mut block = [0; HPACK_BLOCK_CAP];
+    let sent = server
+        .send_response(
+            stream,
+            &response_fields,
+            &mut block,
+            &mut output[*used..],
+            end_stream,
+        )
+        .map_err(|_| ErrorCode::InternalError)?;
+    *used += sent.writer.pending_bytes().len();
     Ok(())
 }
 

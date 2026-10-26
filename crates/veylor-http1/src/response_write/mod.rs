@@ -400,7 +400,7 @@ fn chunked_allowed(response: &ResponseToWrite<'_>) -> bool {
             || response.status == 304)
 }
 
-fn valid_field_value(value: &[u8]) -> bool {
+pub fn valid_field_value(value: &[u8]) -> bool {
     !value.iter().any(|byte| {
         *byte == b'\r' || *byte == b'\n' || (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f
     })

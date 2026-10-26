@@ -5,8 +5,8 @@ use veylor_http1::{
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
 
 use crate::host::{
-    HOST_MAX_METHOD_BYTES, HostInner, HostShared, ParkError, ParkedEntry, RespondOutcome,
-    TombCause, find_tomb,
+    HOST_MAX_METHOD_BYTES, HostInner, HostShared, MAX_STAGED_RESPONSE_HEADERS, ParkError,
+    ParkedEntry, RespondOutcome, TombCause, find_tomb,
 };
 use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::{encode_continue, now_http_date, respond_payload_too_large};
@@ -34,6 +34,7 @@ impl ConnState {
         status: u16,
         reason: &[u8],
         body: &[u8],
+        headers: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ConnClose> {
         let ConnPhase::Parked {
             method_len,
@@ -57,16 +58,28 @@ impl ConnState {
         // NOTE: H2 managed Date is the recorded follow-up (h2/serve.rs Begin/send_full), not this slice.
         let mut now = [0u8; HTTP_DATE_BYTES];
         let now_len = now_http_date(&mut now);
-        let date = [Field {
+        let mut fields = [Field {
+            name: b"",
+            value: b"",
+        }; 1 + MAX_STAGED_RESPONSE_HEADERS];
+        fields[0] = Field {
             name: b"Date",
             value: &now[..now_len],
-        }];
+        };
+        let mut field_count = 1;
+        for (name, value) in headers.iter().take(fields.len() - 1) {
+            fields[field_count] = Field {
+                name: name.as_slice(),
+                value: value.as_slice(),
+            };
+            field_count += 1;
+        }
         let response = ResponseToWrite {
             request_method,
             requested_upgrade: b"",
             status,
             reason,
-            fields: &date,
+            fields: &fields[..field_count],
             framing: ResponseFraming::FixedLength,
             content_length: body.len() as u64,
             connection,

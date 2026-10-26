@@ -35,5 +35,5 @@ pub use response_write::{
     ResponseFraming, ResponseToWrite, ResponseWriteCursor, connection_header_for_response,
     encode_response_chunk, encode_response_chunk_with_required_length, encode_response_final_chunk,
     encode_response_final_chunk_with_required_length, encode_response_head,
-    encode_response_head_with_required_length,
+    encode_response_head_with_required_length, valid_field_value,
 };

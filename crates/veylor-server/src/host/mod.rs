@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use veylor_http1::{is_token, valid_field_value};
 use veylor_runtime::{ConnectionToken, WakeHandle};
 use veylor_tls::{CertificateDer, PrivateKeyDer, TlsAcceptor, TlsError};
 
@@ -20,12 +21,13 @@ pub(crate) use signals::{
     retire_signals, retract_body_append, stage_body_available, stage_writable_locked,
 };
 
-// NOTE: park/poll/respond/cancel mirrors the Odin host queue: bounded per-worker event
-// queues, whole-event dequeue with required-capacity reporting, level-triggered wakeups,
-// one Shutdown event per worker. Fixed-length bodies stage per parked record up to the
-// shared static cap: the worker pushes wire bytes, the host pulls, completion is observed.
+// NOTE: bounded per-worker event queues with whole-event dequeue and required-capacity
+// reporting, level-triggered wakeups, one Shutdown event per worker. Fixed-length bodies
+// stage per parked record up to the shared static cap: the worker pushes wire bytes,
+// the host pulls, completion is observed.
 
-// NOTE: depths mirror the Odin HOST_QUEUE_DEPTH for comparable overload behavior.
+// NOTE: bounded per-worker event queue depth; a full queue reports required capacity
+// instead of growing.
 pub const HOST_QUEUE_DEPTH: usize = 64;
 // NOTE: H2 stream-keyed park range appended to the parked table: 8 conns x 32 subslots,
 // indexed MAX_CONNECTIONS + conn * 32 + subslot; sized from the H2 turn constants.
@@ -33,6 +35,40 @@ pub(crate) const H2_PARK_SLOTS: usize = crate::h2::turn::MAX_H2_CONNS * crate::h
 pub const HOST_MAX_METHOD_BYTES: usize = 16;
 pub const HOST_MAX_PATH_BYTES: usize = 2048;
 pub const HOST_MAX_REASON_BYTES: usize = 64;
+pub const MAX_STAGED_RESPONSE_HEADERS: usize = 8;
+pub const MAX_STAGED_RESPONSE_BYTES: usize = 1024;
+
+fn valid_response_headers(headers: &[(&[u8], &[u8])]) -> bool {
+    if headers.len() > MAX_STAGED_RESPONSE_HEADERS {
+        return false;
+    }
+    let mut total = 0;
+    for (name, value) in headers {
+        if name.is_empty()
+            || name.len() > 128
+            || !name.iter().copied().all(is_token)
+            || is_framing_header(name)
+            || !valid_field_value(value)
+        {
+            return false;
+        }
+        total += name.len() + value.len();
+        if total > MAX_STAGED_RESPONSE_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_framing_header(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"content-length")
+        || name.eq_ignore_ascii_case(b"transfer-encoding")
+        || name.eq_ignore_ascii_case(b"connection")
+        || name.eq_ignore_ascii_case(b"keep-alive")
+        || name.eq_ignore_ascii_case(b"proxy-connection")
+        || name.eq_ignore_ascii_case(b"upgrade")
+        || name.eq_ignore_ascii_case(b"date")
+}
 const HOST_TOMB_DEPTH: usize = 64;
 const SHUTDOWN_PUSH_RETRIES: usize = 50_000;
 
@@ -59,6 +95,7 @@ pub(crate) enum StagedAction {
         status: u16,
         reason: Vec<u8>,
         body: Vec<u8>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
     },
     Cancel,
 }
@@ -169,6 +206,7 @@ pub struct StagedWork {
     pub status: u16,
     pub reason: Vec<u8>,
     pub body: Vec<u8>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     pub cancel: bool,
     pub grant_owed: u32,
 }
@@ -406,12 +444,14 @@ impl HostShared {
         token: ConnectionToken,
         status: u16,
         reason: &[u8],
+        headers: &[(&[u8], &[u8])],
         body: &[u8],
     ) -> RespondOutcome {
         if !(200..=599).contains(&status)
             || reason.is_empty()
             || reason.len() > HOST_MAX_REASON_BYTES
             || !valid_reason(reason)
+            || !valid_response_headers(headers)
         {
             return RespondOutcome::Invalid;
         }
@@ -443,6 +483,10 @@ impl HostShared {
                         status,
                         reason: reason.to_vec(),
                         body: body.to_vec(),
+                        headers: headers
+                            .iter()
+                            .map(|(name, value)| (name.to_vec(), value.to_vec()))
+                            .collect(),
                     });
                     if let Some(epoch) = inner.staged_epoch.get_mut(worker) {
                         *epoch += 1;
@@ -577,13 +621,14 @@ impl HostShared {
                     StagedAction::Cancel => TombCause::Cancelled,
                 };
                 push_tomb(inner, worker, entry.token, cause);
-                let (status, reason, body, cancel) = match action {
+                let (status, reason, body, headers, cancel) = match action {
                     StagedAction::Respond {
                         status,
                         reason,
                         body,
-                    } => (status, reason, body, false),
-                    StagedAction::Cancel => (0, Vec::new(), Vec::new(), true),
+                        headers,
+                    } => (status, reason, body, headers, false),
+                    StagedAction::Cancel => (0, Vec::new(), Vec::new(), Vec::new(), true),
                 };
                 let base = ConnectionToken {
                     request_seq: 0,
@@ -596,6 +641,7 @@ impl HostShared {
                     status,
                     reason,
                     body,
+                    headers,
                     cancel,
                     grant_owed: grant,
                 });
@@ -821,7 +867,19 @@ impl HostHandle {
         reason: &[u8],
         body: &[u8],
     ) -> RespondOutcome {
-        self.shared.stage_respond(token, status, reason, body)
+        self.shared.stage_respond(token, status, reason, &[], body)
+    }
+
+    pub fn respond_with_headers(
+        &self,
+        token: ConnectionToken,
+        status: u16,
+        reason: &[u8],
+        headers: &[(&[u8], &[u8])],
+        body: &[u8],
+    ) -> RespondOutcome {
+        self.shared
+            .stage_respond(token, status, reason, headers, body)
     }
 
     pub fn cancel(&self, token: ConnectionToken) -> CancelOutcome {

@@ -5139,9 +5139,7 @@ fn file_mount_h2c_serves_full_range_conditional_matrix() {
 // must park and pull the staged set.
 #[test]
 // NOTE: allowlist routes mirror to H2C and enforce there: the listed set stages whole,
-// the unlisted set RSTs the stream, the connection survives. Formerly
-// h2c_managed_with_trailers_route_unprojected_documents_gap (404 pin); flipped when the
-// mirror landed together with H2 staging/park enforcement via trailer_allowed.
+// the unlisted set RSTs the stream, the connection survives.
 fn h2c_managed_with_trailers_mirror_serves_and_enforces() {
     let config = test_config(0);
     let server = unsafe { create(&config) };

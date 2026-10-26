@@ -10,7 +10,7 @@ pub(crate) use http_date::system_time_secs;
 pub use http_date::{HTTP_DATE_BYTES, parse_http_date, write_http_date};
 
 pub const MAX_MOUNTS: usize = 16;
-// NOTE: files stream through the pump in bounded turns, so this cap only bounds metadata sanity, never resident memory; it mirrors the Odin STATIC_FILE_MAX_SIZE so every file the old engine planned still plans here.
+// NOTE: files stream through the pump in bounded turns, so this cap only bounds metadata sanity, never resident memory.
 pub const MAX_FILE_SIZE: u64 = i64::MAX as u64;
 // NOTE: at most this many satisfiable windows frame as one multipart body; more valid windows ignore the header to 200 full,
 // so framing work and part-header stack stay constant. Framing itself is bounded per part below, and body bytes always add up
