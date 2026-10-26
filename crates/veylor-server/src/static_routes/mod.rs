@@ -60,7 +60,7 @@ pub struct ManagedRoute {
 // framing presence/length keeps the call FFI-trivial, with fixed-length bodies borrowed
 // when fully buffered (see body). user_data crosses as an address-sized value next to the
 // handler pointer (see below).
-// WARNING: every pointer below borrows worker input bytes for the call only; a handler
+// NOTE: every pointer below borrows worker input bytes for the call only; a handler
 // retaining method/path/body past return is UB, same as the out-param scratch rule.
 #[repr(C)]
 pub struct NativeRequestView {

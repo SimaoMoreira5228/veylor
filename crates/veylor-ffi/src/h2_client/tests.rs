@@ -1252,3 +1252,183 @@ fn scripted_even_stream_id_fails_connection() {
     );
     destroy_client(client);
 }
+
+#[test]
+fn scripted_push_promise_fails_connection() {
+    let client = new_client();
+    scripted_handshake(client);
+    let stream = scripted_get(client);
+    assert_eq!(stream, 1);
+    let mut block = Vec::new();
+    peer_literal(&mut block, b":method", b"GET");
+    peer_literal(&mut block, b":scheme", b"https");
+    peer_literal(&mut block, b":path", b"/pushed");
+    peer_literal(&mut block, b":authority", b"example.com");
+    let mut frame = peer_header(block.len() + 4, 0x05, 0x04, 1).to_vec();
+    frame.extend_from_slice(&2u32.to_be_bytes());
+    frame.extend_from_slice(&block);
+    let out = poll_peer(client, &frame);
+    assert_eq!(out.result, VylResult::ProtocolError);
+    assert_eq!(out.consumed, frame.len());
+    assert_eq!(out.connection_error, 1);
+    let out = poll_peer(client, &[]);
+    assert_eq!(out.result, VylResult::ProtocolError);
+    assert_eq!(out.connection_error, 1);
+    let fields = [
+        encode_field(b":method", b"GET"),
+        encode_field(b":scheme", b"https"),
+        encode_field(b":path", b"/"),
+        encode_field(b":authority", b"example.com"),
+    ];
+    let mut request = [0; 1_024];
+    let mut written = 0;
+    let mut stream_id = 0;
+    let mut required = 0;
+    assert_eq!(
+        unsafe {
+            vyl_h2_client_start_request(
+                client,
+                fields.as_ptr(),
+                fields.len(),
+                1,
+                request.as_mut_ptr(),
+                request.len(),
+                &mut written,
+                &mut stream_id,
+                &mut required,
+            )
+        },
+        VylResult::BadState
+    );
+    destroy_client(client);
+}
+
+#[test]
+fn scripted_ping_ack_round_trip() {
+    let client = new_client();
+    scripted_handshake(client);
+    let opaque = *b"12345678";
+    let mut frame = peer_header(8, 0x06, 0x00, 0).to_vec();
+    frame.extend_from_slice(&opaque);
+    let out = poll_peer(client, &frame);
+    assert_eq!(out.result, VylResult::Ok);
+    assert_eq!(out.consumed, frame.len());
+    assert_eq!(out.actions.len(), 1);
+    assert_eq!(out.actions[0].kind, VylH2ActionKind::PingAck);
+    assert_eq!(out.actions[0].ping, opaque);
+    let echoed = out.actions[0].ping;
+    let mut output = [0; 32];
+    let mut written = 0;
+    let mut required = 0;
+    assert_eq!(
+        unsafe {
+            vyl_h2_client_send_ping_ack(
+                client,
+                echoed.as_ptr(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+                &mut required,
+            )
+        },
+        VylResult::Ok
+    );
+    assert_eq!(written, 17);
+    assert_eq!(&output[..9], &peer_header(8, 0x06, 0x01, 0));
+    assert_eq!(&output[9..written], &opaque);
+    assert_eq!(ack_client(client, written), 0);
+    let stream = scripted_get(client);
+    assert_eq!(stream, 1);
+    let headers = peer_headers(1, true, &[(b":status".as_slice(), b"200".as_slice())]);
+    let out = poll_peer(client, &headers);
+    assert_eq!(out.result, VylResult::Ok);
+    let class = scripted_classify(client, 1, &out.actions[0]);
+    assert_eq!((class.kind, class.status, class.phase), (1, 200, 2));
+    destroy_client(client);
+}
+
+fn peer_fragmented_headers(stream_id: u32, block: &[u8], first_len: usize) -> Vec<u8> {
+    let first_len = first_len.min(block.len());
+    let mut wire = peer_header(first_len, 0x01, 0x00, stream_id).to_vec();
+    wire.extend_from_slice(&block[..first_len]);
+    let rest = &block[first_len..];
+    if !rest.is_empty() {
+        wire.extend_from_slice(&peer_header(rest.len(), 0x09, 0x04, stream_id));
+        wire.extend_from_slice(rest);
+    }
+    wire
+}
+
+fn peer_padded_block(status: &[u8], pad_value_len: usize) -> Vec<u8> {
+    let mut block = Vec::new();
+    peer_literal(&mut block, b":status", status);
+    let pad_value = vec![b'p'; pad_value_len];
+    for _ in 0..3 {
+        peer_literal(&mut block, b"x-pad", &pad_value);
+    }
+    block
+}
+
+#[test]
+fn scripted_continuation_within_limit_succeeds() {
+    let client = new_client();
+    scripted_handshake(client);
+    let stream = scripted_get(client);
+    assert_eq!(stream, 1);
+    let block = peer_padded_block(b"200", 1_100);
+    assert!(block.len() < 4_096);
+    let wire = peer_fragmented_headers(1, &block, 1_000);
+    let out = poll_peer(client, &wire);
+    assert_eq!(out.result, VylResult::Ok);
+    assert_eq!(out.consumed, wire.len());
+    assert_eq!(out.actions.len(), 1);
+    assert_eq!(out.actions[0].kind, VylH2ActionKind::Headers);
+    let class = scripted_classify(client, 1, &out.actions[0]);
+    assert_eq!((class.kind, class.status, class.phase), (1, 200, 1));
+    assert_eq!(out.fields.len(), 4);
+    destroy_client(client);
+}
+
+#[test]
+fn scripted_continuation_over_limit_fails_closed() {
+    let client = new_client();
+    scripted_handshake(client);
+    let stream = scripted_get(client);
+    assert_eq!(stream, 1);
+    let block = peer_padded_block(b"200", 1_500);
+    assert!(block.len() > 4_096);
+    let wire = peer_fragmented_headers(1, &block, 1_000);
+    let out = poll_peer(client, &wire);
+    assert_eq!(out.result, VylResult::ProtocolError);
+    assert_eq!(out.connection_error, 9);
+    let out = poll_peer(client, &[]);
+    assert_eq!(out.result, VylResult::ProtocolError);
+    assert_eq!(out.connection_error, 9);
+    let fields = [
+        encode_field(b":method", b"GET"),
+        encode_field(b":scheme", b"https"),
+        encode_field(b":path", b"/"),
+        encode_field(b":authority", b"example.com"),
+    ];
+    let mut request = [0; 1_024];
+    let mut written = 0;
+    let mut stream_id = 0;
+    let mut required = 0;
+    assert_eq!(
+        unsafe {
+            vyl_h2_client_start_request(
+                client,
+                fields.as_ptr(),
+                fields.len(),
+                1,
+                request.as_mut_ptr(),
+                request.len(),
+                &mut written,
+                &mut stream_id,
+                &mut required,
+            )
+        },
+        VylResult::BadState
+    );
+    destroy_client(client);
+}

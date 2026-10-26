@@ -187,7 +187,7 @@ fn reset_errors_map_to_reset_close_reason() {
     // NOTE: stable Rust cannot set SO_LINGER without a new dependency, and an
     // unread-data close still delivers FIN on this stack, so no user-space
     // sequence reliably produces ECONNRESET here. The mapping itself is pinned
-    // with synthetic errors instead; the Odin reference covers the kernel path.
+    // with synthetic errors instead; the kernel path stays uncovered.
     assert_eq!(
         map_read_error(&std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
         ReadAttempt::Closed(CloseReason::Reset)

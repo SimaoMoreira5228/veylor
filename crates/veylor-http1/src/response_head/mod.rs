@@ -226,12 +226,12 @@ impl<'a> ResponseParser<'a> {
                     if self.header_count == limits.header_count {
                         return self.fail(ParseError::HeaderSectionTooLarge);
                     }
-                    
-
-
-
-
-
+                    // NOTE: structural validity comes before caller-buffer capacity:
+                    // a line without a colon can never occupy a header slot,
+                    // so reporting `HeaderCapacity` for it would yield
+                    // `required_header_capacity() == header_count`, a value
+                    // the caller already provides — a resume loop that never
+                    // terminates. Fail it terminally instead.
                     let line = &input[self.line_start..line_end];
                     let Some(colon) = line.iter().position(|byte| *byte == b':') else {
                         return self.fail(ParseError::Invalid);
