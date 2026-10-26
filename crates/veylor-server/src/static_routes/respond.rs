@@ -12,6 +12,7 @@ use crate::static_files::{
 };
 
 use super::native::respond_native;
+use super::{CONTENT_ENCODING_GZIP, accepts_gzip_value};
 use super::{
     MAX_STATIC_BODY_BYTES, RouteBuildError, StaticRoutes, in_native_handler, now_http_date,
     route_cap,
@@ -87,7 +88,7 @@ pub fn respond_to_head(
         }
     }
     // NOTE: unmatched requests have no route cap of their own, so 404s keep the default.
-    let (status, reason, body, cap) = match found {
+    let (status, reason, body, gzip, cap) = match found {
         Ok(found) => {
             let cap = route_cap(found.body);
             match routes.lookup(head.method(input).unwrap_or_default(), found.pattern) {
@@ -95,6 +96,7 @@ pub fn respond_to_head(
                     route.status,
                     route.reason.as_slice(),
                     route.body.as_slice(),
+                    route.gzip_body.as_deref(),
                     cap,
                 ),
                 None => return Err(RouteBuildError::Invalid),
@@ -104,6 +106,7 @@ pub fn respond_to_head(
             404,
             b"Not Found".as_slice(),
             NOT_FOUND_BODY,
+            None,
             MAX_STATIC_BODY_BYTES,
         ),
         Err(error) => return Err(RouteBuildError::from(error)),
@@ -144,12 +147,36 @@ pub fn respond_to_head(
         name: b"Date",
         value: &now[..now_len],
     }];
+    let encode_gzip = match gzip {
+        Some(twin) => match header_value(headers, head, input, b"accept-encoding") {
+            Some(value) if accepts_gzip_value(value) => Some(twin),
+            _ => None,
+        },
+        None => None,
+    };
+    let (body, content_encoding) = match encode_gzip {
+        Some(twin) => (twin, Some(CONTENT_ENCODING_GZIP)),
+        None => (body, None),
+    };
+    let encoding_field = Field {
+        name: b"Content-Encoding",
+        value: CONTENT_ENCODING_GZIP,
+    };
+    let vary_field = Field {
+        name: b"Vary",
+        value: b"Accept-Encoding",
+    };
+    let fields: &[Field] = match (content_encoding, gzip) {
+        (Some(_), _) => &[date[0], encoding_field, vary_field],
+        (None, Some(_)) => &[date[0], vary_field],
+        (None, None) => &date,
+    };
     let response = ResponseToWrite {
         request_method: method,
         requested_upgrade: b"",
         status,
         reason,
-        fields: &date,
+        fields,
         framing: ResponseFraming::FixedLength,
         content_length: body.len() as u64,
         connection,

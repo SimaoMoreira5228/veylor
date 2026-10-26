@@ -76,7 +76,14 @@ impl CloseCounts {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+pub struct TlsConfig {
+    pub cert_der: Vec<u8>,
+    pub key_der: Vec<u8>,
+    pub max_handshakes: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub timeouts: ConnectionTimeouts,
     pub shutdown_grace_ns: u64,
@@ -90,6 +97,7 @@ pub struct ServerConfig {
     // bind address IP. One extra port (not ALPN/upgrades) keeps the H1 path
     // untouched; each worker binds its own reuse-port h2c listener like H1.
     pub h2c_port: Option<u16>,
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for ServerConfig {
@@ -108,6 +116,7 @@ impl Default for ServerConfig {
             worker_count: 1,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             h2c_port: None,
+            tls: None,
         }
     }
 }
@@ -157,6 +166,7 @@ pub(crate) struct H2StaticRoute {
     pub(crate) path: Vec<u8>,
     pub(crate) status: u16,
     pub(crate) body: Vec<u8>,
+    pub(crate) gzip_body: Option<Vec<u8>>,
     pub(crate) managed: bool,
     pub(crate) native: Option<(NativeHandler, usize)>,
     pub(crate) file_root: Option<PathBuf>,
@@ -166,16 +176,26 @@ pub(crate) struct H2StaticRoute {
 impl Server {
     pub fn bind(addr: SocketAddr, config: ServerConfig) -> Result<Self, ServerError> {
         validate_config(&config)?;
-        let listener = if config.worker_count == 1 {
+        if let Some(tls) = config.tls.as_ref() {
+            let max = tls.max_handshakes;
+            if max == 0 || tls.cert_der.is_empty() || tls.key_der.is_empty() {
+                return Err(ServerError::InvalidConfig);
+            }
+            veylor_tls::TlsAcceptor::new(&tls.cert_der, &tls.key_der, max)
+                .map_err(|_| ServerError::InvalidConfig)?;
+        }
+        let worker_count = config.worker_count;
+        let h2c_port = config.h2c_port;
+        let listener = if worker_count == 1 {
             TcpListener::bind(addr).map_err(ServerError::Bind)?
         } else {
             bind_reuse_port(addr).map_err(ServerError::Bind)?
         };
-        let h2c_listener = match config.h2c_port {
+        let h2c_listener = match h2c_port {
             None => None,
             Some(port) => {
                 let h2c_addr = SocketAddr::new(addr.ip(), port);
-                let bound = if config.worker_count == 1 {
+                let bound = if worker_count == 1 {
                     TcpListener::bind(h2c_addr).map_err(ServerError::Bind)?
                 } else {
                     bind_reuse_port(h2c_addr).map_err(ServerError::Bind)?
@@ -189,7 +209,7 @@ impl Server {
             config,
             routes: StaticRoutes::new(),
             h2_routes: Vec::new(),
-            host: Arc::new(HostShared::new(config.worker_count)),
+            host: Arc::new(HostShared::new(worker_count)),
         })
     }
 
@@ -222,6 +242,38 @@ impl Server {
                 path: path.to_vec(),
                 status,
                 body: body.to_vec(),
+                gzip_body: None,
+                managed: false,
+                native: None,
+                file_root: None,
+                trailers: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn register_gzip_route(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        status: u16,
+        reason: &[u8],
+        body: &[u8],
+        max_body_bytes: u64,
+    ) -> Result<(), ServerError> {
+        self.routes
+            .register_gzip(method, path, status, reason, body, max_body_bytes)
+            .map_err(ServerError::from)?;
+        if self.h2_routes.len() < MAX_ROUTES {
+            self.h2_routes.push(H2StaticRoute {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                status,
+                body: body.to_vec(),
+                gzip_body: self
+                    .routes
+                    .gzip_body(method, path)
+                    .map(|twin| twin.to_vec()),
                 managed: false,
                 native: None,
                 file_root: None,
@@ -248,6 +300,7 @@ impl Server {
                 path: path.to_vec(),
                 status: 200,
                 body: Vec::new(),
+                gzip_body: None,
                 managed: true,
                 native: None,
                 file_root: None,
@@ -274,6 +327,7 @@ impl Server {
                 path: prefix.to_vec(),
                 status: 200,
                 body: Vec::new(),
+                gzip_body: None,
                 managed: false,
                 native: None,
                 file_root: Some(root.to_path_buf()),
@@ -301,6 +355,7 @@ impl Server {
                 path: path.to_vec(),
                 status: 200,
                 body: Vec::new(),
+                gzip_body: None,
                 managed: true,
                 native: None,
                 file_root: None,
@@ -332,6 +387,7 @@ impl Server {
                     path: path.to_vec(),
                     status: 200,
                     body: Vec::new(),
+                    gzip_body: None,
                     managed: false,
                     native: Some((handler, user_data)),
                     file_root: None,

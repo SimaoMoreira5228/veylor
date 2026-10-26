@@ -85,6 +85,18 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         .ok()
         .and_then(|view| view.with_natives(&h2_natives).ok());
     let h2_enabled = h2c_listener.is_some() && h2_view.is_some();
+    let mut tls_acceptor: Option<veylor_tls::TlsAcceptor> = match config.tls.as_ref() {
+        None => None,
+        Some(tls) => {
+            match veylor_tls::TlsAcceptor::new(&tls.cert_der, &tls.key_der, tls.max_handshakes) {
+                Ok(acceptor) => Some(acceptor),
+                Err(_) => {
+                    result.error = Some("tls acceptor build failed".to_string());
+                    return result;
+                }
+            }
+        }
+    };
 
     let mut slots = vec![ConnectionSlot::EMPTY; max_conns];
     let mut free_stack = vec![0u32; max_conns];
@@ -274,6 +286,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut stream_poller,
                     &mut worker,
                     &mut result.counts,
+                    &mut tls_acceptor,
                 );
                 h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
                 worker.destroy();
@@ -299,6 +312,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             &mut stream_poller,
             &mut worker,
             &mut result.counts,
+            &mut tls_acceptor,
         );
         drain_expired(
             &expired,
@@ -307,6 +321,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             &mut stream_poller,
             &mut worker,
             &mut result.counts,
+            &mut tls_acceptor,
         );
         let draining = worker.shutdown_phase() != ShutdownPhase::Running;
         // NOTE: one take per turn: H1 slots drain below, H2 stream-keyed slots ride the H2
@@ -327,6 +342,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             &mut worker,
             &mut result.counts,
             now_ns,
+            &mut tls_acceptor,
         );
         let h2_accept_budget = match &turn_result {
             Ok(outcome) => config
@@ -347,6 +363,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         &mut stream_poller,
                         &mut worker,
                         &mut result.counts,
+                        &mut tls_acceptor,
                     );
                     h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
                     worker.destroy();
@@ -363,6 +380,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut stream_poller,
                     &mut worker,
                     &mut result.counts,
+                    &mut tls_acceptor,
                 );
                 h2_turn::abandon_slots(&mut h2_meta, &host, worker_id, &mut result.counts);
                 worker.destroy();
@@ -468,6 +486,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut stream_poller,
                     &mut worker,
                     &mut result.counts,
+                    &mut tls_acceptor,
                 );
             }
         }
@@ -539,6 +558,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 &mut stream_poller,
                 &mut worker,
                 &mut result.counts,
+                &mut tls_acceptor,
             );
         }
     }
@@ -566,6 +586,7 @@ fn drain_admitted(
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
     for entry in admitted.iter_mut() {
         let Some(admitted_conn) = entry.take() else {
@@ -574,14 +595,37 @@ fn drain_admitted(
         let slot = admitted_conn.token.slot as usize;
         let mut registered = false;
         if slot < conns.len() && conns[slot].is_none() {
+            let pending_tls = match tls_acceptor.as_mut() {
+                None => None,
+                Some(acceptor) => match acceptor.admit() {
+                    Ok(tls_conn) => Some(tls_conn),
+                    Err(_) => {
+                        let _ = worker.close(admitted_conn.token);
+                        counts.add(ConnClose::TransportError);
+                        continue;
+                    }
+                },
+            };
             let mut stream = admitted_conn.stream;
             if stream_poller
                 .register(&mut stream, conn_poll_token(slot), PollInterest::Readable)
                 .is_ok()
             {
-                conns[slot] = Some(ConnState::new(admitted_conn.token, stream));
+                let mut state = ConnState::new(admitted_conn.token, stream);
+
+                if let Some(tls_conn) = pending_tls {
+                    state.attach_tls(tls_conn);
+                }
+
+                conns[slot] = Some(state);
                 registered = true;
             } else {
+                if pending_tls.is_some() {
+                    if let Some(acceptor) = tls_acceptor.as_mut() {
+                        acceptor.release();
+                    }
+                }
+
                 let _ = worker.close(admitted_conn.token);
             }
         } else {
@@ -600,6 +644,7 @@ fn drain_expired(
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
     for deadline in expired {
         if deadline.token.slot == SENTINEL_SLOT {
@@ -618,7 +663,16 @@ fn drain_expired(
             } else {
                 ConnClose::Timeout
             };
-            close_conn(slot, reason, host, conns, stream_poller, worker, counts);
+            close_conn(
+                slot,
+                reason,
+                host,
+                conns,
+                stream_poller,
+                worker,
+                counts,
+                tls_acceptor,
+            );
         }
     }
 }
@@ -626,6 +680,7 @@ fn drain_expired(
 // NOTE: a staged validation failure drops the work without touching the slot: the entry
 // is already tombed, and the host got its outcome at stage time. Single-threaded worker
 // order makes this unreachable except under table divergence, so fail closed silently.
+#[allow(clippy::too_many_arguments)]
 fn drain_host_staged(
     host: &HostShared,
     staged: Vec<StagedWork>,
@@ -634,6 +689,7 @@ fn drain_host_staged(
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
     now_ns: u64,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
     for work in staged {
         let valid = conns
@@ -655,6 +711,7 @@ fn drain_host_staged(
                 stream_poller,
                 worker,
                 counts,
+                tls_acceptor,
             );
             continue;
         }
@@ -676,6 +733,7 @@ fn drain_host_staged(
                         stream_poller,
                         worker,
                         counts,
+                        tls_acceptor,
                     );
                 }
             }
@@ -688,6 +746,7 @@ fn drain_host_staged(
                     stream_poller,
                     worker,
                     counts,
+                    tls_acceptor,
                 );
             }
             None => {}
@@ -805,6 +864,7 @@ fn apply_pump_hooks(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn close_conn(
     index: usize,
     reason: ConnClose,
@@ -813,15 +873,22 @@ fn close_conn(
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
     let Some(conn) = conns[index].take() else {
         return;
     };
     let token = conn.token();
     let parked = conn.is_parked();
+    let had_tls = conn.has_tls();
     let mut stream = conn.into_stream();
     let _ = stream_poller.deregister(&mut stream);
     let _ = worker.close(token);
+    if had_tls {
+        if let Some(acceptor) = tls_acceptor.as_mut() {
+            acceptor.release();
+        }
+    }
     // NOTE: every parked close unparks exactly once (take_staged already removed staged
     // entries, so this is a no-op for applied responds/cancels): the host tomb records
     // Gone and a later respond can never report success for a dead connection.
@@ -837,6 +904,7 @@ fn cleanup_all(
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
     for index in 0..conns.len() {
         if conns[index].is_some() {
@@ -848,6 +916,7 @@ fn cleanup_all(
                 stream_poller,
                 worker,
                 counts,
+                tls_acceptor,
             );
         }
     }
@@ -867,6 +936,7 @@ fn close_idle_for_drain(
     stream_poller: &mut Poller,
     worker: &mut Worker<'_>,
     counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
     for index in 0..conns.len() {
         let idle = conns[index].as_ref().is_some_and(|conn| conn.is_idle());
@@ -879,6 +949,7 @@ fn close_idle_for_drain(
                 stream_poller,
                 worker,
                 counts,
+                tls_acceptor,
             );
         }
     }

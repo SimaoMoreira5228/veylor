@@ -31,6 +31,6 @@ pub use static_routes::{
     NativeResponseOut, RouteBuildError, in_native_handler,
 };
 pub use static_server::{
-    CloseCounts, MAX_WORKERS, RunningServer, Server, ServerConfig, ServerError,
+    CloseCounts, MAX_WORKERS, RunningServer, Server, ServerConfig, ServerError, TlsConfig,
 };
 pub use static_server::{LISTENER_TOKEN, MAX_CONNECTIONS, SHUTDOWN_TIMER_ID};

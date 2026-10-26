@@ -12,7 +12,8 @@ use crate::connection::trailer_allowed;
 use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
 use crate::static_files::FileReject;
 use crate::static_routes::{
-    MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
+    CONTENT_ENCODING_GZIP, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler,
+    NativeRequestView, accepts_gzip_value,
 };
 
 use super::file::FileDecision;
@@ -123,6 +124,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 stream,
                 invoked.status,
                 invoked.body,
+                None,
+                false,
                 false,
                 false,
                 self.output,
@@ -138,6 +141,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             stream,
             invoked.status,
             invoked.body,
+            None,
+            false,
             is_head || invoked.body.is_empty(),
             true,
             self.output,
@@ -302,6 +307,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                             stream,
                             414,
                             URI_TOO_LONG_BODY,
+                            None,
+                            false,
                             false,
                             false,
                             self.output,
@@ -318,6 +325,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         stream,
                         414,
                         URI_TOO_LONG_BODY,
+                        None,
+                        false,
                         is_head,
                         true,
                         self.output,
@@ -406,6 +415,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                                 stream,
                                 413,
                                 b"Payload Too Large",
+                                None,
+                                false,
                                 false,
                                 true,
                                 self.output,
@@ -422,13 +433,32 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         }
                     }
                 }
-                let (status, body) = found.unwrap_or((404, NOT_FOUND_BODY));
+                let (status, body, gzip) = found.unwrap_or((404, NOT_FOUND_BODY, None));
+                let mut encoding_value: Option<&[u8]> = None;
+                for header in fields {
+                    if let Some((name, value)) = self.server.driver().resolve_header(*header) {
+                        if name.eq_ignore_ascii_case(b"accept-encoding") {
+                            encoding_value = Some(value);
+                            break;
+                        }
+                    }
+                }
+                let twin = match (gzip, encoding_value) {
+                    (Some(twin), Some(value)) if accepts_gzip_value(value) => Some(twin),
+                    _ => None,
+                };
+                let (body, encoding, vary) = match twin {
+                    Some(twin) => (twin, Some(CONTENT_ENCODING_GZIP), true),
+                    None => (body, None, gzip.is_some()),
+                };
                 if !end {
                     if send_full(
                         self.server,
                         stream,
                         status,
                         body,
+                        encoding,
+                        vary,
                         false,
                         false,
                         self.output,
@@ -445,6 +475,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     stream,
                     status,
                     body,
+                    encoding,
+                    vary,
                     is_head || body.is_empty(),
                     true,
                     self.output,

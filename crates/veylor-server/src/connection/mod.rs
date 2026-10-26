@@ -8,6 +8,7 @@ use veylor_router::{RouteKind, RouteTable};
 use veylor_runtime::{
     CloseReason, ConnectionToken, IoBatch, ReadStatus, TcpStream, WriteStatus, dispatch,
 };
+use veylor_tls::{TlsConn, drain_plaintext, feed_ciphertext};
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_files::FilePlan;
@@ -177,6 +178,10 @@ pub struct ConnState {
     pub(crate) closing: bool,
     pub(crate) close_reason: ConnClose,
     pub(crate) error_hint: bool,
+    pub(crate) tls: Option<TlsConn>,
+    pub(crate) tls_pending: Vec<u8>,
+    pub(crate) tls_pending_sent: usize,
+    pub(crate) tls_plain: Vec<u8>,
 }
 
 impl ConnState {
@@ -207,7 +212,33 @@ impl ConnState {
             closing: false,
             close_reason: ConnClose::Completed,
             error_hint: false,
+            tls: None,
+            tls_pending: Vec::new(),
+            tls_pending_sent: 0,
+            tls_plain: Vec::new(),
         }
+    }
+
+    pub(crate) fn attach_tls(&mut self, tls: TlsConn) {
+        self.tls = Some(tls);
+
+        if self.tls_pending.capacity() < 16384 {
+            self.tls_pending
+                .reserve(16384 - self.tls_pending.capacity());
+        }
+
+        if self.tls_plain.capacity() < INPUT_CAP {
+            self.tls_plain
+                .reserve(INPUT_CAP - self.tls_plain.capacity());
+        }
+    }
+
+    pub(crate) fn has_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    pub(crate) fn tls_unflushed(&self) -> usize {
+        self.tls_pending.len().saturating_sub(self.tls_pending_sent)
     }
 
     pub fn token(&self) -> ConnectionToken {
@@ -227,7 +258,7 @@ impl ConnState {
     }
 
     pub fn has_pending_output(&self) -> bool {
-        self.out_sent < self.out_len
+        self.out_sent < self.out_len || self.tls_pending_sent < self.tls_pending.len()
     }
 
     pub fn has_unparsed_input(&self) -> bool {
@@ -277,6 +308,392 @@ impl ConnState {
     }
 }
 
+pub(crate) fn tls_flush_pending(conn: &mut ConnState, budget: u64) -> Result<u64, ConnClose> {
+    let unflushed = conn.tls_pending.len().saturating_sub(conn.tls_pending_sent);
+
+    if unflushed == 0 {
+        return Ok(0);
+    }
+
+    if conn.write_blocked {
+        return Ok(0);
+    }
+
+    if budget == 0 {
+        return Ok(0);
+    }
+
+    let mut total = 0usize;
+    let mut attempts = 0;
+
+    while total < unflushed {
+        let remaining_budget = budget.saturating_sub(total as u64);
+
+        if remaining_budget == 0 {
+            break;
+        }
+
+        let start = conn.tls_pending_sent + total;
+        let end = conn.tls_pending.len();
+        let available = end - start;
+        let limit = (remaining_budget as usize).min(available);
+
+        if limit == 0 {
+            break;
+        }
+
+        let chunk: &[u8] = &conn.tls_pending[start..start + limit];
+
+        let wrote = tls_write_once(&mut conn.stream, chunk);
+
+        match wrote {
+            TlsWriteOutcome::Accepted(accepted) => {
+                total += accepted;
+
+                if accepted == 0 {
+                    break;
+                }
+
+                if accepted < limit {
+                    break;
+                }
+            }
+            TlsWriteOutcome::Blocked => {
+                conn.write_blocked = true;
+
+                break;
+            }
+            TlsWriteOutcome::Interrupted => {
+                attempts += 1;
+
+                if attempts >= 2 {
+                    break;
+                }
+            }
+            TlsWriteOutcome::Closed(reason) => {
+                conn.tls_pending_sent += total;
+                return Err(reason);
+            }
+        }
+    }
+
+    conn.tls_pending_sent += total;
+
+    if conn.tls_pending_sent >= conn.tls_pending.len() {
+        conn.tls_pending.clear();
+        conn.tls_pending_sent = 0;
+    }
+
+    Ok(total as u64)
+}
+
+pub(crate) fn tls_encrypt_output(conn: &mut ConnState) -> Result<(), ConnClose> {
+    if conn.tls_pending.len() > conn.tls_pending_sent {
+        return Ok(());
+    }
+
+    let plain_start = conn.out_sent;
+    let plain_end = conn.out_len;
+
+    if plain_start >= plain_end {
+        return Ok(());
+    }
+
+    let Some(output) = conn.output.as_ref() else {
+        return Err(ConnClose::TransportError);
+    };
+
+    let width = plain_end - plain_start;
+
+    if width > OUTPUT_CAP || plain_end > output.len() {
+        return Err(ConnClose::TransportError);
+    }
+
+    let Some(tls) = conn.tls.as_mut() else {
+        return Err(ConnClose::TransportError);
+    };
+
+    conn.tls_pending.clear();
+    conn.tls_pending_sent = 0;
+
+    drain_plaintext(tls, &output[plain_start..plain_end], &mut conn.tls_pending)
+        .map_err(|_| ConnClose::TransportError)?;
+
+    conn.out_sent = conn.out_len;
+    conn.write_blocked = false;
+
+    Ok(())
+}
+
+pub(crate) fn tls_generate_flight(conn: &mut ConnState) -> Result<(), ConnClose> {
+    let unflushed = conn.tls_pending.len().saturating_sub(conn.tls_pending_sent);
+
+    if unflushed > 0 {
+        return Ok(());
+    }
+
+    let handshaking = conn.tls.as_ref().is_some_and(|tls| tls.is_handshaking());
+
+    if !handshaking {
+        return Ok(());
+    }
+
+    if conn.tls.is_none() {
+        return Err(ConnClose::TransportError);
+    }
+
+    conn.tls_pending.clear();
+    conn.tls_pending_sent = 0;
+
+    let Some(tls) = conn.tls.as_mut() else {
+        return Err(ConnClose::TransportError);
+    };
+
+    drain_plaintext(tls, &[], &mut conn.tls_pending).map_err(|_| ConnClose::TransportError)?;
+
+    if conn.tls_pending.is_empty() {
+        return Ok(());
+    }
+
+    conn.write_blocked = false;
+
+    Ok(())
+}
+
+pub(crate) fn tls_read_available(
+    conn: &mut ConnState,
+    budget: u64,
+) -> Result<(u64, u64), ConnClose> {
+    if !conn.read_ready {
+        return Ok((0, 0));
+    }
+
+    if conn.len >= INPUT_CAP {
+        return Ok((0, 0));
+    }
+
+    if budget == 0 {
+        return Ok((0, 0));
+    }
+
+    ConnState::materialize_input(&mut conn.input);
+
+    let spare = INPUT_CAP - conn.len;
+    let want = (spare.min(4096) as u64).min(budget) as usize;
+
+    if want == 0 {
+        return Ok((0, 0));
+    }
+
+    let mut raw = [0u8; 4096];
+    let mut wire = 0usize;
+    let mut attempts = 0;
+
+    let got = loop {
+        if want <= wire {
+            break wire;
+        }
+
+        let limit = (want - wire).min(4096 - wire);
+
+        let outcome = tls_read_once(&mut conn.stream, &mut raw[wire..wire + limit]);
+
+        match outcome {
+            TlsReadOutcome::Progress(n) => {
+                wire += n;
+
+                break wire;
+            }
+            TlsReadOutcome::Blocked => {
+                if wire > 0 {
+                    break wire;
+                }
+
+                conn.read_ready = false;
+
+                return Ok((0, 0));
+            }
+            TlsReadOutcome::Interrupted => {
+                attempts += 1;
+
+                if attempts >= 2 {
+                    break wire;
+                }
+            }
+            TlsReadOutcome::Eof => {
+                return Err(ConnClose::PeerClosed);
+            }
+            TlsReadOutcome::Closed(reason) => {
+                return Err(reason);
+            }
+        }
+    };
+
+    if got == 0 {
+        return Ok((0, 0));
+    }
+
+    let Some(tls) = conn.tls.as_mut() else {
+        return Err(ConnClose::TransportError);
+    };
+
+    conn.tls_plain.clear();
+
+    let consumed = feed_ciphertext(tls, &raw[..got], &mut conn.tls_plain)
+        .map_err(|_| ConnClose::TransportError)?;
+
+    if consumed != got {
+        return Err(ConnClose::TransportError);
+    }
+
+    let decrypted = conn.tls_plain.len();
+    let end = conn.len + decrypted;
+
+    if end > INPUT_CAP {
+        return Err(ConnClose::TransportError);
+    }
+
+    if decrypted > 0 {
+        if let Some(input) = conn.input.as_mut() {
+            input[conn.len..end].copy_from_slice(&conn.tls_plain[..]);
+        }
+
+        conn.tls_plain.clear();
+        conn.len = end;
+    }
+
+    conn.read_ready = true;
+
+    Ok((got as u64, decrypted as u64))
+}
+
+enum TlsWriteOutcome {
+    Accepted(usize),
+    Blocked,
+    Interrupted,
+    Closed(ConnClose),
+}
+
+enum TlsReadOutcome {
+    Progress(usize),
+    Blocked,
+    Interrupted,
+    Eof,
+    Closed(ConnClose),
+}
+
+fn tls_write_once(stream: &mut TcpStream, chunk: &[u8]) -> TlsWriteOutcome {
+    use std::io::Write as _;
+
+    if chunk.is_empty() {
+        return TlsWriteOutcome::Accepted(0);
+    }
+
+    match stream.write(chunk) {
+        Ok(accepted) => TlsWriteOutcome::Accepted(accepted),
+        Err(error) => {
+            let kind = error.kind();
+
+            if kind == std::io::ErrorKind::WouldBlock {
+                return TlsWriteOutcome::Blocked;
+            }
+
+            if kind == std::io::ErrorKind::Interrupted {
+                return TlsWriteOutcome::Interrupted;
+            }
+
+            if kind == std::io::ErrorKind::ConnectionReset {
+                return TlsWriteOutcome::Closed(ConnClose::Reset);
+            }
+
+            if kind == std::io::ErrorKind::BrokenPipe {
+                return TlsWriteOutcome::Closed(ConnClose::PeerClosed);
+            }
+
+            TlsWriteOutcome::Closed(ConnClose::TransportError)
+        }
+    }
+}
+
+fn tls_read_once(stream: &mut TcpStream, scratch: &mut [u8]) -> TlsReadOutcome {
+    use std::io::Read as _;
+
+    if scratch.is_empty() {
+        return TlsReadOutcome::Progress(0);
+    }
+
+    match stream.read(scratch) {
+        Ok(0) => TlsReadOutcome::Eof,
+        Ok(n) => TlsReadOutcome::Progress(n),
+        Err(error) => {
+            let kind = error.kind();
+
+            if kind == std::io::ErrorKind::WouldBlock {
+                return TlsReadOutcome::Blocked;
+            }
+
+            if kind == std::io::ErrorKind::Interrupted {
+                return TlsReadOutcome::Interrupted;
+            }
+
+            if kind == std::io::ErrorKind::ConnectionReset {
+                return TlsReadOutcome::Closed(ConnClose::Reset);
+            }
+
+            TlsReadOutcome::Closed(ConnClose::TransportError)
+        }
+    }
+}
+
+pub(crate) fn tls_turn_active(
+    conn: &mut ConnState,
+    byte_budget: u64,
+    progress: &mut PumpProgress,
+) -> Result<(), ConnClose> {
+    let mut remaining = byte_budget;
+
+    let flushed = tls_flush_pending(conn, remaining)?;
+
+    progress.bytes_written += flushed;
+    remaining = remaining.saturating_sub(flushed);
+
+    tls_generate_flight(conn)?;
+
+    let staged = tls_flush_pending(conn, remaining)?;
+
+    progress.bytes_written += staged;
+    remaining = remaining.saturating_sub(staged);
+
+    let draining_body = matches!(conn.phase, ConnPhase::DrainingBody { .. });
+    let want_read = (conn.phase == ConnPhase::ReadingHead || draining_body) && conn.len < INPUT_CAP;
+
+    if want_read {
+        let (wire, _decrypted) = tls_read_available(conn, remaining)?;
+
+        progress.bytes_read += wire;
+        remaining = remaining.saturating_sub(wire);
+    }
+
+    tls_generate_flight(conn)?;
+
+    let staged = tls_flush_pending(conn, remaining)?;
+
+    progress.bytes_written += staged;
+    remaining = remaining.saturating_sub(staged);
+
+    let handshaking = conn.tls.as_ref().is_some_and(|tls| tls.is_handshaking());
+
+    if !handshaking {
+        tls_encrypt_output(conn)?;
+
+        let staged = tls_flush_pending(conn, remaining)?;
+
+        progress.bytes_written += staged;
+    }
+
+    Ok(())
+}
+
 pub enum PumpOutcome {
     Keep(PumpProgress),
     Close(ConnClose),
@@ -321,9 +738,15 @@ pub fn pump_connection(
     let file_sent: u64 = 0;
     #[cfg(target_os = "linux")]
     if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
-        match sendfile_file_chunk(conn, byte_budget) {
-            Ok(sent) => file_sent = sent,
-            Err(reason) => return PumpOutcome::Close(reason),
+        if conn.has_tls() {
+            if let Err(reason) = stage_file_chunk(conn) {
+                return PumpOutcome::Close(reason);
+            }
+        } else {
+            match sendfile_file_chunk(conn, byte_budget) {
+                Ok(sent) => file_sent = sent,
+                Err(reason) => return PumpOutcome::Close(reason),
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -331,6 +754,18 @@ pub fn pump_connection(
         if let Err(reason) = stage_file_chunk(conn) {
             return PumpOutcome::Close(reason);
         }
+    }
+    if conn.has_tls() {
+        return pump_tls_full(
+            conn,
+            routes,
+            table,
+            byte_budget,
+            worker_id,
+            host,
+            draining,
+            file_sent,
+        );
     }
     let draining_body = matches!(conn.phase, ConnPhase::DrainingBody { .. });
     let reading = (conn.phase == ConnPhase::ReadingHead || draining_body) && conn.len < INPUT_CAP;
@@ -505,6 +940,115 @@ pub fn pump_connection(
     } else if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
         conn.read_ready = true;
     }
+    PumpOutcome::Keep(progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pump_tls_full(
+    conn: &mut ConnState,
+    routes: &StaticRoutes,
+    table: &RouteTable<'_, '_>,
+    byte_budget: u64,
+    worker_id: u32,
+    host: &HostShared,
+    draining: bool,
+    file_sent: u64,
+) -> PumpOutcome {
+    let mut progress = PumpProgress::default();
+    let read_ready_before = conn.read_ready;
+
+    if conn.is_idle() {
+        conn.input = None;
+        conn.headers = None;
+
+        if conn.tls_unflushed() == 0 && conn.out_sent >= conn.out_len {
+            conn.output = None;
+        }
+    } else if conn.len < INPUT_CAP {
+        ConnState::materialize_input(&mut conn.input);
+    }
+
+    if let Err(reason) = tls_turn_active(conn, byte_budget, &mut progress) {
+        return PumpOutcome::Close(reason);
+    }
+
+    progress.bytes_written += file_sent;
+
+    if conn.phase == ConnPhase::ReadingHead
+        && (progress.bytes_read > 0 || (conn.len > 0 && read_ready_before))
+    {
+        progress.resumed_idle = true;
+    }
+
+    if let ConnPhase::DrainingBody {
+        remaining,
+        responded,
+    } = conn.phase
+    {
+        let skip = (conn.len as u64).min(remaining) as usize;
+
+        if let Some(input) = conn.input.as_mut() {
+            input.copy_within(skip..conn.len, 0);
+        }
+
+        conn.len -= skip;
+        let left = remaining - skip as u64;
+
+        if left == 0 {
+            conn.out_len = conn.pending_len;
+            conn.pending_len = 0;
+            conn.phase = if conn.file.is_some() {
+                ConnPhase::SendingFile
+            } else {
+                ConnPhase::SendingResponse
+            };
+            conn.write_blocked = false;
+            progress.entered_response = !responded;
+        } else {
+            conn.phase = ConnPhase::DrainingBody {
+                remaining: left,
+                responded,
+            };
+        }
+    }
+
+    if conn.phase == ConnPhase::ReadingHead {
+        match parse_exchange(conn, routes, table, worker_id, host, draining) {
+            ExchangeOutcome::NeedMore | ExchangeOutcome::Responded => {}
+            ExchangeOutcome::Parked => progress.entered_park = true,
+            ExchangeOutcome::Close(reason) => return PumpOutcome::Close(reason),
+        }
+
+        if conn.phase == ConnPhase::SendingResponse || conn.phase == ConnPhase::SendingFile {
+            progress.entered_response = true;
+        } else if matches!(conn.phase, ConnPhase::DrainingBody { .. }) {
+            progress.entered_body = true;
+        }
+    }
+
+    if !conn.tls.as_ref().is_some_and(|tls| tls.is_handshaking())
+        && conn.out_sent < conn.out_len
+        && tls_encrypt_output(conn).is_err()
+    {
+        return PumpOutcome::Close(ConnClose::TransportError);
+    }
+
+    let file_done = matches!(&conn.file, Some(transfer) if transfer.offset >= transfer.plan.size);
+    let response_done = conn.phase == ConnPhase::SendingResponse
+        || (conn.phase == ConnPhase::SendingFile && file_done);
+
+    if response_done && !conn.has_pending_output() {
+        if conn.closing {
+            return PumpOutcome::Close(conn.close_reason);
+        }
+
+        conn.file = None;
+        reuse_keep_alive(conn);
+        progress.response_flushed = true;
+    } else if conn.phase == ConnPhase::SendingFile && !conn.has_pending_output() {
+        conn.read_ready = true;
+    }
+
     PumpOutcome::Keep(progress)
 }
 

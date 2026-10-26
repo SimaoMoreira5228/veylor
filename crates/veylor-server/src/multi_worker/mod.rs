@@ -122,7 +122,7 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
             PreparedInputs {
                 listener,
                 h2c_listener,
-                config,
+                config: config.clone(),
                 routes: &routes,
                 h2_routes: &h2_routes,
                 host: &host,

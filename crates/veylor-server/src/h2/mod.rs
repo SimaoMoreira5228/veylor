@@ -277,6 +277,8 @@ impl<'a> H2Conn<'a> {
             stream,
             staged.status,
             &staged.body,
+            None,
+            false,
             staged.body.is_empty(),
             true,
             &mut output[..],

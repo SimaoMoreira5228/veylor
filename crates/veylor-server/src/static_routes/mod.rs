@@ -44,6 +44,7 @@ pub struct StaticRoute {
     pub(crate) status: u16,
     pub(crate) reason: Vec<u8>,
     pub(crate) body: Vec<u8>,
+    pub(crate) gzip_body: Option<Vec<u8>>,
     pub(crate) max_body_bytes: u64,
 }
 
@@ -176,8 +177,31 @@ impl StaticRoutes {
             status,
             reason: reason.to_vec(),
             body: body.to_vec(),
+            gzip_body: None,
             max_body_bytes,
         });
+        Ok(())
+    }
+
+    pub fn register_gzip(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        status: u16,
+        reason: &[u8],
+        body: &[u8],
+        max_body_bytes: u64,
+    ) -> Result<(), RouteBuildError> {
+        self.register(method, path, status, reason, body, max_body_bytes)?;
+        let route = self.routes.last_mut().ok_or(RouteBuildError::Invalid)?;
+        route.gzip_body = gzip::compress_route_body(&route.body)?;
+        if route
+            .gzip_body
+            .as_ref()
+            .is_some_and(|twin| twin.len() > gzip::GZIP_MAX_BYTES)
+        {
+            return Err(RouteBuildError::BodyTooLarge);
+        }
         Ok(())
     }
 
@@ -359,6 +383,13 @@ impl StaticRoutes {
         }
     }
 
+    pub(crate) fn gzip_body(&self, method: &[u8], path: &[u8]) -> Option<&[u8]> {
+        self.routes
+            .iter()
+            .find(|route| route.method == method && route.path == path)
+            .and_then(|route| route.gzip_body.as_deref())
+    }
+
     // NOTE: the frozen table keeps an empty trailer view for managed routes, so the park path
     // reads the allowlist here instead: same match shape as the static lookup above, empty when
     // the route is gone so trailer staging fails closed without disturbing the body path.
@@ -411,8 +442,11 @@ pub(crate) fn valid_reason(reason: &[u8]) -> bool {
         })
 }
 
+mod gzip;
 mod native;
 mod respond;
+
+pub(crate) use gzip::{CONTENT_ENCODING_GZIP, accepts_gzip_value};
 
 pub(crate) use respond::encode_continue;
 pub(crate) use respond::reject_payload;

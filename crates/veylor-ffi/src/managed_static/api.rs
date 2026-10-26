@@ -46,7 +46,7 @@ unsafe fn create_server(
         Err(error) => return error,
     };
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let server = match Server::bind(addr, server_config) {
+    let server = match Server::bind(addr, server_config.clone()) {
         Ok(server) => server,
         Err(error) => return server_error_to_result(error),
     };
@@ -57,6 +57,7 @@ unsafe fn create_server(
             addr,
             h2c_port: None,
             worker_count: 1,
+            tls: None,
             ops: Vec::new(),
         })),
     });
@@ -428,6 +429,59 @@ unsafe fn enable_h2c(server: *mut VylManagedStaticServer, port: u16) -> VylResul
     VylResult::Ok
 }
 
+#[unsafe(no_mangle)]
+
+
+
+
+
+
+pub unsafe extern "C" fn vyl_managed_static_enable_tls(
+    server: *mut VylManagedStaticServer,
+    cert_ptr: *const u8,
+    cert_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+    max_handshakes: usize,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        enable_tls(server, cert_ptr, cert_len, key_ptr, key_len, max_handshakes)
+    })
+}
+
+unsafe fn enable_tls(
+    server: *mut VylManagedStaticServer,
+    cert_ptr: *const u8,
+    cert_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+    max_handshakes: usize,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if max_handshakes == 0 {
+        return VylResult::InvalidArgument;
+    }
+    if cert_len == 0 || key_len == 0 {
+        return VylResult::InvalidArgument;
+    }
+    if cert_ptr.is_null() || key_ptr.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if !slice_length_valid::<u8>(cert_len) || !slice_length_valid::<u8>(key_len) {
+        return VylResult::InvalidArgument;
+    }
+    let cert = unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) };
+    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    ready.tls = Some((cert.to_vec(), key.to_vec(), max_handshakes));
+    VylResult::Ok
+}
+
 
 
 
@@ -485,9 +539,10 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
         addr,
         h2c_port,
         worker_count,
+        tls,
         ops,
     } = *ready;
-    if h2c_port.is_none() && worker_count == 1 {
+    if h2c_port.is_none() && worker_count == 1 && tls.is_none() {
         return match server.start() {
             Ok(running) => {
                 handle.state = ManagedStaticState::Running(running);
@@ -499,6 +554,13 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
     let mut staged = config;
     staged.worker_count = worker_count;
     staged.h2c_port = h2c_port;
+    if let Some((cert_der, key_der, max_handshakes)) = tls {
+        staged.tls = Some(veylor_server::TlsConfig {
+            cert_der,
+            key_der,
+            max_handshakes,
+        });
+    }
     let bind_addr = server.addr().unwrap_or(addr);
     drop(server);
     let mut rebound = match Server::bind(bind_addr, staged) {

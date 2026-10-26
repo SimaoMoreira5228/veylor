@@ -815,6 +815,18 @@ vyl_http1_result vyl_managed_static_enable_h2c(
     vyl_managed_static_server* server,
     uint16_t port
 );
+/* NOTE: Stages DER certificate/key bytes plus the per-worker handshake budget for
+   start; bytes are copied at call time. Zero budget or empty inputs reject; the
+   dedicated port binds loopback TLS at start beside the H1 listener. Valid only
+   before start; post-start reports BAD_STATE. */
+vyl_http1_result vyl_managed_static_enable_tls(
+    vyl_managed_static_server* server,
+    const uint8_t* cert,
+    size_t cert_len,
+    const uint8_t* key,
+    size_t key_len,
+    size_t max_handshakes
+);
 /* NOTE: Stages the worker count for start against the server cap of 16 workers: zero and
    counts past 16 report INVALID_ARGUMENT. One keeps the single-worker path; more workers
    bind reuse-port listeners at start. The last call wins. Valid only before start;

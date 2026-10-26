@@ -14,7 +14,8 @@ use crate::static_routes::{encode_continue, now_http_date, respond_payload_too_l
 use super::streams::{apply_stream_cmd, decode_chunked, take_stream_cmd};
 use super::{
     ConnClose, ConnPhase, ConnState, ExchangeOutcome, INPUT_CAP, PumpOutcome, PumpProgress,
-    TrailerOutcome, TrailerReport, connection_value,
+    TrailerOutcome, TrailerReport, connection_value, tls_encrypt_output, tls_flush_pending,
+    tls_generate_flight, tls_read_available,
 };
 
 pub(crate) use super::streams::{BodyPushOutcome, StreamCmd, StreamState, push_staged_body};
@@ -134,7 +135,28 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
         return PumpOutcome::Close(ConnClose::TransportError);
     };
     let mut progress = PumpProgress::default();
-    if conn.out_sent < conn.out_len {
+    if conn.out_sent < conn.out_len || conn.tls_unflushed() > 0 {
+        if conn.has_tls() {
+            if conn.out_sent < conn.out_len {
+                if let Err(reason) = tls_encrypt_output(conn) {
+                    return PumpOutcome::Close(reason);
+                }
+            }
+
+            if let Err(reason) = tls_generate_flight(conn) {
+                return PumpOutcome::Close(reason);
+            }
+
+            match tls_flush_pending(conn, u64::MAX) {
+                Ok(wrote) => {
+                    progress.bytes_written = wrote;
+
+                    return PumpOutcome::Keep(progress);
+                }
+                Err(reason) => return PumpOutcome::Close(reason),
+            }
+        }
+
         let out_sent = conn.out_sent;
         let out_len = conn.out_len;
         let write_ready = !conn.write_blocked;
@@ -189,59 +211,79 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
     if host.is_writable(event_token) {
         host.stage_writable(event_token);
     }
-    let read_ready = conn.read_ready;
-    if conn.len < INPUT_CAP {
-        ConnState::materialize_input(&mut conn.input);
-    }
-    let len = conn.len;
-    let read_scratch: &mut [u8] = match conn.input.as_mut() {
-        Some(input) => &mut input[len..],
-        None => &mut [],
-    };
-    let mut batch = [IoBatch::new(
-        token,
-        &mut conn.stream,
-        read_scratch,
-        read_ready,
-        &[],
-        false,
-    )];
-    dispatch(u64::MAX, &mut batch);
-    let read = batch[0].read;
-    let write = batch[0].write;
-    conn.read_ready = matches!(read, ReadStatus::Progress(_) | ReadStatus::BudgetExhausted);
-    match read {
-        ReadStatus::Progress(bytes) => {
-            conn.len += bytes;
-            progress.bytes_read = bytes as u64;
+    if conn.has_tls() {
+        if conn.len < INPUT_CAP {
+            ConnState::materialize_input(&mut conn.input);
         }
-        ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
-        ReadStatus::Closed(CloseReason::PeerClosed) => {
-            return PumpOutcome::Close(ConnClose::PeerClosed);
+
+        match tls_read_available(conn, u64::MAX) {
+            Ok((wire, _)) => {
+                progress.bytes_read = wire;
+            }
+            Err(reason) => return PumpOutcome::Close(reason),
         }
-        ReadStatus::Closed(CloseReason::Reset) => return PumpOutcome::Close(ConnClose::Reset),
-        ReadStatus::Closed(CloseReason::Error(_)) | ReadStatus::Error(_) => {
-            return PumpOutcome::Close(ConnClose::TransportError);
+
+        match tls_flush_pending(conn, u64::MAX) {
+            Ok(wrote) => {
+                progress.bytes_written = wrote;
+            }
+            Err(reason) => return PumpOutcome::Close(reason),
         }
-        ReadStatus::Idle
-        | ReadStatus::WouldBlock
-        | ReadStatus::BudgetExhausted
-        | ReadStatus::PausedForWrite
-        | ReadStatus::Interrupted => {}
-    }
-    match write {
-        WriteStatus::Progress(_)
-        | WriteStatus::WouldBlock(_)
-        | WriteStatus::BudgetExhausted(_)
-        | WriteStatus::Interrupted(_) => {}
-        WriteStatus::Closed(CloseReason::PeerClosed) => {
-            return PumpOutcome::Close(ConnClose::PeerClosed);
+    } else {
+        let read_ready = conn.read_ready;
+        if conn.len < INPUT_CAP {
+            ConnState::materialize_input(&mut conn.input);
         }
-        WriteStatus::Closed(CloseReason::Reset) => return PumpOutcome::Close(ConnClose::Reset),
-        WriteStatus::Closed(CloseReason::Error(_)) | WriteStatus::Error(_) => {
-            return PumpOutcome::Close(ConnClose::TransportError);
+        let len = conn.len;
+        let read_scratch: &mut [u8] = match conn.input.as_mut() {
+            Some(input) => &mut input[len..],
+            None => &mut [],
+        };
+        let mut batch = [IoBatch::new(
+            token,
+            &mut conn.stream,
+            read_scratch,
+            read_ready,
+            &[],
+            false,
+        )];
+        dispatch(u64::MAX, &mut batch);
+        let read = batch[0].read;
+        let write = batch[0].write;
+        conn.read_ready = matches!(read, ReadStatus::Progress(_) | ReadStatus::BudgetExhausted);
+        match read {
+            ReadStatus::Progress(bytes) => {
+                conn.len += bytes;
+                progress.bytes_read = bytes as u64;
+            }
+            ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
+            ReadStatus::Closed(CloseReason::PeerClosed) => {
+                return PumpOutcome::Close(ConnClose::PeerClosed);
+            }
+            ReadStatus::Closed(CloseReason::Reset) => return PumpOutcome::Close(ConnClose::Reset),
+            ReadStatus::Closed(CloseReason::Error(_)) | ReadStatus::Error(_) => {
+                return PumpOutcome::Close(ConnClose::TransportError);
+            }
+            ReadStatus::Idle
+            | ReadStatus::WouldBlock
+            | ReadStatus::BudgetExhausted
+            | ReadStatus::PausedForWrite
+            | ReadStatus::Interrupted => {}
         }
-        WriteStatus::Idle => {}
+        match write {
+            WriteStatus::Progress(_)
+            | WriteStatus::WouldBlock(_)
+            | WriteStatus::BudgetExhausted(_)
+            | WriteStatus::Interrupted(_) => {}
+            WriteStatus::Closed(CloseReason::PeerClosed) => {
+                return PumpOutcome::Close(ConnClose::PeerClosed);
+            }
+            WriteStatus::Closed(CloseReason::Reset) => return PumpOutcome::Close(ConnClose::Reset),
+            WriteStatus::Closed(CloseReason::Error(_)) | WriteStatus::Error(_) => {
+                return PumpOutcome::Close(ConnClose::TransportError);
+            }
+            WriteStatus::Idle => {}
+        }
     }
     if chunked {
         if !chunked_done {

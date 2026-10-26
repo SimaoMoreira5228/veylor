@@ -692,6 +692,7 @@ pub(crate) fn project_routes<'a>(
             path: &route.path,
             status: route.status,
             body: &route.body,
+            gzip_body: route.gzip_body.as_deref(),
             managed: route.managed,
             file_root: route.file_root.as_deref(),
             trailers: &route.trailers,

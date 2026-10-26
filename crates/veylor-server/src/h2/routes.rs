@@ -34,6 +34,7 @@ pub struct FrozenRoute<'a> {
     pub path: &'a [u8],
     pub status: u16,
     pub body: &'a [u8],
+    pub gzip_body: Option<&'a [u8]>,
     pub managed: bool,
     pub file_root: Option<&'a Path>,
     pub trailers: &'a [Vec<u8>],
@@ -56,6 +57,8 @@ pub struct FrozenRoutesView<'a> {
     routes: &'a [FrozenRoute<'a>],
     natives: &'a [FrozenNativeRoute<'a>],
 }
+
+pub(crate) type StaticContent<'a> = (u16, &'a [u8], Option<&'a [u8]>);
 
 impl<'a> FrozenRoutesView<'a> {
     pub fn new(routes: &'a [FrozenRoute<'a>]) -> Result<Self, RouteBuildError> {
@@ -147,9 +150,14 @@ impl<'a> FrozenRoutesView<'a> {
         })
     }
 
-    pub(crate) fn lookup(&self, method: &[u8], path: &[u8]) -> Option<(u16, &[u8])> {
-        self.find(method, path)
-            .map(|index| (self.routes[index].status, self.routes[index].body))
+    pub(crate) fn lookup(&self, method: &[u8], path: &[u8]) -> Option<StaticContent<'_>> {
+        self.find(method, path).map(|index| {
+            (
+                self.routes[index].status,
+                self.routes[index].body,
+                self.routes[index].gzip_body,
+            )
+        })
     }
 
     // NOTE: native-first dispatch like H1 (respond_to_head checks natives before statics):
@@ -496,6 +504,8 @@ pub(crate) fn send_full(
     stream: u32,
     status: u16,
     body: &[u8],
+    content_encoding: Option<&[u8]>,
+    vary: bool,
     end_stream: bool,
     send_body: bool,
     output: &mut [u8],
@@ -510,16 +520,27 @@ pub(crate) fn send_full(
     let length_len = push_decimal(&mut length_buf, body.len() as u64);
     let mut now_buf = [0; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now_buf);
-    let response_fields = [
+    let mut response_fields = [
         field(b":status", &status_buf[..status_len]),
         field(b"date", &now_buf[..now_len]),
         field(b"content-length", &length_buf[..length_len]),
+        field(b"content-encoding", b""),
+        field(b"vary", b""),
     ];
+    let mut field_count = 3;
+    if let Some(encoding) = content_encoding {
+        response_fields[field_count] = field(b"content-encoding", encoding);
+        field_count += 1;
+    }
+    if vary {
+        response_fields[field_count] = field(b"vary", b"Accept-Encoding");
+        field_count += 1;
+    }
     let mut block = [0; HPACK_BLOCK_CAP];
     let sent = server
         .send_response(
             stream,
-            &response_fields,
+            &response_fields[..field_count],
             &mut block,
             &mut output[*used..],
             end_stream,
@@ -674,6 +695,7 @@ mod tests {
                 path: b"/a",
                 status: 200,
                 body: b"a",
+                gzip_body: None,
                 managed: false,
                 file_root: None,
                 trailers: &[],
@@ -683,6 +705,7 @@ mod tests {
                 path: b"/a",
                 status: 200,
                 body: b"b",
+                gzip_body: None,
                 managed: false,
                 file_root: None,
                 trailers: &[],
@@ -692,6 +715,7 @@ mod tests {
                 path: b"/b",
                 status: 200,
                 body: b"c",
+                gzip_body: None,
                 managed: false,
                 file_root: None,
                 trailers: &[],
@@ -701,6 +725,7 @@ mod tests {
                 path: b"/files/",
                 status: 200,
                 body: b"",
+                gzip_body: None,
                 managed: false,
                 file_root: Some(file_root),
                 trailers: &[],

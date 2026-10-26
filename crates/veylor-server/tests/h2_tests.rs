@@ -33,6 +33,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         path: b"/hello",
         status: 200,
         body: b"hello",
+        gzip_body: None,
         managed: true,
         file_root: None,
         trailers: &[],
@@ -42,6 +43,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         path: b"/empty",
         status: 200,
         body: b"",
+        gzip_body: None,
         managed: false,
         file_root: None,
         trailers: &[],
@@ -244,6 +246,8 @@ struct Response {
     status: u16,
     content_length: u64,
     content_type: Vec<u8>,
+    content_encoding: Vec<u8>,
+    vary: Vec<u8>,
     last_modified: Vec<u8>,
     content_range: Vec<u8>,
     allow: Vec<u8>,
@@ -308,6 +312,8 @@ fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
     let mut status = 0;
     let mut content_length = 0;
     let mut content_type = Vec::new();
+    let mut content_encoding = Vec::new();
+    let mut vary = Vec::new();
     let mut last_modified = Vec::new();
     let mut content_range = Vec::new();
     let mut allow = Vec::new();
@@ -329,6 +335,10 @@ fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
                 .expect("length int");
         } else if name == b"content-type" {
             content_type = value.to_vec();
+        } else if name == b"content-encoding" {
+            content_encoding = value.to_vec();
+        } else if name == b"vary" {
+            vary = value.to_vec();
         } else if name == b"last-modified" {
             last_modified = value.to_vec();
         } else if name == b"content-range" {
@@ -344,6 +354,8 @@ fn decode_with(decoder: &mut HpackTable<'_>, block: &[u8]) -> Response {
         status,
         content_length,
         content_type,
+        content_encoding,
+        vary,
         last_modified,
         content_range,
         allow,
@@ -1223,6 +1235,7 @@ fn route_view_rejects_bad_input() {
         path: b"/a",
         status: 204,
         body: b"",
+        gzip_body: None,
         managed: false,
         file_root: None,
         trailers: &[],
@@ -1236,6 +1249,7 @@ fn route_view_rejects_bad_input() {
         path: b"/a",
         status: 200,
         body: b"x",
+        gzip_body: None,
         managed: false,
         file_root: None,
         trailers: &[],
@@ -1249,6 +1263,7 @@ fn route_view_rejects_bad_input() {
         path: b"/a",
         status: 200,
         body: &[0; 4097],
+        gzip_body: None,
         managed: false,
         file_root: None,
         trailers: &[],
@@ -1262,6 +1277,7 @@ fn route_view_rejects_bad_input() {
         path: b"/a",
         status: 200,
         body: b"a",
+        gzip_body: None,
         managed: false,
         file_root: None,
         trailers: &[],
@@ -1271,6 +1287,7 @@ fn route_view_rejects_bad_input() {
         path: b"/a",
         status: 200,
         body: b"b",
+        gzip_body: None,
         managed: false,
         file_root: None,
         trailers: &[],
@@ -1290,6 +1307,7 @@ fn route_view_rejects_bad_input() {
             path,
             status: 200,
             body: b"x",
+            gzip_body: None,
             managed: false,
             file_root: None,
             trailers: &[],
@@ -3371,6 +3389,7 @@ static H2N_PRE_ROUTES: [FrozenRoute<'static>; 1] = [FrozenRoute {
     path: b"/x",
     status: 200,
     body: b"static-head",
+    gzip_body: None,
     managed: false,
     file_root: None,
     trailers: &[],
@@ -4622,4 +4641,87 @@ fn h2_file_post_traversal_and_missing_stay_404() {
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 3, "counts: {counts:?}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+fn gzip_plain_body() -> Vec<u8> {
+    b"The quick brown fox jumps over the lazy dog. ".repeat(50)
+}
+
+fn gzip_h2_server() -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_gzip_route(
+            b"GET",
+            b"/gzip",
+            200,
+            b"OK",
+            &gzip_plain_body(),
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register gzip");
+    server.start().expect("start server")
+}
+
+fn gunzip_plain(body: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(body);
+    let mut plain = Vec::new();
+    decoder.read_to_end(&mut plain).expect("gunzip body");
+    plain
+}
+
+#[test]
+fn gzip_static_route_round_trips_over_h2c() {
+    let server = gzip_h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers_extra(
+        &mut client,
+        1,
+        b"GET",
+        b"/gzip",
+        &[(b"accept-encoding".as_slice(), b"gzip".as_slice())],
+        true,
+    );
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.content_encoding, b"gzip");
+    assert_eq!(response.vary, b"Accept-Encoding");
+    assert_date_first(&response.order, true);
+    assert!(response.body.len() < gzip_plain_body().len());
+    assert_eq!(response.content_length as usize, response.body.len());
+    assert_eq!(gunzip_plain(&response.body), gzip_plain_body());
+    server.stop_accepting();
+    let (_, code) = read_goaway(&mut client);
+    assert_eq!(code, ErrorCode::NoError);
+    read_eof(&mut client);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 1);
+    assert_eq!(counts.shutdown, 1);
+}
+
+#[test]
+fn gzip_static_route_identity_without_accept_encoding_over_h2c() {
+    let server = gzip_h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"GET", b"/gzip", true);
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, gzip_plain_body());
+    assert!(response.content_encoding.is_empty());
+    assert_eq!(response.vary, b"Accept-Encoding");
+    assert_date_first(&response.order, true);
+    server.stop_accepting();
+    let (_, code) = read_goaway(&mut client);
+    assert_eq!(code, ErrorCode::NoError);
+    read_eof(&mut client);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 1);
+    assert_eq!(counts.shutdown, 1);
 }

@@ -10,9 +10,10 @@ mod native;
 mod tests;
 
 pub use api::{
-    vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_h2c_addr,
-    vyl_managed_static_join, vyl_managed_static_local_addr, vyl_managed_static_new,
-    vyl_managed_static_register_file_mount, vyl_managed_static_register_managed_route,
+    vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_enable_tls,
+    vyl_managed_static_h2c_addr, vyl_managed_static_join, vyl_managed_static_local_addr,
+    vyl_managed_static_new, vyl_managed_static_register_file_mount,
+    vyl_managed_static_register_managed_route,
     vyl_managed_static_register_managed_route_with_trailers,
     vyl_managed_static_register_static_route,
     vyl_managed_static_register_static_route_with_body_cap, vyl_managed_static_set_worker_count,
@@ -108,6 +109,7 @@ pub(super) struct ReadyServer {
     pub(super) addr: std::net::SocketAddr,
     pub(super) h2c_port: Option<u16>,
     pub(super) worker_count: usize,
+    pub(super) tls: Option<(Vec<u8>, Vec<u8>, usize)>,
     pub(super) ops: Vec<ReadyRouteOp>,
 }
 
