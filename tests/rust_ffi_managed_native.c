@@ -267,6 +267,19 @@ int main(void) {
             VYL_HTTP1_INVALID_ARGUMENT
     );
     assert(
+        vyl_managed_static_register_native_route_with_gzip(NULL, (vyl_http1_bytes){0}, (vyl_http1_bytes){0}, native_handler, NULL) ==
+            VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_register_native_route_with_gzip(
+            server,
+            (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            NULL,
+            &native_tag
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
         vyl_managed_static_register_native_route(
             server,
             (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
@@ -304,6 +317,15 @@ int main(void) {
     );
     assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_OK);
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
+    assert(
+        vyl_managed_static_register_native_route_with_gzip(
+            server,
+            (vyl_http1_bytes){.data = method, .length = sizeof(method) - 1},
+            (vyl_http1_bytes){.data = path, .length = sizeof(path) - 1},
+            native_handler,
+            &native_tag
+        ) == VYL_HTTP1_BAD_STATE
+    );
     assert(vyl_managed_static_local_addr(server, &port) == VYL_HTTP1_OK);
     assert(port != 0);
     uint16_t h2c_port = 0;

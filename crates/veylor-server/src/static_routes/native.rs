@@ -4,18 +4,19 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use veylor_http1::{
-    ConnectionHeader, Field, RequestHead, ResponseFraming, ResponseToWrite,
+    ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite,
     connection_header_for_response, encode_response_head,
 };
 
 use crate::host::HOST_MAX_REASON_BYTES;
 use crate::static_files::HTTP_DATE_BYTES;
 
-use super::{EncodedStaticResponse, encode_continue, now_http_date, reject_payload};
 use super::{
-    IN_NATIVE, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
-    NativeResponseOut, RouteBuildError, valid_reason,
+    CONTENT_ENCODING_GZIP, IN_NATIVE, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler,
+    NativeRequestView, NativeResponseOut, RouteBuildError, accepts_gzip_value, compress_route_body,
+    header_value, valid_reason,
 };
+use super::{EncodedStaticResponse, encode_continue, now_http_date, reject_payload};
 
 // NOTE: native dispatch: framing mirrors the static path (chunked and over-cap bodies
 // reject, expect-continue interims, drain-before-respond) while status/reason/body come
@@ -28,6 +29,7 @@ use super::{
 // (null body with has_body/body_len intact, the v1 contract) and the pump still drains
 // declared bytes exactly like a static route. The handler views, the pump owns: drain
 // accounting below is untouched by what the handler saw.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn respond_native(
     handler: NativeHandler,
     user_data: usize,
@@ -35,6 +37,8 @@ pub(super) fn respond_native(
     method: &[u8],
     path: &[u8],
     input: &[u8],
+    headers: &[Header],
+    gzip: bool,
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
     if head.is_chunked {
@@ -90,12 +94,39 @@ pub(super) fn respond_native(
         name: b"Date",
         value: &now[..now_len],
     }];
+    let twin = if gzip {
+        match header_value(headers, head, input, b"accept-encoding") {
+            Some(value) if accepts_gzip_value(value) => {
+                compress_route_body(body).map_err(|_| RouteBuildError::Invalid)?
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let (body, content_encoding) = match twin {
+        Some(ref twin) => (twin.as_slice(), Some(CONTENT_ENCODING_GZIP)),
+        None => (body, None),
+    };
+    let encoding_field = Field {
+        name: b"Content-Encoding",
+        value: CONTENT_ENCODING_GZIP,
+    };
+    let vary_field = Field {
+        name: b"Vary",
+        value: b"Accept-Encoding",
+    };
+    let fields: &[Field] = match (content_encoding, gzip) {
+        (Some(_), _) => &[date[0], encoding_field, vary_field],
+        (None, true) => &[date[0], vary_field],
+        (None, false) => &date,
+    };
     let response = ResponseToWrite {
         request_method: method,
         requested_upgrade: b"",
         status,
         reason,
-        fields: &date,
+        fields,
         framing: ResponseFraming::FixedLength,
         content_length: body.len() as u64,
         connection,

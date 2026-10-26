@@ -5239,3 +5239,165 @@ fn h2c_managed_with_trailers_mirror_serves_and_enforces() {
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
+
+const ROTATE_CERT1: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/server_cert.der");
+const ROTATE_KEY1: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/server_key.der");
+const ROTATE_CERT2: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/server_cert2.der");
+const ROTATE_KEY2: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/server_key2.der");
+
+unsafe fn enable_tls(server: *mut VylManagedStaticServer, cert: &[u8], key: &[u8]) {
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_enable_tls(
+                server,
+                cert.as_ptr(),
+                cert.len(),
+                key.as_ptr(),
+                key.len(),
+                16,
+            )
+        },
+        VylResult::Ok
+    );
+}
+
+#[test]
+fn rotate_tls_validates_state_and_applies_on_running_server() {
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_rotate_tls(
+                server,
+                ROTATE_CERT2.as_ptr(),
+                ROTATE_CERT2.len(),
+                ROTATE_KEY2.as_ptr(),
+                ROTATE_KEY2.len(),
+            )
+        },
+        VylResult::BadState
+    );
+    unsafe { enable_tls(server, ROTATE_CERT1, ROTATE_KEY1) };
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_rotate_tls(
+                server,
+                ROTATE_CERT2.as_ptr(),
+                ROTATE_CERT2.len(),
+                ROTATE_KEY2.as_ptr(),
+                ROTATE_KEY2.len(),
+            )
+        },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_rotate_tls(
+                server,
+                b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----".as_ptr(),
+                55,
+                ROTATE_KEY2.as_ptr(),
+                ROTATE_KEY2.len(),
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    let _ = unsafe { stop_join(server) };
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+static NATIVE_GZIP_BODY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+fn native_gzip_body() -> &'static [u8] {
+    NATIVE_GZIP_BODY.get_or_init(|| b"The quick brown fox jumps over the lazy dog. ".repeat(50))
+}
+
+unsafe extern "C" fn native_gzip_handler(
+    _user_data: *mut c_void,
+    _request: *const VylManagedStaticNativeRequest,
+    response: *mut VylManagedStaticNativeResponse,
+) -> i32 {
+    answer_native(response, 200, b"OK", native_gzip_body());
+    0
+}
+
+#[test]
+fn gzip_native_route_round_trips_through_ffi() {
+    let plain = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_native_route_with_gzip(
+                server,
+                bytes(b"GET"),
+                bytes(b"/gzip-native"),
+                Some(native_gzip_handler),
+                std::ptr::null_mut(),
+            )
+        },
+        VylResult::Ok
+    );
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_native_route_with_gzip(
+                server,
+                bytes(b"GET"),
+                bytes(b"/gzip-native"),
+                Some(native_gzip_handler),
+                std::ptr::null_mut(),
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_native_route_with_gzip(
+                std::ptr::null_mut(),
+                bytes(b"GET"),
+                bytes(b"/gzip-native"),
+                Some(native_gzip_handler),
+                std::ptr::null_mut(),
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_register_native_route_with_gzip(
+                server,
+                bytes(b"GET"),
+                bytes(b"/late"),
+                Some(native_gzip_handler),
+                std::ptr::null_mut(),
+            )
+        },
+        VylResult::BadState
+    );
+
+    let (status, head, gzipped) = get_raw(port, "/gzip-native", "Accept-Encoding: gzip\r\n");
+    assert_eq!(status, 200);
+    assert!(
+        head.contains("Content-Encoding: gzip"),
+        "encoding: {head:?}"
+    );
+    assert!(head.contains("Vary: Accept-Encoding"), "vary: {head:?}");
+    assert_eq!(&gzipped[..2], &[0x1f, 0x8b], "gzip magic");
+    assert!(gzipped.len() < plain.len());
+
+    let (plain_status, plain_head, identity) = get_raw(port, "/gzip-native", "");
+    assert_eq!(plain_status, 200);
+    assert_eq!(identity, plain);
+    assert!(
+        !plain_head.to_ascii_lowercase().contains("content-encoding"),
+        "no encoding: {plain_head:?}"
+    );
+
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 2);
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}

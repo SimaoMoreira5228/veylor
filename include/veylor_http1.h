@@ -836,6 +836,16 @@ vyl_http1_result vyl_managed_static_enable_tls(
     size_t key_len,
     size_t max_handshakes
 );
+/* NOTE: Swaps the live TLS identity without restarting; staged material applies on the
+   next worker turn while established connections keep serving. Running-only; pre-start
+   and empty inputs report as for enable. */
+vyl_http1_result vyl_managed_static_rotate_tls(
+    vyl_managed_static_server* server,
+    const uint8_t* cert,
+    size_t cert_len,
+    const uint8_t* key,
+    size_t key_len
+);
 /* NOTE: Stages the worker count for start against the server cap of 16 workers: zero and
    counts past 16 report INVALID_ARGUMENT. One keeps the single-worker path; more workers
    bind reuse-port listeners at start. The last call wins. Valid only before start;
@@ -1082,6 +1092,15 @@ _Static_assert(
 );
 
 vyl_http1_result vyl_managed_static_register_native_route(
+    vyl_managed_static_server* server,
+    vyl_http1_bytes method,
+    vyl_http1_bytes path,
+    vyl_managed_static_native_handler handler,
+    void* user_data
+);
+/* NOTE: Same copy rule as above; the handler body compresses per response when the
+   route opts in and the client sends Accept-Encoding: gzip. */
+vyl_http1_result vyl_managed_static_register_native_route_with_gzip(
     vyl_managed_static_server* server,
     vyl_http1_bytes method,
     vyl_http1_bytes path,

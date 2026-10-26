@@ -867,12 +867,15 @@ pub(crate) fn project_routes<'a>(
     let natives = h2_routes
         .iter()
         .filter_map(|route| {
-            route.native.map(|(handler, user_data)| FrozenNativeRoute {
-                method: &route.method,
-                path: &route.path,
-                handler,
-                user_data,
-            })
+            route
+                .native
+                .map(|(handler, user_data, gzip)| FrozenNativeRoute {
+                    method: &route.method,
+                    path: &route.path,
+                    handler,
+                    user_data,
+                    gzip,
+                })
         })
         .collect();
     (flat, natives)

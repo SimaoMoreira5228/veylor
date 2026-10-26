@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use veylor_http2::{
@@ -1503,7 +1503,7 @@ fn host_park_poll_respond_round_trip() {
             shared.stage_respond(event.token, 200, b"OK", b"host-hello"),
             RespondOutcome::Ok
         );
-        let staged = shared.take_staged(0);
+        let (staged, _) = shared.take_staged(0);
         assert_eq!(staged.len(), 1);
         assert!(!staged[0].cancel);
         let mut output = [0u8; 16384];
@@ -1535,7 +1535,7 @@ fn host_cancel_mid_park_rsts_sibling_unaffected() {
         let (event, _, _) = poll_request_event(shared);
         assert_eq!(event.token.stream_id, 1);
         assert_eq!(shared.stage_cancel(event.token), CancelOutcome::Ok);
-        let staged = shared.take_staged(0);
+        let (staged, _) = shared.take_staged(0);
         assert_eq!(staged.len(), 1);
         assert!(staged[0].cancel);
         let mut output = [0u8; 16384];
@@ -1580,7 +1580,7 @@ fn host_stale_replay_and_duplicate_fail_closed() {
             shared.stage_respond(event.token, 200, b"OK", b"live"),
             RespondOutcome::Ok
         );
-        let staged = shared.take_staged(0);
+        let (staged, _) = shared.take_staged(0);
         assert_eq!(staged.len(), 1);
         let mut output = [0u8; 16384];
         let applied = conn.apply_staged(&mut output, &staged[0]);
@@ -3304,6 +3304,7 @@ static H2N_OK: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/native",
     handler: h2n_ok,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_ECHO: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3311,6 +3312,7 @@ static H2N_ECHO: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/echo",
     handler: h2n_record,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_END_PROBE: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3318,6 +3320,7 @@ static H2N_END_PROBE: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/echo",
     handler: h2n_probe_end,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_CAP_PROBE: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3325,6 +3328,7 @@ static H2N_CAP_PROBE: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/echo",
     handler: h2n_probe_cap,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_FAIL: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3332,6 +3336,7 @@ static H2N_FAIL: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/fail",
     handler: h2n_fail,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_BAD_STATUS: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3339,6 +3344,7 @@ static H2N_BAD_STATUS: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/fail",
     handler: h2n_bad_status,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_BIG_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3346,6 +3352,7 @@ static H2N_BIG_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/fail",
     handler: h2n_big_body,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_BAD_REASON: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3353,6 +3360,7 @@ static H2N_BAD_REASON: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/fail",
     handler: h2n_bad_reason,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_204: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3360,6 +3368,7 @@ static H2N_204: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/fail",
     handler: h2n_204,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_204_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
@@ -3367,6 +3376,7 @@ static H2N_204_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/fail",
     handler: h2n_204_body,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_SELECT: [FrozenNativeRoute<'static>; 2] = [
@@ -3375,12 +3385,14 @@ static H2N_SELECT: [FrozenNativeRoute<'static>; 2] = [
         path: b"/u1",
         handler: h2n_select,
         user_data: 1,
+        gzip: false,
     },
     FrozenNativeRoute {
         method: b"GET",
         path: b"/u2",
         handler: h2n_select,
         user_data: 2,
+        gzip: false,
     },
 ];
 
@@ -3400,6 +3412,7 @@ static H2N_PRE_NATIVES: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     path: b"/x",
     handler: h2n_ok,
     user_data: 0,
+    gzip: false,
 }];
 
 static H2N_BIG: [u8; 4097] = [b'x'; 4097];
@@ -3772,7 +3785,7 @@ fn h2_managed_respond_204_serves_status_only() {
             shared.stage_respond(event.token, 204, b"No Content", b"stray"),
             RespondOutcome::Ok
         );
-        let staged = shared.take_staged(0);
+        let (staged, _) = shared.take_staged(0);
         assert_eq!(staged.len(), 1);
         let mut output = [0u8; 16384];
         let applied = conn.apply_staged(&mut output, &staged[0]);
@@ -3821,6 +3834,7 @@ fn h2_native_view_rejects_overlaps_and_bad_input() {
         path: b"/empty",
         handler: h2n_ok,
         user_data: 0,
+        gzip: false,
     }];
     assert_eq!(
         FrozenRoutesView::new(&ROUTES)
@@ -3834,6 +3848,7 @@ fn h2_native_view_rejects_overlaps_and_bad_input() {
         path: b"/hello",
         handler: h2n_ok,
         user_data: 0,
+        gzip: false,
     }];
     assert_eq!(
         FrozenRoutesView::new(&ROUTES)
@@ -3848,12 +3863,14 @@ fn h2_native_view_rejects_overlaps_and_bad_input() {
             path: b"/a",
             handler: h2n_ok,
             user_data: 0,
+            gzip: false,
         },
         FrozenNativeRoute {
             method: b"GET",
             path: b"/a",
             handler: h2n_ok,
             user_data: 1,
+            gzip: false,
         },
     ];
     assert_eq!(
@@ -3868,6 +3885,7 @@ fn h2_native_view_rejects_overlaps_and_bad_input() {
         path: b"/a",
         handler: h2n_ok,
         user_data: 0,
+        gzip: false,
     }];
     assert_eq!(
         FrozenRoutesView::new(&ROUTES)
@@ -3881,6 +3899,7 @@ fn h2_native_view_rejects_overlaps_and_bad_input() {
         path: b"",
         handler: h2n_ok,
         user_data: 0,
+        gzip: false,
     }];
     assert_eq!(
         FrozenRoutesView::new(&ROUTES)
@@ -4711,6 +4730,84 @@ fn gzip_static_route_identity_without_accept_encoding_over_h2c() {
     let mut client = h2_connect(&server);
     handshake(&mut client);
     send_headers(&mut client, 1, b"GET", b"/gzip", true);
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, gzip_plain_body());
+    assert!(response.content_encoding.is_empty());
+    assert_eq!(response.vary, b"Accept-Encoding");
+    assert_date_first(&response.order, true);
+    server.stop_accepting();
+    let (_, code) = read_goaway(&mut client);
+    assert_eq!(code, ErrorCode::NoError);
+    read_eof(&mut client);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 1);
+    assert_eq!(counts.shutdown, 1);
+}
+
+static H2N_GZIP_BODY: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn h2n_gzip_body() -> &'static [u8] {
+    H2N_GZIP_BODY.get_or_init(gzip_plain_body)
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_gzip(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 200, b"OK", h2n_gzip_body())
+}
+
+fn gzip_native_h2_server() -> RunningServer {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_native_gzip(b"GET", b"/gzip-native", Some(h2n_gzip), 0)
+        .expect("register gzip native");
+    server.start().expect("start server")
+}
+
+#[test]
+fn gzip_native_route_round_trips_over_h2c() {
+    let server = gzip_native_h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers_extra(
+        &mut client,
+        1,
+        b"GET",
+        b"/gzip-native",
+        &[(b"accept-encoding".as_slice(), b"gzip".as_slice())],
+        true,
+    );
+    let response = read_response(&mut client, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.content_encoding, b"gzip");
+    assert_eq!(response.vary, b"Accept-Encoding");
+    assert_date_first(&response.order, true);
+    assert!(response.body.len() < gzip_plain_body().len());
+    assert_eq!(gunzip_plain(&response.body), gzip_plain_body());
+    server.stop_accepting();
+    let (_, code) = read_goaway(&mut client);
+    assert_eq!(code, ErrorCode::NoError);
+    read_eof(&mut client);
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.h2_served, 1);
+    assert_eq!(counts.shutdown, 1);
+}
+
+#[test]
+fn gzip_native_route_identity_without_accept_encoding_over_h2c() {
+    let server = gzip_native_h2_server();
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    send_headers(&mut client, 1, b"GET", b"/gzip-native", true);
     let response = read_response(&mut client, 1);
     assert_eq!(response.status, 200);
     assert_eq!(response.body, gzip_plain_body());

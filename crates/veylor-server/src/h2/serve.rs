@@ -13,7 +13,7 @@ use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
 use crate::static_files::FileReject;
 use crate::static_routes::{
     CONTENT_ENCODING_GZIP, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler,
-    NativeRequestView, accepts_gzip_value,
+    NativeRequestView, compress_route_body,
 };
 
 use super::file::FileDecision;
@@ -95,6 +95,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
     // HEADERS time, so every invoke is framing-only (null body, has_body/body_len
     // intact). Tails RST rather than drain: sync routes hold no streaming state, so an
     // open stream answers HEADERS-open then refuses exactly like a static body refusal.
+    #[allow(clippy::too_many_arguments)]
     fn serve_native(
         &mut self,
         stream: u32,
@@ -103,6 +104,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         is_head: bool,
         handler: NativeHandler,
         user_data: usize,
+        gzip: bool,
+        encode: bool,
     ) {
         let declared = view.body_len;
         if declared > MAX_STATIC_BODY_BYTES {
@@ -118,14 +121,26 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             Ok(invoked) => invoked,
             Err(_) => return self.deny(stream, ErrorCode::InternalError, false),
         };
+        let twin = if encode {
+            match compress_route_body(invoked.body) {
+                Ok(twin) => twin,
+                Err(_) => return self.fail(ErrorCode::InternalError),
+            }
+        } else {
+            None
+        };
+        let (body, content_encoding, vary) = match twin {
+            Some(ref twin) => (twin.as_slice(), Some(CONTENT_ENCODING_GZIP), true),
+            None => (invoked.body, None, gzip),
+        };
         if !end {
             let refused = send_full(
                 self.server,
                 stream,
                 invoked.status,
-                invoked.body,
-                None,
-                false,
+                body,
+                content_encoding,
+                vary,
                 false,
                 false,
                 self.output,
@@ -140,10 +155,10 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             self.server,
             stream,
             invoked.status,
-            invoked.body,
-            None,
-            false,
-            is_head || invoked.body.is_empty(),
+            body,
+            content_encoding,
+            vary,
+            is_head || body.is_empty(),
             true,
             self.output,
             self.used,
@@ -354,7 +369,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         }
                     }
                 }
-                if let Some((handler, user_data)) = self.routes.lookup_native(request.method, path)
+                if let Some((handler, user_data, gzip)) =
+                    self.routes.lookup_native(request.method, path)
                 {
                     let declared = request.content_length.unwrap_or(0);
                     let view = NativeRequestView {
@@ -366,7 +382,10 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         body_len: declared,
                         body: std::ptr::null(),
                     };
-                    return self.serve_native(stream, view, end, is_head, handler, user_data);
+                    let encode = gzip && FrozenRoutesView::accepts_gzip(fields, self.server);
+                    return self.serve_native(
+                        stream, view, end, is_head, handler, user_data, gzip, encode,
+                    );
                 }
                 // NOTE: exact statics win; file mounts serve only table misses, so existing
                 // routes never change behavior when mounts are added (H1 respond_to_head parity).
@@ -434,17 +453,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     }
                 }
                 let (status, body, gzip) = found.unwrap_or((404, NOT_FOUND_BODY, None));
-                let mut encoding_value: Option<&[u8]> = None;
-                for header in fields {
-                    if let Some((name, value)) = self.server.driver().resolve_header(*header) {
-                        if name.eq_ignore_ascii_case(b"accept-encoding") {
-                            encoding_value = Some(value);
-                            break;
-                        }
-                    }
-                }
-                let twin = match (gzip, encoding_value) {
-                    (Some(twin), Some(value)) if accepts_gzip_value(value) => Some(twin),
+                let twin = match gzip {
+                    Some(twin) if FrozenRoutesView::accepts_gzip(fields, self.server) => Some(twin),
                     _ => None,
                 };
                 let (body, encoding, vary) = match twin {

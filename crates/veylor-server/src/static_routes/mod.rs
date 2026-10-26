@@ -96,6 +96,7 @@ pub struct NativeRoute {
     pub(crate) path: Vec<u8>,
     pub(crate) handler: NativeHandler,
     pub(crate) user_data: usize,
+    pub(crate) gzip: bool,
 }
 
 // NOTE: reentrancy guard: handlers must not call back into server APIs, so every registry
@@ -283,7 +284,21 @@ impl StaticRoutes {
             path: path.to_vec(),
             handler,
             user_data,
+            gzip: false,
         });
+        Ok(())
+    }
+
+    pub fn register_native_gzip(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        handler: Option<NativeHandler>,
+        user_data: usize,
+    ) -> Result<(), RouteBuildError> {
+        self.register_native(method, path, handler, user_data)?;
+        let route = self.natives.last_mut().ok_or(RouteBuildError::Invalid)?;
+        route.gzip = true;
         Ok(())
     }
 
@@ -446,9 +461,10 @@ mod gzip;
 mod native;
 mod respond;
 
-pub(crate) use gzip::{CONTENT_ENCODING_GZIP, accepts_gzip_value};
+pub(crate) use gzip::{CONTENT_ENCODING_GZIP, accepts_gzip_value, compress_route_body};
 
 pub(crate) use respond::encode_continue;
+pub(crate) use respond::header_value;
 pub(crate) use respond::reject_payload;
 pub use respond::{
     EncodedStaticResponse, respond_bad_request, respond_expectation_failed,

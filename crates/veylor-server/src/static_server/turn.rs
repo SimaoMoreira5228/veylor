@@ -200,6 +200,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let mut parked_live = false;
     let mut drain_start_ns = 0u64;
     let mut h2_force_ns = 0u64;
+    let mut staged_epoch_seen = 0u64;
     let mut tls_epoch_seen = 0u64;
 
     loop {
@@ -339,7 +340,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         let draining = worker.shutdown_phase() != ShutdownPhase::Running;
         // NOTE: one take per turn: H1 slots drain below, H2 stream-keyed slots ride the H2
         // pump dispatch; either side drops divergent work silently (already tombed).
-        let staged = host.take_staged(worker_id);
+        let staged;
+        if host.staged_epoch(worker_id as usize) == staged_epoch_seen {
+            staged = Vec::new();
+        } else {
+            let (taken, epoch) = host.take_staged(worker_id);
+            staged_epoch_seen = epoch;
+            staged = taken;
+        }
         if host.tls_rotation_epoch() != tls_epoch_seen {
             if let Some((chain, key, epoch)) = host.take_tls_rotation(tls_epoch_seen) {
                 if let Some(acceptor) = tls_acceptor.as_mut() {

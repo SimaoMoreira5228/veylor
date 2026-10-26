@@ -72,6 +72,8 @@ pub fn respond_to_head(
                     method,
                     path,
                     input,
+                    headers,
+                    native.gzip,
                     output,
                 );
             }
@@ -516,7 +518,7 @@ fn range_header_value<'a>(
     header_value(headers, head, input, b"range")
 }
 
-fn header_value<'a>(
+pub(crate) fn header_value<'a>(
     headers: &'a [Header],
     head: RequestHead,
     input: &'a [u8],

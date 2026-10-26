@@ -1,11 +1,14 @@
 use std::path::Path;
 
 use veylor_http1::is_token;
-use veylor_http2::{ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackRepresentation};
+use veylor_http2::{
+    ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackHeader, HpackRepresentation,
+};
 
 use crate::static_files::{FileMounts, FilePlan, FileReject, HTTP_DATE_BYTES, write_http_date};
 use crate::static_routes::{
-    MAX_RESPONSE_BODY, MAX_ROUTES, NativeHandler, RouteBuildError, now_http_date,
+    MAX_RESPONSE_BODY, MAX_ROUTES, NativeHandler, RouteBuildError, accepts_gzip_value,
+    now_http_date,
 };
 
 use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
@@ -50,6 +53,7 @@ pub struct FrozenNativeRoute<'a> {
     pub path: &'a [u8],
     pub handler: NativeHandler,
     pub user_data: usize,
+    pub gzip: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +154,21 @@ impl<'a> FrozenRoutesView<'a> {
         })
     }
 
+    pub(crate) fn accepts_gzip<'b, 't, 'd, 'e>(
+        fields: &[HpackHeader],
+        server: &H2ServerDriver<'b, 't, 'd, 'e>,
+    ) -> bool {
+        for header in fields {
+            if let Some((name, value)) = server.driver().resolve_header(*header) {
+                if name.eq_ignore_ascii_case(b"accept-encoding") && accepts_gzip_value(value) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub(crate) fn lookup(&self, method: &[u8], path: &[u8]) -> Option<StaticContent<'_>> {
         self.find(method, path).map(|index| {
             (
@@ -166,7 +185,7 @@ impl<'a> FrozenRoutesView<'a> {
         &self,
         method: &[u8],
         path: &[u8],
-    ) -> Option<(NativeHandler, usize)> {
+    ) -> Option<(NativeHandler, usize, bool)> {
         let direct = self
             .natives
             .iter()
@@ -179,7 +198,7 @@ impl<'a> FrozenRoutesView<'a> {
         } else {
             direct
         };
-        found.map(|native| (native.handler, native.user_data))
+        found.map(|native| (native.handler, native.user_data, native.gzip))
     }
 
     // NOTE: miss-only path scan, so hits return with no extra work: one bounded pass
@@ -736,6 +755,7 @@ mod tests {
             path: b"/a",
             handler: probe,
             user_data: 0,
+            gzip: false,
         }];
         let view = FrozenRoutesView::new(&routes)
             .expect("frozen routes")

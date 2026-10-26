@@ -212,7 +212,7 @@ pub(crate) struct H2StaticRoute {
     pub(crate) body: Vec<u8>,
     pub(crate) gzip_body: Option<Vec<u8>>,
     pub(crate) managed: bool,
-    pub(crate) native: Option<(NativeHandler, usize)>,
+    pub(crate) native: Option<(NativeHandler, usize, bool)>,
     pub(crate) file_root: Option<PathBuf>,
     pub(crate) trailers: Vec<Vec<u8>>,
 }
@@ -436,7 +436,35 @@ impl Server {
                     body: Vec::new(),
                     gzip_body: None,
                     managed: false,
-                    native: Some((handler, user_data)),
+                    native: Some((handler, user_data, false)),
+                    file_root: None,
+                    trailers: Vec::new(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn register_native_gzip(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        handler: Option<NativeHandler>,
+        user_data: usize,
+    ) -> Result<(), ServerError> {
+        self.routes
+            .register_native_gzip(method, path, handler, user_data)
+            .map_err(ServerError::from)?;
+        if self.h2_routes.len() < MAX_ROUTES {
+            if let Some(handler) = handler {
+                self.h2_routes.push(H2StaticRoute {
+                    method: method.to_vec(),
+                    path: path.to_vec(),
+                    status: 200,
+                    body: Vec::new(),
+                    gzip_body: None,
+                    managed: false,
+                    native: Some((handler, user_data, true)),
                     file_root: None,
                     trailers: Vec::new(),
                 });

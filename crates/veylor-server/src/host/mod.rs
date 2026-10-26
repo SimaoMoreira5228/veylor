@@ -183,12 +183,14 @@ pub(crate) struct HostInner {
     pub(crate) counters: HostCounters,
     tls_rotation: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     tls_rotation_epoch: u64,
+    staged_epoch: Vec<u64>,
 }
 
 pub struct HostShared {
     inner: Mutex<HostInner>,
     wake: Condvar,
     tls_rotation_epoch: AtomicU64,
+    staged_epoch: Vec<AtomicU64>,
 }
 
 impl HostShared {
@@ -198,6 +200,7 @@ impl HostShared {
         let mut tombs = Vec::with_capacity(worker_count);
         let mut seqs = Vec::with_capacity(worker_count);
         let mut wakers = Vec::with_capacity(worker_count);
+        let mut staged_epoch = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             events.push(VecDeque::with_capacity(HOST_QUEUE_DEPTH));
             let park_cap = super::MAX_CONNECTIONS + H2_PARK_SLOTS;
@@ -205,6 +208,7 @@ impl HostShared {
             tombs.push(VecDeque::with_capacity(HOST_TOMB_DEPTH));
             seqs.push(vec![0u32; super::MAX_CONNECTIONS + H2_PARK_SLOTS]);
             wakers.push(None);
+            staged_epoch.push(AtomicU64::new(0));
         }
         Self {
             inner: Mutex::new(HostInner {
@@ -217,9 +221,11 @@ impl HostShared {
                 counters: HostCounters::default(),
                 tls_rotation: None,
                 tls_rotation_epoch: 0,
+                staged_epoch: vec![0; worker_count],
             }),
             wake: Condvar::new(),
             tls_rotation_epoch: AtomicU64::new(0),
+            staged_epoch,
         }
     }
 
@@ -438,6 +444,9 @@ impl HostShared {
                         reason: reason.to_vec(),
                         body: body.to_vec(),
                     });
+                    if let Some(epoch) = inner.staged_epoch.get_mut(worker) {
+                        *epoch += 1;
+                    }
                     retire_signals(inner, worker, token);
                     inner.counters.responds_ok += 1;
                     let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
@@ -460,6 +469,7 @@ impl HostShared {
             return RespondOutcome::Stale;
         };
         if result == RespondOutcome::Ok {
+            self.note_staged(token.worker_id as usize);
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }
@@ -487,6 +497,9 @@ impl HostShared {
             if let Some(entry) = inner.parked[worker][slot].as_mut() {
                 entry.staged = Some(StagedAction::Cancel);
             }
+            if let Some(epoch) = inner.staged_epoch.get_mut(worker) {
+                *epoch += 1;
+            }
             retire_signals(inner, worker, token);
             inner.counters.cancels_ok += 1;
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
@@ -496,6 +509,7 @@ impl HostShared {
             return CancelOutcome::Stale;
         };
         if result == CancelOutcome::Ok {
+            self.note_staged(token.worker_id as usize);
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }
@@ -529,11 +543,24 @@ impl HostShared {
         staged
     }
 
-    pub fn take_staged(&self, worker_id: u32) -> Vec<StagedWork> {
+    pub(crate) fn staged_epoch(&self, worker: usize) -> u64 {
+        self.staged_epoch
+            .get(worker)
+            .map(|epoch| epoch.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    fn note_staged(&self, worker: usize) {
+        if let Some(epoch) = self.staged_epoch.get(worker) {
+            epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub fn take_staged(&self, worker_id: u32) -> (Vec<StagedWork>, u64) {
         let taken = self.with_inner(|inner| {
             let worker = worker_id as usize;
             if inner.parked.len() <= worker {
-                return (Vec::new(), None);
+                return ((Vec::new(), 0), None);
             }
             let mut staged = Vec::new();
             for slot in 0..inner.parked[worker].len() {
@@ -573,9 +600,14 @@ impl HostShared {
                     grant_owed: grant,
                 });
             }
-            (staged, None)
+            (
+                (staged, inner.staged_epoch.get(worker).copied().unwrap_or(0)),
+                None,
+            )
         });
-        taken.map(|(staged, _)| staged).unwrap_or_default()
+        taken
+            .map(|((staged, epoch), _)| (staged, epoch))
+            .unwrap_or_default()
     }
 
     pub(crate) fn tls_rotation_epoch(&self) -> u64 {

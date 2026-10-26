@@ -564,6 +564,54 @@ unsafe fn enable_tls(
 
 
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_rotate_tls(
+    server: *mut VylManagedStaticServer,
+    cert_ptr: *const u8,
+    cert_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> VylResult {
+    catch_ffi(|| unsafe { rotate_tls(server, cert_ptr, cert_len, key_ptr, key_len) })
+}
+
+unsafe fn rotate_tls(
+    server: *mut VylManagedStaticServer,
+    cert_ptr: *const u8,
+    cert_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if cert_len == 0 || key_len == 0 {
+        return VylResult::InvalidArgument;
+    }
+    if cert_ptr.is_null() || key_ptr.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if !slice_length_valid::<u8>(cert_len) || !slice_length_valid::<u8>(key_len) {
+        return VylResult::InvalidArgument;
+    }
+    let cert = unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) };
+    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    match running.rotate_tls(cert, key) {
+        Ok(()) => VylResult::Ok,
+        Err(_) => VylResult::InvalidArgument,
+    }
+}
+
+
+
+
+
+
+
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_set_worker_count(

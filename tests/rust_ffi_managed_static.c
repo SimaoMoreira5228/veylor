@@ -236,6 +236,8 @@ int main(void) {
     assert(vyl_managed_static_set_worker_count(server, 2) == VYL_HTTP1_OK);
     assert(vyl_managed_static_enable_h2c(NULL, 0) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_OK);
+    assert(vyl_managed_static_rotate_tls(NULL, NULL, 0, NULL, 0) == VYL_HTTP1_INVALID_ARGUMENT);
+    assert(vyl_managed_static_rotate_tls(server, method, sizeof(method) - 1, method, sizeof(method) - 1) == VYL_HTTP1_BAD_STATE);
     assert(vyl_managed_static_enable_tls(NULL, NULL, 0, NULL, 0, 0) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_enable_tls(server, NULL, 0, NULL, 0, 1) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_enable_tls(server, method, 0, method, sizeof(method) - 1, 1) == VYL_HTTP1_INVALID_ARGUMENT);
@@ -311,6 +313,7 @@ int main(void) {
     assert(vyl_managed_static_start(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_set_worker_count(server, 1) == VYL_HTTP1_BAD_STATE);
     assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_BAD_STATE);
+    assert(vyl_managed_static_rotate_tls(server, method, sizeof(method) - 1, method, sizeof(method) - 1) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_enable_tls(server, method, sizeof(method) - 1, method, sizeof(method) - 1, 1) == VYL_HTTP1_BAD_STATE);
     assert(
         vyl_managed_static_register_static_route_with_gzip(

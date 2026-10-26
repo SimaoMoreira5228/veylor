@@ -17,8 +17,9 @@ pub use api::{
     vyl_managed_static_register_managed_route_with_trailers,
     vyl_managed_static_register_static_route,
     vyl_managed_static_register_static_route_with_body_cap,
-    vyl_managed_static_register_static_route_with_gzip, vyl_managed_static_set_worker_count,
-    vyl_managed_static_start, vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
+    vyl_managed_static_register_static_route_with_gzip, vyl_managed_static_rotate_tls,
+    vyl_managed_static_set_worker_count, vyl_managed_static_start,
+    vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
     vyl_managed_static_host_begin_stream, vyl_managed_static_host_cancel,
@@ -30,6 +31,7 @@ pub use dispatch::{
 pub use native::{
     VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn, VylManagedStaticNativeRequest,
     VylManagedStaticNativeResponse, vyl_managed_static_register_native_route,
+    vyl_managed_static_register_native_route_with_gzip,
 };
 use veylor_server::{CloseCounts, NativeHandler, RunningServer, Server, ServerConfig};
 
@@ -155,6 +157,7 @@ pub(super) enum ReadyRouteOp {
         path: Vec<u8>,
         handler: NativeHandler,
         user_data: usize,
+        gzip: bool,
     },
 }
 
@@ -197,7 +200,14 @@ impl ReadyRouteOp {
                 path,
                 handler,
                 user_data,
-            } => server.register_native(method, path, Some(*handler), *user_data),
+                gzip,
+            } => {
+                if *gzip {
+                    server.register_native_gzip(method, path, Some(*handler), *user_data)
+                } else {
+                    server.register_native(method, path, Some(*handler), *user_data)
+                }
+            }
         };
         result.map_err(server_error_to_result)
     }

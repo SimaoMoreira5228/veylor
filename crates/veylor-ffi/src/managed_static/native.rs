@@ -130,8 +130,7 @@ unsafe fn register_native_route(
 
 
 
-    let handler =
-        unsafe { std::mem::transmute::<VylManagedStaticNativeHandlerFn, NativeHandler>(handler) };
+    let handler = convert_handler(handler);
     match ready
         .server
         .register_native(method, path, Some(handler), user_data as usize)
@@ -142,9 +141,78 @@ unsafe fn register_native_route(
                 path: path.to_vec(),
                 handler,
                 user_data: user_data as usize,
+                gzip: false,
             });
             VylResult::Ok
         }
         Err(error) => server_error_to_result(error),
     }
+}
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_register_native_route_with_gzip(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    handler: VylManagedStaticNativeHandler,
+    user_data: *mut c_void,
+) -> VylResult {
+    catch_ffi(|| unsafe { register_native_gzip_route(server, method, path, handler, user_data) })
+}
+
+unsafe fn register_native_gzip_route(
+    server: *mut VylManagedStaticServer,
+    method: VylBytes,
+    path: VylBytes,
+    handler: VylManagedStaticNativeHandler,
+    user_data: *mut c_void,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let Some(handler) = handler else {
+        return VylResult::InvalidArgument;
+    };
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    let method = match unsafe { read_bytes(method) } {
+        Ok(method) => method,
+        Err(error) => return error,
+    };
+    let path = match unsafe { read_bytes(path) } {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let handler = convert_handler(handler);
+    match ready
+        .server
+        .register_native_gzip(method, path, Some(handler), user_data as usize)
+    {
+        Ok(()) => {
+            ready.ops.push(ReadyRouteOp::Native {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                handler,
+                user_data: user_data as usize,
+                gzip: true,
+            });
+            VylResult::Ok
+        }
+        Err(error) => server_error_to_result(error),
+    }
+}
+
+fn convert_handler(handler: VylManagedStaticNativeHandlerFn) -> NativeHandler {
+    
+
+
+    unsafe { std::mem::transmute::<VylManagedStaticNativeHandlerFn, NativeHandler>(handler) }
 }
