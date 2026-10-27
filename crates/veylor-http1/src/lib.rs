@@ -18,7 +18,9 @@ pub use connection::{
     WriteDriver, WriteEvent, WriteResult, WriteState,
 };
 pub use fields::{ConnectionOptions, is_token};
-pub use request_body::{RequestBodyAdmission, RequestBodyDecoder};
+pub use request_body::{
+    RequestBodyAdmission, RequestBodyDecoder, admission_needs_interim, admission_rejects_body,
+};
 pub use request_head::{Header, Limits, ParseError, Parser, RequestHead, Span};
 pub use request_target::TargetForm;
 pub use request_write::{
@@ -32,8 +34,9 @@ pub use response_head::{
 };
 pub use response_write::{
     ConnectionHeader, EncodedResponseHead, FixedResponseBodyWriter, ResponseEncodeError,
-    ResponseFraming, ResponseToWrite, ResponseWriteCursor, connection_header_for_response,
-    encode_response_chunk, encode_response_chunk_with_required_length, encode_response_final_chunk,
+    ResponseFraming, ResponseToWrite, ResponseWriteCursor, can_reuse_after_response,
+    connection_header_for_response, continue_interim, encode_response_chunk,
+    encode_response_chunk_with_required_length, encode_response_final_chunk,
     encode_response_final_chunk_with_required_length, encode_response_head,
-    encode_response_head_with_required_length, valid_field_value,
+    encode_response_head_with_required_length, response_permits_reuse, valid_field_value,
 };

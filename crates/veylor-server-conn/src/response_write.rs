@@ -1,7 +1,8 @@
 use veylor_http1::{
     ConnectionHeader, Field, Header, ResponseEncodeError, ResponseFraming, ResponseToWrite, Span,
-    connection_header_for_response, encode_response_chunk_with_required_length,
-    encode_response_final_chunk_with_required_length, encode_response_head_with_required_length,
+    can_reuse_after_response, connection_header_for_response,
+    encode_response_chunk_with_required_length, encode_response_final_chunk_with_required_length,
+    encode_response_head_with_required_length,
 };
 
 use super::{MAX_REQUEST_FIELDS, ServerConnection, ServerError};
@@ -206,6 +207,9 @@ impl<'a> ServerConnection<'a> {
                     ResponseFraming::CloseDelimited => ResponseBodyState::CloseDelimited,
                 });
                 if params.status == 100 {
+                    // NOTE: the 100 interim head shape is shared (veylor_http1::continue_interim);
+                    // this flag only tracks that this engine flushed it, so mark_continue_sent can
+                    // release body reads. Flush timing stays transport-local in both engines.
                     self.continue_ready = false;
                 }
                 self.response = ResponseWriteState::HeadPending {
@@ -258,6 +262,9 @@ impl<'a> ServerConnection<'a> {
                     )
                 } else if status < 200 && status != 101 {
                     if status == 100 {
+                        // NOTE: see the encode-side NOTE: only the shared 100 interim arms the
+                        // continue gate; other 1xx return to Idle without starting the final
+                        // response, so the exchange stays reusable in both engines.
                         self.continue_ready = true;
                     }
                     (0, ResponseWriteState::Idle)
@@ -459,10 +466,16 @@ impl<'a> ServerConnection<'a> {
         let Some(last) = self.last_response else {
             return false;
         };
-        if last.upgraded || last.connection == ConnectionHeader::Close {
-            return false;
-        }
-        self.body_complete || last.request_body_complete
+        // NOTE: the exchange verdict lives in veylor_http1::can_reuse_after_response (shared
+        // with the managed pump's keep_open verdict): upgrade/tunnel and Close pin the conn
+        // shut, and at least one request-body drain signal must hold. Cancelled, incomplete,
+        // and no-response gating stays local: it is this engine's state machine, not policy.
+        can_reuse_after_response(
+            last.upgraded,
+            last.connection,
+            self.body_complete,
+            last.request_body_complete,
+        )
     }
 }
 

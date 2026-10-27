@@ -9,6 +9,21 @@ pub enum RequestBodyAdmission {
     Rejected,
 }
 
+// NOTE: single source for the 100-continue admission verdicts: SendContinue alone arms the
+// interim, ReadyToRead proceeds with no interim, and Rejected answers final with no interim.
+// Both engines read these predicates instead of matching the variants locally, so the arming
+// rule cannot drift between the managed pump and the host-driven conn crate.
+pub fn admission_needs_interim(admission: RequestBodyAdmission) -> bool {
+    matches!(admission, RequestBodyAdmission::SendContinue)
+}
+
+// NOTE: rejection companion to admission_needs_interim above: a disallowed body (over-cap
+// route, refused host admission) never stages an interim in either engine; see the arming
+// NOTE there for the shared-verdict contract.
+pub fn admission_rejects_body(admission: RequestBodyAdmission) -> bool {
+    matches!(admission, RequestBodyAdmission::Rejected)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdmissionState {
     Pending { expect_continue: bool },

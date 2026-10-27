@@ -1,4 +1,6 @@
-use super::{RequestBodyAdmission, RequestBodyDecoder};
+use super::{
+    RequestBodyAdmission, RequestBodyDecoder, admission_needs_interim, admission_rejects_body,
+};
 use crate::body::{BodyEvent, BodyLimits};
 use crate::request_head::{Header, Limits, ParseError, Parser, RequestHead, Span};
 
@@ -462,4 +464,92 @@ fn rejects_invalid_borrowed_trailer_name_spans() {
         .err(),
         Some(ParseError::Invalid)
     );
+}
+
+#[test]
+fn admission_verdicts_match_shared_continue_policy() {
+    // NOTE: drift alarm for the converged 100-continue policy: the decoder owns the
+    // Expect-to-admission mapping and both engines read admission_needs_interim /
+    // admission_rejects_body instead of matching variants locally, so any verdict edit
+    // here must update the predicates and both consumers together.
+    // Expect with a declared body arms the interim; refusal never does, even with Expect.
+    let request =
+        b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n";
+    let (head, headers) = parse_request(request);
+    let mut decoder = RequestBodyDecoder::new(
+        head,
+        request,
+        &headers[..head.header_count],
+        &[],
+        BodyLimits::default(),
+    )
+    .unwrap();
+    let verdict = decoder.admit_body(true).unwrap();
+    assert_eq!(verdict, RequestBodyAdmission::SendContinue);
+    assert!(admission_needs_interim(verdict));
+    assert!(!admission_rejects_body(verdict));
+
+    let mut decoder = RequestBodyDecoder::new(
+        head,
+        request,
+        &headers[..head.header_count],
+        &[],
+        BodyLimits::default(),
+    )
+    .unwrap();
+    let verdict = decoder.admit_body(false).unwrap();
+    assert_eq!(verdict, RequestBodyAdmission::Rejected);
+    assert!(!admission_needs_interim(verdict));
+    assert!(admission_rejects_body(verdict));
+
+    
+    let chunked =
+        b"POST /upload HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+    let (head, headers) = parse_request(chunked);
+    let mut decoder = RequestBodyDecoder::new(
+        head,
+        chunked,
+        &headers[..head.header_count],
+        &[],
+        BodyLimits::default(),
+    )
+    .unwrap();
+    let verdict = decoder.admit_body(true).unwrap();
+    assert_eq!(verdict, RequestBodyAdmission::SendContinue);
+    assert!(admission_needs_interim(verdict));
+
+    
+
+
+
+    let plain = b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n";
+    let (head, headers) = parse_request(plain);
+    let mut decoder = RequestBodyDecoder::new(
+        head,
+        plain,
+        &headers[..head.header_count],
+        &[],
+        BodyLimits::default(),
+    )
+    .unwrap();
+    let verdict = decoder.admit_body(true).unwrap();
+    assert_eq!(verdict, RequestBodyAdmission::ReadyToRead);
+    assert!(!admission_needs_interim(verdict));
+    assert!(!admission_rejects_body(verdict));
+
+    let bodyless = b"GET /status HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\n\r\n";
+    let (head, headers) = parse_request(bodyless);
+    assert!(head.expect_continue);
+    let mut decoder = RequestBodyDecoder::new(
+        head,
+        bodyless,
+        &headers[..head.header_count],
+        &[],
+        BodyLimits::default(),
+    )
+    .unwrap();
+    let verdict = decoder.admit_body(true).unwrap();
+    assert_eq!(verdict, RequestBodyAdmission::ReadyToRead);
+    assert!(!admission_needs_interim(verdict));
+    assert!(!admission_rejects_body(verdict));
 }

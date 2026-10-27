@@ -851,6 +851,9 @@ pub fn pump_connection(
     // order. An admitted 100-continue interim is staged ahead of the final and stays writable
     // during the drain; dispatch serves the write first and pauses reads while it is pending, so
     // the interim always flushes before further drain bytes are consumed from the wire.
+    // NOTE: this flush-before-drain order is the pump's transport half; the verdicts (who gets
+    // an interim, the 100 shape) are shared policy in veylor_http1. The host-driven conn crate
+    // mirrors the order via its return-to-Idle 100 state, so only the mechanism differs.
     let sending = conn.phase == ConnPhase::SendingResponse || conn.phase == ConnPhase::SendingFile;
     let flushing_interim =
         matches!(conn.phase, ConnPhase::DrainingBody { .. }) && out_sent < out_len;
@@ -1160,6 +1163,12 @@ fn parse_exchange(
         }
         Ok(None) if conn.len < INPUT_CAP => ExchangeOutcome::NeedMore,
         Err(ParseError::ExpectationFailed) => {
+            // NOTE: 417 precedence over admission is structural and shared: the veylor_http1
+            // head parser rejects an unsupported Expect before any head exists to admit, so
+            // neither engine can stage an interim past this point. The 417+close rendering
+            // itself stays managed-side (status-shape territory, not this policy); the
+            // host-driven conn crate maps the failed head to ProtocolError and fails every
+            // follow-up closed instead.
             send_expectation_failed(conn);
             ExchangeOutcome::Responded
         }
@@ -1460,6 +1469,11 @@ fn finish_simple(conn: &mut ConnState, reason: ConnClose, staged: Option<usize>)
 }
 
 fn reuse_keep_alive(conn: &mut ConnState) {
+    // NOTE: mechanics only, not the reuse decision: admission is the shared
+    // veylor_http1::response_permits_reuse verdict folded into conn.closing at the encode
+    // sites (static/parked keep_open) with request-body drain enforced by the DrainingBody
+    // phase; this function only shifts the pipelined tail, resets the parser, and re-arms
+    // read_ready for the next exchange.
     let tail = conn.len - conn.head_len;
     if let Some(input) = conn.input.as_mut() {
         input.copy_within(conn.head_len..conn.len, 0);

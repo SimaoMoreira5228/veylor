@@ -200,3 +200,89 @@ fn colon_less_line_past_caller_capacity_fails_instead_of_livelocking_resume() {
         Ok(_) => panic!("colon-less line must not parse successfully"),
     }
 }
+
+#[test]
+fn head_error_precedence_pins_shared_decoder_ordering() {
+    // NOTE: drift alarm for H1-6 (error precedence): the which-error-wins ordering lives in the
+    // shared head-parser scan (request_head/parser.rs), not in either engine's mapper — the
+    // managed pump arms (connection/mod.rs parse_exchange) and the conn-crate map_parse_error
+    // (server-conn request_read.rs) are disjoint patterns over a single error value, so a
+    // canonical rank function would only relabel ParseError with zero call-site deletion. This
+    // corpus pins the decoder verdict each evil input must yield; the per-engine renderings
+    // pinned alongside must stay in agreement (managed status <=> conn ServerError):
+    // ExpectationFailed <=> 417 / ProtocolError
+    // (server_tests unsupported_expectation_rejected_with_417_then_close; server-conn
+    // request_read/tests unsupported_expectation_never_admits_or_arms_interim),
+    // HeaderSectionTooLarge <=> 431 / ProtocolError
+    // (server_tests oversized_header_section_closes_with_431), RequestLineTooLarge with a long
+    // target <=> 414 / ProtocolError (server_tests oversized_request_target_answers_414),
+    // RequestLineTooLarge on method/version <=> 400 / ProtocolError
+    // (server_tests oversized_request_method_stays_400), Invalid <=> 400 / ProtocolError
+    // (server_tests malformed_request_line_closes_with_400). The full-buffer Ok(None) row stays
+    // a deliberate split: the pump owns INPUT_CAP and attributes 414/400 while the host-driven
+    // conn crate returns NeedMore (host owns its buffers).
+    fn parse_fresh(input: &[u8]) -> Result<Option<RequestHead>, ParseError> {
+        let mut parser = Parser::new();
+        let mut storage = [Header::default(); 128];
+        parser.parse(input, &mut storage, Limits::default())
+    }
+
+    let split = b"GET /health HTTP/1.1\r\nHost: example.test\r\nAcc".to_vec();
+    assert_eq!(parse_fresh(&split), Ok(None));
+
+    assert_eq!(
+        parse_fresh(b"BAD REQUEST\r\n\r\n"),
+        Err(ParseError::Invalid)
+    );
+    assert_eq!(
+        parse_fresh(b"POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 3\r\nExpect: magic\r\n\r\n"),
+        Err(ParseError::ExpectationFailed)
+    );
+
+    let mut section = b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n".to_vec();
+    for index in 0..120 {
+        section.extend_from_slice(format!("X-Pad-{index:03}: abcdefgh\r\n").as_bytes());
+    }
+    section.extend_from_slice(b"\r\n");
+    assert_eq!(
+        parse_fresh(&section),
+        Err(ParseError::HeaderSectionTooLarge)
+    );
+
+    let target = format!("/{}", "a".repeat(9000));
+    let long_target = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    assert_eq!(
+        parse_fresh(long_target.as_bytes()),
+        Err(ParseError::RequestLineTooLarge)
+    );
+    let method = "A".repeat(9000);
+    let long_method = format!("{method} /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    assert_eq!(
+        parse_fresh(long_method.as_bytes()),
+        Err(ParseError::RequestLineTooLarge)
+    );
+
+    // NOTE: combined evil inputs pin the decoder line order both engines inherit: section
+    // overflow scanned before the Expect line wins as HeaderSectionTooLarge (managed 431), while
+    // an early Expect line wins as ExpectationFailed (managed 417). Neither engine re-decides
+    // this; the parser does.
+    let mut pads_before_expect = b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n".to_vec();
+    for index in 0..120 {
+        pads_before_expect.extend_from_slice(format!("X-Pad-{index:03}: abcdefgh\r\n").as_bytes());
+    }
+    pads_before_expect.extend_from_slice(b"Expect: magic\r\n\r\n");
+    assert_eq!(
+        parse_fresh(&pads_before_expect),
+        Err(ParseError::HeaderSectionTooLarge)
+    );
+    let mut expect_before_pads =
+        b"POST /upload HTTP/1.1\r\nHost: example.test\r\nExpect: magic\r\n".to_vec();
+    for index in 0..120 {
+        expect_before_pads.extend_from_slice(format!("X-Pad-{index:03}: abcdefgh\r\n").as_bytes());
+    }
+    expect_before_pads.extend_from_slice(b"\r\n");
+    assert_eq!(
+        parse_fresh(&expect_before_pads),
+        Err(ParseError::ExpectationFailed)
+    );
+}

@@ -1,8 +1,9 @@
 use super::{
     ConnectionHeader, FixedResponseBodyWriter, ResponseEncodeError, ResponseFraming,
-    ResponseToWrite, ResponseWriteCursor, connection_header_for_response, encode_response_chunk,
-    encode_response_chunk_with_required_length, encode_response_final_chunk,
-    encode_response_final_chunk_with_required_length, encode_response_head,
+    ResponseToWrite, ResponseWriteCursor, can_reuse_after_response, connection_header_for_response,
+    continue_interim, encode_response_chunk, encode_response_chunk_with_required_length,
+    encode_response_final_chunk, encode_response_final_chunk_with_required_length,
+    encode_response_head, response_permits_reuse,
 };
 use crate::request_head::{Header, Limits, Parser};
 use crate::request_write::Field;
@@ -475,4 +476,84 @@ fn reports_required_lengths_for_chunk_data_and_trailers() {
     );
     assert_eq!(required, 17);
     assert!(output.iter().all(|byte| *byte == 0xa5));
+}
+
+#[test]
+fn continue_interim_encodes_exact_wire_bytes() {
+    // NOTE: drift alarm for the converged 100-continue policy: the managed pump stages this
+    // exact shape ahead of the final response and the host-driven conn crate encodes the same
+    // shape for its continue handshake, so any shape edit here must update both engines.
+    let interim = continue_interim();
+    assert_eq!(interim.status, 100);
+    assert_eq!(interim.reason, b"Continue");
+    assert!(interim.fields.is_empty());
+    assert_eq!(interim.framing, ResponseFraming::FixedLength);
+    assert_eq!(interim.content_length, 0);
+    assert_eq!(interim.connection, ConnectionHeader::Omit);
+    let mut output = [0u8; 64];
+    let encoded = encode_response_head(&interim, &mut output).unwrap();
+    assert!(!encoded.body_allowed);
+    assert_eq!(&output[..encoded.length], b"HTTP/1.1 100 Continue\r\n\r\n");
+}
+
+#[test]
+fn reuse_verdict_matches_shared_keep_alive_policy() {
+    // NOTE: drift alarm for the converged keep-alive policy: the host-driven conn crate calls
+    // can_reuse_after_response with its live flags and the managed pump keys keep_open on
+    // response_permits_reuse, so any verdict edit here must update both consumers together.
+    // Upgrade/tunnel and Close never reuse, even drained; Omit and KeepAlive reuse once at
+    // least one request-body drain signal holds.
+    assert!(!response_permits_reuse(false, ConnectionHeader::Close));
+    assert!(!response_permits_reuse(true, ConnectionHeader::Omit));
+    assert!(!response_permits_reuse(true, ConnectionHeader::KeepAlive));
+    assert!(response_permits_reuse(false, ConnectionHeader::Omit));
+    assert!(response_permits_reuse(false, ConnectionHeader::KeepAlive));
+    assert!(!can_reuse_after_response(
+        false,
+        ConnectionHeader::Close,
+        true,
+        true
+    ));
+    assert!(!can_reuse_after_response(
+        true,
+        ConnectionHeader::Omit,
+        true,
+        true
+    ));
+    assert!(!can_reuse_after_response(
+        true,
+        ConnectionHeader::Upgrade,
+        true,
+        true
+    ));
+    assert!(!can_reuse_after_response(
+        false,
+        ConnectionHeader::Omit,
+        false,
+        false
+    ));
+    assert!(!can_reuse_after_response(
+        false,
+        ConnectionHeader::KeepAlive,
+        false,
+        false
+    ));
+    assert!(can_reuse_after_response(
+        false,
+        ConnectionHeader::Omit,
+        true,
+        false
+    ));
+    assert!(can_reuse_after_response(
+        false,
+        ConnectionHeader::Omit,
+        false,
+        true
+    ));
+    assert!(can_reuse_after_response(
+        false,
+        ConnectionHeader::KeepAlive,
+        true,
+        true
+    ));
 }

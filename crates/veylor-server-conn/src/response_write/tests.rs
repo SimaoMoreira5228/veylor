@@ -261,6 +261,122 @@ fn upgrade_and_close_verdicts_are_not_reusable() {
 }
 
 #[test]
+fn reuse_verdict_follows_shared_keep_alive_policy() {
+    // NOTE: drift alarm for the converged keep-alive policy: can_reuse must agree with
+    // veylor_http1::can_reuse_after_response on every row below, so a verdict edit upstream
+    // fails here until this crate follows. Only the cancelled/incomplete/no-response gates
+    // stay local (engine state machine, not policy).
+    use veylor_http1::{ConnectionHeader, can_reuse_after_response, response_permits_reuse};
+
+    
+    let mut connection = ServerConnection::new();
+    let input = get();
+    let mut headers = [Header::default(); 4];
+    parse(&mut connection, input, &mut headers);
+    let mut output = [0u8; 256];
+    let head = connection
+        .encode_response_head(input, &headers, plain(200), &mut output)
+        .unwrap();
+    connection.advance_response_write(head.written).unwrap();
+    assert!(!connection.can_reuse());
+    connection.finish_response_body(&[], &mut output).unwrap();
+    assert!(connection.can_reuse());
+    assert_eq!(
+        connection.can_reuse(),
+        can_reuse_after_response(false, ConnectionHeader::Omit, false, true)
+    );
+
+    
+    let mut connection = ServerConnection::new();
+    let input = post();
+    let mut headers = [Header::default(); 4];
+    parse(&mut connection, input, &mut headers);
+    connection
+        .admit_body(input, &headers, &[], &[], true)
+        .unwrap();
+    let mut output = [0u8; 256];
+    let params = crate::ResponseHeadParams {
+        content_length: 0,
+        request_body_complete: false,
+        ..plain(200)
+    };
+    let head = connection
+        .encode_response_head(input, &headers, params, &mut output)
+        .unwrap();
+    connection.advance_response_write(head.written).unwrap();
+    connection.finish_response_body(&[], &mut output).unwrap();
+    assert!(!connection.can_reuse());
+    assert_eq!(
+        connection.can_reuse(),
+        can_reuse_after_response(false, ConnectionHeader::Close, false, false)
+    );
+
+    
+    let mut connection = ServerConnection::new();
+    let input = get();
+    let mut headers = [Header::default(); 4];
+    parse(&mut connection, input, &mut headers);
+    let mut output = [0u8; 256];
+    let params = crate::ResponseHeadParams {
+        response_close: true,
+        ..plain(200)
+    };
+    let head = connection
+        .encode_response_head(input, &headers, params, &mut output)
+        .unwrap();
+    connection.advance_response_write(head.written).unwrap();
+    connection.finish_response_body(&[], &mut output).unwrap();
+    assert!(!connection.can_reuse());
+    assert_eq!(
+        connection.can_reuse(),
+        can_reuse_after_response(false, ConnectionHeader::Close, false, true)
+    );
+
+    
+    assert!(can_reuse_after_response(
+        false,
+        ConnectionHeader::Omit,
+        true,
+        false
+    ));
+    assert!(response_permits_reuse(false, ConnectionHeader::Omit));
+}
+
+#[test]
+fn connect_tunnel_completion_never_reuses() {
+    // NOTE: drift alarm for the deliberate upgrade split: the shared verdict maps a
+    // CONNECT-tunnel 2xx to Omit on the wire, but only the upgraded input flips reuse shut.
+    // This crate passes its live upgraded flag, so a tunnel never reuses; the managed pump
+    // passes upgraded=false structurally (it never serves 101/CONNECT) and enforces the rest
+    // through its drain phase, so unifying the flag would change pump wire behavior.
+    use veylor_http1::{ConnectionHeader, can_reuse_after_response, response_permits_reuse};
+
+    let mut connection = ServerConnection::new();
+    let input: &[u8] = b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    let mut headers = [Header::default(); 4];
+    parse(&mut connection, input, &mut headers);
+    let mut output = [0u8; 256];
+    let head = connection
+        .encode_response_head(input, &headers, plain(200), &mut output)
+        .unwrap();
+    connection.advance_response_write(head.written).unwrap();
+    // NOTE: a CONNECT-tunnel 2xx carries no body, so the head advance lands in Complete
+    // with no finish step; the exchange is complete yet still not reusable (upgraded).
+    assert!(!connection.can_reuse());
+    assert_eq!(
+        connection.can_reuse(),
+        can_reuse_after_response(true, ConnectionHeader::Omit, false, true)
+    );
+    assert!(!can_reuse_after_response(
+        true,
+        ConnectionHeader::Omit,
+        false,
+        true
+    ));
+    assert!(response_permits_reuse(false, ConnectionHeader::Omit));
+}
+
+#[test]
 fn duplicate_upgrade_headers_are_rejected() {
     let mut connection = ServerConnection::new();
     let input: &[u8] =

@@ -2,8 +2,8 @@
 mod tests;
 
 use veylor_http1::{
-    BodyEvent, BodyLimits, Header, Limits, ParseError, RequestBodyAdmission, RequestBodyDecoder,
-    RequestHead, Span,
+    BodyEvent, BodyLimits, Header, Limits, ParseError, RequestBodyDecoder, RequestHead, Span,
+    admission_needs_interim, admission_rejects_body,
 };
 
 use super::{MAX_REQUEST_FIELDS, ServerConnection, ServerError};
@@ -108,15 +108,26 @@ impl<'a> ServerConnection<'a> {
         let admission = decoder
             .admit_body(allowed)
             .map_err(|error| map_parse_error(error, request.header_count))?;
-        let admission = match admission {
-            RequestBodyAdmission::ReadyToRead => Admission::Ready,
-            RequestBodyAdmission::SendContinue => Admission::SendContinue,
-            RequestBodyAdmission::Rejected => Admission::Rejected,
+        // NOTE: the interim arming lives in veylor_http1 (admission_needs_interim /
+        // admission_rejects_body): SendContinue alone obliges the host to emit the shared
+        // 100 interim before body reads, Rejected answers final with no interim. The local
+        // Admission mirrors the decoder verdicts 1:1, so the mapping below follows the
+        // predicates instead of re-deciding the verdicts.
+        let admission = if admission_needs_interim(admission) {
+            Admission::SendContinue
+        } else if admission_rejects_body(admission) {
+            Admission::Rejected
+        } else {
+            Admission::Ready
         };
         self.body = Some(decoder);
         Ok(admission)
     }
 
+    // NOTE: transport bookkeeping stays local to this crate: the shared policy only decides
+    // that SendContinue obliges a 100 interim (admission_needs_interim); the flush tracking
+    // (continue_ready set on 100 write-out, consumed here) and the decoder gate below are the
+    // host-driven engine's half and are not shared with the managed pump's staged interim.
     pub fn mark_continue_sent(&mut self) -> Result<(), ServerError> {
         if self.cancelled {
             return Err(ServerError::Cancelled);

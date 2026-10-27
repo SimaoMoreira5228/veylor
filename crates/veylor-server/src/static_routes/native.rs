@@ -4,8 +4,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use veylor_http1::{
-    ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite,
-    connection_header_for_response, encode_response_head,
+    Field, Header, RequestHead, ResponseFraming, ResponseToWrite, connection_header_for_response,
+    encode_response_head, response_permits_reuse,
 };
 
 use crate::host::HOST_MAX_REASON_BYTES;
@@ -147,7 +147,9 @@ pub(super) fn respond_native(
     }
     Ok(EncodedStaticResponse {
         length,
-        keep_open: connection != ConnectionHeader::Close,
+        // NOTE: shared keep-alive verdict (see respond.rs keep_open NOTE): Close pins the
+        // conn shut; natives never upgrade either, so the upgrade input stays false here too.
+        keep_open: response_permits_reuse(false, connection),
         drain_total,
         interim_len,
         file: None,

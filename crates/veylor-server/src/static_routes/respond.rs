@@ -2,7 +2,7 @@
 // validation (super), this module owns response encoding over already-matched routes.
 use veylor_http1::{
     ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
-    connection_header_for_response, encode_response_head,
+    connection_header_for_response, encode_response_head, response_permits_reuse,
 };
 use veylor_router::{RouteCapture, RouteError, RouteKind, RouteTable};
 
@@ -133,6 +133,9 @@ pub fn respond_to_head(
         Some(length) => length,
         None => 0,
     };
+    // NOTE: like the managed park path, the interim stages on the bare Expect flag (see the
+    // park_request NOTE for the deliberate bodyless split); the staged shape is shared policy
+    // and rejections above carry no interim in either engine.
     let interim_len = if head.expect_continue {
         encode_continue(output)?
     } else {
@@ -207,7 +210,11 @@ pub fn respond_to_head(
     }
     Ok(EncodedStaticResponse {
         length,
-        keep_open: connection != ConnectionHeader::Close,
+        // NOTE: the keep-open verdict is shared (veylor_http1::response_permits_reuse): Close
+        // pins the conn shut. The pump never upgrades (requested_upgrade is always empty on
+        // this path), so the upgrade input stays false, and request-body drain rides
+        // drain_total/DrainingBody below instead of the shared booleans.
+        keep_open: response_permits_reuse(false, connection),
         drain_total,
         interim_len,
         file: None,
@@ -324,7 +331,7 @@ fn encode_method_not_allowed(
     }
     Ok(EncodedStaticResponse {
         length,
-        keep_open: connection != ConnectionHeader::Close,
+        keep_open: response_permits_reuse(false, connection),
         drain_total,
         interim_len,
         file: None,
@@ -371,7 +378,7 @@ fn respond_server_options(
     let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     Ok(EncodedStaticResponse {
         length: encoded.length,
-        keep_open: connection != ConnectionHeader::Close,
+        keep_open: response_permits_reuse(false, connection),
         drain_total: 0,
         interim_len: 0,
         file: None,
@@ -563,7 +570,7 @@ fn respond_file(
     };
     Ok(Some(EncodedStaticResponse {
         length,
-        keep_open: connection != ConnectionHeader::Close,
+        keep_open: response_permits_reuse(false, connection),
         drain_total,
         interim_len,
         file,
@@ -638,7 +645,7 @@ fn respond_not_modified(
         encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
     Ok(EncodedStaticResponse {
         length: interim_len + encoded.length,
-        keep_open: connection != ConnectionHeader::Close,
+        keep_open: response_permits_reuse(false, connection),
         drain_total,
         interim_len,
         file: None,
@@ -687,7 +694,7 @@ fn respond_range_unsatisfiable(
         encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
     Ok(EncodedStaticResponse {
         length: interim_len + encoded.length,
-        keep_open: connection != ConnectionHeader::Close,
+        keep_open: response_permits_reuse(false, connection),
         drain_total,
         interim_len,
         file: None,
@@ -762,16 +769,10 @@ pub(crate) fn reject_payload(
 }
 
 pub(crate) fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildError> {
-    let interim = ResponseToWrite {
-        request_method: b"GET",
-        requested_upgrade: b"",
-        status: 100,
-        reason: b"Continue",
-        fields: &[],
-        framing: ResponseFraming::FixedLength,
-        content_length: 0,
-        connection: ConnectionHeader::Omit,
-    };
+    // NOTE: the interim head shape is shared (veylor_http1::continue_interim); this function
+    // only stages those bytes into pump/host output buffers ahead of the final. Staging,
+    // flush timing, and drain ordering stay transport-local in both engines.
+    let interim = veylor_http1::continue_interim();
     let encoded = encode_response_head(&interim, output).map_err(|_| RouteBuildError::Invalid)?;
     Ok(encoded.length)
 }
@@ -920,4 +921,99 @@ pub fn respond_uri_too_long(output: &mut [u8]) -> Result<usize, RouteBuildError>
         .ok_or(RouteBuildError::Invalid)?
         .copy_from_slice(URI_TOO_LONG_BODY);
     Ok(end)
+}
+
+#[cfg(test)]
+mod tests {
+    // NOTE: drift alarm for the converged 100-continue policy: the managed pump stages this
+    // exact shape ahead of the final response while the host-driven conn crate encodes the
+    // same shared shape for its continue handshake, so any shape edit upstream fails here
+    // until the pump follows.
+    use super::encode_continue;
+    use veylor_http1::{continue_interim, encode_response_head};
+
+    #[test]
+    fn interim_stages_shared_continue_shape_ahead_of_final() {
+        let mut staged = [0u8; 64];
+        let len = encode_continue(&mut staged).expect("interim fits");
+        let mut expected = [0u8; 64];
+        let encoded = encode_response_head(&continue_interim(), &mut expected)
+            .expect("shared interim encodes");
+        assert_eq!(&staged[..len], &expected[..encoded.length]);
+        assert_eq!(&staged[..len], b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
+    #[test]
+    fn keep_open_verdict_matches_shared_reuse_policy() {
+        // NOTE: drift alarm for the converged keep-alive policy: every static keep_open below
+        // must equal veylor_http1::response_permits_reuse on the same verdict, so a local
+        // verdict edit fails here until the shared predicate follows. The upgrade input stays
+        // false (this path never upgrades) and drain rides drain_total, not the booleans.
+        use super::respond_to_head;
+        use crate::static_routes::StaticRoutes;
+        use veylor_http1::{
+            Header, Limits, Parser, RequestHead, ResponseFraming, connection_header_for_response,
+            response_permits_reuse,
+        };
+        use veylor_router::RouteSlot;
+
+        fn drive(routes: &StaticRoutes, input: &[u8]) -> (RequestHead, bool) {
+            let mut slots = [RouteSlot::EMPTY; 8];
+            let table = routes.build_table(&mut slots).expect("table builds");
+            let mut headers = [Header::default(); 16];
+            let mut parser = Parser::new();
+            let head = parser
+                .parse(input, &mut headers, Limits::default())
+                .expect("head parses")
+                .expect("head complete");
+            let mut output = [0u8; 2048];
+            let encoded = respond_to_head(routes, &table, head, &headers, input, &mut output)
+                .expect("static encodes");
+            (head, encoded.keep_open)
+        }
+
+        let mut routes = StaticRoutes::new();
+        routes
+            .register(b"GET", b"/hello", 200, b"OK", b"hi", 1024)
+            .expect("register static");
+
+        let plain = b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n";
+        let (head, keep_open) = drive(&routes, plain);
+        let verdict = connection_header_for_response(
+            head,
+            plain,
+            200,
+            ResponseFraming::FixedLength,
+            true,
+            false,
+        );
+        assert!(keep_open);
+        assert_eq!(keep_open, response_permits_reuse(false, verdict));
+
+        let close = b"GET /hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+        let (head, keep_open) = drive(&routes, close);
+        let verdict = connection_header_for_response(
+            head,
+            close,
+            200,
+            ResponseFraming::FixedLength,
+            true,
+            false,
+        );
+        assert!(!keep_open);
+        assert_eq!(keep_open, response_permits_reuse(false, verdict));
+
+        let missing = b"GET /nope HTTP/1.1\r\nHost: test\r\n\r\n";
+        let (head, keep_open) = drive(&routes, missing);
+        let verdict = connection_header_for_response(
+            head,
+            missing,
+            404,
+            ResponseFraming::FixedLength,
+            true,
+            true,
+        );
+        assert!(!keep_open);
+        assert_eq!(keep_open, response_permits_reuse(false, verdict));
+    }
 }

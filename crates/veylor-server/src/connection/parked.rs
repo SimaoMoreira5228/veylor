@@ -1,6 +1,6 @@
 use veylor_http1::{
     BodyDecoder, BodyLimits, ConnectionHeader, Field, Header, ResponseBody, ResponseFraming,
-    ResponseToWrite, connection_header_for_response, encode_response_head,
+    ResponseToWrite, connection_header_for_response, encode_response_head, response_permits_reuse,
 };
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
 
@@ -394,7 +394,11 @@ pub(crate) fn park_request(
     }
     let connection =
         connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
-    let keep_open = connection != ConnectionHeader::Close;
+    // NOTE: shared keep-alive verdict (see respond.rs keep_open NOTE): the park stores this
+    // provisional response-half verdict and complete_parked folds it into closing, while the
+    // body half rides body_total/body_received (or chunked_done) through the DrainingBody
+    // phase instead of the shared booleans.
+    let keep_open = response_permits_reuse(false, connection);
     let token = conn.token;
     let mut snapshot = [0u8; HOST_MAX_METHOD_BYTES];
     snapshot[..method_len]
@@ -419,6 +423,11 @@ pub(crate) fn park_request(
     // it flushes on the next parked turn ahead of further reads, exactly once per park.
     // A chunked park also arms its worker-side incremental decoder now; buffered framing bytes
     // decode on the following parked turns, never staged raw.
+    // NOTE: the arming verdict is shared (veylor_http1::admission_needs_interim) but this
+    // staging keys on the bare Expect flag, not the body-gated decoder rule: a bodyless Expect
+    // still stages the interim here while the decoder admits Ready with no interim. The split
+    // stays for this change (unifying it would alter GET-with-Expect wire bytes); the staged
+    // shape is the shared continue_interim, only the staging decision and flush timing are local.
     if head.expect_continue {
         ConnState::materialize_output(&mut conn.output);
         let interim = match conn.output.as_mut() {

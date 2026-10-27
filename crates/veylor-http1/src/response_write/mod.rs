@@ -192,6 +192,48 @@ pub struct EncodedResponseHead {
     pub body_allowed: bool,
 }
 
+// NOTE: single source for the 100-continue interim head: 100 with reason Continue, no fields,
+// fixed-length zero body, and no Connection header (1xx carries no Date per RFC 9110 10.2.1,
+// and the shared validator below only accepts Omit on non-101 1xx). The managed pump stages
+// this ahead of the final response and the host-driven conn crate encodes the same shape for
+// its continue handshake, so the interim wire bytes cannot drift between engines.
+pub fn continue_interim() -> ResponseToWrite<'static> {
+    ResponseToWrite {
+        request_method: b"GET",
+        requested_upgrade: b"",
+        status: 100,
+        reason: b"Continue",
+        fields: &[],
+        framing: ResponseFraming::FixedLength,
+        content_length: 0,
+        connection: ConnectionHeader::Omit,
+    }
+}
+
+// NOTE: single source for the keep-alive reuse verdict: an upgraded exchange (101 or a
+// CONNECT-tunnel 2xx) never reuses, a Close verdict never reuses, and at least one
+// request-body drain signal must hold (drained through reads, or attested complete when the
+// head went out). The host-driven conn crate calls can_reuse_after_response with its live
+// flags; the managed pump calls response_permits_reuse with upgraded=false (it never serves
+// 101/CONNECT, so requested_upgrade is always empty) and enforces the drain half through its
+// DrainingBody phase instead of the booleans. Tail shifting, parser reset, and read_ready
+// arming stay pump-local transport mechanics.
+pub fn response_permits_reuse(upgraded: bool, connection: ConnectionHeader) -> bool {
+    !upgraded && connection != ConnectionHeader::Close
+}
+
+// NOTE: full-exchange companion to response_permits_reuse above: the response half plus both
+// request-body drain states. The conn crate owns this call; the managed pump keys its
+// keep_open verdict on the response half only (see the NOTE above for the split).
+pub fn can_reuse_after_response(
+    upgraded: bool,
+    connection: ConnectionHeader,
+    body_complete: bool,
+    request_body_complete: bool,
+) -> bool {
+    response_permits_reuse(upgraded, connection) && (body_complete || request_body_complete)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseEncodeError {
     Invalid,

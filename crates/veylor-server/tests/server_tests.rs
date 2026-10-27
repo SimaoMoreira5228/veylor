@@ -381,6 +381,58 @@ fn oversized_request_method_stays_400() {
 }
 
 #[test]
+fn oversized_headers_with_bad_expect_answers_431() {
+    // NOTE: drift alarm for H1-6 (error precedence), managed half: with both the section cap
+    // breached and Expect unsupported, the shared head parser fails on the section overflow
+    // first (request_head/parser.rs scans line order; the 101st header trips before the Expect
+    // line), so the 431 arm wins over the 417 arm. The conn crate inherits the same decoder
+    // verdict and collapses it to ProtocolError (request_read/tests
+    // head_error_corpus_matches_managed_status_table pins the mirror row); the 417-vs-431 order
+    // itself is decoder truth, not a mapper choice — the parse_exchange arms are disjoint.
+    let server = test_server();
+    let mut stream = connect(&server);
+    let mut request = String::from("GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    for index in 0..120 {
+        request.push_str(&format!("X-Pad-{index:03}: abcdefgh\r\n"));
+    }
+    request.push_str("Expect: magic\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("write headers");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 431);
+    assert_eq!(response.body, b"Request Header Fields Too Large");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_eof(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn full_buffer_without_head_answers_400() {
+    // NOTE: drift alarm for H1-6 (error precedence), transport-split row: a full INPUT_CAP with
+    // no complete head and no newline attributes 400 (no target side to blame 414 on). The
+    // host-driven conn crate deliberately diverges here — the host owns its buffers, so the same
+    // bytes read NeedMore (request_read/tests head_error_corpus_matches_managed_status_table
+    // pins that half). Sharing the attribution helper would drag pump buffer semantics into the
+    // host API, so the split is documented, not converged.
+    let server = test_server();
+    let mut stream = connect(&server);
+    stream
+        .write_all(&vec![b'A'; 8192])
+        .expect("write full buffer");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 400);
+    assert_eq!(response.body, b"Bad Request");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    read_closed(&mut stream);
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}
+
+#[test]
 fn request_body_on_static_route_closes_after_response() {
     let server = test_server();
     let mut stream = connect(&server);
