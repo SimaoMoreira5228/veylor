@@ -2958,7 +2958,7 @@ fn file_mount_conditional_round_trip_stale_and_garbage_dates() {
     let conditional = format!(
         "GET /assets/data.txt HTTP/1.1\r\nHost: test\r\nIf-Modified-Since: {last_modified}\r\nConnection: keep-alive\r\n\r\n"
     );
-    let (status, head, body) = file_exchange(&mut stream, conditional.as_bytes(), false);
+    let (status, head, body) = file_exchange(&mut stream, conditional.as_bytes(), true);
     assert_eq!(status, 304);
     assert!(body.is_empty(), "304 carries no body");
     assert_eq!(
@@ -4691,8 +4691,8 @@ fn h2_expect_rst_h2(stream: &mut TcpStream, id: u32, code: u32) {
 // NOTE: H2C response-trailer pin through the managed C ABI: HEADERS-open POST plus DATA-end
 // stages the body, the empty-set trailer pull proves the staged whole-set discipline over
 // H2C, and end-with-trailers lands terminal HEADERS with exact fields while the conn
-// survives for a sibling. Plain managed registration: see the unprojected-allowlist test
-// below for why trailer-allowlist routes cannot serve H2C yet.
+// survives for a sibling. Plain managed registration; allowlist-registered routes serve
+// H2C too, covered by h2c_managed_with_trailers_mirror_serves_and_enforces below.
 #[test]
 fn h2c_managed_stream_end_with_trailers_exact_fields() {
     let config = test_config(0);
@@ -5126,17 +5126,9 @@ fn file_mount_h2c_serves_full_range_conditional_matrix() {
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }
 
-// NOTE: gap pin (server sources owned by a parallel slice — do NOT fix here): a route
-// registered ONLY via vyl_managed_static_register_managed_route_with_trailers never parks
-// over H2C. Server::register_managed_with_trailers
-// (crates/veylor-server/src/static_server/mod.rs) pushes no H2StaticRoute mirror into
-// h2_routes, unlike register_managed/register_route/register_file_mount/register_native,
-// so the H2 projection (h2/turn.rs project_routes, h2/routes.rs is_managed) misses it and
-// the Headers !end arm (h2/serve.rs) answers 404, RSTs RefusedStream, and closes the conn
-// (deny close=true). The H1 park path still stages (connection/mod.rs park_or_respond
-// reads routes.managed_trailers), and the H2 stage path (h2/serve.rs stage_request_trailers)
-// never consults the allowlist anyway. Update this test when the mirror lands: the POST
-// must park and pull the staged set.
+// NOTE: with_trailers registration mirrors to H2C like every other managed route: the
+// projection carries the same allowlist H1 reads at park, so a route registered only this
+// way still parks, and unlisted trailer sets RST the stream while the connection survives.
 #[test]
 // NOTE: allowlist routes mirror to H2C and enforce there: the listed set stages whole,
 // the unlisted set RSTs the stream, the connection survives.
@@ -5544,4 +5536,80 @@ fn managed_respond_with_headers_serves_them_after_date() {
     let counts = unsafe { stop_join(server) };
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
     let _ = counts;
+}
+
+#[test]
+fn managed_stream_begin_with_headers_streams_them() {
+    let config = test_config(0);
+    let idle = unsafe { create(&config) };
+    unsafe { register_managed(idle, b"GET", b"/s", u64::MAX) };
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_begin_stream_with_headers(
+                idle,
+                VylManagedStaticToken::default(),
+                200,
+                bytes(b"OK"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        },
+        VylResult::BadState
+    );
+    assert_eq!(unsafe { vyl_managed_static_destroy(idle) }, VylResult::Ok);
+    let config = test_config(0);
+    let server = unsafe { create(&config) };
+    unsafe { register_managed(server, b"GET", b"/s", u64::MAX) };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let mut stream = connect_loopback(port);
+    stream
+        .write_all(b"GET /s HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write request");
+    let token = unsafe { poll_one(server) };
+    let names = [bytes(b"content-type"), bytes(b"x-test")];
+    let values = [bytes(b"text/plain"), bytes(b"yes")];
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_host_begin_stream_with_headers(
+                server,
+                token,
+                200,
+                bytes(b"OK"),
+                names.as_ptr(),
+                values.as_ptr(),
+                names.len(),
+            )
+        },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"hello ")) },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_write_stream(server, token, bytes(b"world")) },
+        VylResult::Ok
+    );
+    unsafe { wait_stream_writable(server, token) };
+    assert_eq!(
+        unsafe { vyl_managed_static_host_end_stream(server, token) },
+        VylResult::Ok
+    );
+    let (status, raw, body) = read_streamed(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello world");
+    let (head, tail) = split_head(&raw);
+    head_with_date(
+        head,
+        b"HTTP/1.1 200 OK",
+        b"\r\ncontent-type: text/plain\r\nx-test: yes\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    assert_eq!(tail, b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n");
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
 }

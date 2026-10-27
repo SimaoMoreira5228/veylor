@@ -387,6 +387,7 @@ fn response_body_allowed(response: &ResponseToWrite<'_>) -> bool {
 fn content_length_allowed(response: &ResponseToWrite<'_>) -> bool {
     response.status >= 200
         && response.status != 204
+        && response.status != 304
         && !(response.request_method == b"CONNECT" && (200..300).contains(&response.status))
 }
 

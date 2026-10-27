@@ -418,6 +418,42 @@ int main(void) {
             ) == VYL_HTTP1_INVALID_ARGUMENT
         );
     }
+    assert(
+        vyl_managed_static_host_begin_stream_with_headers(
+            NULL, token, 200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            hdr_names, hdr_values, 2
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_host_begin_stream_with_headers(
+            server, token, 200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            NULL, hdr_values, 2
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_host_begin_stream_with_headers(
+            server, token, 200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            hdr_names, NULL, 2
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    {
+        static vyl_http1_bytes begin_nine_names[9];
+        static vyl_http1_bytes begin_nine_values[9];
+        for (size_t i = 0; i < 9; i++) {
+            begin_nine_names[i] = (vyl_http1_bytes){.data = x_name, .length = sizeof(x_name) - 1};
+            begin_nine_values[i] = (vyl_http1_bytes){.data = x_value, .length = sizeof(x_value) - 1};
+        }
+        assert(
+            vyl_managed_static_host_begin_stream_with_headers(
+                server, token, 200,
+                (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+                begin_nine_names, begin_nine_values, 9
+            ) == VYL_HTTP1_INVALID_ARGUMENT
+        );
+    }
     fd = connect_loopback(port);
     assert(send(fd, request, sizeof(request) - 1, 0) == (ssize_t)(sizeof(request) - 1));
     assert(
@@ -1264,13 +1300,11 @@ int main(void) {
         ) == VYL_HTTP1_OK
     );
     wait_stream_writable(server, token);
-    /* NOTE: zero-body shape only. The Begin HEADERS declares content-length: 0
-       (h2/serve.rs streams Begin via send_full with an empty body), so any staged DATA
-       would misframe against it and this repo's own validating client rejects the bytes
-       (BodyTooLong). Non-empty streamed bodies plus trailers are covered byte-exact by
-       the Rust h2c_managed_stream_end_with_trailers_exact_fields test; the strict client
-       here proves the terminal HEADERS land exact on consistent framing. Server sources
-       belong to a parallel slice: begin must omit content-length for open streams. */
+    /* NOTE: zero-body shape only. The Begin HEADERS carries no content-length
+       (length-unknown open stream), so the terminal HEADERS land exact with no DATA
+       between them; the strict client classifies FINAL then TRAILERS with exact field
+       bytes. Non-empty streamed bodies plus trailers are covered byte-exact by
+       the Rust h2c_managed_stream_end_with_trailers_exact_fields test. */
     static const vyl_http1_field h2_resp_trailers[] = {
         {
             .name = {.data = checksum_name, .length = sizeof(checksum_name) - 1},
@@ -1802,6 +1836,13 @@ int main(void) {
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
             counts.shutdown == 9
+    );
+    assert(
+        vyl_managed_static_host_begin_stream_with_headers(
+            server, token, 200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            NULL, NULL, 0
+        ) == VYL_HTTP1_BAD_STATE
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

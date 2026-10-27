@@ -1899,7 +1899,13 @@ fn file_conditional_round_trip_304_keeps_alive() {
     let not_modified = read_response(&mut stream);
     assert_eq!(not_modified.status, 304);
     assert!(not_modified.body.is_empty());
-    assert_eq!(header(&not_modified, "content-length"), "0");
+    assert!(
+        not_modified
+            .headers
+            .iter()
+            .all(|(field, _)| !field.eq_ignore_ascii_case("content-length")),
+        "304 omits content-length: only the would-be-200 length is legal"
+    );
     assert_eq!(
         last_modified(&not_modified),
         seen,

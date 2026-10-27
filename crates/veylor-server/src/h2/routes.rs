@@ -401,7 +401,9 @@ impl<'a> FrozenRoutesView<'a> {
 // NOTE: file HEADERS assembly next to send_full: every status carries Date first (H1 parity:
 // respond_file 200/206, respond_not_modified 304, respond_range_unsatisfiable 416 all emit
 // Date first); 200/206 add content-length, content-type, accept-ranges, and last-modified;
-// 304 carries content-length 0 plus last-modified (H1 emits both); 416 carries content-length 0 plus content-range */total. Single-range
+// 304 carries no content-length (RFC 9110 8.6: only the would-be-200 length is legal, so the
+// engine omits it on both protocols) plus last-modified; 416 carries content-length 0 plus
+// content-range */total. Single-range
 // 206 adds content-range; multipart 206 carries the dynamic boundary content-type instead
 // of the file type and no top-level content-range (H1 parity, body pages via read_chunk).
 pub(crate) struct FileHead {
@@ -427,7 +429,6 @@ pub(crate) fn send_file_head(
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(head.status));
     let mut length_buf = [0; DECIMAL_CAP];
-    let length_len = push_decimal(&mut length_buf, head.content_length);
     let mut mtime_buf = [0; HTTP_DATE_BYTES];
     let mtime_len = head
         .mtime
@@ -450,8 +451,12 @@ pub(crate) fn send_file_head(
     let mut fields = [field(b"", b""); 7];
     fields[0] = field(b":status", &status_buf[..status_len]);
     fields[1] = field(b"date", &now_buf[..now_len]);
-    fields[2] = field(b"content-length", &length_buf[..length_len]);
-    let mut count = 3;
+    let mut count = 2;
+    if head.status != 304 {
+        let length_len = push_decimal(&mut length_buf, head.content_length);
+        fields[count] = field(b"content-length", &length_buf[..length_len]);
+        count += 1;
+    }
     if head.multipart {
         fields[count] = field(b"content-type", &ctype_buf[..ctype_len]);
         count += 1;
@@ -603,14 +608,17 @@ pub(crate) fn send_full(
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut length_buf = [0; DECIMAL_CAP];
-    let length_len = push_decimal(&mut length_buf, body.len() as u64);
     let mut now_buf = [0; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now_buf);
     let mut response_fields = [field(b"", b""); MAX_RESPONSE_FIELDS];
     response_fields[0] = field(b":status", &status_buf[..status_len]);
     response_fields[1] = field(b"date", &now_buf[..now_len]);
-    response_fields[2] = field(b"content-length", &length_buf[..length_len]);
-    let mut field_count = 3;
+    let mut field_count = 2;
+    if status != 304 {
+        let length_len = push_decimal(&mut length_buf, body.len() as u64);
+        response_fields[field_count] = field(b"content-length", &length_buf[..length_len]);
+        field_count += 1;
+    }
     if let Some(encoding) = content_encoding {
         response_fields[field_count] = field(b"content-encoding", encoding);
         field_count += 1;

@@ -402,7 +402,7 @@ fn date_shape(response: &Response) -> String {
 }
 
 // NOTE: Date-first pin mirroring H1 (Date rides first on every H1 assembly): :status then
-// date, then the length pin per shape (length-unknown Begin/204 omit content-length).
+// date, then the length pin per shape (length-unknown Begin/204/304 omit content-length).
 fn assert_date_first(order: &[Vec<u8>], with_length: bool) {
     assert!(order.len() >= 2, "status plus date: {order:?}");
     assert_eq!(order[0], b":status", "status first: {order:?}");
@@ -1002,13 +1002,12 @@ fn h2_date_file_200_304_416_first_shaped() {
     assert!(fresh.body.is_empty());
     assert_eq!(fresh.last_modified, got.last_modified);
     date_shape(&fresh);
-    assert_date_first(&fresh.order, true);
+    assert_date_first(&fresh.order, false);
     assert_eq!(
         fresh.order,
         vec![
             b":status".to_vec(),
             b"date".to_vec(),
-            b"content-length".to_vec(),
             b"last-modified".to_vec()
         ]
     );
