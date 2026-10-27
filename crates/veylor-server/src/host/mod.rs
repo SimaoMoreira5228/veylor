@@ -38,7 +38,7 @@ pub const HOST_MAX_REASON_BYTES: usize = 64;
 pub const MAX_STAGED_RESPONSE_HEADERS: usize = 8;
 pub const MAX_STAGED_RESPONSE_BYTES: usize = 1024;
 
-fn valid_response_headers(headers: &[(&[u8], &[u8])]) -> bool {
+pub(crate) fn valid_response_headers(headers: &[(&[u8], &[u8])]) -> bool {
     if headers.len() > MAX_STAGED_RESPONSE_HEADERS {
         return false;
     }

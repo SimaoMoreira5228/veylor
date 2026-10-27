@@ -273,14 +273,7 @@ impl<'a> H2Conn<'a> {
         }
         used += grant_window(server, stream, owed, &mut output[used..]);
         let mut extra = [(&b""[..], &b""[..]); crate::host::MAX_STAGED_RESPONSE_HEADERS];
-        let mut extra_len = 0;
-        for (name, value) in staged.headers.iter() {
-            let Some(slot) = extra.get_mut(extra_len) else {
-                break;
-            };
-            *slot = (name.as_slice(), value.as_slice());
-            extra_len += 1;
-        }
+        let extra_len = crate::h2::routes::project_extra_headers(&mut extra, &staged.headers);
         match routes::send_full(
             server,
             stream,

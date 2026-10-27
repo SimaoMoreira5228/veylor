@@ -171,6 +171,95 @@ unsafe fn host_respond(
 
 
 
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_respond_with_headers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    status: u16,
+    reason: VylBytes,
+    names: *const VylBytes,
+    values: *const VylBytes,
+    count: usize,
+    body: VylBytes,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        host_respond_with_headers(server, token, status, reason, names, values, count, body)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn host_respond_with_headers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    status: u16,
+    reason: VylBytes,
+    names: *const VylBytes,
+    values: *const VylBytes,
+    count: usize,
+    body: VylBytes,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if count > veylor_server::MAX_STAGED_RESPONSE_HEADERS {
+        return VylResult::InvalidArgument;
+    }
+    if count > 0 && (names.is_null() || values.is_null()) {
+        return VylResult::InvalidArgument;
+    }
+    if !slice_length_valid::<VylBytes>(count) {
+        return VylResult::InvalidArgument;
+    }
+    let reason = match unsafe { read_bytes(reason) } {
+        Ok(reason) => reason,
+        Err(error) => return error,
+    };
+    let body = match unsafe { read_bytes(body) } {
+        Ok(body) => body,
+        Err(error) => return error,
+    };
+    let names = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(names, count) }
+    };
+    let values = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(values, count) }
+    };
+    let mut headers = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = match unsafe { read_bytes(names[index]) } {
+            Ok(name) => name,
+            Err(error) => return error,
+        };
+        let value = match unsafe { read_bytes(values[index]) } {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        headers.push((name, value));
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    respond_outcome_to_result(running.host().respond_with_headers(
+        token_to_server(token),
+        status,
+        reason,
+        &headers,
+        body,
+    ))
+}
+
+
+
+
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_cancel(
     server: *mut VylManagedStaticServer,
@@ -380,6 +469,87 @@ unsafe fn host_begin_stream(
             .host()
             .begin_stream(token_to_server(token), status, reason),
     )
+}
+
+
+
+
+
+
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_host_begin_stream_with_headers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    status: u16,
+    reason: VylBytes,
+    names: *const VylBytes,
+    values: *const VylBytes,
+    count: usize,
+) -> VylResult {
+    catch_ffi(|| unsafe {
+        host_begin_stream_with_headers(server, token, status, reason, names, values, count)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn host_begin_stream_with_headers(
+    server: *mut VylManagedStaticServer,
+    token: VylManagedStaticToken,
+    status: u16,
+    reason: VylBytes,
+    names: *const VylBytes,
+    values: *const VylBytes,
+    count: usize,
+) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    if count > veylor_server::MAX_STAGED_RESPONSE_HEADERS {
+        return VylResult::InvalidArgument;
+    }
+    if count > 0 && (names.is_null() || values.is_null()) {
+        return VylResult::InvalidArgument;
+    }
+    if !slice_length_valid::<VylBytes>(count) {
+        return VylResult::InvalidArgument;
+    }
+    let reason = match unsafe { read_bytes(reason) } {
+        Ok(reason) => reason,
+        Err(error) => return error,
+    };
+    let names = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(names, count) }
+    };
+    let values = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(values, count) }
+    };
+    let mut headers = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = match unsafe { read_bytes(names[index]) } {
+            Ok(name) => name,
+            Err(error) => return error,
+        };
+        let value = match unsafe { read_bytes(values[index]) } {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        headers.push((name, value));
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    respond_outcome_to_result(running.host().begin_stream_with_headers(
+        token_to_server(token),
+        status,
+        reason,
+        &headers,
+    ))
 }
 
 

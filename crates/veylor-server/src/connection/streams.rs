@@ -6,8 +6,8 @@ use veylor_http1::{
 use veylor_runtime::ConnectionToken;
 
 use crate::host::{
-    HOST_MAX_REASON_BYTES, HostInner, HostShared, ParkedEntry, RespondOutcome, StagedAction,
-    TombCause, find_tomb, valid_reason,
+    HOST_MAX_REASON_BYTES, HostInner, HostShared, MAX_STAGED_RESPONSE_HEADERS, ParkedEntry,
+    RespondOutcome, StagedAction, TombCause, find_tomb, valid_reason, valid_response_headers,
 };
 
 use crate::static_files::HTTP_DATE_BYTES;
@@ -84,10 +84,18 @@ pub(crate) struct StreamState {
 
 #[derive(Clone, Debug)]
 pub(crate) enum StreamCmd {
-    Begin { status: u16, reason: Vec<u8> },
-    Write { chunk: Vec<u8> },
+    Begin {
+        status: u16,
+        reason: Vec<u8>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    Write {
+        chunk: Vec<u8>,
+    },
     End,
-    EndWithTrailers { trailers: Vec<StagedTrailer> },
+    EndWithTrailers {
+        trailers: Vec<StagedTrailer>,
+    },
     Cancel,
 }
 
@@ -131,10 +139,23 @@ impl HostShared {
         status: u16,
         reason: &[u8],
     ) -> RespondOutcome {
+        self.begin_stream_with_headers(token, status, reason, &[])
+    }
+
+    pub fn begin_stream_with_headers(
+        &self,
+        token: ConnectionToken,
+        status: u16,
+        reason: &[u8],
+        headers: &[(&[u8], &[u8])],
+    ) -> RespondOutcome {
         if !(200..=599).contains(&status) || status == 204 || status == 205 || status == 304 {
             return RespondOutcome::Invalid;
         }
         if reason.len() > HOST_MAX_REASON_BYTES || !valid_reason(reason) {
+            return RespondOutcome::Invalid;
+        }
+        if !valid_response_headers(headers) {
             return RespondOutcome::Invalid;
         }
         self.stage_stream(
@@ -142,6 +163,10 @@ impl HostShared {
             StreamCmd::Begin {
                 status,
                 reason: reason.to_vec(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| (name.to_vec(), value.to_vec()))
+                    .collect(),
             },
             RespondOutcome::Stale,
         )
@@ -361,7 +386,11 @@ pub(crate) fn apply_stream_cmd(
     };
     ConnState::materialize_output(&mut conn.output);
     let length = match cmd {
-        StreamCmd::Begin { status, reason } => {
+        StreamCmd::Begin {
+            status,
+            reason,
+            headers,
+        } => {
             // NOTE: the entry holds no method snapshot, so HEAD cannot reject at stage; the
             // parked snapshot here fails the connection closed instead.
             let ConnPhase::Parked {
@@ -381,16 +410,28 @@ pub(crate) fn apply_stream_cmd(
             };
             let mut now = [0u8; HTTP_DATE_BYTES];
             let now_len = now_http_date(&mut now);
-            let date = [Field {
+            let mut fields = [Field {
+                name: b"",
+                value: &[][..],
+            }; 1 + MAX_STAGED_RESPONSE_HEADERS];
+            fields[0] = Field {
                 name: b"Date",
                 value: &now[..now_len],
-            }];
+            };
+            let mut field_count = 1;
+            for (name, value) in headers.iter().take(fields.len() - 1) {
+                fields[field_count] = Field {
+                    name: name.as_slice(),
+                    value: value.as_slice(),
+                };
+                field_count += 1;
+            }
             let response = ResponseToWrite {
                 request_method: &method[..usize::from(method_len)],
                 requested_upgrade: b"",
                 status,
                 reason: &reason,
-                fields: &date,
+                fields: &fields[..field_count],
                 framing: ResponseFraming::Chunked,
                 content_length: 0,
                 connection,
@@ -576,6 +617,17 @@ impl crate::host::HostHandle {
         reason: &[u8],
     ) -> RespondOutcome {
         self.shared.begin_stream(token, status, reason)
+    }
+
+    pub fn begin_stream_with_headers(
+        &self,
+        token: ConnectionToken,
+        status: u16,
+        reason: &[u8],
+        headers: &[(&[u8], &[u8])],
+    ) -> RespondOutcome {
+        self.shared
+            .begin_stream_with_headers(token, status, reason, headers)
     }
 
     pub fn write_stream(&self, token: ConnectionToken, chunk: &[u8]) -> RespondOutcome {

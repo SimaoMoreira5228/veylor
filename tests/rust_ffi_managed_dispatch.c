@@ -374,6 +374,77 @@ int main(void) {
             (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
         ) == VYL_HTTP1_DUPLICATE
     );
+    static const uint8_t ct_name[] = "Content-Type";
+    static const uint8_t ct_value[] = "text/plain";
+    static const uint8_t x_name[] = "X-Test";
+    static const uint8_t x_value[] = "yes";
+    static const vyl_http1_bytes hdr_names[] = {
+        {.data = ct_name, .length = sizeof(ct_name) - 1},
+        {.data = x_name, .length = sizeof(x_name) - 1},
+    };
+    static const vyl_http1_bytes hdr_values[] = {
+        {.data = ct_value, .length = sizeof(ct_value) - 1},
+        {.data = x_value, .length = sizeof(x_value) - 1},
+    };
+    assert(
+        vyl_managed_static_host_respond_with_headers(
+            NULL, token, 200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            hdr_names, hdr_values, 2,
+            (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    assert(
+        vyl_managed_static_host_respond_with_headers(
+            server, token, 200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            NULL, hdr_values, 2,
+            (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
+        ) == VYL_HTTP1_INVALID_ARGUMENT
+    );
+    {
+        static vyl_http1_bytes nine_names[9];
+        static vyl_http1_bytes nine_values[9];
+        for (size_t i = 0; i < 9; i++) {
+            nine_names[i] = (vyl_http1_bytes){.data = x_name, .length = sizeof(x_name) - 1};
+            nine_values[i] = (vyl_http1_bytes){.data = x_value, .length = sizeof(x_value) - 1};
+        }
+        assert(
+            vyl_managed_static_host_respond_with_headers(
+                server, token, 200,
+                (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+                nine_names, nine_values, 9,
+                (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
+            ) == VYL_HTTP1_INVALID_ARGUMENT
+        );
+    }
+    fd = connect_loopback(port);
+    assert(send(fd, request, sizeof(request) - 1, 0) == (ssize_t)(sizeof(request) - 1));
+    assert(
+        vyl_managed_static_poll_events(
+            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+        ) == VYL_HTTP1_OK
+    );
+    assert(report.copied == 1);
+    token = events[0].token;
+    assert(
+        vyl_managed_static_host_respond_with_headers(
+            server,
+            token,
+            200,
+            (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
+            hdr_names,
+            hdr_values,
+            2,
+            (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
+        ) == VYL_HTTP1_OK
+    );
+    read_to_end(fd, response, sizeof(response));
+    assert(close(fd) == 0);
+    assert(strstr(response, "HTTP/1.1 200 OK\r\nDate: ") != NULL);
+    assert(strstr(response, "Content-Type: text/plain") != NULL);
+    assert(strstr(response, "X-Test: yes") != NULL);
+    assert(strstr(response, "managed-hi") != NULL);
 
     fd = connect_loopback(port);
     assert(
@@ -1724,13 +1795,13 @@ int main(void) {
 
     assert(vyl_managed_static_stop_accepting(server) == VYL_HTTP1_OK);
     assert(vyl_managed_static_join(server, &counts) == VYL_HTTP1_OK);
-    assert(counts.completed == 6);
+    assert(counts.completed == 7);
     assert(counts.peer_closed == 1);
     assert(counts.protocol_error == 1);
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 8
+            counts.shutdown == 9
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     return 0;

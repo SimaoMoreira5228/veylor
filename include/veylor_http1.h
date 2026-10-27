@@ -932,6 +932,18 @@ vyl_http1_result vyl_managed_static_host_respond(
     vyl_http1_bytes reason,
     vyl_http1_bytes body
 );
+/* NOTE: Same copy rule as host_respond, plus caller-owned name/value arrays of `count`
+   entries; framing/date headers stay engine-owned and reject as INVALID_ARGUMENT. */
+vyl_http1_result vyl_managed_static_host_respond_with_headers(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    const vyl_http1_bytes* names,
+    const vyl_http1_bytes* values,
+    size_t count,
+    vyl_http1_bytes body
+);
 /* NOTE: Cancels a parked request; the owner worker closes the connection. A repeat or an
    unknown token reports STALE_TOKEN. Valid only while running. */
 vyl_http1_result vyl_managed_static_host_cancel(
@@ -980,6 +992,17 @@ vyl_http1_result vyl_managed_static_host_begin_stream(
     vyl_managed_static_token token,
     uint16_t status,
     vyl_http1_bytes reason
+);
+/* NOTE: Same as begin_stream plus caller-owned name/value arrays; framing stays engine-owned
+   and rejects like the fixed variant. */
+vyl_http1_result vyl_managed_static_host_begin_stream_with_headers(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint16_t status,
+    vyl_http1_bytes reason,
+    const vyl_http1_bytes* names,
+    const vyl_http1_bytes* values,
+    size_t count
 );
 /* NOTE: Stages one bounded chunk on an open stream. Each admitted write consumes the writable
    arm: a write with no arm reports BAD_STATE, a write racing a staged command WOULD_BLOCK.

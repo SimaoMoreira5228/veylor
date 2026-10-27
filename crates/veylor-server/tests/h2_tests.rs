@@ -1068,6 +1068,11 @@ fn h2_date_managed_begin_first_shaped() {
     assert!(trailers.is_empty());
     date_shape(&response);
     assert_date_first(&response.order, false);
+    assert_eq!(
+        response.order.len(),
+        2,
+        "plain Begin carries status plus date only"
+    );
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
@@ -2680,7 +2685,8 @@ fn decode_fields(block: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 // NOTE: RFC 9113 section 8.2.2 length-match pin: a length-unknown Begin must ride :status-only
 // HEADERS with END_STREAM clear; a content-length: 0 would turn the first DATA into a real-client
 // PROTOCOL_ERROR, so every streaming test reads its head through here and the absence is asserted.
-// Date rides first after :status here too (H1 Begin parity), shaped and exactly once.
+// Date rides first after :status here too (H1 Begin parity), shaped and exactly once; managed
+// headers, when the host stages any, follow Date.
 fn read_begin_block(stream: &mut TcpStream, id: u32) -> Vec<u8> {
     let first = loop {
         let frame = read_frame(stream);
@@ -2701,7 +2707,6 @@ fn read_begin_block(stream: &mut TcpStream, id: u32) -> Vec<u8> {
     );
     assert_eq!(fields[0].0, b":status", "status first on Begin");
     assert_eq!(fields[1].0, b"date", "date first after :status on Begin");
-    assert_eq!(fields.len(), 2, "Begin carries status plus date only");
     date_value_shape(&fields[1].1);
     block
 }
@@ -4892,6 +4897,44 @@ fn h2_managed_respond_with_headers_sends_them_after_pseudo() {
     assert_date_first(&response.order, true);
     let names: Vec<&[u8]> = response.order.iter().map(Vec::as_slice).collect();
     assert_eq!(names[..2], [b":status".as_slice(), b"date".as_slice()]);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_begin_with_headers_sends_them_after_date() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"content-type".as_slice(), b"text/plain".as_slice())],
+        ),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.write_stream(event.token, b"managed-h2"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"managed-h2");
+    assert!(trailers.is_empty());
+    assert_eq!(response.content_type, b"text/plain");
+    date_shape(&response);
+    let order: Vec<&[u8]> = response.order.iter().map(Vec::as_slice).collect();
+    assert_eq!(order[0], b":status");
+    assert_eq!(order[1], b"date");
+    assert!(order.contains(&b"content-type".as_slice()));
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }

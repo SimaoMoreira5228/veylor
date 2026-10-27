@@ -19,7 +19,7 @@ use crate::static_routes::{
 use super::file::FileDecision;
 use super::routes::{
     ALLOW_BYTES, FrozenRoutesView, MAX_REQUEST_TARGET_BYTES, NOT_FOUND_BODY, URI_TOO_LONG_BODY,
-    field, send_begin, send_full, send_method_not_allowed, send_options,
+    field, project_extra_headers, send_begin, send_full, send_method_not_allowed, send_options,
 };
 use super::turn;
 use super::{
@@ -827,14 +827,25 @@ pub(crate) fn apply_h2_streams(
     }
     let spare = turn::pending_spare(meta);
     let step = match cmd {
-        StreamCmd::Begin { status, .. } => {
+        StreamCmd::Begin {
+            status, headers, ..
+        } => {
             // NOTE: HEAD-park parity with H1 Begin fail-closed via the ParkedEntry method snapshot.
             let head = is_head_park(host, token);
             if head {
                 abort_stream(server, host, token, fail, spare)
             } else {
                 let mut used = 0;
-                match send_begin(server, stream, status, spare, &mut used) {
+                let mut extra = [(&b""[..], &b""[..]); crate::host::MAX_STAGED_RESPONSE_HEADERS];
+                let extra_len = project_extra_headers(&mut extra, headers.as_slice());
+                match send_begin(
+                    server,
+                    stream,
+                    status,
+                    &extra[..extra_len],
+                    spare,
+                    &mut used,
+                ) {
                     Ok(()) => StreamStep::Done {
                         used,
                         served: false,

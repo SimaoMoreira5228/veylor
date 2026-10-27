@@ -26,6 +26,22 @@ pub(crate) const MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
 const ALLOW_METHODS: usize = 16;
 pub(crate) const ALLOW_BYTES: usize = 320;
 const MAX_RESPONSE_FIELDS: usize = 5 + crate::host::MAX_STAGED_RESPONSE_HEADERS;
+const MAX_BEGIN_FIELDS: usize = 2 + crate::host::MAX_STAGED_RESPONSE_HEADERS;
+
+pub(crate) fn project_extra_headers<'a>(
+    out: &mut [(&'a [u8], &'a [u8])],
+    src: &'a [(Vec<u8>, Vec<u8>)],
+) -> usize {
+    let mut count = 0;
+    for (name, value) in src.iter() {
+        let Some(slot) = out.get_mut(count) else {
+            break;
+        };
+        *slot = (name.as_slice(), value.as_slice());
+        count += 1;
+    }
+    count
+}
 // NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
 const CONTENT_RANGE_BYTES: usize = 80;
 // NOTE: "multipart/byteranges; boundary=" plus token and hex fields tops out near 91 bytes;
@@ -534,6 +550,7 @@ pub(crate) fn send_begin(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
     status: u16,
+    extra: &[(&[u8], &[u8])],
     output: &mut [u8],
     used: &mut usize,
 ) -> Result<(), ErrorCode> {
@@ -541,15 +558,22 @@ pub(crate) fn send_begin(
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut now_buf = [0; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now_buf);
-    let response_fields = [
-        field(b":status", &status_buf[..status_len]),
-        field(b"date", &now_buf[..now_len]),
-    ];
+    let mut response_fields = [field(b"", b""); MAX_BEGIN_FIELDS];
+    response_fields[0] = field(b":status", &status_buf[..status_len]);
+    response_fields[1] = field(b"date", &now_buf[..now_len]);
+    let mut field_count = 2;
+    if extra.len() > response_fields.len() - field_count {
+        return Err(ErrorCode::InternalError);
+    }
+    for (name, value) in extra {
+        response_fields[field_count] = field(name, value);
+        field_count += 1;
+    }
     let mut block = [0; HPACK_BLOCK_CAP];
     let sent = server
         .send_response(
             stream,
-            &response_fields,
+            &response_fields[..field_count],
             &mut block,
             &mut output[*used..],
             false,

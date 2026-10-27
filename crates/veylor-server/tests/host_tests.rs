@@ -2262,3 +2262,72 @@ fn managed_respond_with_headers_rejects_bad_fields() {
     server.stop_accepting();
     let _ = server.join().expect("join server");
 }
+
+#[test]
+fn managed_stream_begin_with_headers_sends_them_after_date() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"content-type".as_slice(), b"text/plain".as_slice())],
+        ),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(host.write_stream(event.token, b"chunk"), RespondOutcome::Ok);
+    wait_writable(&host, event.token);
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (status, raw, body) = read_chunked(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"chunk");
+    let head_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("head end")
+        + 4;
+    let head = std::str::from_utf8(&raw[..head_end]).expect("head utf8");
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK\r\nDate: "),
+        "head: {head:?}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("\r\ncontent-type: text/plain\r\n")
+    );
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_stream_begin_rejects_bad_headers() {
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream_with_headers(
+            event.token,
+            200,
+            b"OK",
+            &[(b"content-length".as_slice(), b"5".as_slice())],
+        ),
+        RespondOutcome::Invalid
+    );
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let (status, _, _) = read_chunked(&mut stream);
+    assert_eq!(status, 200);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
