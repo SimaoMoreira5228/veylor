@@ -593,7 +593,10 @@ fn prohibited_response_trailer(name: &[u8]) -> bool {
     .any(|prohibited| name.eq_ignore_ascii_case(prohibited))
 }
 
-fn prohibited_request_trailer(name: &[u8]) -> bool {
+// NOTE: single source for the request-trailer prohibited set: the managed H1
+// response-terminal stage and the H2 request-trailer gate both import this predicate
+// instead of keeping local copies, so membership drift is impossible by construction.
+pub fn prohibited_request_trailer(name: &[u8]) -> bool {
     [
         b"authorization".as_slice(),
         b"connection",

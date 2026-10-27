@@ -2,6 +2,7 @@ use veylor_http1::{
     BodyEvent, ConnectionHeader, Field, Limits, ResponseFraming, ResponseToWrite,
     encode_response_chunk, encode_response_chunk_with_required_length,
     encode_response_final_chunk_with_required_length, encode_response_head,
+    prohibited_request_trailer,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -217,7 +218,7 @@ impl HostShared {
         }
         let mut total = 0usize;
         for (name, value) in fields {
-            if request_trailer_prohibited(name) {
+            if prohibited_request_trailer(name) {
                 return RespondOutcome::Invalid;
             }
             total += name.len() + value.len();
@@ -516,32 +517,12 @@ pub(crate) struct ChunkedFeed {
     pub(crate) failed: bool,
 }
 
-// NOTE: the request-trailer prohibited set, mirrored from the http1 chunked decoder policy so
-// the response terminal refuses the same framing/routing/auth metadata. Kept local (not read
-// from the decoder) because the decoder type carries no query for it and the response encoder's
-// own set omits content-length.
-fn request_trailer_prohibited(name: &[u8]) -> bool {
-    const PROHIBITED: [&[u8]; 15] = [
-        b"authorization",
-        b"connection",
-        b"content-encoding",
-        b"content-length",
-        b"content-range",
-        b"content-type",
-        b"expect",
-        b"host",
-        b"keep-alive",
-        b"proxy-authorization",
-        b"proxy-connection",
-        b"te",
-        b"trailer",
-        b"transfer-encoding",
-        b"upgrade",
-    ];
-    PROHIBITED
-        .iter()
-        .any(|prohibited| name.eq_ignore_ascii_case(prohibited))
-}
+// NOTE: the request-trailer prohibited set lives in veylor_http1::prohibited_request_trailer
+// (decoder policy, shared with the H2 gate below): the response terminal refuses the same
+// framing/routing/auth metadata, and the response encoder's own set omits content-length,
+// so the stage gate must name it. Staged caps stay local: 8 fields / 1 KiB bound host
+// staging and are intentionally stricter than the decoder's wider BodyLimits (32 fields,
+// 8 KiB); narrowing the decoder would change wire behavior, so the caps are not unified.
 
 impl HostShared {
     pub(crate) fn mark_chunked_done(&self, token: ConnectionToken) -> bool {
@@ -760,4 +741,43 @@ pub(crate) fn decode_chunked(
         }
     }
     feed
+}
+
+#[cfg(test)]
+mod tests {
+    // NOTE: drift alarm for the converged trailer policy: the stage path calls the shared
+    // veylor_http1 predicate, so this pins the exact 15-name membership plus the staged
+    // caps (8 fields / 1 KiB) at the H1 consumer. A deliberate policy edit must update
+    // the shared set and this test together.
+    use super::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
+    use veylor_http1::prohibited_request_trailer;
+
+    const PROHIBITED: [&[u8]; 15] = [
+        b"authorization",
+        b"connection",
+        b"content-encoding",
+        b"content-length",
+        b"content-range",
+        b"content-type",
+        b"expect",
+        b"host",
+        b"keep-alive",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+
+    #[test]
+    fn staged_request_trailer_policy_matches_decoder_truth() {
+        for name in PROHIBITED {
+            assert!(prohibited_request_trailer(name), "must refuse {name:?}");
+        }
+        assert!(!prohibited_request_trailer(b"x-checksum"));
+        assert!(!prohibited_request_trailer(b"digest"));
+        assert_eq!(TRAILER_SLOTS, 8);
+        assert_eq!(MAX_STAGED_TRAILER_BYTES, 1024);
+    }
 }

@@ -9,7 +9,7 @@ mod request_target;
 mod request_write;
 mod response_head;
 mod response_write;
-pub use body::{BodyDecoder, BodyEvent, BodyLimits, BodyProgress};
+pub use body::{BodyDecoder, BodyEvent, BodyLimits, BodyProgress, prohibited_request_trailer};
 pub use client_response::{ClientResponse, ClientResponseEvent, ClientResponseProgress};
 pub use connection::{
     BodyDriver, BodyEvent as ConnectionBodyEvent, BodyResult, BodyState, ClientReadEvent,

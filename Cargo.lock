@@ -295,6 +295,7 @@ name = "veylor-client"
 version = "0.1.0"
 dependencies = [
  "veylor-http1",
+ "veylor-http2",
 ]
 
 [[package]]
@@ -307,6 +308,7 @@ dependencies = [
  "veylor-http2",
  "veylor-runtime",
  "veylor-server",
+ "veylor-server-conn",
 ]
 
 [[package]]
@@ -345,6 +347,14 @@ dependencies = [
  "veylor-router",
  "veylor-runtime",
  "veylor-tls",
+]
+
+[[package]]
+name = "veylor-server-conn"
+version = "0.1.0"
+dependencies = [
+ "veylor-http1",
+ "veylor-http2",
 ]
 
 [[package]]

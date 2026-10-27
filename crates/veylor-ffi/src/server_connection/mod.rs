@@ -11,6 +11,8 @@ mod response_write;
 #[allow(unsafe_code)]
 mod tests;
 
+use veylor_server_conn::ServerError;
+
 pub use api::{
     VYL_HTTP1_CHUNKED, VYL_HTTP1_CONNECTION_CLOSE, VYL_HTTP1_CONNECTION_KEEP_ALIVE,
     VYL_HTTP1_CONNECTION_UPGRADE, VYL_HTTP1_EXPECT_CONTINUE, VYL_HTTP1_HAS_CONTENT_LENGTH,
@@ -30,3 +32,20 @@ pub use response_write::{
     vyl_http1_server_connection_encode_response_body,
     vyl_http1_server_connection_finish_response_body,
 };
+
+pub(super) fn map_error(error: ServerError) -> crate::abi::VylResult {
+    use crate::abi::VylResult;
+    match error {
+        ServerError::InvalidArgument => VylResult::InvalidArgument,
+        ServerError::ProtocolError => VylResult::ProtocolError,
+        ServerError::BufferTooSmall { .. } => VylResult::BufferTooSmall,
+        ServerError::HeaderCapacity { .. } => VylResult::BufferTooSmall,
+        ServerError::Capacity => VylResult::Capacity,
+        ServerError::WouldBlock => VylResult::WouldBlock,
+        ServerError::BodyTooLong => VylResult::BodyTooLong,
+        ServerError::BadState => VylResult::BadState,
+        ServerError::WriteOverrun => VylResult::WriteOverrun,
+        ServerError::Cancelled => VylResult::Cancelled,
+        ServerError::NeedMore => VylResult::NeedMore,
+    }
+}

@@ -22,6 +22,9 @@ pub(crate) use super::streams::{BodyPushOutcome, StreamCmd, StreamState, push_st
 
 // NOTE: request-trailer staging bounds: at most TRAILER_SLOTS fields and MAX_STAGED_TRAILER_BYTES
 // of staged name/value bytes per park; the first field past either cap fails the connection closed.
+// NOTE: these bound host staging only and are intentionally stricter than the decoder's wider
+// BodyLimits (32 fields, 8 KiB): the staged layer fails first, so the values are not unified
+// with the decoder (narrowing it would change wire behavior).
 pub(crate) const TRAILER_SLOTS: usize = 8;
 pub(crate) const MAX_STAGED_TRAILER_BYTES: usize = 1024;
 

@@ -1548,8 +1548,14 @@ fn managed_stream_end_with_trailers_invalid_stages_nothing() {
     );
     wait_writable(&host, event.token);
     let bad_names: &[&[u8]] = &[
+        b"authorization",
+        b"content-encoding",
         b"content-length",
+        b"content-range",
+        b"content-type",
         b"transfer-encoding",
+        b"proxy-authorization",
+        b"proxy-connection",
         b"te",
         b"trailer",
         b"expect",

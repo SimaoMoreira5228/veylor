@@ -1,6 +1,8 @@
 mod request_write;
 mod response_read;
 
+pub mod h2;
+
 pub use request_write::EncodeOut;
 pub use response_read::{ClientReadEvent, ClientReadKind};
 pub use veylor_http1::ResponseRequestMethod as RequestMethod;

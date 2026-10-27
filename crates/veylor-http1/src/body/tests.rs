@@ -210,3 +210,54 @@ fn rejects_bad_chunk_framing_trailers_and_truncated_bodies() {
         Err(ParseError::Incomplete)
     );
 }
+
+#[test]
+fn request_trailer_prohibited_set_is_exactly_the_fifteen() {
+    // NOTE: drift alarm for the converged trailer policy: the managed H1 response-terminal
+    // stage and the H2 request-trailer gate import this predicate, so any membership edit
+    // here changes both servers and must fail this test first.
+    use crate::prohibited_request_trailer;
+    const PROHIBITED: [&[u8]; 15] = [
+        b"authorization",
+        b"connection",
+        b"content-encoding",
+        b"content-length",
+        b"content-range",
+        b"content-type",
+        b"expect",
+        b"host",
+        b"keep-alive",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    for name in PROHIBITED {
+        assert!(prohibited_request_trailer(name), "must refuse {name:?}");
+        let mut upper = name.to_vec();
+        upper.make_ascii_uppercase();
+        assert!(
+            prohibited_request_trailer(&upper),
+            "must refuse case-insensitively {upper:?}"
+        );
+    }
+    for name in [
+        b"x-checksum".as_slice(),
+        b"digest",
+        b"content-lengthx",
+        b"x-te",
+        b"",
+    ] {
+        assert!(!prohibited_request_trailer(name), "must allow {name:?}");
+    }
+}
+
+#[test]
+fn decoder_default_trailer_caps_stay_wider_than_staged_caps() {
+    // NOTE: pins the deliberate non-unification: the decoder admits up to 32 trailers /
+    // 8 KiB while host staging fails first at 8 / 1 KiB (veylor-server parked bounds).
+    assert_eq!(crate::BodyLimits::DEFAULT.trailer_count, 32);
+    assert_eq!(crate::BodyLimits::DEFAULT.trailer_bytes, 8 * 1024);
+}

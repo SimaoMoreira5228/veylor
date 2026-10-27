@@ -13,58 +13,42 @@ mod roundtrip;
 #[allow(unsafe_code)]
 mod tests;
 
-use veylor_http2::{ClientResponseHeaders, H2ClientDriver, H2FrameAction, HpackHeader};
+use veylor_client::h2::{
+    FeedScratch, H2ClientConnection, H2ClientError, H2ClientTables, HEADER_BLOCK, HPACK_ENTRIES,
+    HPACK_SCRATCH, HpackEntrySlot, SETTINGS_ACKS, STREAM_SLOTS, StreamSlot,
+};
 
-pub(crate) const STREAM_SLOTS: usize = 32;
-pub(crate) const HEADER_BLOCK: usize = 4_096;
-pub(crate) const HPACK_ENTRIES: usize = 32;
-pub(crate) const HPACK_SCRATCH: usize = 4_096;
-pub(crate) const SETTINGS_ACKS: usize = 8;
-pub(crate) const HEADER_BLOCK_SCRATCH: usize = 4_096;
-pub(crate) const MAX_RESPONSES: usize = 32;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum PendingKind {
-    #[default]
-    None,
-    Settings,
-    Headers,
-    Data,
-    Control,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PendingWrite {
-    pub(crate) kind: PendingKind,
-    pub(crate) remaining: usize,
-    pub(crate) setting_count: usize,
-    pub(crate) settings: [(u16, u32); crate::abi::VYL_H2_MAX_SETTINGS],
-}
+const _: () = assert!(veylor_client::h2::MAX_ACTIONS == crate::abi::VYL_H2_MAX_ACTIONS);
+const _: () = assert!(veylor_client::h2::MAX_FIELDS == crate::abi::VYL_H2_MAX_FIELDS);
+const _: () = assert!(veylor_client::h2::MAX_SETTINGS == crate::abi::VYL_H2_MAX_SETTINGS);
 
 pub struct VylH2Client {
-    pub(crate) slots: [veylor_http2::StreamSlot; STREAM_SLOTS],
+    pub(crate) slots: [StreamSlot; STREAM_SLOTS],
     pub(crate) header_block: [u8; HEADER_BLOCK],
-    pub(crate) decoder_entries: [veylor_http2::HpackEntrySlot; HPACK_ENTRIES],
+    pub(crate) decoder_entries: [HpackEntrySlot; HPACK_ENTRIES],
     pub(crate) decoder_scratch: [u8; HPACK_SCRATCH],
-    pub(crate) encoder_entries: [veylor_http2::HpackEntrySlot; HPACK_ENTRIES],
+    pub(crate) encoder_entries: [HpackEntrySlot; HPACK_ENTRIES],
     pub(crate) encoder_scratch: [u8; HPACK_SCRATCH],
     pub(crate) settings_ack_limits: [u32; SETTINGS_ACKS],
-    pub(crate) streams: Option<veylor_http2::StreamTable<'static>>,
-    pub(crate) decoder: Option<veylor_http2::HpackTable<'static>>,
-    pub(crate) encoder: Option<veylor_http2::HpackTable<'static>>,
-    pub(crate) driver: Option<H2ClientDriver<'static, 'static, 'static, 'static>>,
-    pub(crate) feed_actions: [Option<H2FrameAction<'static>>; crate::abi::VYL_H2_MAX_ACTIONS],
-    pub(crate) feed_headers: [HpackHeader; crate::abi::VYL_H2_MAX_FIELDS],
-    pub(crate) feed_action_count: usize,
-    pub(crate) feed_header_count: usize,
-    pub(crate) feed_pending: bool,
-    pub(crate) feed_consumed: usize,
-    pub(crate) feed_error: Option<u32>,
-    pub(crate) feed_failed: bool,
-    pub(crate) block: [u8; HEADER_BLOCK_SCRATCH],
-    pub(crate) pending: PendingWrite,
-    pub(crate) responses: Vec<(u32, ClientResponseHeaders)>,
-    pub(crate) cancelled: bool,
+    pub(crate) tables: Option<H2ClientTables<'static>>,
+    pub(crate) connection: Option<H2ClientConnection<'static, 'static>>,
+    pub(crate) feed_scratch: FeedScratch<'static>,
+}
+
+pub(crate) fn split_error(error: H2ClientError) -> (crate::abi::VylResult, usize) {
+    match error {
+        H2ClientError::InvalidArgument => (crate::abi::VylResult::InvalidArgument, 0),
+        H2ClientError::ProtocolError => (crate::abi::VylResult::ProtocolError, 0),
+        H2ClientError::BufferTooSmall { required } => {
+            (crate::abi::VylResult::BufferTooSmall, required)
+        }
+        H2ClientError::InternalError => (crate::abi::VylResult::InternalError, 0),
+        H2ClientError::Capacity => (crate::abi::VylResult::Capacity, 0),
+        H2ClientError::WouldBlock => (crate::abi::VylResult::WouldBlock, 0),
+        H2ClientError::BadState => (crate::abi::VylResult::BadState, 0),
+        H2ClientError::WriteOverrun => (crate::abi::VylResult::WriteOverrun, 0),
+        H2ClientError::Cancelled => (crate::abi::VylResult::Cancelled, 0),
+    }
 }
 
 pub use api::{

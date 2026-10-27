@@ -1,97 +1,10 @@
 use std::slice;
 
-use veylor_http2::{DataWriteError, HeadersWriteError, ServerError};
-
-use super::{PendingKind, PendingWrite, VylH2Server};
+use super::{VylH2Server, split_error};
 use crate::abi::{
     VYL_H2_MAX_FIELDS, VYL_H2_NO_FIELD, VylBytes, VylH2FieldToEncode, VylH2ValidatedRequest,
     VylResult, catch_ffi, slice_length_valid,
 };
-
-fn ensure_live(handle: &VylH2Server) -> Result<(), VylResult> {
-    if handle.cancelled {
-        return Err(VylResult::Cancelled);
-    }
-    Ok(())
-}
-
-fn ensure_writable(handle: &VylH2Server) -> Result<(), VylResult> {
-    ensure_live(handle)?;
-    if handle.pending.kind != PendingKind::None {
-        return Err(VylResult::WouldBlock);
-    }
-    if handle.driver.is_none() {
-        return Err(VylResult::InternalError);
-    }
-    Ok(())
-}
-
-fn map_server_error(error: ServerError, required: &mut usize) -> VylResult {
-    match error {
-        ServerError::OutputTooSmall { required: need } => {
-            *required = need;
-            VylResult::BufferTooSmall
-        }
-        ServerError::Headers(error) => map_headers_error(error, required),
-        ServerError::Data(error) => map_data_error(error, required),
-        ServerError::Control(error) => match error {
-            veylor_http2::FrameWriteError::OutputTooSmall { required: need } => {
-                *required = need;
-                VylResult::BufferTooSmall
-            }
-            veylor_http2::FrameWriteError::InvalidHeader(_)
-            | veylor_http2::FrameWriteError::InvalidPayload(_) => VylResult::InvalidArgument,
-            veylor_http2::FrameWriteError::PendingFrame => VylResult::WouldBlock,
-            veylor_http2::FrameWriteError::OverAcknowledged => VylResult::WriteOverrun,
-            veylor_http2::FrameWriteError::Terminal => VylResult::BadState,
-            veylor_http2::FrameWriteError::UnsupportedAction => VylResult::InternalError,
-        },
-        ServerError::Request(_) => VylResult::ProtocolError,
-        ServerError::Response(_) => VylResult::InvalidArgument,
-        ServerError::SettingsNotSent | ServerError::NewStreamsClosed => VylResult::BadState,
-        ServerError::RefusedStream => VylResult::Capacity,
-        ServerError::UnknownStream => VylResult::InvalidArgument,
-        ServerError::StreamClosed => VylResult::BadState,
-        ServerError::WrongRole | ServerError::Stream(_) | ServerError::Flow(_) => {
-            VylResult::InternalError
-        }
-    }
-}
-
-fn map_headers_error(error: HeadersWriteError, required: &mut usize) -> VylResult {
-    match error {
-        HeadersWriteError::OutputTooSmall { required: need } => {
-            *required = need;
-            VylResult::BufferTooSmall
-        }
-        HeadersWriteError::SettingsNotSent => VylResult::BadState,
-        HeadersWriteError::PendingFrame => VylResult::WouldBlock,
-        HeadersWriteError::Terminal | HeadersWriteError::OverAcknowledged => {
-            VylResult::WriteOverrun
-        }
-        HeadersWriteError::StreamRejected(_) => VylResult::ProtocolError,
-        HeadersWriteError::InvalidStreamId
-        | HeadersWriteError::LengthOverflow
-        | HeadersWriteError::InvalidHeader(_) => VylResult::InternalError,
-    }
-}
-
-fn map_data_error(error: DataWriteError, required: &mut usize) -> VylResult {
-    match error {
-        DataWriteError::OutputTooSmall { required: need } => {
-            *required = need;
-            VylResult::BufferTooSmall
-        }
-        DataWriteError::InvalidStreamId | DataWriteError::UnknownStream => {
-            VylResult::InvalidArgument
-        }
-        DataWriteError::StreamClosed => VylResult::BadState,
-        DataWriteError::SettingsNotSent => VylResult::BadState,
-        DataWriteError::NoSendCredit | DataWriteError::PendingFrame => VylResult::WouldBlock,
-        DataWriteError::OverAcknowledged | DataWriteError::Terminal => VylResult::WriteOverrun,
-        DataWriteError::InvalidHeader(_) => VylResult::InternalError,
-    }
-}
 
 unsafe fn read_bytes(bytes: VylBytes) -> Result<&'static [u8], VylResult> {
     if (bytes.data.is_null() && bytes.length != 0) || !slice_length_valid::<u8>(bytes.length) {
@@ -137,58 +50,44 @@ unsafe fn accept_request(
         out_request.write(VylH2ValidatedRequest::default());
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_live(handle) {
-        return error;
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
+    if connection.is_cancelled() {
+        return VylResult::Cancelled;
     }
     let Some(end) = header_start.checked_add(header_count) else {
         return VylResult::InvalidArgument;
     };
-    if end > handle.feed_header_count {
+    if end > connection.feed_header_count() {
         return VylResult::InvalidArgument;
     }
-    let driver = match handle.driver.as_ref() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
-    let validated = match driver.accept_request(stream_id, &handle.feed_headers[header_start..end])
-    {
+    // SECURITY: the header slice aliases the handle's feed scratch and stays valid until the
+    // next poll under the documented caller contract; the validated indexes below are relative
+    // to this same slice.
+    let headers = &handle.feed_scratch.headers()[header_start..end];
+    let validated = match connection.accept_request(stream_id, headers) {
         Ok(validated) => validated,
-        Err(error) => {
-            let mut required = 0;
-            return map_server_error(error, &mut required);
-        }
+        Err(error) => return split_error(error).0,
     };
-    let mut method_field = VYL_H2_NO_FIELD;
-    let mut scheme_field = VYL_H2_NO_FIELD;
-    let mut authority_field = VYL_H2_NO_FIELD;
-    let mut path_field = VYL_H2_NO_FIELD;
-    for (index, header) in handle.feed_headers[header_start..end].iter().enumerate() {
-        let Some((name, value)) = driver.driver().resolve_header(*header) else {
-            return VylResult::InternalError;
-        };
-        if name == b":method" && value == validated.method {
-            method_field = header_start + index;
-        } else if name == b":scheme" && Some(value) == validated.scheme {
-            scheme_field = header_start + index;
-        } else if name == b":authority" && Some(value) == validated.authority {
-            authority_field = header_start + index;
-        } else if name == b":path" && Some(value) == validated.path {
-            path_field = header_start + index;
-        }
-    }
-    if method_field == VYL_H2_NO_FIELD {
-        return VylResult::InternalError;
-    }
     let (content_length, has_content_length) = match validated.content_length {
         Some(length) => (length, 1),
         None => (0, 0),
     };
     unsafe {
         out_request.write(VylH2ValidatedRequest {
-            method_field,
-            scheme_field,
-            authority_field,
-            path_field,
+            method_field: validated
+                .method
+                .map_or(VYL_H2_NO_FIELD, |index| header_start.saturating_add(index)),
+            scheme_field: validated
+                .scheme
+                .map_or(VYL_H2_NO_FIELD, |index| header_start.saturating_add(index)),
+            authority_field: validated
+                .authority
+                .map_or(VYL_H2_NO_FIELD, |index| header_start.saturating_add(index)),
+            path_field: validated
+                .path
+                .map_or(VYL_H2_NO_FIELD, |index| header_start.saturating_add(index)),
             content_length,
             has_content_length,
         });
@@ -274,15 +173,13 @@ unsafe fn send_response(
     if field_count > VYL_H2_MAX_FIELDS {
         return VylResult::Capacity;
     }
-    let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
     let fields = if field_count == 0 {
         &[]
     } else {
         unsafe { slice::from_raw_parts(fields, field_count) }
     };
+    // NOTE: content errors are recorded, not returned, so state errors reported by
+    // `check_writable` keep their historical precedence over field content errors.
     let mut encode_fields = [veylor_http2::HpackFieldToEncode {
         name: &[][..],
         value: &[][..],
@@ -290,24 +187,34 @@ unsafe fn send_response(
         huffman_name: false,
         huffman_value: false,
     }; VYL_H2_MAX_FIELDS];
+    let mut content_error: Option<VylResult> = None;
     for (destination, field) in encode_fields.iter_mut().zip(fields.iter()) {
         let name = match unsafe { read_bytes(field.name) } {
             Ok(name) => name,
-            Err(error) => return error,
+            Err(error) => {
+                content_error.get_or_insert(error);
+                &[][..]
+            }
         };
         let value = match unsafe { read_bytes(field.value) } {
             Ok(value) => value,
-            Err(error) => return error,
+            Err(error) => {
+                content_error.get_or_insert(error);
+                &[][..]
+            }
         };
         let representation = match field.representation {
             0 => veylor_http2::HpackRepresentation::Indexed,
             1 => veylor_http2::HpackRepresentation::Incremental,
             2 => veylor_http2::HpackRepresentation::WithoutIndexing,
             3 => veylor_http2::HpackRepresentation::NeverIndexed,
-            _ => return VylResult::InvalidArgument,
+            _ => {
+                content_error.get_or_insert(VylResult::InvalidArgument);
+                veylor_http2::HpackRepresentation::WithoutIndexing
+            }
         };
         if field.huffman_name > 1 || field.huffman_value > 1 {
-            return VylResult::InvalidArgument;
+            content_error.get_or_insert(VylResult::InvalidArgument);
         }
         *destination = veylor_http2::HpackFieldToEncode {
             name,
@@ -317,42 +224,44 @@ unsafe fn send_response(
             huffman_value: field.huffman_value != 0,
         };
     }
+    let handle = unsafe { &mut *handle };
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
+    if let Err(error) = connection.check_writable() {
+        return split_error(error).0;
+    }
+    if let Some(error) = content_error {
+        return error;
+    }
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let driver = match handle.driver.as_mut() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
-    let mut required = 0;
-    let sent = match driver.send_response(
+    match connection.send_response(
         stream_id,
         &encode_fields[..field_count],
-        &mut handle.block,
-        output,
         end_stream != 0,
+        output,
     ) {
-        Ok(sent) => sent,
-        Err(error) => {
-            let result = map_server_error(error, &mut required);
+        Ok(sent) => {
             unsafe {
-                out_required.write(required);
+                out_written.write(sent.written);
+                out_required.write(sent.required);
             }
-            return result;
+            VylResult::Ok
         }
-    };
-    handle.pending = PendingWrite {
-        kind: PendingKind::Headers,
-        remaining: sent.frame.output_length,
-        ..PendingWrite::default()
-    };
-    unsafe {
-        out_written.write(sent.frame.output_length);
-        out_required.write(sent.frame.output_length);
+        Err(error) => {
+            let (result, required) = split_error(error);
+            if result == VylResult::BufferTooSmall {
+                unsafe {
+                    out_required.write(required);
+                }
+            }
+            result
+        }
     }
-    VylResult::Ok
 }
 
 
@@ -442,41 +351,34 @@ unsafe fn send_data(
         Err(error) => return error,
     };
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let driver = match handle.driver.as_mut() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
-    let mut required = 0;
-    let sent = match driver.send_data(stream_id, input, end_stream != 0, output) {
-        Ok(sent) => sent,
-        Err(error) => {
-            let result = map_server_error(error, &mut required);
+    match connection.send_data(stream_id, input, end_stream != 0, output) {
+        Ok(sent) => {
             unsafe {
-                out_required.write(required);
+                out_consumed.write(sent.consumed);
+                out_written.write(sent.written);
+                out_end_stream.write(u32::from(sent.end_stream));
+                out_required.write(sent.required);
             }
-            return result;
+            VylResult::Ok
         }
-    };
-    handle.pending = PendingWrite {
-        kind: PendingKind::Data,
-        remaining: sent.frame.frame_length,
-        ..PendingWrite::default()
-    };
-    unsafe {
-        out_consumed.write(sent.frame.payload_length);
-        out_written.write(sent.frame.frame_length);
-        out_end_stream.write(u32::from(sent.frame.end_stream));
-        out_required.write(sent.frame.frame_length);
+        Err(error) => {
+            let (result, required) = split_error(error);
+            if result == VylResult::BufferTooSmall {
+                unsafe {
+                    out_required.write(required);
+                }
+            }
+            result
+        }
     }
-    VylResult::Ok
 }
 
 
@@ -564,40 +466,37 @@ unsafe fn reset_stream(
         out_required.write(0);
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let driver = match handle.driver.as_mut() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
+    let result = if error_code == veylor_http2::ErrorCode::RefusedStream {
+        connection.refuse(stream_id, output)
+    } else {
+        connection.send_reset(stream_id, error_code, output)
     };
-    let mut required = 0;
-    let writer = match driver.rst_stream(stream_id, error_code, output) {
-        Ok(writer) => writer,
-        Err(error) => {
-            let result = map_server_error(error, &mut required);
+    match result {
+        Ok(sent) => {
             unsafe {
-                out_required.write(required);
+                out_written.write(sent.written);
+                out_required.write(sent.required);
             }
-            return result;
+            VylResult::Ok
         }
-    };
-    let written = writer.pending_bytes().len();
-    handle.pending = PendingWrite {
-        kind: PendingKind::Control,
-        remaining: written,
-        ..PendingWrite::default()
-    };
-    unsafe {
-        out_written.write(written);
-        out_required.write(written);
+        Err(error) => {
+            let (result, required) = split_error(error);
+            if result == VylResult::BufferTooSmall {
+                unsafe {
+                    out_required.write(required);
+                }
+            }
+            result
+        }
     }
-    VylResult::Ok
 }
 
 
@@ -648,38 +547,30 @@ unsafe fn goaway_drain(
         out_required.write(0);
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let driver = match handle.driver.as_mut() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
-    let mut required = 0;
-    let writer = match driver.goaway_drain(last_stream_id, output) {
-        Ok(writer) => writer,
-        Err(error) => {
-            let result = map_server_error(error, &mut required);
+    match connection.goaway_drain(last_stream_id, output) {
+        Ok(sent) => {
             unsafe {
-                out_required.write(required);
+                out_written.write(sent.written);
+                out_required.write(sent.required);
             }
-            return result;
+            VylResult::Ok
         }
-    };
-    let written = writer.pending_bytes().len();
-    handle.pending = PendingWrite {
-        kind: PendingKind::Control,
-        remaining: written,
-        ..PendingWrite::default()
-    };
-    unsafe {
-        out_written.write(written);
-        out_required.write(written);
+        Err(error) => {
+            let (result, required) = split_error(error);
+            if result == VylResult::BufferTooSmall {
+                unsafe {
+                    out_required.write(required);
+                }
+            }
+            result
+        }
     }
-    VylResult::Ok
 }

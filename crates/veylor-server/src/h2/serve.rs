@@ -1,4 +1,4 @@
-use veylor_http1::is_token;
+use veylor_http1::{is_token, prohibited_request_trailer};
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HeaderRange, HeadersFrameWriter, HpackHeader, ServerError,
     StreamState, ValidatedServerRequest, encode_header_block,
@@ -592,7 +592,7 @@ enum H2Trailer {
 }
 
 fn valid_trailer_field(name: &[u8], value: &[u8]) -> bool {
-    if name.is_empty() || name.first() == Some(&b':') || trailer_prohibited(name) {
+    if name.is_empty() || name.first() == Some(&b':') || prohibited_request_trailer(name) {
         return false;
     }
     if !name
@@ -615,28 +615,13 @@ fn valid_trailer_field(name: &[u8], value: &[u8]) -> bool {
     })
 }
 
-fn trailer_prohibited(name: &[u8]) -> bool {
-    const PROHIBITED: [&[u8]; 15] = [
-        b"authorization",
-        b"connection",
-        b"content-encoding",
-        b"content-length",
-        b"content-range",
-        b"content-type",
-        b"expect",
-        b"host",
-        b"keep-alive",
-        b"proxy-authorization",
-        b"proxy-connection",
-        b"te",
-        b"trailer",
-        b"transfer-encoding",
-        b"upgrade",
-    ];
-    PROHIBITED
-        .iter()
-        .any(|prohibited| name.eq_ignore_ascii_case(prohibited))
-}
+// NOTE: the H2 request-trailer prohibited set is the same 15-name decoder policy as H1
+// (veylor_http1::prohibited_request_trailer, byte-identical membership): H2 framing has no
+// connection-specific fields (they never survive accept_request), so no H2-only names exist
+// and the set is shared, not copied. The connection-specific handling lives in
+// trailer_allowed, which H2 calls with an empty connection value for exactly that reason.
+// Staged caps (TRAILER_SLOTS / MAX_STAGED_TRAILER_BYTES) are the shared H1 host-staging
+// bounds, intentionally stricter than the decoder's wider BodyLimits.
 
 enum H2DataOutcome {
     Stored,
@@ -966,4 +951,43 @@ pub(crate) fn apply_h2_streams(
     turn.counts.h2_served += u64::from(served);
     turn.counts.h2_refused += u64::from(refused);
     progress
+}
+
+#[cfg(test)]
+mod tests {
+    // NOTE: drift alarm for the converged trailer policy: the H2 gate shares the H1/decoder
+    // 15-name predicate (no H2-only names: connection-specific fields never survive
+    // accept_request), so this pins valid_trailer_field against the exact membership plus
+    // the shared staged caps at the H2 consumer.
+    use super::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS, valid_trailer_field};
+
+    const PROHIBITED: [&[u8]; 15] = [
+        b"authorization",
+        b"connection",
+        b"content-encoding",
+        b"content-length",
+        b"content-range",
+        b"content-type",
+        b"expect",
+        b"host",
+        b"keep-alive",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+
+    #[test]
+    fn h2_request_trailer_policy_matches_decoder_truth() {
+        for name in PROHIBITED {
+            assert!(!valid_trailer_field(name, b"v"), "must refuse {name:?}");
+        }
+        assert!(valid_trailer_field(b"x-checksum", b"v"));
+        assert!(!valid_trailer_field(b"", b"v"));
+        assert!(!valid_trailer_field(b":pseudo", b"v"));
+        assert_eq!(TRAILER_SLOTS, 8);
+        assert_eq!(MAX_STAGED_TRAILER_BYTES, 1024);
+    }
 }

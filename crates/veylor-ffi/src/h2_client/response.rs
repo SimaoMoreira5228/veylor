@@ -1,12 +1,5 @@
-use super::VylH2Client;
+use super::{VylH2Client, split_error};
 use crate::abi::{VylH2ResponseClass, VylResult, catch_ffi};
-
-fn ensure_live(handle: &VylH2Client) -> Result<(), VylResult> {
-    if handle.cancelled {
-        return Err(VylResult::Cancelled);
-    }
-    Ok(())
-}
 
 
 
@@ -50,56 +43,49 @@ unsafe fn classify_headers(
         out_class.write(VylH2ResponseClass::default());
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_live(handle) {
-        return error;
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
+    if connection.is_cancelled() {
+        return VylResult::Cancelled;
     }
     let Some(end) = header_start.checked_add(header_count) else {
         return VylResult::InvalidArgument;
     };
-    if end > handle.feed_header_count {
+    if end > connection.feed_header_count() {
         return VylResult::InvalidArgument;
     }
-    let position = match handle.responses.iter().position(|(id, _)| *id == stream_id) {
-        Some(position) => position,
-        None => return VylResult::InvalidArgument,
-    };
-    let driver = match handle.driver.as_ref() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
-    let section = match handle.responses[position].1.classify(
-        driver.driver(),
-        &handle.feed_headers[header_start..end],
-        end_stream != 0,
-    ) {
-        Ok(section) => section,
-        Err(_) => return VylResult::ProtocolError,
-    };
-    let kind = match section.kind {
-        veylor_http2::ResponseSectionKind::Informational => 0,
-        veylor_http2::ResponseSectionKind::Final => 1,
-        veylor_http2::ResponseSectionKind::Trailers => 2,
-    };
-    let phase = match handle.responses[position].1.phase() {
-        veylor_http2::ClientResponsePhase::AwaitingFinalHeaders => 0,
-        veylor_http2::ClientResponsePhase::Content => 1,
-        veylor_http2::ClientResponsePhase::Complete => 2,
-    };
-    let (content_length, has_content_length) = match handle.responses[position].1.content_length() {
-        Some(length) => (length, 1),
-        None => (0, 0),
-    };
-    unsafe {
-        out_class.write(VylH2ResponseClass {
-            kind,
-            status: section.status.unwrap_or(0),
-            phase,
-            content_length,
-            has_content_length,
-            end_stream,
-        });
+    let headers = &handle.feed_scratch.headers()[header_start..end];
+    match connection.classify_headers(stream_id, headers, end_stream != 0) {
+        Ok(class) => {
+            let kind = match class.kind {
+                veylor_http2::ResponseSectionKind::Informational => 0,
+                veylor_http2::ResponseSectionKind::Final => 1,
+                veylor_http2::ResponseSectionKind::Trailers => 2,
+            };
+            let phase = match class.phase {
+                veylor_http2::ClientResponsePhase::AwaitingFinalHeaders => 0,
+                veylor_http2::ClientResponsePhase::Content => 1,
+                veylor_http2::ClientResponsePhase::Complete => 2,
+            };
+            let (content_length, has_content_length) = match class.content_length {
+                Some(length) => (length, 1),
+                None => (0, 0),
+            };
+            unsafe {
+                out_class.write(VylH2ResponseClass {
+                    kind,
+                    status: class.status,
+                    phase,
+                    content_length,
+                    has_content_length,
+                    end_stream,
+                });
+            }
+            VylResult::Ok
+        }
+        Err(error) => split_error(error).0,
     }
-    VylResult::Ok
 }
 
 
@@ -132,26 +118,20 @@ unsafe fn account_data(
         out_phase.write(0);
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_live(handle) {
-        return error;
-    }
-    let position = match handle.responses.iter().position(|(id, _)| *id == stream_id) {
-        Some(position) => position,
-        None => return VylResult::InvalidArgument,
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
     };
-    let phase = match handle.responses[position]
-        .1
-        .data_received(data_length, end_stream != 0)
-    {
-        Ok(phase) => phase,
-        Err(_) => return VylResult::ProtocolError,
-    };
-    unsafe {
-        out_phase.write(match phase {
-            veylor_http2::ClientResponsePhase::AwaitingFinalHeaders => 0,
-            veylor_http2::ClientResponsePhase::Content => 1,
-            veylor_http2::ClientResponsePhase::Complete => 2,
-        });
+    match connection.account_data(stream_id, data_length, end_stream != 0) {
+        Ok(accounted) => {
+            unsafe {
+                out_phase.write(match accounted.phase {
+                    veylor_http2::ClientResponsePhase::AwaitingFinalHeaders => 0,
+                    veylor_http2::ClientResponsePhase::Content => 1,
+                    veylor_http2::ClientResponsePhase::Complete => 2,
+                });
+            }
+            VylResult::Ok
+        }
+        Err(error) => split_error(error).0,
     }
-    VylResult::Ok
 }

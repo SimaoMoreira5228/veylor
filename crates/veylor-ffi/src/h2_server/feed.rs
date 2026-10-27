@@ -1,32 +1,14 @@
 use std::slice;
 
-use veylor_http2::{FeedStatus, H2FrameAction, HeaderRange};
+use veylor_server_conn::h2::{
+    BatchStatus, FeedBatch, FeedScratch, H2ServerConnection, error_code_value,
+};
 
-use super::VylH2Server;
+use super::{VylH2Server, split_error};
 use crate::abi::{
     VYL_H2_END_STREAM, VylH2Action, VylH2ActionKind, VylH2Field, VylResult, catch_ffi,
     slice_length_valid,
 };
-
-pub(crate) fn error_code_value(code: veylor_http2::ErrorCode) -> u32 {
-    match code {
-        veylor_http2::ErrorCode::NoError => 0,
-        veylor_http2::ErrorCode::ProtocolError => 1,
-        veylor_http2::ErrorCode::InternalError => 2,
-        veylor_http2::ErrorCode::FlowControlError => 3,
-        veylor_http2::ErrorCode::SettingsTimeout => 4,
-        veylor_http2::ErrorCode::StreamClosed => 5,
-        veylor_http2::ErrorCode::FrameSizeError => 6,
-        veylor_http2::ErrorCode::RefusedStream => 7,
-        veylor_http2::ErrorCode::Cancel => 8,
-        veylor_http2::ErrorCode::CompressionError => 9,
-        veylor_http2::ErrorCode::ConnectError => 10,
-        veylor_http2::ErrorCode::EnhanceYourCalm => 11,
-        veylor_http2::ErrorCode::InadequateSecurity => 12,
-        veylor_http2::ErrorCode::Http11Required => 13,
-        veylor_http2::ErrorCode::Unknown(value) => value,
-    }
-}
 
 struct PollArguments {
     input: *const u8,
@@ -143,47 +125,71 @@ unsafe fn poll_feed(handle: *mut VylH2Server, arguments: PollArguments) -> VylRe
         out_connection_error.write(0);
     }
     let handle = unsafe { &mut *handle };
-    if handle.cancelled {
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
+    if connection.is_cancelled() {
         return VylResult::Cancelled;
     }
-    if handle.driver.is_none() {
-        return VylResult::InternalError;
-    }
-    let fresh = !handle.feed_pending;
+    // SECURITY: the scratch borrow is extended to the input lifetime so polled actions can
+    // reference the caller's input bytes across the retry window. This is sound only under the
+    // documented caller contract: the input stays alive and unchanged until a later call
+    // succeeds, and the handle is exclusively accessed so no live alias escapes.
+    let scratch: &mut FeedScratch<'_> =
+        unsafe { std::mem::transmute(&mut handle.feed_scratch as &mut FeedScratch<'static>) };
+    let fresh = !connection.has_pending_batch();
     if fresh {
         let input = if input_length == 0 {
             &[]
         } else {
             unsafe { slice::from_raw_parts(input, input_length) }
         };
-        let driver = handle.driver.as_mut().expect("driver checked above");
-        let actions_scratch: &mut [Option<H2FrameAction<'_>>] =
-            unsafe { std::mem::transmute(&mut handle.feed_actions as &mut [_]) };
-        let result = driver
-            .driver_mut()
-            .feed(input, actions_scratch, &mut handle.feed_headers);
-        handle.feed_action_count = result.actions;
-        handle.feed_header_count = result.headers;
-        handle.feed_consumed = result.consumed;
-        handle.feed_failed = result.status == FeedStatus::ConnectionFailed;
-        handle.feed_error = result.error.map(error_code_value);
-        handle.feed_pending = result.actions > 0;
+        let batch = match connection.poll_feed(input, scratch) {
+            Ok(batch) => batch,
+            Err(error) => return split_error(error).0,
+        };
         unsafe {
-            out_consumed.write(result.consumed);
+            out_consumed.write(batch.consumed);
         }
-        if !handle.feed_pending {
-            if handle.feed_failed {
+        if batch.status == BatchStatus::NeedMore {
+            if batch.connection_failed {
                 unsafe {
-                    out_connection_error.write(handle.feed_error.unwrap_or(1));
+                    out_connection_error
+                        .write(batch.connection_error.map(error_code_value).unwrap_or(1));
                 }
                 return VylResult::ProtocolError;
             }
             return VylResult::NeedMore;
         }
+        return unsafe {
+            translate_pending(
+                connection,
+                batch,
+                TranslateOutputs {
+                    actions,
+                    action_capacity,
+                    fields,
+                    field_capacity,
+                    data,
+                    data_capacity,
+                    out_actions,
+                    out_fields,
+                    out_actions_required,
+                    out_fields_required,
+                    out_data_required,
+                    out_connection_error,
+                },
+            )
+        };
     }
+    let batch = match connection.poll_retry(scratch) {
+        Ok(batch) => batch,
+        Err(error) => return split_error(error).0,
+    };
     unsafe {
         translate_pending(
-            handle,
+            connection,
+            batch,
             TranslateOutputs {
                 actions,
                 action_capacity,
@@ -217,22 +223,20 @@ struct TranslateOutputs {
     out_connection_error: *mut u32,
 }
 
-unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs) -> VylResult {
-    let driver = match handle.driver.as_ref() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
+unsafe fn translate_pending(
+    connection: &mut H2ServerConnection<'static, 'static>,
+    batch: FeedBatch<'_, '_>,
+    outputs: TranslateOutputs,
+) -> VylResult {
     let mut needed_fields: usize = 0;
     let mut needed_data: usize = 0;
-    for slot in handle.feed_actions[..handle.feed_action_count].iter() {
+    for slot in batch.actions[..batch.action_count].iter() {
         let Some(action) = slot else { continue };
         match action {
-            H2FrameAction::Headers { headers, .. } => {
+            veylor_http2::H2FrameAction::Headers { headers, .. } => {
                 needed_fields += headers.count;
-                for header in
-                    handle.feed_headers[headers.start..headers.start + headers.count].iter()
-                {
-                    let Some((name, value)) = driver.driver().resolve_header(*header) else {
+                for header in batch.headers[headers.start..headers.start + headers.count].iter() {
+                    let Some((name, value)) = connection.resolve_header(*header) else {
                         return VylResult::InternalError;
                     };
                     needed_data = needed_data
@@ -240,18 +244,18 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
                         .saturating_add(value.len());
                 }
             }
-            H2FrameAction::Data { data, .. } => {
+            veylor_http2::H2FrameAction::Data { data, .. } => {
                 needed_data = needed_data.saturating_add(data.len());
             }
-            H2FrameAction::GoAway { debug_data, .. } => {
+            veylor_http2::H2FrameAction::GoAway { debug_data, .. } => {
                 needed_data = needed_data.saturating_add(debug_data.len());
             }
             _ => {}
         }
     }
-    if handle.feed_action_count > outputs.action_capacity {
+    if batch.action_count > outputs.action_capacity {
         unsafe {
-            outputs.out_actions_required.write(handle.feed_action_count);
+            outputs.out_actions_required.write(batch.action_count);
             outputs.out_fields_required.write(needed_fields);
             outputs.out_data_required.write(needed_data);
         }
@@ -259,7 +263,7 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
     }
     if needed_fields > outputs.field_capacity || needed_data > outputs.data_capacity {
         unsafe {
-            outputs.out_actions_required.write(handle.feed_action_count);
+            outputs.out_actions_required.write(batch.action_count);
             outputs.out_fields_required.write(needed_fields);
             outputs.out_data_required.write(needed_data);
         }
@@ -283,17 +287,17 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
     let mut field_next = 0;
     let mut data_next = 0;
     let mut action_next = 0;
-    for slot in handle.feed_actions[..handle.feed_action_count].iter() {
+    for slot in batch.actions[..batch.action_count].iter() {
         let Some(action) = slot else { continue };
         let translated = match action {
-            H2FrameAction::Headers {
+            veylor_http2::H2FrameAction::Headers {
                 stream_id,
-                headers: HeaderRange { start, count },
+                headers: range,
                 end_stream,
             } => {
                 let field_start = field_next;
-                for header in handle.feed_headers[*start..*start + *count].iter() {
-                    let Some((name, value)) = driver.driver().resolve_header(*header) else {
+                for header in batch.headers[range.start..range.start + range.count].iter() {
+                    let Some((name, value)) = connection.resolve_header(*header) else {
                         return VylResult::InternalError;
                     };
                     data[data_next..data_next + name.len()].copy_from_slice(name);
@@ -315,11 +319,11 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
                     stream_id: *stream_id,
                     flags: u32::from(*end_stream) & VYL_H2_END_STREAM,
                     field_start,
-                    field_count: *count,
+                    field_count: range.count,
                     ..VylH2Action::default()
                 }
             }
-            H2FrameAction::Data {
+            veylor_http2::H2FrameAction::Data {
                 stream_id,
                 data: payload,
                 end_stream,
@@ -336,7 +340,7 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
                     ..VylH2Action::default()
                 }
             }
-            H2FrameAction::StreamReset {
+            veylor_http2::H2FrameAction::StreamReset {
                 stream_id,
                 error_code,
             } => VylH2Action {
@@ -345,7 +349,7 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
                 error_code: error_code_value(*error_code),
                 ..VylH2Action::default()
             },
-            H2FrameAction::GoAway {
+            veylor_http2::H2FrameAction::GoAway {
                 last_stream_id,
                 error_code,
                 debug_data,
@@ -362,16 +366,16 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
                     ..VylH2Action::default()
                 }
             }
-            H2FrameAction::SettingsAckRequired => VylH2Action {
+            veylor_http2::H2FrameAction::SettingsAckRequired => VylH2Action {
                 kind: VylH2ActionKind::SettingsAckRequired,
                 ..VylH2Action::default()
             },
-            H2FrameAction::PingAck { opaque_data } => VylH2Action {
+            veylor_http2::H2FrameAction::PingAck { opaque_data } => VylH2Action {
                 kind: VylH2ActionKind::PingAck,
                 ping: *opaque_data,
                 ..VylH2Action::default()
             },
-            H2FrameAction::SendReset {
+            veylor_http2::H2FrameAction::SendReset {
                 stream_id,
                 error_code,
             } => VylH2Action {
@@ -380,7 +384,7 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
                 error_code: error_code_value(*error_code),
                 ..VylH2Action::default()
             },
-            H2FrameAction::ConnectionError { error_code } => VylH2Action {
+            veylor_http2::H2FrameAction::ConnectionError { error_code } => VylH2Action {
                 kind: VylH2ActionKind::ConnectionError,
                 error_code: error_code_value(*error_code),
                 ..VylH2Action::default()
@@ -394,12 +398,10 @@ unsafe fn translate_pending(handle: &mut VylH2Server, outputs: TranslateOutputs)
         outputs.out_fields.write(field_next);
         outputs
             .out_connection_error
-            .write(handle.feed_error.unwrap_or(0));
+            .write(batch.connection_error.map(error_code_value).unwrap_or(0));
     }
-    handle.feed_actions.fill(None);
-    handle.feed_action_count = 0;
-    handle.feed_pending = false;
-    if handle.feed_failed {
+    connection.finish_batch();
+    if batch.connection_failed {
         VylResult::ProtocolError
     } else {
         VylResult::Ok

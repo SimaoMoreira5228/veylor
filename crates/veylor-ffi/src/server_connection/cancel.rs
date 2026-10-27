@@ -20,18 +20,11 @@ unsafe fn cancel_connection(connection: *mut VylServerConnection) -> VylResult {
     }
 
     let connection = unsafe { &mut *connection };
-    if connection.cancelled {
+    if connection.inner.is_cancelled() {
         return VylResult::Ok;
     }
 
-    connection.cancelled = true;
-    connection.body = None;
-    connection.parser.reset();
-    connection.request = None;
-    connection.input_base = core::ptr::null();
-    connection.input_length = 0;
+    connection.inner.cancel();
     connection.headers_base = core::ptr::null();
-    connection.response_started = true;
-    connection.response_writer.cancel();
     VylResult::Ok
 }

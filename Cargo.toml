@@ -8,6 +8,7 @@ members = [
     "crates/veylor-router",
     "crates/veylor-runtime",
     "crates/veylor-server",
+    "crates/veylor-server-conn",
     "crates/veylor-tls",
 ]
 default-members = [
@@ -18,6 +19,7 @@ default-members = [
     "crates/veylor-router",
     "crates/veylor-runtime",
     "crates/veylor-server",
+    "crates/veylor-server-conn",
     "crates/veylor-tls",
 ]
 exclude = ["fuzz"]

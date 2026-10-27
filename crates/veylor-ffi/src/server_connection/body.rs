@@ -1,10 +1,11 @@
 use std::slice;
 
-use veylor_http1::{BodyEvent, BodyLimits, Limits, RequestBodyAdmission, RequestBodyDecoder};
+use veylor_server_conn::{Admission, BodyKind, ServerError};
 
 use crate::abi::{VylHeader, VylResult, VylSpan, catch_ffi, slice_length_valid};
 
 use super::api::VylServerConnection;
+use super::map_error;
 
 pub const VYL_HTTP1_ADMISSION_READY: u32 = 0;
 pub const VYL_HTTP1_ADMISSION_SEND_CONTINUE: u32 = 1;
@@ -113,69 +114,80 @@ unsafe fn admit_body(
     }
 
     let connection = unsafe { &mut *connection };
-    if connection.cancelled {
+    if connection.inner.is_cancelled() {
         return VylResult::Cancelled;
     }
-    let Some(request) = connection.request else {
-        return VylResult::BadState;
-    };
-    if connection.body.is_some()
-        || connection.response_started
-        || input != connection.input_base
-        || input_length < request.length
-        || request_headers != connection.headers_base
-    {
+    if request_headers != connection.headers_base {
         return VylResult::BadState;
     }
-
-    let request_input = if connection.input_length == 0 {
+    let Some(request) = connection.inner.request_head() else {
+        return VylResult::BadState;
+    };
+    let input = if input_length == 0 {
         &[]
     } else {
-        unsafe { slice::from_raw_parts(connection.input_base, connection.input_length) }
+        unsafe { slice::from_raw_parts(input, input_length) }
     };
+    // SECURITY: the trusted slices below alias the stable parse-time buffers (the header base
+    // equality is checked above) and are erased to 'static; they stay valid until reset or
+    // destruction under the documented caller contract.
     let request_headers = if request.header_count == 0 {
         &[]
     } else {
-        unsafe { slice::from_raw_parts(connection.headers_base, request.header_count) }
+        unsafe {
+            std::mem::transmute::<&[VylHeader], &'static [VylHeader]>(slice::from_raw_parts(
+                connection.headers_base,
+                request.header_count,
+            ))
+        }
     };
     let trailer_name_data = if trailer_name_data_length == 0 {
         &[]
     } else {
-        unsafe { slice::from_raw_parts(trailer_name_data, trailer_name_data_length) }
+        unsafe {
+            std::mem::transmute::<&[u8], &'static [u8]>(slice::from_raw_parts(
+                trailer_name_data,
+                trailer_name_data_length,
+            ))
+        }
     };
     let permitted_trailers = if permitted_trailer_count == 0 {
         &[]
     } else {
-        unsafe { slice::from_raw_parts(permitted_trailers, permitted_trailer_count) }
+        unsafe {
+            std::mem::transmute::<&[VylSpan], &'static [VylSpan]>(slice::from_raw_parts(
+                permitted_trailers,
+                permitted_trailer_count,
+            ))
+        }
     };
-
-    let decoder = match RequestBodyDecoder::new_with_trailer_spans(
-        request,
-        request_input,
+    match connection.inner.admit_body(
+        input,
         request_headers,
         trailer_name_data,
         permitted_trailers,
-        BodyLimits::default(),
+        allowed != 0,
     ) {
-        Ok(decoder) => decoder,
-        Err(error) => return map_parse_error(error),
-    };
-    // SECURITY: C callers retain these borrowed buffers until reset or destruction.
-    let mut decoder: RequestBodyDecoder<'static> = unsafe { std::mem::transmute(decoder) };
-    let admission = match decoder.admit_body(allowed != 0) {
-        Ok(admission) => admission,
-        Err(error) => return map_parse_error(error),
-    };
-    let admission = match admission {
-        RequestBodyAdmission::ReadyToRead => VYL_HTTP1_ADMISSION_READY,
-        RequestBodyAdmission::SendContinue => VYL_HTTP1_ADMISSION_SEND_CONTINUE,
-        RequestBodyAdmission::Rejected => VYL_HTTP1_ADMISSION_REJECTED,
-    };
-    connection.body = Some(decoder);
-    unsafe {
-        out_admission.write(admission);
+        Ok(Admission::Ready) => {
+            unsafe {
+                out_admission.write(VYL_HTTP1_ADMISSION_READY);
+            }
+            VylResult::Ok
+        }
+        Ok(Admission::SendContinue) => {
+            unsafe {
+                out_admission.write(VYL_HTTP1_ADMISSION_SEND_CONTINUE);
+            }
+            VylResult::Ok
+        }
+        Ok(Admission::Rejected) => {
+            unsafe {
+                out_admission.write(VYL_HTTP1_ADMISSION_REJECTED);
+            }
+            VylResult::Ok
+        }
+        Err(error) => map_error(error),
     }
-    VylResult::Ok
 }
 
 
@@ -195,27 +207,9 @@ unsafe fn mark_continue_sent(connection: *mut VylServerConnection) -> VylResult 
     }
 
     let connection = unsafe { &mut *connection };
-    if connection.cancelled {
-        return VylResult::Cancelled;
-    }
-    if connection.response_started {
-        return VylResult::BadState;
-    }
-    if !connection.response_writer.can_flush_continue() {
-        return VylResult::BadState;
-    }
-    let Some(body) = connection.body.as_mut() else {
-        return VylResult::BadState;
-    };
-    match body.continue_sent() {
-        Ok(()) => {
-            if connection.response_writer.continue_flushed() {
-                VylResult::Ok
-            } else {
-                VylResult::BadState
-            }
-        }
-        Err(error) => map_parse_error(error),
+    match connection.inner.mark_continue_sent() {
+        Ok(()) => VylResult::Ok,
+        Err(error) => map_error(error),
     }
 }
 
@@ -280,13 +274,6 @@ unsafe fn read_body(
     }
 
     let connection = unsafe { &mut *connection };
-    if connection.cancelled {
-        return VylResult::Cancelled;
-    }
-    if connection.response_started {
-        return VylResult::BadState;
-    }
-
     let input = if input_length == 0 {
         &[]
     } else {
@@ -297,49 +284,37 @@ unsafe fn read_body(
     } else {
         unsafe { slice::from_raw_parts_mut(trailers, trailer_capacity) }
     };
-    let Some(body) = connection.body.as_mut() else {
-        return VylResult::BadState;
-    };
-    let progress = match body.next(input, eof != 0, trailers, Limits::default()) {
-        Ok(progress) => progress,
-        Err(veylor_http1::ParseError::HeaderCapacity) => {
-            unsafe {
-                out_trailers_required.write(body.required_trailer_capacity());
+    match connection.inner.read_body(input, eof != 0, trailers) {
+        Ok(event) => {
+            let mut out = VylServerBodyEvent {
+                consumed: event.consumed,
+                ..VylServerBodyEvent::default()
+            };
+            match event.kind {
+                BodyKind::NeedMore => out.kind = VYL_HTTP1_BODY_NEED_MORE,
+                BodyKind::Data => {
+                    out.kind = VYL_HTTP1_BODY_DATA;
+                    out.data = event.data;
+                }
+                BodyKind::Trailers => {
+                    out.kind = VYL_HTTP1_BODY_TRAILERS;
+                    out.trailer_count = event.trailer_count;
+                }
+                BodyKind::Complete => out.kind = VYL_HTTP1_BODY_COMPLETE,
             }
-            return VylResult::BufferTooSmall;
+            unsafe {
+                out_event.write(out);
+            }
+            VylResult::Ok
         }
-        Err(error) => return map_parse_error(error),
-    };
-
-    let mut event = VylServerBodyEvent {
-        consumed: progress.consumed,
-        ..VylServerBodyEvent::default()
-    };
-    match progress.event {
-        Some(BodyEvent::Data(span)) => {
-            event.kind = VYL_HTTP1_BODY_DATA;
-            event.data = span;
+        Err(ServerError::HeaderCapacity {
+            trailers_required, ..
+        }) => {
+            unsafe {
+                out_trailers_required.write(trailers_required);
+            }
+            VylResult::BufferTooSmall
         }
-        Some(BodyEvent::Trailers { count }) => {
-            event.kind = VYL_HTTP1_BODY_TRAILERS;
-            event.trailer_count = count;
-        }
-        Some(BodyEvent::Complete) => event.kind = VYL_HTTP1_BODY_COMPLETE,
-        None => event.kind = VYL_HTTP1_BODY_NEED_MORE,
-    }
-    unsafe {
-        out_event.write(event);
-    }
-    VylResult::Ok
-}
-
-fn map_parse_error(error: veylor_http1::ParseError) -> VylResult {
-    match error {
-        veylor_http1::ParseError::BodyTooLarge => VylResult::BodyTooLong,
-        veylor_http1::ParseError::AdmissionPending
-        | veylor_http1::ParseError::BodyRejected
-        | veylor_http1::ParseError::Cancelled => VylResult::BadState,
-        veylor_http1::ParseError::HeaderCapacity => VylResult::BufferTooSmall,
-        _ => VylResult::ProtocolError,
+        Err(error) => map_error(error),
     }
 }

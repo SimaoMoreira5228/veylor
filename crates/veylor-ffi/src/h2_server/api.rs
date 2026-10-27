@@ -2,52 +2,40 @@ use std::boxed::Box;
 use std::ptr;
 use std::slice;
 
-use veylor_http2::{
-    ControlFrameWriter, H2FrameAction, H2ServerDriver, HpackEntrySlot, HpackHeader, HpackTable,
-    MAX_WINDOW_INCREMENT, SettingsParameter, StreamSlot, StreamTable, settings_parameter_valid,
+use veylor_server_conn::h2::{
+    FeedScratch, H2ServerConnection, H2ServerTables, HEADER_BLOCK, HPACK_ENTRIES, HPACK_SCRATCH,
+    HpackEntrySlot, SETTINGS_ACKS, STREAM_SLOTS, StreamSlot, WriteOut,
 };
 
-use super::{PendingKind, PendingWrite, VylH2Server};
+use super::{VylH2Server, split_error};
 use crate::abi::{VylH2Setting, VylResult, catch_ffi, slice_length_valid};
 
-fn ensure_live(handle: &VylH2Server) -> Result<(), VylResult> {
-    if handle.cancelled {
-        return Err(VylResult::Cancelled);
+fn write_out(written: usize, required: usize, out_written: *mut usize, out_required: *mut usize) {
+    unsafe {
+        out_written.write(written);
+        out_required.write(required);
     }
-    Ok(())
 }
 
-fn ensure_writable(handle: &VylH2Server) -> Result<(), VylResult> {
-    ensure_live(handle)?;
-    if handle.pending.kind != PendingKind::None {
-        return Err(VylResult::WouldBlock);
-    }
-    if handle.driver.is_none() {
-        return Err(VylResult::InternalError);
-    }
-    Ok(())
-}
-
-fn control_writer_max_frame(handle: &VylH2Server) -> u32 {
-    handle
-        .driver
-        .as_ref()
-        .map(|driver| driver.driver().streams().remote_settings().max_frame_size)
-        .unwrap_or(veylor_http2::DEFAULT_MAX_FRAME_SIZE)
-}
-
-fn map_control_error(error: veylor_http2::FrameWriteError, required: &mut usize) -> VylResult {
-    match error {
-        veylor_http2::FrameWriteError::OutputTooSmall { required: need } => {
-            *required = need;
-            VylResult::BufferTooSmall
+fn report_write(
+    result: Result<WriteOut, veylor_server_conn::h2::H2ServerError>,
+    out_written: *mut usize,
+    out_required: *mut usize,
+) -> VylResult {
+    match result {
+        Ok(out) => {
+            write_out(out.written, out.required, out_written, out_required);
+            VylResult::Ok
         }
-        veylor_http2::FrameWriteError::PendingFrame => VylResult::WouldBlock,
-        veylor_http2::FrameWriteError::Terminal => VylResult::BadState,
-        veylor_http2::FrameWriteError::UnsupportedAction => VylResult::InternalError,
-        veylor_http2::FrameWriteError::InvalidHeader(_)
-        | veylor_http2::FrameWriteError::InvalidPayload(_) => VylResult::InvalidArgument,
-        veylor_http2::FrameWriteError::OverAcknowledged => VylResult::WriteOverrun,
+        Err(error) => {
+            let (result, required) = split_error(error);
+            if result == VylResult::BufferTooSmall {
+                unsafe {
+                    out_required.write(required);
+                }
+            }
+            result
+        }
     }
 }
 
@@ -68,37 +56,36 @@ unsafe fn create_handle(out_handle: *mut *mut VylH2Server) -> VylResult {
         out_handle.write(ptr::null_mut());
     }
     let mut handle = Box::new(VylH2Server {
-        slots: [StreamSlot::EMPTY; super::STREAM_SLOTS],
-        header_block: [0; super::HEADER_BLOCK],
-        decoder_entries: [HpackEntrySlot::EMPTY; super::HPACK_ENTRIES],
-        decoder_scratch: [0; super::HPACK_SCRATCH],
-        encoder_entries: [HpackEntrySlot::EMPTY; super::HPACK_ENTRIES],
-        encoder_scratch: [0; super::HPACK_SCRATCH],
-        settings_ack_limits: [0; super::SETTINGS_ACKS],
-        streams: None,
-        decoder: None,
-        encoder: None,
-        driver: None,
-        feed_actions: [None; crate::abi::VYL_H2_MAX_ACTIONS],
-        feed_headers: [HpackHeader::EMPTY; crate::abi::VYL_H2_MAX_FIELDS],
-        feed_action_count: 0,
-        feed_header_count: 0,
-        feed_pending: false,
-        feed_consumed: 0,
-        feed_error: None,
-        feed_failed: false,
-        block: [0; super::HEADER_BLOCK_SCRATCH],
-        pending: PendingWrite::default(),
-        cancelled: false,
+        slots: [StreamSlot::EMPTY; STREAM_SLOTS],
+        header_block: [0; HEADER_BLOCK],
+        decoder_entries: [HpackEntrySlot::EMPTY; HPACK_ENTRIES],
+        decoder_scratch: [0; HPACK_SCRATCH],
+        encoder_entries: [HpackEntrySlot::EMPTY; HPACK_ENTRIES],
+        encoder_scratch: [0; HPACK_SCRATCH],
+        settings_ack_limits: [0; SETTINGS_ACKS],
+        tables: None,
+        connection: None,
+        feed_scratch: FeedScratch::new(),
     });
     let handle_ptr: *mut VylH2Server = &mut *handle;
-    let (streams, decoder, encoder, driver) = unsafe { build_driver(handle_ptr) };
-    handle.streams = Some(streams);
-    handle.decoder = Some(decoder);
-    handle.encoder = Some(encoder);
-    match driver {
-        Ok(driver) => handle.driver = Some(driver),
-        Err(_) => return VylResult::InternalError,
+    let tables = unsafe { build_tables(handle_ptr) };
+    unsafe {
+        (*handle_ptr).tables = Some(tables);
+    }
+    let connection = unsafe {
+        let tables = (*ptr::addr_of_mut!((*handle_ptr).tables))
+            .as_mut()
+            .expect("tables stored above");
+        match tables.connect() {
+            Ok(connection) => std::mem::transmute::<
+                H2ServerConnection<'_, 'static>,
+                H2ServerConnection<'static, 'static>,
+            >(connection),
+            Err(_) => return VylResult::InternalError,
+        }
+    };
+    unsafe {
+        (*handle_ptr).connection = Some(connection);
     }
     unsafe {
         out_handle.write(Box::into_raw(handle));
@@ -106,18 +93,12 @@ unsafe fn create_handle(out_handle: *mut *mut VylH2Server) -> VylResult {
     VylResult::Ok
 }
 
-// SECURITY: the 'static borrows below alias fixed-size arrays inside the same heap-pinned
-// handle: the Box address is stable from into_raw to the single from_raw at destroy, the
-// fields never reallocate, and each FFI call takes exclusive access under the host's
-// single-owner contract, so no live alias ever escapes.
-unsafe fn build_driver(
-    handle: *mut VylH2Server,
-) -> (
-    StreamTable<'static>,
-    HpackTable<'static>,
-    HpackTable<'static>,
-    Result<H2ServerDriver<'static, 'static, 'static, 'static>, ()>,
-) {
+// SECURITY: the 'static borrows alias fixed-size arrays inside the same heap-pinned handle:
+// the Box address is stable from into_raw to the single from_raw at destroy, the fields
+// never reallocate, and each FFI call takes exclusive access under the host's single-owner
+// contract, so no live alias ever escapes. The connection borrow is additionally tied to the
+// tables field it borrows; both are destroyed together without further use.
+unsafe fn build_tables(handle: *mut VylH2Server) -> H2ServerTables<'static> {
     let slots = unsafe { &mut *ptr::addr_of_mut!((*handle).slots) };
     let header_block = unsafe { &mut *ptr::addr_of_mut!((*handle).header_block) };
     let decoder_entries = unsafe { &mut *ptr::addr_of_mut!((*handle).decoder_entries) };
@@ -137,47 +118,15 @@ unsafe fn build_driver(
     let encoder_scratch: &'static mut [u8] =
         unsafe { std::mem::transmute(encoder_scratch as &mut [u8]) };
     let ack_limits: &'static mut [u32] = unsafe { std::mem::transmute(ack_limits as &mut [u32]) };
-    let streams = StreamTable::new(
+    H2ServerTables::new(
         slots,
-        veylor_http2::H2Role::Server,
         header_block,
-        super::HEADER_BLOCK as u32,
-    );
-    let streams_ptr = unsafe { &mut *ptr::addr_of_mut!((*handle).streams) };
-    *streams_ptr = Some(streams);
-    let streams: &'static mut StreamTable<'static> = unsafe {
-        std::mem::transmute(
-            streams_ptr.as_mut().expect("streams assigned above") as &mut StreamTable<'_>
-        )
-    };
-    let decoder = HpackTable::new(decoder_entries, decoder_scratch, 4_096);
-    let encoder = HpackTable::new(encoder_entries, encoder_scratch, 4_096);
-    let decoder_ptr = unsafe { &mut *ptr::addr_of_mut!((*handle).decoder) };
-    let encoder_ptr = unsafe { &mut *ptr::addr_of_mut!((*handle).encoder) };
-    *decoder_ptr = Some(decoder);
-    *encoder_ptr = Some(encoder);
-    let (decoder, encoder) = unsafe {
-        (
-            std::mem::transmute::<&mut HpackTable<'_>, &'static mut HpackTable<'static>>(
-                decoder_ptr.as_mut().expect("decoder assigned above") as &mut HpackTable<'_>,
-            ),
-            std::mem::transmute::<&mut HpackTable<'_>, &'static mut HpackTable<'static>>(
-                encoder_ptr.as_mut().expect("encoder assigned above") as &mut HpackTable<'_>,
-            ),
-        )
-    };
-    let driver = H2ServerDriver::new(streams, decoder, encoder, ack_limits).map_err(|_| ());
-    let streams = unsafe { (*ptr::addr_of_mut!((*handle).streams)).take() };
-    let decoder = unsafe { (*ptr::addr_of_mut!((*handle).decoder)).take() };
-    let encoder = unsafe { (*ptr::addr_of_mut!((*handle).encoder)).take() };
-    match (streams, decoder, encoder) {
-        (Some(streams), Some(decoder), Some(encoder)) => (streams, decoder, encoder, driver),
-        _ => unreachable_cold(),
-    }
-}
-
-fn unreachable_cold() -> ! {
-    unreachable!("storage assigned immediately above")
+        decoder_entries,
+        decoder_scratch,
+        encoder_entries,
+        encoder_scratch,
+        ack_limits,
+    )
 }
 
 
@@ -195,8 +144,10 @@ unsafe fn cancel_handle(handle: *mut VylH2Server) -> VylResult {
         return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *handle };
-    handle.cancelled = true;
-    handle.pending = PendingWrite::default();
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
+    connection.cancel();
     VylResult::Ok
 }
 
@@ -275,62 +226,39 @@ unsafe fn send_settings(
     if parameter_count > crate::abi::VYL_H2_MAX_SETTINGS {
         return VylResult::Capacity;
     }
-    let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
     let parameters = if parameter_count == 0 {
         &[]
     } else {
         unsafe { slice::from_raw_parts(parameters, parameter_count) }
     };
-    let mut settings = [SettingsParameter { id: 0, value: 0 }; crate::abi::VYL_H2_MAX_SETTINGS];
+    let mut settings = [veylor_server_conn::h2::SettingsParameter { id: 0, value: 0 };
+        crate::abi::VYL_H2_MAX_SETTINGS];
+    // NOTE: out-of-range ids are staged as zero (always rejected) instead of returned here,
+    // so state errors reported by the core keep their historical precedence over id errors.
     for (destination, parameter) in settings.iter_mut().zip(parameters.iter()) {
         if parameter.id == 0 || parameter.id > u16::MAX as u32 {
-            return VylResult::InvalidArgument;
+            *destination = veylor_server_conn::h2::SettingsParameter { id: 0, value: 0 };
+        } else {
+            *destination = veylor_server_conn::h2::SettingsParameter {
+                id: parameter.id as u16,
+                value: parameter.value,
+            };
         }
-        let id = parameter.id as u16;
-        if !settings_parameter_valid(id, parameter.value) {
-            return VylResult::InvalidArgument;
-        }
-        *destination = SettingsParameter {
-            id,
-            value: parameter.value,
-        };
     }
-    let max_frame_size = control_writer_max_frame(handle);
+    let handle = unsafe { &mut *handle };
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let mut writer = ControlFrameWriter::new(output, max_frame_size);
-    let mut required = 0;
-    let written = match writer.queue_settings(&settings[..parameter_count]) {
-        Ok(written) => written,
-        Err(error) => {
-            let result = map_control_error(error, &mut required);
-            unsafe {
-                out_required.write(required);
-            }
-            return result;
-        }
-    };
-    let mut stored = [(0, 0); crate::abi::VYL_H2_MAX_SETTINGS];
-    for (destination, setting) in stored.iter_mut().zip(settings.iter()) {
-        *destination = (setting.id, setting.value);
-    }
-    handle.pending = PendingWrite {
-        kind: PendingKind::Settings,
-        remaining: written,
-        setting_count: parameter_count,
-        settings: stored,
-    };
-    unsafe {
-        out_written.write(written);
-        out_required.write(written);
-    }
-    VylResult::Ok
+    report_write(
+        connection.send_settings(&settings[..parameter_count], output),
+        out_written,
+        out_required,
+    )
 }
 
 
@@ -359,49 +287,21 @@ unsafe fn acknowledge(
         out_pending.write(0);
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_live(handle) {
-        return error;
-    }
-    if handle.pending.kind == PendingKind::None {
-        return VylResult::BadState;
-    }
-    if transferred_bytes > handle.pending.remaining {
-        return VylResult::WriteOverrun;
-    }
-    handle.pending.remaining -= transferred_bytes;
-    if handle.pending.remaining != 0 {
-        unsafe {
-            out_pending.write(handle.pending.remaining);
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
+    match connection.acknowledge(transferred_bytes) {
+        Ok(pending) => {
+            unsafe {
+                out_pending.write(pending);
+            }
+            VylResult::Ok
         }
-        return VylResult::Ok;
-    }
-    if handle.pending.kind == PendingKind::Settings {
-        let driver = match handle.driver.as_mut() {
-            Some(driver) => driver,
-            None => return VylResult::InternalError,
-        };
-        let mut parameters =
-            [SettingsParameter { id: 0, value: 0 }; crate::abi::VYL_H2_MAX_SETTINGS];
-        for (destination, stored) in parameters
-            .iter_mut()
-            .zip(handle.pending.settings.iter())
-            .take(handle.pending.setting_count)
-        {
-            *destination = SettingsParameter {
-                id: stored.0,
-                value: stored.1,
-            };
-        }
-        if driver
-            .driver_mut()
-            .register_fully_written_local_settings(&parameters[..handle.pending.setting_count])
-            .is_err()
-        {
-            return VylResult::InternalError;
+        Err(error) => {
+            let (result, _) = split_error(error);
+            result
         }
     }
-    handle.pending = PendingWrite::default();
-    VylResult::Ok
 }
 
 
@@ -422,11 +322,13 @@ pub unsafe extern "C" fn vyl_h2_server_send_settings_ack(
         send_control(
             handle,
             ControlKind::SettingsAck,
-            output,
-            output_capacity,
-            out_written,
-            out_required,
-            None,
+            ControlArguments {
+                output,
+                output_capacity,
+                out_written,
+                out_required,
+                opaque_data: None,
+            },
         )
     })
 }
@@ -450,11 +352,13 @@ pub unsafe extern "C" fn vyl_h2_server_send_ping_ack(
         send_control(
             handle,
             ControlKind::PingAck,
-            output,
-            output_capacity,
-            out_written,
-            out_required,
-            Some(opaque_data),
+            ControlArguments {
+                output,
+                output_capacity,
+                out_written,
+                out_required,
+                opaque_data: Some(opaque_data),
+            },
         )
     })
 }
@@ -494,15 +398,26 @@ enum ControlKind {
     PingAck,
 }
 
-unsafe fn send_control(
-    handle: *mut VylH2Server,
-    kind: ControlKind,
+struct ControlArguments {
     output: *mut u8,
     output_capacity: usize,
     out_written: *mut usize,
     out_required: *mut usize,
     opaque_data: Option<*const u8>,
+}
+
+unsafe fn send_control(
+    handle: *mut VylH2Server,
+    kind: ControlKind,
+    arguments: ControlArguments,
 ) -> VylResult {
+    let ControlArguments {
+        output,
+        output_capacity,
+        out_written,
+        out_required,
+        opaque_data,
+    } = arguments;
     if handle.is_null()
         || (output.is_null() && output_capacity != 0)
         || out_written.is_null()
@@ -528,43 +443,19 @@ unsafe fn send_control(
         (_, _) => [0; 8],
     };
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
-    let max_frame_size = control_writer_max_frame(handle);
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
+    };
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let mut writer = ControlFrameWriter::new(output, max_frame_size);
-    let action = match kind {
-        ControlKind::SettingsAck => H2FrameAction::SettingsAckRequired,
-        ControlKind::PingAck => H2FrameAction::PingAck {
-            opaque_data: opaque,
-        },
+    let result = match kind {
+        ControlKind::SettingsAck => connection.send_settings_ack(output),
+        ControlKind::PingAck => connection.send_ping_ack(&opaque, output),
     };
-    let mut required = 0;
-    let written = match writer.queue_action(action, 0) {
-        Ok(written) => written,
-        Err(error) => {
-            let result = map_control_error(error, &mut required);
-            unsafe {
-                out_required.write(required);
-            }
-            return result;
-        }
-    };
-    handle.pending = PendingWrite {
-        kind: PendingKind::Control,
-        remaining: written,
-        ..PendingWrite::default()
-    };
-    unsafe {
-        out_written.write(written);
-        out_required.write(written);
-    }
-    VylResult::Ok
+    report_write(result, out_written, out_required)
 }
 
 unsafe fn send_window_update(
@@ -588,75 +479,24 @@ unsafe fn send_window_update(
         out_written.write(0);
         out_required.write(0);
     }
-    if increment == 0 || increment > MAX_WINDOW_INCREMENT {
+    if increment == 0 || increment > veylor_http2::MAX_WINDOW_INCREMENT {
         return VylResult::InvalidArgument;
     }
     if stream_id > veylor_http2::MAX_STREAM_ID {
         return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *handle };
-    if let Err(error) = ensure_writable(handle) {
-        return error;
-    }
-    let driver = match handle.driver.as_mut() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
+    let Some(connection) = handle.connection.as_mut() else {
+        return VylResult::InternalError;
     };
-    let available = if stream_id == 0 {
-        veylor_http2::MAX_FLOW_WINDOW_SIZE - driver.driver().connection_receive_window().value()
-    } else {
-        match driver.driver().streams().find(stream_id) {
-            Some(stream) => veylor_http2::MAX_FLOW_WINDOW_SIZE - stream.receive_window.value(),
-            None => return VylResult::InvalidArgument,
-        }
-    };
-    if i64::from(increment) > available {
-        return VylResult::InvalidArgument;
-    }
-    let max_frame_size = control_writer_max_frame(handle);
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let mut writer = ControlFrameWriter::new(output, max_frame_size);
-    let mut required = 0;
-    let written = match writer.queue_window_update(stream_id, increment) {
-        Ok(written) => written,
-        Err(error) => {
-            let result = map_control_error(error, &mut required);
-            unsafe {
-                out_required.write(required);
-            }
-            return result;
-        }
-    };
-    let driver = match handle.driver.as_mut() {
-        Some(driver) => driver,
-        None => return VylResult::InternalError,
-    };
-    let credited = if stream_id == 0 {
-        driver
-            .driver_mut()
-            .add_connection_receive_credit(increment)
-            .is_ok()
-    } else {
-        driver
-            .driver_mut()
-            .add_stream_receive_credit(stream_id, increment)
-            .is_ok()
-    };
-    if !credited {
-        return VylResult::InternalError;
-    }
-    handle.pending = PendingWrite {
-        kind: PendingKind::Control,
-        remaining: written,
-        ..PendingWrite::default()
-    };
-    unsafe {
-        out_written.write(written);
-        out_required.write(written);
-    }
-    VylResult::Ok
+    report_write(
+        connection.send_window_update(stream_id, increment, output),
+        out_written,
+        out_required,
+    )
 }
