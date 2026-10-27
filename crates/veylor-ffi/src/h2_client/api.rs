@@ -114,6 +114,10 @@ unsafe fn create_handle(out_handle: *mut *mut VylH2Client) -> VylResult {
     VylResult::Ok
 }
 
+// SECURITY: the 'static borrows below alias fixed-size arrays inside the same heap-pinned
+// handle: the Box address is stable from into_raw to the single from_raw at destroy, the
+// fields never reallocate, and each FFI call takes exclusive access under the host's
+// single-owner contract, so no live alias ever escapes.
 unsafe fn build_driver(
     handle: *mut VylH2Client,
 ) -> (

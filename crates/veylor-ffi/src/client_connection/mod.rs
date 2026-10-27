@@ -5,8 +5,6 @@ mod request_write;
 #[allow(unsafe_code)]
 mod response_read;
 
-use veylor_http1::ClientResponse;
-
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VylRequestMethod {
@@ -84,11 +82,7 @@ pub struct VylClientReadEvent {
 }
 
 pub struct VylClientConnection {
-    request_method: VylRequestMethod,
-    requested_upgrade: &'static [u8],
-    response: ClientResponse<'static>,
-    response_started: bool,
-    request_writer: request_write::RequestWriteState,
+    inner: veylor_client::ClientConnection<'static>,
 }
 
 pub use api::{

@@ -1,8 +1,6 @@
 use std::slice;
 
-use veylor_http1::{
-    BodyEvent, ClientResponseEvent, Limits, ResponseBody, ResponseHead, ResponseKind,
-};
+use veylor_client::{ClientError, ClientReadKind};
 
 use crate::abi::{VylHeader, VylResult, catch_ffi, slice_length_valid};
 
@@ -117,82 +115,78 @@ unsafe fn read_response(
         unsafe { slice::from_raw_parts_mut(trailers, trailer_capacity) }
     };
     let connection = unsafe { &mut *connection };
-    connection.response_started |= input_length != 0 || eof != 0;
 
-    let progress =
-        match connection
-            .response
-            .next(input, eof != 0, headers, trailers, Limits::default())
-        {
-            Ok(progress) => progress,
-            Err(veylor_http1::ParseError::Cancelled) => return VylResult::Cancelled,
-            Err(veylor_http1::ParseError::HeaderCapacity) => {
-                unsafe {
-                    out_headers_required.write(connection.response.required_header_capacity());
-                    out_trailers_required.write(connection.response.required_trailer_capacity());
-                }
-                return VylResult::BufferTooSmall;
+    let event = match connection
+        .inner
+        .read_response(input, eof != 0, headers, trailers)
+    {
+        Ok(event) => event,
+        Err(ClientError::Cancelled) => return VylResult::Cancelled,
+        Err(ClientError::HeaderCapacity {
+            headers_required,
+            trailers_required,
+        }) => {
+            unsafe {
+                out_headers_required.write(headers_required);
+                out_trailers_required.write(trailers_required);
             }
-            Err(_) => return VylResult::ProtocolError,
-        };
+            return VylResult::BufferTooSmall;
+        }
+        Err(_) => return VylResult::ProtocolError,
+    };
 
-    let mut event = VylClientReadEvent {
-        consumed: progress.consumed,
-        can_reuse: u32::from(connection.response.can_reuse()),
+    let mut out = VylClientReadEvent {
+        consumed: event.consumed,
+        can_reuse: u32::from(event.can_reuse),
         ..VylClientReadEvent::default()
     };
-    let has_event = progress.event.is_some();
-    match progress.event {
-        Some(ClientResponseEvent::Informational(head)) => {
-            event.kind = VylClientReadKind::Informational;
-            event.response = to_ffi_head(head);
+    if let Some(head) = event.head {
+        out.response = to_ffi_head(head);
+    }
+    match event.kind {
+        ClientReadKind::NeedMore => {}
+        ClientReadKind::Informational => {
+            out.kind = VylClientReadKind::Informational;
         }
-        Some(ClientResponseEvent::Head(head)) => {
-            event.kind = if head.kind == ResponseKind::Upgrade {
-                VylClientReadKind::Upgrade
-            } else {
-                VylClientReadKind::Head
-            };
-            event.response = to_ffi_head(head);
+        ClientReadKind::Head => {
+            out.kind = VylClientReadKind::Head;
         }
-        Some(ClientResponseEvent::Body(BodyEvent::Data(span))) => {
-            event.kind = VylClientReadKind::BodyData;
-            event.body_data = span;
+        ClientReadKind::Upgrade => {
+            out.kind = VylClientReadKind::Upgrade;
         }
-        Some(ClientResponseEvent::Body(BodyEvent::Trailers { count })) => {
-            event.kind = VylClientReadKind::Trailers;
-            event.trailer_count = count;
+        ClientReadKind::BodyData => {
+            out.kind = VylClientReadKind::BodyData;
+            out.body_data = event.body_data;
         }
-        Some(ClientResponseEvent::Body(BodyEvent::Complete)) => {
-            event.kind = VylClientReadKind::Complete;
+        ClientReadKind::Trailers => {
+            out.kind = VylClientReadKind::Trailers;
+            out.trailer_count = event.trailer_count;
         }
-        None if connection.response.is_upgraded() => {
-            event.kind = VylClientReadKind::Upgrade;
+        ClientReadKind::Complete => {
+            out.kind = VylClientReadKind::Complete;
         }
-        None => {}
     }
 
     unsafe {
-        out_event.write(event);
+        out_event.write(out);
     }
-    if has_event || connection.response.is_upgraded() {
-        VylResult::Ok
-    } else {
-        VylResult::NeedMore
+    match event.kind {
+        ClientReadKind::NeedMore => VylResult::NeedMore,
+        _ => VylResult::Ok,
     }
 }
 
-fn to_ffi_head(head: ResponseHead) -> VylResponseHead {
+fn to_ffi_head(head: veylor_client::ResponseHead) -> VylResponseHead {
     let (body_kind, body_length) = match head.body {
-        ResponseBody::None => (VylResponseBodyKind::None, 0),
-        ResponseBody::Fixed(length) => (VylResponseBodyKind::Fixed, length),
-        ResponseBody::Chunked => (VylResponseBodyKind::Chunked, 0),
-        ResponseBody::CloseDelimited => (VylResponseBodyKind::CloseDelimited, 0),
+        veylor_client::ResponseBody::None => (VylResponseBodyKind::None, 0),
+        veylor_client::ResponseBody::Fixed(length) => (VylResponseBodyKind::Fixed, length),
+        veylor_client::ResponseBody::Chunked => (VylResponseBodyKind::Chunked, 0),
+        veylor_client::ResponseBody::CloseDelimited => (VylResponseBodyKind::CloseDelimited, 0),
     };
     let kind = match head.kind {
-        ResponseKind::Informational => VylResponseKind::Informational,
-        ResponseKind::Final => VylResponseKind::Final,
-        ResponseKind::Upgrade => VylResponseKind::Upgrade,
+        veylor_client::ResponseKind::Informational => VylResponseKind::Informational,
+        veylor_client::ResponseKind::Final => VylResponseKind::Final,
+        veylor_client::ResponseKind::Upgrade => VylResponseKind::Upgrade,
     };
     let mut flags = 0;
     if head.reusable {

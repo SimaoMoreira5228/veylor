@@ -9,6 +9,7 @@ rust-version.workspace = true
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
+veylor-client = { version = "0.1.0", path = "../veylor-client" }
 veylor-http1 = { version = "0.1.0", path = "../veylor-http1" }
 veylor-http2 = { version = "0.1.0", path = "../veylor-http2" }
 veylor-runtime = { version = "0.1.0", path = "../veylor-runtime" }

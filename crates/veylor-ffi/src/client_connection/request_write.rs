@@ -1,44 +1,10 @@
 use std::slice;
 
-use veylor_http1::{
-    BodyFraming, Field, Request, RequestEncodeError, encode_chunk,
-    encode_head_with_required_length, finish_chunks_with_required_length,
-};
+use veylor_client::{BodyFraming, ClientError, Field};
 
 use crate::abi::{VylBytes, VylField, VylResult, catch_ffi, slice_length_valid};
 
-use super::{
-    VYL_HTTP1_MAX_REQUEST_FIELDS, VylClientConnection, VylRequestBodyKind, VylRequestMethod,
-};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RequestBodyState {
-    Finished,
-    Fixed(u64),
-    Chunked,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RequestWriteState {
-    Idle,
-    HeadPending {
-        pending: usize,
-        body: RequestBodyState,
-    },
-    Ready(RequestBodyState),
-    Pending {
-        pending: usize,
-        body: RequestBodyState,
-    },
-    Complete,
-    Cancelled,
-}
-
-impl RequestWriteState {
-    pub(super) const fn new() -> Self {
-        Self::Idle
-    }
-}
+use super::{VYL_HTTP1_MAX_REQUEST_FIELDS, VylClientConnection, VylRequestBodyKind};
 
 struct ClientRequestHeadArguments {
     method: VylBytes,
@@ -143,16 +109,6 @@ unsafe fn encode_request_head(
     };
 
     let connection = unsafe { &mut *connection };
-    if connection.request_writer == RequestWriteState::Cancelled {
-        return VylResult::Cancelled;
-    }
-    if connection.request_writer != RequestWriteState::Idle {
-        return VylResult::BadState;
-    }
-    if !matches_request_method(connection.request_method, method) {
-        return VylResult::InvalidArgument;
-    }
-
     let fields = if field_count == 0 {
         &[]
     } else {
@@ -175,36 +131,34 @@ unsafe fn encode_request_head(
         *destination = Field { name, value };
     }
 
-    let request = Request {
-        method,
-        target,
-        fields: &request_fields[..field_count],
-        body,
-    };
     let output = if output_capacity == 0 {
         &mut []
     } else {
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
-    let mut required = 0;
-    match encode_head_with_required_length(&request, output, &mut required) {
-        Ok(written) => {
-            connection.request_writer = RequestWriteState::HeadPending {
-                pending: written,
-                body: body_state(body),
-            };
+    match connection.inner.encode_request_head(
+        method,
+        target,
+        &request_fields[..field_count],
+        body,
+        output,
+    ) {
+        Ok(encoded) => {
             unsafe {
-                out_written.write(written);
-                out_required.write(required);
+                out_written.write(encoded.written);
+                out_required.write(encoded.required);
             }
             VylResult::Ok
         }
-        Err(RequestEncodeError::BufferTooSmall) => {
+        Err(ClientError::BufferTooSmall { required }) => {
             unsafe {
                 out_required.write(required);
             }
             VylResult::BufferTooSmall
         }
+        Err(ClientError::Capacity) => VylResult::Capacity,
+        Err(ClientError::Cancelled) => VylResult::Cancelled,
+        Err(ClientError::BadState) => VylResult::BadState,
         Err(_) => VylResult::InvalidArgument,
     }
 }
@@ -233,34 +187,17 @@ unsafe fn advance_request_write(
     }
 
     let connection = unsafe { &mut *connection };
-    let (pending, body, is_head) = match connection.request_writer {
-        RequestWriteState::HeadPending { pending, body } => (pending, body, true),
-        RequestWriteState::Pending { pending, body } => (pending, body, false),
-        RequestWriteState::Idle | RequestWriteState::Ready(_) | RequestWriteState::Complete => {
-            return VylResult::BadState;
+    match connection.inner.advance_request_write(transferred_bytes) {
+        Ok(pending) => {
+            unsafe {
+                out_pending.write(pending);
+            }
+            VylResult::Ok
         }
-        RequestWriteState::Cancelled => return VylResult::Cancelled,
-    };
-    if transferred_bytes > pending {
-        return VylResult::WriteOverrun;
+        Err(ClientError::WriteOverrun) => VylResult::WriteOverrun,
+        Err(ClientError::Cancelled) => VylResult::Cancelled,
+        Err(_) => VylResult::BadState,
     }
-
-    let pending = pending - transferred_bytes;
-    connection.request_writer = if pending != 0 {
-        if is_head {
-            RequestWriteState::HeadPending { pending, body }
-        } else {
-            RequestWriteState::Pending { pending, body }
-        }
-    } else if body == RequestBodyState::Finished {
-        RequestWriteState::Complete
-    } else {
-        RequestWriteState::Ready(body)
-    };
-    unsafe {
-        out_pending.write(pending);
-    }
-    VylResult::Ok
 }
 
 
@@ -322,72 +259,26 @@ unsafe fn encode_request_body(
         unsafe { slice::from_raw_parts_mut(output, output_capacity) }
     };
     let connection = unsafe { &mut *connection };
-    let body = match connection.request_writer {
-        RequestWriteState::Ready(body) => body,
-        RequestWriteState::HeadPending { .. } | RequestWriteState::Pending { .. } => {
-            return VylResult::WouldBlock;
+    match connection.inner.encode_request_body(input, output) {
+        Ok(encoded) => {
+            unsafe {
+                out_written.write(encoded.written);
+                out_required.write(encoded.required);
+            }
+            VylResult::Ok
         }
-        RequestWriteState::Cancelled => return VylResult::Cancelled,
-        RequestWriteState::Idle | RequestWriteState::Complete => return VylResult::BadState,
-    };
-
-    let (written, next_body) = match body {
-        RequestBodyState::Fixed(remaining) => {
-            let input_length = match u64::try_from(input.len()) {
-                Ok(length) => length,
-                Err(_) => return VylResult::BodyTooLong,
-            };
-            if input_length > remaining {
-                return VylResult::BodyTooLong;
+        Err(ClientError::BufferTooSmall { required }) => {
+            unsafe {
+                out_required.write(required);
             }
-            if input.is_empty() {
-                return VylResult::Ok;
-            }
-            if output.is_empty() {
-                unsafe {
-                    out_required.write(input.len());
-                }
-                return VylResult::BufferTooSmall;
-            }
-
-            let written = input.len().min(output.len());
-            output[..written].copy_from_slice(&input[..written]);
-            let written_u64 = match u64::try_from(written) {
-                Ok(length) => length,
-                Err(_) => return VylResult::BodyTooLong,
-            };
-            (written, RequestBodyState::Fixed(remaining - written_u64))
+            VylResult::BufferTooSmall
         }
-        RequestBodyState::Chunked => {
-            if input.is_empty() {
-                return VylResult::InvalidArgument;
-            }
-            let Some(required) = chunk_length(input.len()) else {
-                return VylResult::BodyTooLong;
-            };
-            if output.len() < required {
-                unsafe {
-                    out_required.write(required);
-                }
-                return VylResult::BufferTooSmall;
-            }
-            if encode_chunk(input, output).is_err() {
-                return VylResult::InvalidArgument;
-            }
-            (required, RequestBodyState::Chunked)
-        }
-        RequestBodyState::Finished => return VylResult::BadState,
-    };
-
-    connection.request_writer = RequestWriteState::Pending {
-        pending: written,
-        body: next_body,
-    };
-    unsafe {
-        out_written.write(written);
-        out_required.write(written);
+        Err(ClientError::BodyTooLong) => VylResult::BodyTooLong,
+        Err(ClientError::WouldBlock) => VylResult::WouldBlock,
+        Err(ClientError::Cancelled) => VylResult::Cancelled,
+        Err(ClientError::BadState) => VylResult::BadState,
+        Err(_) => VylResult::InvalidArgument,
     }
-    VylResult::Ok
 }
 
 
@@ -448,67 +339,54 @@ unsafe fn finish_request_body(
         return VylResult::Capacity;
     }
     let connection = unsafe { &mut *connection };
-    let body = match connection.request_writer {
-        RequestWriteState::Ready(body) => body,
-        RequestWriteState::HeadPending { .. } | RequestWriteState::Pending { .. } => {
-            return VylResult::WouldBlock;
-        }
-        RequestWriteState::Cancelled => return VylResult::Cancelled,
-        RequestWriteState::Idle | RequestWriteState::Complete => return VylResult::BadState,
+    let trailers = if trailer_count == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(trailers, trailer_count) }
     };
-
-    match body {
-        RequestBodyState::Fixed(_) => VylResult::BadState,
-        RequestBodyState::Finished => VylResult::BadState,
-        RequestBodyState::Chunked => {
-            let trailers = if trailer_count == 0 {
-                &[]
-            } else {
-                unsafe { slice::from_raw_parts(trailers, trailer_count) }
-            };
-            let empty_field = Field {
-                name: &[],
-                value: &[],
-            };
-            let mut trailer_fields = [empty_field; VYL_HTTP1_MAX_REQUEST_FIELDS];
-            for (destination, field) in trailer_fields.iter_mut().zip(trailers) {
-                let name = match unsafe { read_bytes(field.name) } {
-                    Ok(name) => name,
-                    Err(error) => return error,
-                };
-                let value = match unsafe { read_bytes(field.value) } {
-                    Ok(value) => value,
-                    Err(error) => return error,
-                };
-                *destination = Field { name, value };
-            }
-
-            let output = unsafe { slice::from_raw_parts_mut(output, output_capacity) };
-            let mut required = 0;
-            let written = match finish_chunks_with_required_length(
-                &trailer_fields[..trailer_count],
-                output,
-                &mut required,
-            ) {
-                Ok(written) => written,
-                Err(RequestEncodeError::BufferTooSmall) => {
-                    unsafe {
-                        out_required.write(required);
-                    }
-                    return VylResult::BufferTooSmall;
-                }
-                Err(_) => return VylResult::InvalidArgument,
-            };
-            connection.request_writer = RequestWriteState::Pending {
-                pending: written,
-                body: RequestBodyState::Finished,
-            };
+    let empty_field = Field {
+        name: &[],
+        value: &[],
+    };
+    let mut trailer_fields = [empty_field; VYL_HTTP1_MAX_REQUEST_FIELDS];
+    for (destination, field) in trailer_fields.iter_mut().zip(trailers) {
+        let name = match unsafe { read_bytes(field.name) } {
+            Ok(name) => name,
+            Err(error) => return error,
+        };
+        let value = match unsafe { read_bytes(field.value) } {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        *destination = Field { name, value };
+    }
+    let output = if output_capacity == 0 {
+        &mut []
+    } else {
+        unsafe { slice::from_raw_parts_mut(output, output_capacity) }
+    };
+    match connection
+        .inner
+        .finish_request_body(&trailer_fields[..trailer_count], output)
+    {
+        Ok(finished) => {
             unsafe {
-                out_written.write(written);
-                out_required.write(required);
+                out_written.write(finished.written);
+                out_required.write(finished.required);
             }
             VylResult::Ok
         }
+        Err(ClientError::BufferTooSmall { required }) => {
+            unsafe {
+                out_required.write(required);
+            }
+            VylResult::BufferTooSmall
+        }
+        Err(ClientError::Capacity) => VylResult::Capacity,
+        Err(ClientError::WouldBlock) => VylResult::WouldBlock,
+        Err(ClientError::Cancelled) => VylResult::Cancelled,
+        Err(ClientError::BadState) => VylResult::BadState,
+        Err(_) => VylResult::InvalidArgument,
     }
 }
 
@@ -530,30 +408,8 @@ unsafe fn cancel_connection(connection: *mut VylClientConnection) -> VylResult {
     }
 
     let connection = unsafe { &mut *connection };
-    if connection.request_writer == RequestWriteState::Cancelled {
-        return VylResult::Ok;
-    }
-    connection.response.cancel();
-    connection.request_writer = RequestWriteState::Cancelled;
+    connection.inner.cancel();
     VylResult::Ok
-}
-
-fn body_state(framing: BodyFraming) -> RequestBodyState {
-    match framing {
-        BodyFraming::None | BodyFraming::Fixed(0) => RequestBodyState::Finished,
-        BodyFraming::Fixed(length) => RequestBodyState::Fixed(length),
-        BodyFraming::Chunked => RequestBodyState::Chunked,
-    }
-}
-
-fn chunk_length(length: usize) -> Option<usize> {
-    let mut digits = 1;
-    let mut remaining = length;
-    while remaining >= 16 {
-        digits += 1;
-        remaining >>= 4;
-    }
-    length.checked_add(digits)?.checked_add(4)
 }
 
 unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
@@ -564,12 +420,4 @@ unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
         return Ok(&[]);
     }
     Ok(unsafe { slice::from_raw_parts(bytes.data, bytes.length) })
-}
-
-fn matches_request_method(request_method: VylRequestMethod, method: &[u8]) -> bool {
-    match request_method {
-        VylRequestMethod::Head => method == b"HEAD",
-        VylRequestMethod::Connect => method == b"CONNECT",
-        VylRequestMethod::Other => method != b"HEAD" && method != b"CONNECT",
-    }
 }

@@ -120,7 +120,7 @@ fn body_allowed_expected(method: &[u8], status: u16) -> bool {
 }
 
 fn content_length_expected(method: &[u8], status: u16) -> bool {
-    status >= 200 && status != 204 && !(method == b"CONNECT" && (200..300).contains(&status))
+    status >= 200 && status != 204 && status != 304 && !(method == b"CONNECT" && (200..300).contains(&status))
 }
 
 fn take<'a>(stream: &mut &'a [u8], len: usize) -> &'a [u8] {

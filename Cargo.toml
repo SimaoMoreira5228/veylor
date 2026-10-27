@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/veylor-client",
     "crates/veylor-ffi",
     "crates/veylor-http1",
     "crates/veylor-http2",
@@ -10,6 +11,7 @@ members = [
     "crates/veylor-tls",
 ]
 default-members = [
+    "crates/veylor-client",
     "crates/veylor-ffi",
     "crates/veylor-http1",
     "crates/veylor-http2",

@@ -2,7 +2,7 @@ use std::boxed::Box;
 use std::ptr;
 use std::slice;
 
-use veylor_http1::{ClientResponse, Limits, ResponseRequestMethod as RequestMethod};
+use veylor_client::{ClientError, Limits};
 
 use super::{VylClientConnection, VylRequestMethod};
 use crate::abi::{VylResult, catch_ffi, slice_length_valid};
@@ -63,14 +63,13 @@ unsafe fn create_connection(
     } else {
         unsafe { slice::from_raw_parts(requested_upgrade, requested_upgrade_length) }
     };
+    // NOTE: the borrow is honest on the Rust side (`ClientConnection<'a>`); the FFI handle
+    // erases it to `'static`, which is sound only under this function's documented caller
+    // contract that the upgrade bytes outlive the handle.
     let requested_upgrade =
         unsafe { std::mem::transmute::<&[u8], &'static [u8]>(requested_upgrade) };
     let connection = Box::new(VylClientConnection {
-        request_method,
-        requested_upgrade,
-        response: ClientResponse::new(request_method.into(), requested_upgrade),
-        response_started: false,
-        request_writer: super::request_write::RequestWriteState::new(),
+        inner: veylor_client::ClientConnection::new(request_method.into(), requested_upgrade),
     });
 
     unsafe {
@@ -96,30 +95,11 @@ unsafe fn reset_connection(connection: *mut VylClientConnection) -> VylResult {
     }
 
     let connection = unsafe { &mut *connection };
-    if connection.request_writer == super::request_write::RequestWriteState::Cancelled {
-        return VylResult::Cancelled;
+    match connection.inner.reset() {
+        Ok(()) => VylResult::Ok,
+        Err(ClientError::Cancelled) => VylResult::Cancelled,
+        Err(_) => VylResult::BadState,
     }
-    if connection.response.is_upgraded()
-        || (connection.response_started && !connection.response.is_complete())
-        || (connection.request_writer == super::request_write::RequestWriteState::Complete
-            && !connection.response_started)
-    {
-        return VylResult::BadState;
-    }
-    if !matches!(
-        connection.request_writer,
-        super::request_write::RequestWriteState::Idle
-            | super::request_write::RequestWriteState::Complete
-    ) {
-        return VylResult::BadState;
-    }
-    connection.response = ClientResponse::new(
-        connection.request_method.into(),
-        connection.requested_upgrade,
-    );
-    connection.response_started = false;
-    connection.request_writer = super::request_write::RequestWriteState::new();
-    VylResult::Ok
 }
 
 
@@ -143,7 +123,7 @@ unsafe fn destroy_connection(connection: *mut VylClientConnection) -> VylResult 
     VylResult::Ok
 }
 
-impl From<VylRequestMethod> for RequestMethod {
+impl From<VylRequestMethod> for veylor_client::RequestMethod {
     fn from(method: VylRequestMethod) -> Self {
         match method {
             VylRequestMethod::Head => Self::Head,
