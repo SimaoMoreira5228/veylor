@@ -3,6 +3,7 @@ use std::path::Path;
 use veylor_http1::is_token;
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackHeader, HpackRepresentation,
+    status_sheds_length,
 };
 
 use crate::static_files::{FileMounts, FilePlan, FileReject, HTTP_DATE_BYTES, write_http_date};
@@ -402,7 +403,8 @@ impl<'a> FrozenRoutesView<'a> {
 // respond_file 200/206, respond_not_modified 304, respond_range_unsatisfiable 416 all emit
 // Date first); 200/206 add content-length, content-type, accept-ranges, and last-modified;
 // 304 carries no content-length (RFC 9110 8.6: only the would-be-200 length is legal, so the
-// engine omits it on both protocols) plus last-modified; 416 carries content-length 0 plus
+// engine omits it on both protocols, gated below by status_sheds_length shared with
+// send_full) plus last-modified; 416 carries content-length 0 plus
 // content-range */total. Single-range
 // 206 adds content-range; multipart 206 carries the dynamic boundary content-type instead
 // of the file type and no top-level content-range (H1 parity, body pages via read_chunk).
@@ -452,7 +454,7 @@ pub(crate) fn send_file_head(
     fields[0] = field(b":status", &status_buf[..status_len]);
     fields[1] = field(b"date", &now_buf[..now_len]);
     let mut count = 2;
-    if head.status != 304 {
+    if !status_sheds_length(head.status) {
         let length_len = push_decimal(&mut length_buf, head.content_length);
         fields[count] = field(b"content-length", &length_buf[..length_len]);
         count += 1;
@@ -602,6 +604,10 @@ pub(crate) fn send_full(
     output: &mut [u8],
     used: &mut usize,
 ) -> Result<(), ErrorCode> {
+    // NOTE: 204-only fast path (END_STREAM shape, not the shared length rule): 204 answers
+    // :status plus Date with END_STREAM and never DATA through send_status_only, so it never
+    // reaches the length gate below. status_sheds_length still covers it, and the gate below
+    // agrees because 204 cannot fall through.
     if status == 204 {
         return send_status_only(server, stream, status, output, used);
     }
@@ -614,7 +620,7 @@ pub(crate) fn send_full(
     response_fields[0] = field(b":status", &status_buf[..status_len]);
     response_fields[1] = field(b"date", &now_buf[..now_len]);
     let mut field_count = 2;
-    if status != 304 {
+    if !status_sheds_length(status) {
         let length_len = push_decimal(&mut length_buf, body.len() as u64);
         response_fields[field_count] = field(b"content-length", &length_buf[..length_len]);
         field_count += 1;

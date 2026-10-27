@@ -1,8 +1,7 @@
 use veylor_http1::{
-    BodyEvent, ConnectionHeader, Field, Limits, ResponseFraming, ResponseToWrite,
-    encode_response_chunk, encode_response_chunk_with_required_length,
-    encode_response_final_chunk_with_required_length, encode_response_head,
-    prohibited_request_trailer,
+    BodyEvent, Field, Limits, ResponseFraming, ResponseToWrite, encode_response_chunk,
+    encode_response_chunk_with_required_length, encode_response_final_chunk_with_required_length,
+    encode_response_head, prohibited_request_trailer, response_permits_reuse,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -382,7 +381,7 @@ pub(crate) fn apply_stream_cmd(
     cmd: StreamCmd,
     mut progress: PumpProgress,
 ) -> PumpOutcome {
-    let ConnPhase::Parked { keep_open, .. } = conn.phase else {
+    let ConnPhase::Parked { connection, .. } = conn.phase else {
         return PumpOutcome::Close(ConnClose::TransportError);
     };
     ConnState::materialize_output(&mut conn.output);
@@ -404,11 +403,9 @@ pub(crate) fn apply_stream_cmd(
                 host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             }
-            let connection = if keep_open {
-                ConnectionHeader::Omit
-            } else {
-                ConnectionHeader::Close
-            };
+            // NOTE: the head emits the shared park-time verdict whole (see park_request NOTE):
+            // bool-erasing it to Omit here dropped the HTTP/1.0 keep-alive echo while the
+            // pump still reused, disagreeing with the static path and the conn crate.
             let mut now = [0u8; HTTP_DATE_BYTES];
             let now_len = now_http_date(&mut now);
             let mut fields = [Field {
@@ -489,7 +486,7 @@ pub(crate) fn apply_stream_cmd(
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
             conn.pending_len = 0;
-            conn.closing = !keep_open;
+            conn.closing = !response_permits_reuse(false, connection);
             conn.close_reason = ConnClose::Completed;
             conn.phase = ConnPhase::SendingResponse;
             host.unpark_closed(token.worker_id, token.slot);

@@ -77,4 +77,8 @@ impl<'a> ClientConnection<'a> {
         self.response.cancel();
         self.writer = request_write::RequestWriteState::Cancelled;
     }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.writer == request_write::RequestWriteState::Cancelled
+    }
 }

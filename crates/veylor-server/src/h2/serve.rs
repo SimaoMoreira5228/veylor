@@ -88,8 +88,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
     // where H1 closes protocol-error, never partial DATA since HEADERS emit only after
     // a successful invoke. Every reason validates but never encodes: H2 has no reason
     // phrase. A 204 serves :status-only HEADERS with END_STREAM through send_full: RFC 9113
-    // forbids content-length on 204 while every other status carries it, so the shared sender
-    // sheds the length and any handler body there (H1 drops 204 bodies the same way); the
+    // forbids content-length on 204/304 (status_sheds_length) while every other status here
+    // carries it, so the shared sender sheds the length and any handler body there (H1 drops
+    // 204 bodies the same way); the
     // static projection still rejects 204 outright, so only handler/managed 204s land here.
     // NOTE: request bytes live in HPACK-decoded buffers and DATA has not arrived at
     // HEADERS time, so every invoke is framing-only (null body, has_body/body_len

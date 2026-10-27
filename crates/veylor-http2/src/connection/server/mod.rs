@@ -360,6 +360,17 @@ impl<'borrow, 'streams, 'decoder, 'encoder> H2ServerDriver<'borrow, 'streams, 'd
     }
 }
 
+// NOTE: single source for the H2 content-length shed rule (RFC 9113 section 8.2.2:
+// a length-unknown Begin carries no content-length, and 204/304 never carry it while
+// every other final status does). The managed H2 routes call this from send_full and
+// send_file_head instead of inline status checks, so static, file, and native shapes
+// shed together. The driver validator below keeps its wider 1xx bar (status < 200)
+// beside this predicate: no 1xx sender flows through those call sites, so the two
+// rules agree on every reachable status.
+pub fn status_sheds_length(status: u16) -> bool {
+    matches!(status, 204 | 304)
+}
+
 fn validate_response_fields(
     fields: &[HpackFieldToEncode<'_>],
     end_stream: bool,

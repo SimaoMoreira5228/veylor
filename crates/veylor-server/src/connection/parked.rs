@@ -42,7 +42,7 @@ impl ConnState {
         let ConnPhase::Parked {
             method_len,
             method,
-            keep_open,
+            connection,
             body_total,
             body_received,
             chunked,
@@ -53,11 +53,6 @@ impl ConnState {
             return Err(ConnClose::TransportError);
         };
         let request_method = &method[..usize::from(method_len)];
-        let connection = if keep_open {
-            ConnectionHeader::Omit
-        } else {
-            ConnectionHeader::Close
-        };
         // NOTE: H2 managed Date is the recorded follow-up (h2/serve.rs Begin/send_full), not this slice.
         let mut now = [0u8; HTTP_DATE_BYTES];
         let now_len = now_http_date(&mut now);
@@ -105,7 +100,10 @@ impl ConnState {
         self.out_sent = 0;
         self.pending_len = 0;
         self.write_blocked = false;
-        self.closing = !keep_open;
+        // NOTE: closing follows the shared verdict (response_permits_reuse), which the park
+        // stored whole: an HTTP/1.0 keep-alive request echoes Connection: keep-alive above
+        // instead of a bool-erased Omit, matching the static path and the conn crate.
+        self.closing = !response_permits_reuse(false, connection);
         self.close_reason = ConnClose::Completed;
         // NOTE: chunked completion is terminal-chunk observed, not declared-total: a respond
         // before the terminal chunk closes (framing cannot be skipped without decoding), while
@@ -392,13 +390,18 @@ pub(crate) fn park_request(
     if chunked && max_body_bytes == 0 {
         return reject_managed_body(conn, head);
     }
-    let connection =
+    let connection: ConnectionHeader =
         connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
     // NOTE: shared keep-alive verdict (see respond.rs keep_open NOTE): the park stores this
-    // provisional response-half verdict and complete_parked folds it into closing, while the
-    // body half rides body_total/body_received (or chunked_done) through the DrainingBody
-    // phase instead of the shared booleans.
-    let keep_open = response_permits_reuse(false, connection);
+    // provisional response-half verdict whole — not a bool — so complete_parked and the
+    // streaming Begin arm emit the same Connection header the static path would (including
+    // the HTTP/1.0 keep-alive echo). The body half rides body_total/body_received (or
+    // chunked_done) through the DrainingBody phase instead of the shared booleans.
+    // NOTE: status-driven closes stay path-owned and deliberately split: a static 404/405/416
+    // closes (response_close=true at the encode sites) while a managed host answering the
+    // same status reuses under this provisional verdict (pinned by
+    // managed_date_present_and_shaped_one_shot_stream_and_reuse); the conn crate leaves the
+    // same choice to its host via response_close. Only the request-driven half converges here.
     let token = conn.token;
     let mut snapshot = [0u8; HOST_MAX_METHOD_BYTES];
     snapshot[..method_len]
@@ -498,7 +501,7 @@ pub(crate) fn park_request(
         route_id,
         method_len: method_len as u8,
         method: snapshot,
-        keep_open,
+        connection,
         body_total,
         body_received,
         event_token,

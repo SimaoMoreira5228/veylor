@@ -339,6 +339,96 @@ fn managed_park_poll_respond_keep_alive_reusable() {
 }
 
 #[test]
+fn managed_parked_http10_keep_alive_echoes_and_reuses() {
+    // NOTE: drift alarm for the converged keep-alive verdict: an HTTP/1.0 request with
+    // Connection: keep-alive must echo Connection: keep-alive on every H1 path (static,
+    // parked fixed, streaming Begin). The static path emits the shared
+    // connection_header_for_response verdict directly; the parked paths must carry that same
+    // verdict, not a bool-erased Omit.
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"GET /hello HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write static 1.0");
+    let first = read_response(&mut stream);
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"hello");
+    assert!(
+        first
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("connection")
+                && value.eq_ignore_ascii_case("keep-alive")),
+        "static echoes keep-alive: {:?}",
+        first.headers
+    );
+    stream
+        .write_all(b"GET /work HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write parked 1.0");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"done"),
+        RespondOutcome::Ok
+    );
+    let second = read_response(&mut stream);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.body, b"done");
+    assert!(
+        second
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("connection")
+                && value.eq_ignore_ascii_case("keep-alive")),
+        "parked fixed echoes keep-alive: {:?}",
+        second.headers
+    );
+    stream
+        .write_all(b"GET /work HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write reuse 1.0");
+    let (third, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(third.token, 200, b"OK", b"again"),
+        RespondOutcome::Ok
+    );
+    let again = read_response(&mut stream);
+    assert_eq!(again.status, 200);
+    assert_eq!(again.body, b"again");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
+fn managed_stream_begin_http10_keep_alive_echoes() {
+    // NOTE: same drift alarm as above for the streaming Begin arm: the head must carry the
+    // shared keep-alive verdict so an HTTP/1.0 client reuses instead of closing.
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"GET /work HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write stream 1.0");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    wait_writable(&host, event.token);
+    assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
+    let head = read_raw_head(&mut stream);
+    let text = String::from_utf8(head).expect("head utf8");
+    assert!(
+        text.to_ascii_lowercase().contains("connection: keep-alive"),
+        "stream Begin echoes keep-alive: {text}"
+    );
+    let mut terminal = [0; 5];
+    stream.read_exact(&mut terminal).expect("terminal");
+    assert_eq!(&terminal, b"0\r\n\r\n");
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
 fn managed_date_present_and_shaped_one_shot_stream_and_reuse() {
     let server = default_managed_server();
     let host = server.host();

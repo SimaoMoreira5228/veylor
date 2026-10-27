@@ -1,5 +1,6 @@
 use super::H2ServerDriver;
 use super::ServerError;
+use super::status_sheds_length;
 use crate::connection::FeedResult;
 use crate::connection::H2FrameAction;
 use crate::frame::DEFAULT_MAX_FRAME_SIZE;
@@ -529,6 +530,18 @@ fn response_validation_rejects_bad_status_and_fields() {
             ))
         ));
     });
+}
+
+#[test]
+fn status_sheds_length_pins_204_304_rule() {
+    // NOTE: drift alarm for the converged H2 length rule: the managed routes omit
+    // content-length in send_full and send_file_head exactly when this sheds, so a
+    // widening here must update both call sites together.
+    assert!(status_sheds_length(204));
+    assert!(status_sheds_length(304));
+    for status in [100, 101, 103, 200, 206, 404, 416, 500] {
+        assert!(!status_sheds_length(status), "length rides for {status}");
+    }
 }
 
 #[test]

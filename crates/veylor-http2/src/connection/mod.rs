@@ -18,7 +18,10 @@ pub use output::{
     ControlFrameWriter, DataFrameWriter, DataWriteError, FrameWriteError, HeadersFrameWriter,
     HeadersWriteError, OutputProgress, QueuedDataFrame, QueuedHeadersBlock,
 };
-pub use server::{H2ServerDriver, SentResponse, SentServerData, ServerError, ServerResponseError};
+pub use server::{
+    H2ServerDriver, SentResponse, SentServerData, ServerError, ServerResponseError,
+    status_sheds_length,
+};
 pub use server_request::{
     ServerRequestError, ValidatedServerRequest, validate_server_request_fields,
 };

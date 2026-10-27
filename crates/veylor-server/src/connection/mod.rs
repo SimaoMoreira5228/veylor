@@ -3,7 +3,9 @@ pub(crate) mod streams;
 
 pub(crate) use parked::{pull_staged_body, push_staged_body};
 
-use veylor_http1::{BodyDecoder, Header, Limits, ParseError, Parser, Span, is_token};
+use veylor_http1::{
+    BodyDecoder, ConnectionHeader, Header, Limits, ParseError, Parser, Span, is_token,
+};
 use veylor_router::{RouteKind, RouteTable};
 use veylor_runtime::{
     CloseReason, ConnectionToken, IoBatch, ReadStatus, TcpStream, WriteStatus, dispatch,
@@ -67,13 +69,14 @@ pub(crate) enum ConnPhase {
     // body byte stages through the output buffer, so this variant stays fieldless + Copy.
     SendingFile,
     // NOTE: the owner-side parked snapshot: method copy for HEAD semantics at respond time,
-    // keep-open from the request line alone, fixed-length body admission with the event token
-    // so worker turns can stage wire bytes for host pulls; unread bytes drain within the cap.
+    // shared connection verdict from the request line alone, fixed-length body admission with
+    // the event token so worker turns can stage wire bytes for host pulls; unread bytes drain
+    // within the cap.
     Parked {
         route_id: u64,
         method_len: u8,
         method: [u8; HOST_MAX_METHOD_BYTES],
-        keep_open: bool,
+        connection: ConnectionHeader,
         body_total: u64,
         body_received: u64,
         event_token: ConnectionToken,

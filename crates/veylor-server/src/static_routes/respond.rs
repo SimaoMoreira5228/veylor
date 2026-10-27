@@ -143,6 +143,12 @@ pub fn respond_to_head(
     };
     // NOTE: a declared body at or under the cap is drained by the connection before any response
     // byte is written, so framing treats it as complete now; chunked and oversized already left.
+    // NOTE: status-driven close stays path-owned and deliberately split: an unmatched static
+    // path closes its 404 (like the 405/416 siblings below) while a managed host answering
+    // 404 reuses under its park-time verdict (pinned by
+    // managed_date_present_and_shaped_one_shot_stream_and_reuse) and the conn crate leaves
+    // the same choice to its host via response_close. Only the request-driven half (version,
+    // Connection header, drain) converges through connection_header_for_response.
     let response_close = status == 404;
     let connection = connection_header_for_response(
         head,

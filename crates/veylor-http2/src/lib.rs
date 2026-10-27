@@ -13,7 +13,8 @@ pub use connection::{
     OutputProgress, QueuedDataFrame, QueuedHeadersBlock, RequestFieldSectionError,
     ResponseFieldSection, ResponseSectionError, ResponseSectionKind, SentData, SentResponse,
     SentServerData, ServerError, ServerRequestError, ServerResponseError, StartedRequest,
-    ValidatedServerRequest, encode_request_field_section, validate_server_request_fields,
+    ValidatedServerRequest, encode_request_field_section, status_sheds_length,
+    validate_server_request_fields,
 };
 pub use flow_control::{
     DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError, MAX_FLOW_WINDOW_SIZE,

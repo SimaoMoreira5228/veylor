@@ -173,6 +173,7 @@ fn method_gate_cancel_and_reset_shape_the_write_half() {
         .unwrap();
     assert_eq!(headed.reset().unwrap_err(), ClientError::BadState);
     headed.cancel();
+    assert!(headed.is_cancelled());
     assert_eq!(
         headed
             .encode_request_head(b"HEAD", b"/", &fields, BodyFraming::None, &mut output)
@@ -186,6 +187,7 @@ fn method_gate_cancel_and_reset_shape_the_write_half() {
     assert_eq!(headed.reset().unwrap_err(), ClientError::Cancelled);
 
     let mut fresh = connection();
+    assert!(!fresh.is_cancelled());
     fresh.reset().unwrap();
     let oversized = [Field {
         name: b"a",
