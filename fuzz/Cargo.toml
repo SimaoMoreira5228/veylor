@@ -49,3 +49,9 @@ name = "fuzz_response_write"
 path = "fuzz_targets/fuzz_response_write.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_h2_frame"
+path = "fuzz_targets/fuzz_h2_frame.rs"
+test = false
+doc = false

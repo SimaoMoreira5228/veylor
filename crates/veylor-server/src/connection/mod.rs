@@ -25,8 +25,9 @@ pub const HEADER_SLOTS: usize = 100;
 // NOTE: minimal request-line frame around a target (1-byte method + 2 spaces + 8-byte version);
 // a target side longer than the line limit behind this frame is target-caused (RFC 9110 15.5.15).
 const MIN_REQUEST_LINE_FRAME: usize = 11;
-pub const FD_CACHE_ENTRIES: usize = 1;
 // NOTE: single-entry fd cache (Linux); one handle per conn bounds fds, replace evicts.
+#[cfg(target_os = "linux")]
+pub const FD_CACHE_ENTRIES: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StagedTrailer {

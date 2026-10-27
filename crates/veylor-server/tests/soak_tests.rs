@@ -363,6 +363,46 @@ fn soak_connection_churn_mixed_close_conserves() {
 }
 
 #[test]
+fn soak_idle_burst_reconnect_conserves() {
+    const IDLE: usize = 64;
+    const BURST: usize = 64;
+    const TOTAL: usize = IDLE + BURST;
+    let server = static_server();
+    let mut idle = Vec::with_capacity(IDLE);
+    for _ in 0..IDLE {
+        let mut stream = connect(&server);
+        get(&mut stream, "/hello");
+        let response = read_response(&mut stream);
+        assert_eq!(response.status, 200);
+        idle.push(stream);
+    }
+    let mut burst = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        burst.push(connect(&server));
+    }
+    for stream in idle.iter_mut().chain(burst.iter_mut()) {
+        get(stream, "/hello");
+    }
+    for stream in idle.iter_mut().chain(burst.iter_mut()) {
+        let response = read_response(stream);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+    }
+    for mut stream in idle.into_iter().chain(burst) {
+        get_close(&mut stream, "/hello");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read close tail");
+    }
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    // NOTE: idle-held plus burst-opened connections all answer after the burst, then
+    // close gracefully; the summed close buckets equal dials exactly, so burst accept
+    // neither drops nor double-counts a connection.
+    assert_eq!(total_closes(&counts), TOTAL as u64, "counts: {counts:?}");
+    assert_eq!(counts.completed, TOTAL as u64, "counts: {counts:?}");
+}
+
+#[test]
 fn soak_managed_park_respond_cancel_cycles() {
     const RESPONDS: usize = 100;
     const RACES: usize = 20;
