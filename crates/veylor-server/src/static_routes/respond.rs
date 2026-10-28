@@ -1,8 +1,9 @@
 // NOTE: response-assembly half of the static_routes seam: registry owns route storage and
 // validation (super), this module owns response encoding over already-matched routes.
 use veylor_http1::{
-    ConnectionHeader, Field, Header, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
-    connection_header_for_response, encode_response_head, response_permits_reuse,
+    ALLOW_BYTES, ALLOW_METHODS, CONTENT_RANGE_BYTES, ConnectionHeader, Field, Header,
+    MULTIPART_CTYPE_BYTES, RequestHead, ResponseFraming, ResponseToWrite, TargetForm,
+    connection_header_for_response, encode_response_head, join_allow_value, response_permits_reuse,
 };
 use veylor_router::{RouteCapture, RouteError, RouteKind, RouteTable};
 
@@ -19,15 +20,9 @@ use super::{
 };
 
 const CAPTURE_SLOTS: usize = 8;
-// NOTE: at most this many distinct methods list in Allow; more truncate the tail, so size
-// it at the route cap and the 405 below reports Invalid past the value buffer instead.
-const ALLOW_METHODS: usize = 16;
-const ALLOW_BYTES: usize = 320;
-// NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
-const CONTENT_RANGE_BYTES: usize = 80;
-// NOTE: "multipart/byteranges; boundary=" plus the fixed token and three hex fields tops out near 91 bytes;
-// 128 leaves margin, and the same buffer doubles as the Content-Range scratch since the two never coexist.
-const MULTIPART_CTYPE_BYTES: usize = 128;
+// NOTE: Allow join and range/multipart scratch live in veylor_http1 (response_write):
+// this path shares one join_allow_value plus the four size bounds with H2 routes,
+// so the 405 plus OPTIONS and file assembly cannot drift between engines.
 const NOT_FOUND_BODY: &[u8] = b"Not Found";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"Method Not Allowed";
 const BAD_REQUEST_BODY: &[u8] = b"Bad Request";
@@ -255,7 +250,8 @@ fn respond_method_not_allowed(
         .allowed_methods_for_request(head, input, &mut methods)
         .map_err(|_| RouteBuildError::Invalid)?;
     let mut allow = [0u8; ALLOW_BYTES];
-    let allow_len = join_allow(&methods[..count], &mut allow).ok_or(RouteBuildError::Invalid)?;
+    let allow_len =
+        join_allow_value(&methods[..count], &mut allow).ok_or(RouteBuildError::Invalid)?;
     encode_method_not_allowed(
         head,
         input,
@@ -265,27 +261,6 @@ fn respond_method_not_allowed(
         interim_len,
         output,
     )
-}
-
-fn join_allow(methods: &[&[u8]], out: &mut [u8]) -> Option<usize> {
-    let mut len = 0;
-    for (index, name) in methods.iter().enumerate() {
-        if index > 0 {
-            let end = len + 2;
-            if end > out.len() {
-                return None;
-            }
-            out[len..end].copy_from_slice(b", ");
-            len = end;
-        }
-        let end = len + name.len();
-        if end > out.len() {
-            return None;
-        }
-        out[len..end].copy_from_slice(name);
-        len = end;
-    }
-    Some(len)
 }
 
 fn encode_method_not_allowed(
@@ -356,7 +331,8 @@ fn respond_server_options(
         .server_allow_methods(&mut methods)
         .map_err(|_| RouteBuildError::Invalid)?;
     let mut allow = [0u8; ALLOW_BYTES];
-    let allow_len = join_allow(&methods[..count], &mut allow).ok_or(RouteBuildError::Invalid)?;
+    let allow_len =
+        join_allow_value(&methods[..count], &mut allow).ok_or(RouteBuildError::Invalid)?;
     let connection =
         connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
     let mut now = [0u8; HTTP_DATE_BYTES];
@@ -936,7 +912,10 @@ mod tests {
     // same shared shape for its continue handshake, so any shape edit upstream fails here
     // until the pump follows.
     use super::encode_continue;
-    use veylor_http1::{continue_interim, encode_response_head};
+    use veylor_http1::{
+        ALLOW_BYTES, ALLOW_METHODS, CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES, continue_interim,
+        encode_response_head,
+    };
 
     #[test]
     fn interim_stages_shared_continue_shape_ahead_of_final() {
@@ -1021,5 +1000,16 @@ mod tests {
         );
         assert!(!keep_open);
         assert_eq!(keep_open, response_permits_reuse(false, verdict));
+    }
+
+    #[test]
+    fn allow_scratch_sizes_match_shared_bounds() {
+        // NOTE: drift alarm for the converged Allow scratch policy: this engine sizes
+        // every Allow, Content-Range, and multipart buffer from the shared veylor_http1
+        // bounds, so a shared-bound edit fails here until this consumer follows.
+        assert_eq!(ALLOW_METHODS, 16);
+        assert_eq!(ALLOW_BYTES, 320);
+        assert_eq!(CONTENT_RANGE_BYTES, 80);
+        assert_eq!(MULTIPART_CTYPE_BYTES, 128);
     }
 }

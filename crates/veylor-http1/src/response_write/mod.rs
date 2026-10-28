@@ -174,6 +174,41 @@ pub fn connection_header_for_response(
     }
 }
 
+// NOTE: single source for the Allow value assembly and its scratch bounds: H1
+// respond_method_not_allowed plus server OPTIONS and the H2 write_allow plus
+// write_server_allow join flows all call join_allow_value, so ", " separators and
+// fail-closed overflow (None past the value buffer) cannot drift between engines.
+// ALLOW_METHODS caps the distinct-method list at the route cap; ALLOW_BYTES holds
+// the joined value; CONTENT_RANGE_BYTES holds "bytes start-last/total" (68 worst
+// case); MULTIPART_CTYPE_BYTES holds the shared multipart boundary content-type
+// (31-byte prefix plus at most a 44-byte VEYLOR_hex_hex_count token, 75 worst
+// case, doubling as the Content-Range scratch since the two never coexist).
+pub const ALLOW_METHODS: usize = 16;
+pub const ALLOW_BYTES: usize = 320;
+pub const CONTENT_RANGE_BYTES: usize = 80;
+pub const MULTIPART_CTYPE_BYTES: usize = 128;
+
+pub fn join_allow_value(methods: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    let mut len = 0;
+    for (index, name) in methods.iter().enumerate() {
+        if index > 0 {
+            let end = len + 2;
+            if end > out.len() {
+                return None;
+            }
+            out[len..end].copy_from_slice(b", ");
+            len = end;
+        }
+        let end = len + name.len();
+        if end > out.len() {
+            return None;
+        }
+        out[len..end].copy_from_slice(name);
+        len = end;
+    }
+    Some(len)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResponseToWrite<'a> {
     pub request_method: &'a [u8],

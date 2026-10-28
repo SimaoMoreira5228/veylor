@@ -2427,3 +2427,26 @@ fn managed_stream_begin_rejects_bad_headers() {
     server.stop_accepting();
     let _ = server.join().expect("join server");
 }
+
+#[test]
+fn managed_oversized_target_answers_414_with_close() {
+    let server = default_managed_server();
+    let mut stream = connect(&server);
+    let target = format!("/work?x={}", "a".repeat(3000));
+    let request =
+        format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write long target");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 414);
+    assert_eq!(response.body, b"URI Too Long");
+    date_shape(&response);
+    assert_eq!(header(&response, "connection"), "close");
+    let mut tail = Vec::new();
+    stream.read_to_end(&mut tail).expect("read close tail");
+    assert!(tail.is_empty(), "tail: {tail:?}");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
+}

@@ -419,6 +419,15 @@ pub(crate) fn park_request(
         Ok(event_token) => event_token,
         Err(ParkError::Full) => return ExchangeOutcome::Close(ConnClose::QueueFull),
         Err(ParkError::SnapshotTooLarge) => {
+            // NOTE: attribute like the parser (request_target_too_long): the route matched
+            // on the stripped path but the staged copy carries the whole target, so an
+            // over-long query string lands here, not in the line parser. Answer 414 with
+            // Date and close exactly like the static path instead of closing silent;
+            // other snapshot overflows (method) keep the silent transport close.
+            if target_len > crate::host::HOST_MAX_PATH_BYTES {
+                super::send_uri_too_long(conn);
+                return ExchangeOutcome::Responded;
+            }
             return ExchangeOutcome::Close(ConnClose::TransportError);
         }
     };

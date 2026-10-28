@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use veylor_http1::is_token;
+use veylor_http1::{
+    ALLOW_METHODS, CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES, is_token, join_allow_value,
+};
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackHeader, HpackRepresentation,
     status_sheds_length,
@@ -22,10 +24,6 @@ pub(crate) const URI_TOO_LONG_BODY: &[u8] = b"URI Too Long";
 // minimal framing, while H2 checks the decoded :path directly since its length is known
 // exactly — no buffered-line attribution needed.
 pub(crate) const MAX_REQUEST_TARGET_BYTES: usize = 8 * 1024;
-// NOTE: at most this many distinct methods list in Allow; more truncate the tail, so size
-// it at the route cap and the 405 below RSTs past the value buffer instead.
-const ALLOW_METHODS: usize = 16;
-pub(crate) const ALLOW_BYTES: usize = 320;
 const MAX_RESPONSE_FIELDS: usize = 5 + crate::host::MAX_STAGED_RESPONSE_HEADERS;
 const MAX_BEGIN_FIELDS: usize = 2 + crate::host::MAX_STAGED_RESPONSE_HEADERS;
 
@@ -43,32 +41,9 @@ pub(crate) fn project_extra_headers<'a>(
     }
     count
 }
-// NOTE: "bytes " plus three u64 fields plus separators tops out at 68 bytes; 80 leaves margin.
-const CONTENT_RANGE_BYTES: usize = 80;
-// NOTE: "multipart/byteranges; boundary=" plus token and hex fields tops out near 91 bytes;
-// 128 leaves margin, mirroring the H1 multipart scratch.
-const MULTIPART_CTYPE_BYTES: usize = 128;
-
-fn join_allow_value(methods: &[&[u8]], out: &mut [u8]) -> Option<usize> {
-    let mut len = 0;
-    for (index, name) in methods.iter().enumerate() {
-        if index > 0 {
-            let end = len + 2;
-            if end > out.len() {
-                return None;
-            }
-            out[len..end].copy_from_slice(b", ");
-            len = end;
-        }
-        let end = len + name.len();
-        if end > out.len() {
-            return None;
-        }
-        out[len..end].copy_from_slice(name);
-        len = end;
-    }
-    Some(len)
-}
+// NOTE: Allow join and range/multipart scratch live in veylor_http1 (response_write):
+// both engines share one join_allow_value plus the four size bounds, so the H2 405
+// plus OPTIONS and file-head assembly cannot drift from the H1 shapes.
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrozenRoute<'a> {
@@ -814,6 +789,7 @@ mod tests {
     use crate::static_routes::{NativeRequestView, NativeResponseOut};
 
     use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
+    use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES};
 
     #[allow(unsafe_code)]
     unsafe extern "C" fn probe(
@@ -899,5 +875,16 @@ mod tests {
         assert!(view.write_allow(b"/missing", &mut allow).is_none());
         let mut tiny = [0u8; 3];
         assert!(view.write_allow(b"/a", &mut tiny).is_none());
+    }
+
+    #[test]
+    fn allow_scratch_sizes_match_shared_bounds() {
+        // NOTE: drift alarm for the converged Allow scratch policy: this engine sizes
+        // every Allow, Content-Range, and multipart buffer from the shared veylor_http1
+        // bounds, so a shared-bound edit fails here until this consumer follows.
+        assert_eq!(ALLOW_METHODS, 16);
+        assert_eq!(ALLOW_BYTES, 320);
+        assert_eq!(CONTENT_RANGE_BYTES, 80);
+        assert_eq!(MULTIPART_CTYPE_BYTES, 128);
     }
 }

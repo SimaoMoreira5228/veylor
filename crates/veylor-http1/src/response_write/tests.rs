@@ -1,9 +1,10 @@
 use super::{
-    ConnectionHeader, FixedResponseBodyWriter, ResponseEncodeError, ResponseFraming,
-    ResponseToWrite, ResponseWriteCursor, can_reuse_after_response, connection_header_for_response,
+    ALLOW_BYTES, ALLOW_METHODS, CONTENT_RANGE_BYTES, ConnectionHeader, FixedResponseBodyWriter,
+    MULTIPART_CTYPE_BYTES, ResponseEncodeError, ResponseFraming, ResponseToWrite,
+    ResponseWriteCursor, can_reuse_after_response, connection_header_for_response,
     continue_interim, encode_response_chunk, encode_response_chunk_with_required_length,
     encode_response_final_chunk, encode_response_final_chunk_with_required_length,
-    encode_response_head, response_permits_reuse,
+    encode_response_head, join_allow_value, response_permits_reuse,
 };
 use crate::request_head::{Header, Limits, Parser};
 use crate::request_write::Field;
@@ -556,4 +557,31 @@ fn reuse_verdict_matches_shared_keep_alive_policy() {
         true,
         true
     ));
+}
+
+#[test]
+fn allow_join_value_joins_comma_space_and_fails_closed_on_overflow() {
+    // NOTE: drift alarm for the converged Allow policy: H1 405 plus OPTIONS and H2
+    // write_allow plus write_server_allow share this join, so any separator or
+    // fail-closed edit here must update both engines together.
+    let mut out = [0u8; 64];
+    let len =
+        join_allow_value(&[b"GET".as_slice(), b"POST".as_slice()], &mut out).expect("allow fits");
+    assert_eq!(&out[..len], b"GET, POST");
+    let empty = join_allow_value(&[], &mut out).expect("empty joins");
+    assert_eq!(empty, 0);
+    let mut tiny = [0u8; 3];
+    assert!(join_allow_value(&[b"GET".as_slice(), b"POST".as_slice()], &mut tiny).is_none());
+    let mut exact = [0u8; 9];
+    let len =
+        join_allow_value(&[b"GET".as_slice(), b"POST".as_slice()], &mut exact).expect("exact fit");
+    assert_eq!(&exact[..len], b"GET, POST");
+    assert!(join_allow_value(&[b"GET".as_slice(), b"POST".as_slice()], &mut exact[..8]).is_none());
+    // NOTE: scratch-size pins for the shared Allow, Content-Range, and multipart
+    // buffers: H1 respond plus H2 routes and serve size every scratch from these,
+    // so a bound edit here fails the consumer pins until both engines follow.
+    assert_eq!(ALLOW_METHODS, 16);
+    assert_eq!(ALLOW_BYTES, 320);
+    assert_eq!(CONTENT_RANGE_BYTES, 80);
+    assert_eq!(MULTIPART_CTYPE_BYTES, 128);
 }
