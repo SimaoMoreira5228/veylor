@@ -14,7 +14,8 @@ pub use connection::{TrailerOutcome, TrailerReport};
 pub use h2::{
     ACK_SLOTS, DECIMAL_CAP, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES,
     FrozenRoute, FrozenRoutesView, H2_BODY_CAP, H2Conn, H2HostCtx, HEADER_BLOCK_CAP,
-    HPACK_BLOCK_CAP, INPUT_STAGING_CAP, MAX_STREAMS_PER_STEP, PushError, STREAM_SLOTS, StepOutcome,
+    HPACK_BLOCK_CAP, INPUT_STAGING_CAP, MAX_H2_CONNS, MAX_STREAMS_PER_STEP, PushError,
+    STREAM_SLOTS, StepOutcome,
 };
 pub use host::{
     BodyPull, CancelOutcome, EventSlot, HOST_MAX_METHOD_BYTES, HOST_MAX_PATH_BYTES,

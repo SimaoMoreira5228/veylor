@@ -19,6 +19,9 @@ pub struct EndpointSettings {
 
 impl EndpointSettings {
     pub const fn for_role(role: H2Role) -> Self {
+        // NOTE: max_header_list_size stays at the RFC 9113 default (unlimited): the real
+        // bound is the caller-supplied HPACK table (entries/scratch report Capacity past
+        // their fixed sizes), so no protocol-level setting is needed to stay fail-closed.
         Self {
             header_table_size: 4_096,
             enable_push: match role {

@@ -4937,3 +4937,27 @@ fn h2_managed_begin_with_headers_sends_them_after_date() {
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
+
+#[test]
+fn h2_ninth_concurrent_connection_closes_with_transport_error() {
+    // NOTE: connection-ceiling pin beside the stream-ceiling pin: 8 slots hold 8
+    // handshaked connections, so the 9th accept finds no free slot and the server
+    // drops it (TransportError) instead of handshaking — fail-closed, counted.
+    let server = managed_h2_server();
+    let mut held = Vec::new();
+    for _ in 0..veylor_server::MAX_H2_CONNS {
+        let mut stream = h2_connect(&server);
+        handshake(&mut stream);
+        held.push(stream);
+    }
+    let mut ninth = h2_connect(&server);
+    ninth
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("short timeout");
+    assert!(
+        try_read_frame(&mut ninth).is_none(),
+        "9th connection must close without a frame"
+    );
+    let counts = stop_join(server);
+    assert_eq!(counts.transport_error, 1, "counts: {counts:?}");
+}

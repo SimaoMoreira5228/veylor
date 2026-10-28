@@ -10,7 +10,7 @@ use veylor_tls::{TlsAcceptor, TlsConn};
 use super::{
     ACK_SLOTS, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES, FrozenNativeRoute,
     FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP,
-    STREAM_SLOTS,
+    MAX_H2_CONNS, STREAM_SLOTS,
 };
 use crate::connection::{
     ConnClose, TlsWriteOutcome, tls_encrypt_bytes, tls_read_decrypted, tls_write_once,
@@ -23,7 +23,6 @@ use crate::static_server::{CloseCounts, H2StaticRoute, MAX_CONNECTIONS};
 // NOTE: spanning driver borrows persist across turns: only same-site overwrites end
 // old regions, so workers pre-allocate buffer sets and borrow FIELDS at one inline
 // build site per slot; closes visibly clear the conn. 8x32 streams out-multiplex H1.
-pub(crate) const MAX_H2_CONNS: usize = 8;
 pub(crate) const H2C_LISTENER_TOKEN: usize = usize::MAX - 1;
 pub(crate) const H2_STREAM_TOKEN_BASE: usize = 1024;
 pub(crate) const H2_ACCEPT_STAGING: usize = 8;
@@ -1040,7 +1039,7 @@ macro_rules! drive_h2_pumps {
                     counts: &mut $result.counts,
                     tls_acceptor: $tlsacc.as_mut(),
                 };
-                for index in 0..$crate::h2::turn::MAX_H2_CONNS {
+                for index in 0..$crate::h2::MAX_H2_CONNS {
                     turn.budget = $budget;
                     match index {
                         0 => $crate::h2::turn::pump_h2_one!(0, $metas, m0, $c0, turn, $poller),

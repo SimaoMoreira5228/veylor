@@ -31,7 +31,7 @@ pub(crate) use signals::{
 pub const HOST_QUEUE_DEPTH: usize = 64;
 // NOTE: H2 stream-keyed park range appended to the parked table: 8 conns x 32 subslots,
 // indexed MAX_CONNECTIONS + conn * 32 + subslot; sized from the H2 turn constants.
-pub(crate) const H2_PARK_SLOTS: usize = crate::h2::turn::MAX_H2_CONNS * crate::h2::STREAM_SLOTS;
+pub(crate) const H2_PARK_SLOTS: usize = crate::h2::MAX_H2_CONNS * crate::h2::STREAM_SLOTS;
 pub const HOST_MAX_METHOD_BYTES: usize = 16;
 pub const HOST_MAX_PATH_BYTES: usize = 2048;
 pub const HOST_MAX_REASON_BYTES: usize = 64;
