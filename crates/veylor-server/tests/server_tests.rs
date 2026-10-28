@@ -194,6 +194,7 @@ fn unknown_path_returns_404_then_closes() {
     let response = read_response(&mut stream);
     assert_eq!(response.status, 404);
     assert_eq!(response.body, b"Not Found");
+    assert_eq!(header(&response, "connection"), "close");
     read_eof(&mut stream);
     server.stop_accepting();
     let counts = server.join().expect("join server");
@@ -1234,6 +1235,7 @@ fn file_missing_returns_404_then_closes() {
     let response = read_response(&mut stream);
     assert_eq!(response.status, 404);
     assert_eq!(response.body, b"Not Found");
+    assert_eq!(header(&response, "connection"), "close");
     read_eof(&mut stream);
     server.stop_accepting();
     let counts = server.join().expect("join server");

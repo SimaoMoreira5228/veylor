@@ -5,6 +5,12 @@ mod response;
 #[cfg(test)]
 mod tests;
 
+// NOTE: framing mechanism, not response shaping: this module exposes stream primitives
+// (send_response/send_data/refuse/reset/goaway_drain) while Date/length/trailer/file
+// assembly stays the caller's job — the managed server shapes those in its own routes
+// layer and host-driven callers assemble them from the same primitives. Closing that
+// gap here would duplicate the shaping layer instead of sharing it.
+
 pub use api::WriteOut;
 pub use feed::{BatchStatus, FeedBatch, FeedScratch, error_code_value};
 pub use request::{DataOut, ValidatedRequest};
@@ -35,6 +41,92 @@ pub enum H2ServerError {
     WriteOverrun,
     Cancelled,
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 pub struct H2ServerTables<'a> {
     streams: StreamTable<'a>,
