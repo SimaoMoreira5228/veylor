@@ -2450,3 +2450,27 @@ fn managed_oversized_target_answers_414_with_close() {
     let counts = server.join().expect("join server");
     assert_eq!(counts.protocol_error, 1, "counts: {counts:?}");
 }
+
+#[test]
+fn tomb_overflow_evicts_oldest_and_counts_it() {
+    const CANCELS: usize = 70;
+    const DEPTH: usize = 64;
+    let server = default_managed_server();
+    let host = server.host();
+    for _ in 0..CANCELS {
+        let mut stream = connect(&server);
+        get(&mut stream, "/work");
+        let (event, _, _) = poll_request(&host);
+        assert_eq!(host.cancel(event.token), CancelOutcome::Ok);
+        expect_eof(&mut stream);
+    }
+    assert!(
+        spin_until(|| host.parked_count() == 0),
+        "all cancels unparked"
+    );
+    // NOTE: 70 cancelled parks over one worker exceed the 64-deep tomb queue, so the
+    // oldest 6 evict; the counter pins the loss instead of leaving it silent.
+    assert_eq!(host.counters().tombs_evicted, (CANCELS - DEPTH) as u64);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}

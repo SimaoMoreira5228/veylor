@@ -14,6 +14,10 @@ use super::stream::{H2Role, SettingsError, StreamTable};
 
 pub const H2C_HEADER_TABLE_SIZE: u32 = 4_096;
 pub const H2C_MAX_FRAME_SIZE: u32 = 16_384;
+// NOTE: cap on the advertised peer limit, not the enforced one: the handshake sends
+// min(this, live slot capacity), and every shipped table holds 32 slots, so the
+// effective ceiling is 32 today (pinned by the managed 33rd-stream refusal test).
+// This constant only binds if a larger table ever exists; keep it if the table grows.
 pub const H2C_MAX_CONCURRENT_STREAMS: u32 = 100;
 pub const H2C_SERVER_SETTINGS_LEN: usize = FRAME_HEADER_LEN + 3 * SETTINGS_ENTRY_LEN;
 pub const H2C_GOAWAY_LEN: usize = FRAME_HEADER_LEN + GOAWAY_FIXED_LEN;

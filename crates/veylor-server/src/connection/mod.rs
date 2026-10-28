@@ -24,6 +24,10 @@ use crate::static_routes::{
 pub const INPUT_CAP: usize = 8192;
 pub const OUTPUT_CAP: usize = 8192;
 pub const HEADER_SLOTS: usize = 100;
+// NOTE: TLS scratch floors, not bounds: encrypted records may exceed OUTPUT_CAP, so the
+// pending buffer pre-reserves 16 KiB while the plaintext side matches INPUT_CAP. Floors,
+// not caps — growth beyond them is normal and unbounded by these values.
+pub const TLS_PENDING_MIN_BYTES: usize = 16384;
 // NOTE: minimal request-line frame around a target (1-byte method + 2 spaces + 8-byte version);
 // a target side longer than the line limit behind this frame is target-caused (RFC 9110 15.5.15).
 const MIN_REQUEST_LINE_FRAME: usize = 11;
@@ -226,9 +230,9 @@ impl ConnState {
     pub(crate) fn attach_tls(&mut self, tls: TlsConn) {
         self.tls = Some(tls);
 
-        if self.tls_pending.capacity() < 16384 {
+        if self.tls_pending.capacity() < TLS_PENDING_MIN_BYTES {
             self.tls_pending
-                .reserve(16384 - self.tls_pending.capacity());
+                .reserve(TLS_PENDING_MIN_BYTES - self.tls_pending.capacity());
         }
 
         if self.tls_plain.capacity() < INPUT_CAP {

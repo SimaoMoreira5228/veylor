@@ -37,6 +37,7 @@ pub const HOST_MAX_PATH_BYTES: usize = 2048;
 pub const HOST_MAX_REASON_BYTES: usize = 64;
 pub const MAX_STAGED_RESPONSE_HEADERS: usize = 8;
 pub const MAX_STAGED_RESPONSE_BYTES: usize = 1024;
+pub const MAX_STAGED_RESPONSE_NAME_BYTES: usize = 128;
 
 pub(crate) fn valid_response_headers(headers: &[(&[u8], &[u8])]) -> bool {
     if headers.len() > MAX_STAGED_RESPONSE_HEADERS {
@@ -45,7 +46,7 @@ pub(crate) fn valid_response_headers(headers: &[(&[u8], &[u8])]) -> bool {
     let mut total = 0;
     for (name, value) in headers {
         if name.is_empty()
-            || name.len() > 128
+            || name.len() > MAX_STAGED_RESPONSE_NAME_BYTES
             || !name.iter().copied().all(is_token)
             || is_framing_header(name)
             || !valid_field_value(value)
@@ -198,6 +199,8 @@ pub struct HostCounters {
     pub cancels_ok: u64,
     pub cancels_stale: u64,
     pub shutdowns: u64,
+    pub shutdowns_dropped: u64,
+    pub tombs_evicted: u64,
 }
 
 pub struct StagedWork {
@@ -807,6 +810,12 @@ impl HostShared {
             }
             std::thread::yield_now();
         }
+        // NOTE: best-effort give-up is observable, not silent: a full queue across all
+        // retries means the worker exits on host drop without its shutdown event.
+        self.with_inner(|inner| {
+            inner.counters.shutdowns_dropped += 1;
+            ((), None)
+        });
     }
 
     pub fn counters(&self) -> HostCounters {
@@ -904,7 +913,10 @@ fn push_tomb(inner: &mut HostInner, worker: usize, token: ConnectionToken, cause
         return;
     };
     if queue.len() >= HOST_TOMB_DEPTH {
+        // NOTE: lossy by design (tombs are hints; correctness rides generations), but the
+        // eviction is counted so a late poller missing a tomb is explainable, not silent.
         queue.pop_front();
+        inner.counters.tombs_evicted += 1;
     }
     queue.push_back(Tomb { token, cause });
 }
