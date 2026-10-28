@@ -26,6 +26,9 @@ pub(crate) use serve::apply_h2_streams;
 
 pub const INPUT_STAGING_CAP: usize = 16_384 + 64;
 pub const STREAM_SLOTS: usize = 32;
+// NOTE: H2 decoded-header slots; the H1 pump has its own HEADER_SLOTS (= 100) since plain
+// ranges are cheaper than HPACK entries with dynamic-table state. See the H1 site for the
+// deliberate split (65-100 headers: served on H1, refused on H2).
 pub const HEADER_SLOTS: usize = 64;
 pub const HEADER_BLOCK_CAP: usize = 16_384;
 pub const DECODE_ENTRIES: usize = 64;

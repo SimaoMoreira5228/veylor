@@ -23,6 +23,10 @@ use crate::static_routes::{
 
 pub const INPUT_CAP: usize = 8192;
 pub const OUTPUT_CAP: usize = 8192;
+// NOTE: H1 request-head slots; the H2 turn has its own HEADER_SLOTS (= 64) because decoded
+// HPACK entries carry dynamic-table state and cost more per slot than these plain ranges.
+// A peer sending 65-100 headers is served over H1 and refused over H2 — protocol cost,
+// not an inconsistency; keep both numbers beside their owner, not unified.
 pub const HEADER_SLOTS: usize = 100;
 // NOTE: TLS scratch floors, not bounds: encrypted records may exceed OUTPUT_CAP, so the
 // pending buffer pre-reserves 16 KiB while the plaintext side matches INPUT_CAP. Floors,

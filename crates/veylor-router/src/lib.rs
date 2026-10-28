@@ -1,5 +1,7 @@
 mod path;
 mod table;
+#[cfg(test)]
+mod tests;
 
 pub use path::RouteCapture;
 pub use table::{RouteBodyPolicy, RouteConfig, RouteKind, RouteMatch, RouteSlot, RouteTable};

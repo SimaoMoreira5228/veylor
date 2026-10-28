@@ -712,6 +712,8 @@ impl HostShared {
     // NOTE: whole-event dequeue: the first unfitting event reports required capacities
     // and stays queued; a later one ends the batch silently. The wait is level-triggered:
     // every enqueue notifies and pending is re-checked after each wake.
+    // Timeout convention: 0 takes a single non-blocking pass, u64::MAX waits for the
+    // next wakeup; anything else bounds the wait. Mirrored in the C ABI docs.
     pub fn poll(
         &self,
         timeout_ns: u64,
