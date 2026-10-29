@@ -29,6 +29,9 @@ test:
 
 test-linux: test
 
+# Full gate: format, lint, docs, tests, then the C ABI suite.
+verify: format lint doc test integration-linux
+
 build:
     cargo build --workspace
 

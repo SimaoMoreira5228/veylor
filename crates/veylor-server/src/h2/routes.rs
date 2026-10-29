@@ -586,6 +586,15 @@ pub(crate) fn send_full(
     if status == 204 {
         return send_status_only(server, stream, status, output, used);
     }
+    // NOTE: a 304 never carries a body (RFC 9110 8.6 forbids the bytes; H1 drops them in
+    // the shared sender the same way). Shed any staged body here so neither native nor
+    // managed senders can emit DATA after the terminal HEADERS, and close the stream on
+    // the head itself.
+    let (body, end_stream) = if status == 304 {
+        (&[][..], true)
+    } else {
+        (body, end_stream)
+    };
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut length_buf = [0; DECIMAL_CAP];

@@ -33,6 +33,11 @@ pub struct BodyOut {
 }
 
 impl<'a> ServerConnection<'a> {
+    // NOTE: the parsed head borrows the caller's input slice for the whole exchange:
+    // admit_body and read_body require the same buffer at the same address (checked by
+    // pointer), so hosts append to one growing buffer and re-pass it on NeedMore.
+    // Switching buffers mid-head stalls forever; dropping the buffer early is a
+    // use-after-free across the 'a lifetime.
     pub fn parse_head(
         &mut self,
         input: &'a [u8],

@@ -3401,6 +3401,14 @@ static H2N_204_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     gzip: false,
 }];
 
+static H2N_304_BODY: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
+    method: b"GET",
+    path: b"/fail",
+    handler: h2n_304_body,
+    user_data: 0,
+    gzip: false,
+}];
+
 static H2N_SELECT: [FrozenNativeRoute<'static>; 2] = [
     FrozenNativeRoute {
         method: b"GET",
@@ -3583,6 +3591,15 @@ unsafe extern "C" fn h2n_204_body(
     response: *mut NativeResponseOut,
 ) -> i32 {
     h2n_respond(response, 204, b"No Content", b"stray-body")
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn h2n_304_body(
+    _user_data: *mut c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    h2n_respond(response, 304, b"Not Modified", b"stray-body")
 }
 
 #[allow(unsafe_code)]
@@ -3784,6 +3801,30 @@ fn h2_native_204_serves_status_only_end_stream() {
 #[test]
 fn h2_native_204_drops_handler_body() {
     h2n_204_serves(&H2N_204_BODY);
+}
+
+// NOTE: native 304 with a handler body must shed it like H1 does (H1 native gates on
+// body_allowed; RFC 9110 8.6 forbids the bytes): HEADERS carries END_STREAM with
+// :status + Date only, no DATA follows, and the connection survives for a sibling.
+#[test]
+fn h2_native_304_drops_handler_body() {
+    let view = h2n_view(&H2N_304_BODY);
+    with_rig(|conn, _shared, client, server| {
+        rig_handshake(conn, client, server, &view);
+        send_headers(client, 1, b"GET", b"/fail", true);
+        let outcome = pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        assert_eq!(outcome.served, 1);
+        assert_eq!(outcome.refused, 0);
+        let (header, _) = read_frame(client);
+        assert_eq!(header.frame_type, FrameType::Headers);
+        assert_eq!(header.stream_id, 1);
+        assert_ne!(header.flags & HEADERS_FLAG_END_STREAM, 0);
+        send_headers(client, 3, b"GET", b"/empty", true);
+        pump_until(conn, server, &view, None, |outcome| outcome.served > 0);
+        let sibling = read_response(client, 3);
+        assert_eq!(sibling.status, 200);
+        assert!(sibling.body.is_empty());
+    });
 }
 
 // NOTE: managed 204 pin: stage_respond admits any 200..=599 so a host 204 lands in
