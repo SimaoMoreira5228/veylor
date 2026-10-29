@@ -15,6 +15,29 @@ _Static_assert(
     "close counts layout must match Rust"
 );
 _Static_assert(VYL_HTTP1_BUSY == 15, "busy code must match Rust VylResult::Busy");
+/* NOTE: cross-boundary layout pins (all declared targets are 64-bit, so size_t is
+   8 bytes): the C declarations above must stay byte-identical to the Rust
+   #[repr(C)] originals. Any field addition, removal, or reorder breaks these. */
+_Static_assert(
+    sizeof(vyl_http1_bytes) == 16,
+    "vyl_http1_bytes layout must match Rust VylBytes"
+);
+_Static_assert(
+    sizeof(vyl_http1_field) == 32,
+    "vyl_http1_field layout must match Rust VylField"
+);
+_Static_assert(
+    sizeof(vyl_managed_static_token) == 32,
+    "token layout must match Rust VylManagedStaticToken"
+);
+_Static_assert(
+    sizeof(vyl_managed_static_event) == 80,
+    "event layout must match Rust VylManagedStaticEvent"
+);
+_Static_assert(
+    sizeof(vyl_managed_static_poll_report) == 32,
+    "poll report layout must match Rust VylManagedStaticPollReport"
+);
 
 static int connect_loopback(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);

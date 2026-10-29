@@ -3,6 +3,18 @@
 #include <assert.h>
 #include <string.h>
 
+
+/* NOTE: cross-boundary layout pins (all declared targets are 64-bit, so
+   size_t is 8 bytes): the C declarations must stay byte-identical to the Rust
+   #[repr(C)] originals. Any field addition, removal, or reorder breaks these. */
+_Static_assert(
+    sizeof(vyl_http1_response_head) == 88,
+    "response head layout must match Rust ClientResponseHead"
+);
+_Static_assert(
+    sizeof(vyl_http1_client_read_event) == 136,
+    "read event layout must match Rust ClientReadEvent"
+);
 static void test_client_response_reads(void) {
     static const uint8_t informational_exchange[] = "HTTP/1.1 100 Continue\r\n\r\n"
                                                     "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";

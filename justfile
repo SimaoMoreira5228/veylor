@@ -14,6 +14,9 @@ format:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
 test:
     cargo test --workspace
 

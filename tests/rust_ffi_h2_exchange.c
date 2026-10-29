@@ -4,6 +4,26 @@
 #include <stdio.h>
 #include <string.h>
 
+
+/* NOTE: cross-boundary layout pins (all declared targets are 64-bit, so
+   size_t is 8 bytes): the C declarations must stay byte-identical to the Rust
+   #[repr(C)] originals. Any field addition, removal, or reorder breaks these. */
+_Static_assert(
+    sizeof(vyl_h2_field_to_encode) == 48,
+    "H2 field layout must match Rust HpackFieldToEncode"
+);
+_Static_assert(
+    sizeof(vyl_h2_field) == 32,
+    "H2 decoded field layout must match Rust HpackHeader"
+);
+_Static_assert(
+    sizeof(vyl_h2_action) == 56,
+    "H2 action layout must match Rust H2FrameAction"
+);
+_Static_assert(
+    sizeof(vyl_h2_response_class) == 24,
+    "H2 response class layout must match Rust ResponseClass"
+);
  
 #define WIRE_CAP 4096u
 #define POLL_ACTIONS 16u

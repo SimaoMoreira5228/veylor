@@ -3,6 +3,14 @@
 #include <assert.h>
 #include <string.h>
 
+
+/* NOTE: cross-boundary layout pins (all declared targets are 64-bit, so
+   size_t is 8 bytes): the C declarations must stay byte-identical to the Rust
+   #[repr(C)] originals. Any field addition, removal, or reorder breaks these. */
+_Static_assert(
+    sizeof(vyl_http1_request_head) == 104,
+    "request head layout must match Rust RequestHead"
+);
 static void parse_request(
     vyl_server_connection* connection,
     const uint8_t* request,
