@@ -7,7 +7,10 @@ mod tests;
 
 use assembler::HeadersAssembler;
 pub use preface::{CLIENT_CONNECTION_PREFACE, ClientPrefaceError};
-pub use settings::{EndpointSettings, SettingsError};
+pub use settings::{
+    DEFAULT_HEADER_TABLE_SIZE, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_HEADER_LIST_SIZE,
+    EndpointSettings, SettingsError,
+};
 use state::is_active;
 pub use state::stream_state_on_frame;
 

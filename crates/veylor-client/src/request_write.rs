@@ -194,6 +194,13 @@ impl<'a> ClientConnection<'a> {
             }
         };
         match body {
+            RequestBodyState::Fixed(0) => {
+                self.writer = RequestWriteState::Complete;
+                Ok(EncodeOut {
+                    written: 0,
+                    required: 0,
+                })
+            }
             RequestBodyState::Fixed(_) | RequestBodyState::Finished => Err(ClientError::BadState),
             RequestBodyState::Chunked => {
                 let mut required = 0;

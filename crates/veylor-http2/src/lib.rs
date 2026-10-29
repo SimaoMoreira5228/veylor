@@ -62,7 +62,8 @@ pub use service::{
     StartedResponse, StreamRecord, TRAILER_DATA_CAP, TornDown, TrailerOutcome, TrailerSpan,
 };
 pub use stream::{
-    CLIENT_CONNECTION_PREFACE, ClientPrefaceError, EndpointSettings, FrameDirection, H2Role,
-    SettingsError, Stream, StreamAction, StreamActionKind, StreamSlot, StreamState, StreamTable,
-    StreamTableError, StreamTransition, stream_is_local_id, stream_state_on_frame,
+    CLIENT_CONNECTION_PREFACE, ClientPrefaceError, DEFAULT_HEADER_TABLE_SIZE,
+    DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_HEADER_LIST_SIZE, EndpointSettings, FrameDirection,
+    H2Role, SettingsError, Stream, StreamAction, StreamActionKind, StreamSlot, StreamState,
+    StreamTable, StreamTableError, StreamTransition, stream_is_local_id, stream_state_on_frame,
 };

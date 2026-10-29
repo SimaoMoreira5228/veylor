@@ -17,21 +17,29 @@ pub struct EndpointSettings {
     pub max_header_list_size: u32,
 }
 
+// NOTE: RFC 9113 §6.5.2 protocol defaults, named so deployments can cite them:
+// the table size matches the HPACK default dynamic-table budget, and the two
+// u32::MAX entries mean "no protocol-level cap" (bounded downstream instead:
+// streams by slot tables, header lists by caller HPACK buffers).
+pub const DEFAULT_HEADER_TABLE_SIZE: u32 = 4_096;
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = u32::MAX;
+pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = u32::MAX;
+
 impl EndpointSettings {
     pub const fn for_role(role: H2Role) -> Self {
         // NOTE: max_header_list_size stays at the RFC 9113 default (unlimited): the real
         // bound is the caller-supplied HPACK table (entries/scratch report Capacity past
         // their fixed sizes), so no protocol-level setting is needed to stay fail-closed.
         Self {
-            header_table_size: 4_096,
+            header_table_size: DEFAULT_HEADER_TABLE_SIZE,
             enable_push: match role {
                 H2Role::Client => 1,
                 H2Role::Server => 0,
             },
-            max_concurrent_streams: u32::MAX,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             initial_window_size: DEFAULT_FLOW_WINDOW_SIZE as u32,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            max_header_list_size: u32::MAX,
+            max_header_list_size: DEFAULT_MAX_HEADER_LIST_SIZE,
         }
     }
 }

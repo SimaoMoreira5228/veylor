@@ -2,6 +2,8 @@ use std::io::{Read as _, Write as _};
 
 use crate::{TlsConn, TlsError};
 
+// NOTE: plaintext drain quantum per pump turn: bounded so one connection cannot
+// monopolize the worker on a large TLS record run; the remainder waits for the next turn.
 const DRAIN_CHUNK: usize = 4096;
 
 pub fn feed_ciphertext(

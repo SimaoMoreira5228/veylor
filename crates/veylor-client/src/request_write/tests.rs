@@ -200,3 +200,46 @@ fn method_gate_cancel_and_reset_shape_the_write_half() {
         ClientError::Capacity
     );
 }
+
+#[test]
+fn fixed_body_completes_and_allows_reset_for_reuse() {
+    let mut conn = connection();
+    let fields = host_fields();
+    let mut output = [0u8; 256];
+    let head = conn
+        .encode_request_head(
+            b"POST",
+            b"/upload",
+            &fields,
+            BodyFraming::Fixed(3),
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(conn.advance_request_write(head.written), Ok(0));
+    let wrote = conn.encode_request_body(b"abc", &mut output).unwrap();
+    assert_eq!(wrote.written, 3);
+    assert_eq!(conn.advance_request_write(wrote.written), Ok(0));
+    // NOTE: the fixed body is fully staged; finish marks the stream complete with no
+    // terminal bytes (unlike chunked's zero-chunk), so reset() can park the next exchange.
+    let finished = conn.finish_request_body(&[], &mut output).unwrap();
+    assert_eq!(finished.written, 0);
+    
+    let mut headers = [crate::Header::default(); 8];
+    let mut trailers = [crate::Header::default(); 8];
+    let input = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let head_end = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".len();
+    let head = conn
+        .read_response(&input[..head_end], false, &mut headers, &mut trailers)
+        .unwrap();
+    assert_eq!(head.kind, crate::ClientReadKind::Head);
+    let body = conn
+        .read_response(&input[..], false, &mut headers, &mut trailers)
+        .unwrap();
+    assert_eq!(body.kind, crate::ClientReadKind::BodyData);
+    let done = conn
+        .read_response(&[], false, &mut headers, &mut trailers)
+        .unwrap();
+    assert_eq!(done.kind, crate::ClientReadKind::Complete);
+    assert!(conn.reset().is_ok());
+    assert!(!conn.is_cancelled());
+}

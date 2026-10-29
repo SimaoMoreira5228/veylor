@@ -147,12 +147,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            timeouts: ConnectionTimeouts {
-                request_head_ns: 5_000_000_000,
-                body_progress_ns: 5_000_000_000,
-                response_write_ns: 5_000_000_000,
-                keep_alive_idle_ns: 30_000_000_000,
-            },
+            timeouts: ConnectionTimeouts::production(),
             shutdown_grace_ns: SHUTDOWN_GRACE_DEFAULT_NS,
             drain_idle_linger_ns: 200_000_000,
             turn: TurnConfig::DEFAULT,

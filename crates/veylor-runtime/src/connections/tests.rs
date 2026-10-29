@@ -406,3 +406,15 @@ fn deadline_scheduling_rejects_zero_overflow_full_and_stale_connections() {
         Err(DeadlineError::StaleConnection)
     );
 }
+
+#[test]
+fn production_timeouts_match_documented_defaults() {
+    // NOTE: pins the values deployments cite: 5 s head/body/response budgets,
+    // 30 s keep-alive idle. ServerConfig::default builds from these; changing a
+    // default here changes every default server, so this fails loudly first.
+    let timeouts = ConnectionTimeouts::production();
+    assert_eq!(timeouts.request_head_ns, 5_000_000_000);
+    assert_eq!(timeouts.body_progress_ns, 5_000_000_000);
+    assert_eq!(timeouts.response_write_ns, 5_000_000_000);
+    assert_eq!(timeouts.keep_alive_idle_ns, 30_000_000_000);
+}

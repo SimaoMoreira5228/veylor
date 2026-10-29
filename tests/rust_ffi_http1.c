@@ -138,8 +138,9 @@ static void test_fixed_request_body(void) {
             sizeof(output),
             &written,
             &required
-        ) == VYL_HTTP1_BAD_STATE
+        ) == VYL_HTTP1_OK
     );
+    assert(written == 0);
     assert(vyl_http1_client_connection_destroy(connection) == VYL_HTTP1_OK);
 }
 

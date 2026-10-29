@@ -11,6 +11,25 @@ pub struct ConnectionTimeouts {
     pub keep_alive_idle_ns: u64,
 }
 
+// NOTE: production timeout defaults, named so deployments can cite and override them
+// individually: 5 s head/body/response budgets, 30 s keep-alive idle. Zero disables
+// the corresponding deadline (see schedule_phase_deadline); u64::MAX never appears here.
+impl ConnectionTimeouts {
+    pub const REQUEST_HEAD_NS: u64 = 5_000_000_000;
+    pub const BODY_PROGRESS_NS: u64 = 5_000_000_000;
+    pub const RESPONSE_WRITE_NS: u64 = 5_000_000_000;
+    pub const KEEP_ALIVE_IDLE_NS: u64 = 30_000_000_000;
+
+    pub const fn production() -> Self {
+        Self {
+            request_head_ns: Self::REQUEST_HEAD_NS,
+            body_progress_ns: Self::BODY_PROGRESS_NS,
+            response_write_ns: Self::RESPONSE_WRITE_NS,
+            keep_alive_idle_ns: Self::KEEP_ALIVE_IDLE_NS,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeadlineError {
     Invalid,
