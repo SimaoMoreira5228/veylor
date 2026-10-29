@@ -196,6 +196,10 @@ impl StaticRoutes {
         self.register(method, path, status, reason, body, max_body_bytes)?;
         let route = self.routes.last_mut().ok_or(RouteBuildError::Invalid)?;
         route.gzip_body = gzip::compress_route_body(&route.body)?;
+        // NOTE: currently unreachable-by-construction (static bodies stop at the 4 KiB
+        // response cap above, and even incompressible input gains only deflate framing
+        // overhead — far under the +64 twin bound), kept as defense-in-depth: if either
+        // cap ever moves, this stays the fail-closed backstop instead of silent bloat.
         if route
             .gzip_body
             .as_ref()

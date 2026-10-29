@@ -18,10 +18,6 @@ use veylor_client::h2::{
     HPACK_SCRATCH, HpackEntrySlot, SETTINGS_ACKS, STREAM_SLOTS, StreamSlot,
 };
 
-const _: () = assert!(veylor_client::h2::MAX_ACTIONS == crate::abi::VYL_H2_MAX_ACTIONS);
-const _: () = assert!(veylor_client::h2::MAX_FIELDS == crate::abi::VYL_H2_MAX_FIELDS);
-const _: () = assert!(veylor_client::h2::MAX_SETTINGS == crate::abi::VYL_H2_MAX_SETTINGS);
-
 pub struct VylH2Client {
     pub(crate) slots: [StreamSlot; STREAM_SLOTS],
     pub(crate) header_block: [u8; HEADER_BLOCK],

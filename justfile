@@ -8,6 +8,13 @@ check:
 check-linux:
     cargo check --workspace --target x86_64-unknown-linux-gnu
 
+# Cross compiler for the Windows-GNU target (aws-lc-sys drives it as CC).
+# Override on machines where it lives elsewhere: `just windows-cc=... check-windows`.
+windows-cc := "x86_64-w64-mingw32-gcc"
+
+check-windows:
+    CC_x86_64_pc_windows_gnu={{windows-cc}} cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+
 format:
     cargo fmt --all
 

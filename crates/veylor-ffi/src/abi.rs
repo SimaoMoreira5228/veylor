@@ -94,9 +94,11 @@ pub struct VylH2ValidatedRequest {
 
 pub const VYL_H2_END_STREAM: u32 = 1;
 pub const VYL_H2_NO_FIELD: usize = usize::MAX;
-pub const VYL_H2_MAX_ACTIONS: usize = 16;
-pub const VYL_H2_MAX_FIELDS: usize = 64;
-pub const VYL_H2_MAX_SETTINGS: usize = 8;
+// NOTE: single-sourced from the native client (unlike a mirrored literal): the C ABI
+// exposes the same caps the engine enforces, so they cannot drift apart.
+pub const VYL_H2_MAX_ACTIONS: usize = veylor_client::h2::MAX_ACTIONS;
+pub const VYL_H2_MAX_FIELDS: usize = veylor_client::h2::MAX_FIELDS;
+pub const VYL_H2_MAX_SETTINGS: usize = veylor_client::h2::MAX_SETTINGS;
 
 pub type VylSpan = Span;
 pub type VylHeader = Header;
