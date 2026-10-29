@@ -336,6 +336,9 @@ vyl_http1_result vyl_http1_client_connection_read_response(
 vyl_http1_result vyl_http1_client_connection_reset(vyl_client_connection* connection);
 vyl_http1_result vyl_http1_client_connection_destroy(vyl_client_connection* connection);
 
+/* NOTE: these three sizes must stay identical to the veylor-client native
+   constants (MAX_ACTIONS, MAX_FIELDS, MAX_SETTINGS): the cdylib side takes them
+   from the same source since `155767e`, so update both together or not at all. */
 #define VYL_H2_MAX_ACTIONS 16u
 #define VYL_H2_MAX_FIELDS 64u
 #define VYL_H2_MAX_SETTINGS 8u

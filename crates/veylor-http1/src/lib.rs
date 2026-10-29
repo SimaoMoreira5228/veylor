@@ -39,5 +39,5 @@ pub use response_write::{
     continue_interim, encode_response_chunk, encode_response_chunk_with_required_length,
     encode_response_final_chunk, encode_response_final_chunk_with_required_length,
     encode_response_head, encode_response_head_with_required_length, join_allow_value,
-    response_permits_reuse, valid_field_value,
+    response_body_allowed_for, response_permits_reuse, valid_field_value,
 };

@@ -2139,6 +2139,25 @@ unsafe extern "C" fn native_fixed(
 }
 
 #[allow(unsafe_code)]
+unsafe extern "C" fn native_stray_304(
+    _user_data: *mut std::ffi::c_void,
+    _request: *const NativeRequestView,
+    response: *mut NativeResponseOut,
+) -> i32 {
+    if response.is_null() {
+        return 1;
+    }
+    
+    let out = unsafe { &mut *response };
+    out.status = 304;
+    out.reason = b"Not Modified".as_ptr();
+    out.reason_len = 12;
+    out.body = b"stray-body".as_ptr();
+    out.body_len = 10;
+    0
+}
+
+#[allow(unsafe_code)]
 unsafe extern "C" fn native_boom(
     _user_data: *mut std::ffi::c_void,
     _request: *const NativeRequestView,
@@ -2277,7 +2296,37 @@ fn native_server() -> RunningServer {
     server
         .register_native(b"POST", b"/record", Some(native_record), 0)
         .expect("register record");
+    server
+        .register_native(b"GET", b"/stray", Some(native_stray_304), 0)
+        .expect("register stray");
     server.start().expect("start server")
+}
+
+#[test]
+fn native_304_drops_stray_body_and_keeps_alive() {
+    // NOTE: H1 mirror of h2_native_304_drops_handler_body: a native 304 with a stray
+    // body must shed it (no content-length, no DATA) and keep the connection alive.
+    let server = native_server();
+    let mut stream = connect(&server);
+    get(&mut stream, "/stray");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 304);
+    assert!(response.body.is_empty(), "body: {:?}", response.body);
+    assert!(
+        response
+            .headers
+            .iter()
+            .all(|(name, _)| name != "content-length"),
+        "headers: {:?}",
+        response.headers
+    );
+    get(&mut stream, "/fixed");
+    let sibling = read_response(&mut stream);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"native-hello");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
 
 #[test]

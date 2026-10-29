@@ -1,6 +1,7 @@
 use veylor_http1::{
     BodyDecoder, BodyLimits, ConnectionHeader, Field, Header, ResponseBody, ResponseFraming,
-    ResponseToWrite, connection_header_for_response, encode_response_head, response_permits_reuse,
+    ResponseToWrite, connection_header_for_response, encode_response_head,
+    response_body_allowed_for, response_permits_reuse,
 };
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
 
@@ -53,6 +54,15 @@ impl ConnState {
             return Err(ConnClose::TransportError);
         };
         let request_method = &method[..usize::from(method_len)];
+        // NOTE: shed staged bodies the shared gate forbids (same rule as the native path):
+        // without this a host-staged 204/304/205 body fails encoder validation and closes
+        // the connection instead of answering cleanly. HEAD keeps the would-be length.
+        let (body, content_length) =
+            if response_body_allowed_for(request_method, status) || request_method == b"HEAD" {
+                (body, body.len() as u64)
+            } else {
+                (&b""[..], 0)
+            };
         // NOTE: H2 managed Date is the recorded follow-up (h2/serve.rs Begin/send_full), not this slice.
         let mut now = [0u8; HTTP_DATE_BYTES];
         let now_len = now_http_date(&mut now);
@@ -79,7 +89,7 @@ impl ConnState {
             reason,
             fields: &fields[..field_count],
             framing: ResponseFraming::FixedLength,
-            content_length: body.len() as u64,
+            content_length,
             connection,
         };
         ConnState::materialize_output(&mut self.output);

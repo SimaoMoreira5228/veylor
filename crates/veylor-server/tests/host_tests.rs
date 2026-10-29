@@ -2474,3 +2474,41 @@ fn tomb_overflow_evicts_oldest_and_counts_it() {
     server.stop_accepting();
     let _ = server.join().expect("join server");
 }
+
+#[test]
+fn managed_304_drops_staged_body_and_reuses() {
+    // NOTE: managed twin of the native/H2 304-shed pins: a host-staged body on a 304
+    // must be shed (no content-length, no bytes), not fail the exchange closed.
+    let server = default_managed_server();
+    let host = server.host();
+    let mut stream = connect(&server);
+    get(&mut stream, "/work");
+    let (event, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(event.token, 304, b"Not Modified", b"stray"),
+        RespondOutcome::Ok
+    );
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 304);
+    assert!(response.body.is_empty(), "body: {:?}", response.body);
+    assert!(
+        response
+            .headers
+            .iter()
+            .all(|(name, _)| name != "content-length"),
+        "headers: {:?}",
+        response.headers
+    );
+    get(&mut stream, "/work");
+    let (second, _, _) = poll_request(&host);
+    assert_eq!(
+        host.respond(second.token, 200, b"OK", b"live"),
+        RespondOutcome::Ok
+    );
+    let followed = read_response(&mut stream);
+    assert_eq!(followed.status, 200);
+    assert_eq!(followed.body, b"live");
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.completed + counts.shutdown, 1, "counts: {counts:?}");
+}

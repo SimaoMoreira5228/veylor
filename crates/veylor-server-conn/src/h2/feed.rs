@@ -81,6 +81,10 @@ impl<'c, 'b> H2ServerConnection<'c, 'b> {
         }
     }
 
+    // NOTE: the driver consumes whole frames only and reports the count: advance past
+    // `consumed` and re-feed the remainder (unlike the H1 parse_head, which pins the
+    // whole head and re-parses from the same buffer). NeedMore with consumed == len
+    // means wait for more bytes; finish_batch() before acting, then poll again.
     pub fn poll_feed<'i, 's>(
         &mut self,
         input: &'i [u8],

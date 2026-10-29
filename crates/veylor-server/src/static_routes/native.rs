@@ -5,7 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use veylor_http1::{
     Field, Header, RequestHead, ResponseFraming, ResponseToWrite, connection_header_for_response,
-    encode_response_head, response_permits_reuse,
+    encode_response_head, response_body_allowed_for, response_permits_reuse,
 };
 
 use crate::host::HOST_MAX_REASON_BYTES;
@@ -108,6 +108,14 @@ pub(super) fn respond_native(
         Some(ref twin) => (twin.as_slice(), Some(CONTENT_ENCODING_GZIP)),
         None => (body, None),
     };
+    // NOTE: shed staged bodies the shared gate forbids (304/204/205, CONNECT tunnels):
+    // without this the encoder fail-closes the whole exchange on the inconsistent pair.
+    // HEAD keeps the would-be length (the copy below still drops the bytes).
+    let (body, content_length) = if response_body_allowed_for(method, status) || method == b"HEAD" {
+        (body, body.len() as u64)
+    } else {
+        (&b""[..], 0)
+    };
     let encoding_field = Field {
         name: b"Content-Encoding",
         value: CONTENT_ENCODING_GZIP,
@@ -128,7 +136,7 @@ pub(super) fn respond_native(
         reason,
         fields,
         framing: ResponseFraming::FixedLength,
-        content_length: body.len() as u64,
+        content_length,
         connection,
     };
     let final_buf = output

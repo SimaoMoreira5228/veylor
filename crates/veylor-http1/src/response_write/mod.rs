@@ -452,13 +452,23 @@ fn validate_response(response: &ResponseToWrite<'_>) -> Result<(), ResponseEncod
     Ok(())
 }
 
+// NOTE: shared shed rule for staged fixed responses: a body is emittable only when the
+// method/status pair allows one (HEAD responses keep the would-be length but shed the
+// bytes; 204/205/304 and CONNECT tunnels shed both). Native and managed H1 assembly call
+// this before building the head so a staged body on a bodiless status answers cleanly
+// instead of tripping the encoder's fail-closed validation.
+pub fn response_body_allowed_for(method: &[u8], status: u16) -> bool {
+    let connect_tunnel = method == b"CONNECT" && (200..300).contains(&status);
+    status >= 200
+        && method != b"HEAD"
+        && status != 204
+        && status != 205
+        && status != 304
+        && !connect_tunnel
+}
+
 fn response_body_allowed(response: &ResponseToWrite<'_>) -> bool {
-    response.status >= 200
-        && response.request_method != b"HEAD"
-        && response.status != 204
-        && response.status != 205
-        && response.status != 304
-        && !(response.request_method == b"CONNECT" && (200..300).contains(&response.status))
+    response_body_allowed_for(response.request_method, response.status)
 }
 
 fn content_length_allowed(response: &ResponseToWrite<'_>) -> bool {
