@@ -12,6 +12,10 @@ x-ledger: &ledger
     - /data/accounts.sqlite3
     - --workers
     - "1"
+    - --h2c-port
+    - "9998"
+  expose:
+    - "9998"
   init: true
   read_only: true
   cap_drop:

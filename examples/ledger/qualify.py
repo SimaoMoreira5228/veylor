@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -97,11 +98,15 @@ def request(url, path, payment=None):
     method = "GET" if payment is None else "POST"
 
     try:
+        headers = {"Content-Type": "application/json"}
+        if payment is not None:
+            headers["Idempotency-Key"] = uuid.uuid4().hex
+
         connection.request(
             method,
             path,
             body,
-            {"Content-Type": "application/json"},
+            headers,
         )
         response = connection.getresponse()
         data = response.read(4097)

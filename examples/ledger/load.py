@@ -5,6 +5,7 @@ import json
 import math
 import threading
 import time
+import uuid
 from collections import Counter
 from urllib.parse import urlsplit
 
@@ -51,6 +52,7 @@ def run(args, targets):
             "description": "load",
         }
     ).encode()
+    run_id = uuid.uuid4().hex
 
     def send(index, scheduled):
         if not hasattr(local, "connections"):
@@ -71,7 +73,10 @@ def run(args, targets):
                 "POST",
                 f"/accounts/{account}/transactions",
                 payload,
-                {"Content-Type": "application/json"},
+                {
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": f"{run_id}-{index}",
+                },
             )
             response = connection.getresponse()
             body = response.read(4097)

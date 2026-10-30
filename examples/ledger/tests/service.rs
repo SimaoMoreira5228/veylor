@@ -1,171 +1,19 @@
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+mod harness;
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use serde_json::{Value, json};
-
-struct Service {
-    child: Child,
-    address: SocketAddr,
-    _output: BufReader<std::process::ChildStdout>,
-}
-
-impl Service {
-    fn start(database: &Path) -> Self {
-        Self::start_with_options(database, &[])
-    }
-
-    fn start_with_options(database: &Path, options: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_veylor-ledger"))
-            .args([
-                "--address",
-                "127.0.0.1:0",
-                "--database",
-                database.to_str().unwrap(),
-                "--workers",
-                "2",
-            ])
-            .args(options)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        output.read_line(&mut line).unwrap();
-
-        let address = line.trim().split_once("://").unwrap().1.parse().unwrap();
-
-        Self {
-            child,
-            address,
-            _output: output,
-        }
-    }
-}
-
-impl Drop for Service {
-    fn drop(&mut self) {
-        if self.child.try_wait().unwrap().is_none() {
-            let status = Command::new("kill")
-                .args(["-TERM", &self.child.id().to_string()])
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                if !std::thread::panicking() {
-                    assert!(status.success());
-                }
-                return;
-            }
-
-            if std::time::Instant::now() >= deadline {
-                self.child.kill().unwrap();
-                self.child.wait().unwrap();
-                panic!("service shutdown exceeded deadline");
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
-struct Database(PathBuf);
-
-impl Database {
-    fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("veylor-ledger-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-
-        Self(path)
-    }
-
-    fn file(&self) -> PathBuf {
-        self.0.join("accounts.sqlite3")
-    }
-}
-
-impl Drop for Database {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
-fn request(
-    address: SocketAddr,
-    method: &str,
-    path: &str,
-    body: &[u8],
-    fragmented: bool,
-) -> (u16, Value) {
-    request_with_content_type(address, method, path, "application/json", body, fragmented)
-}
-
-fn request_with_content_type(
-    address: SocketAddr,
-    method: &str,
-    path: &str,
-    content_type: &str,
-    body: &[u8],
-    fragmented: bool,
-) -> (u16, Value) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        body.len(),
-    );
-    stream.write_all(head.as_bytes()).unwrap();
-    if fragmented && !body.is_empty() {
-        let middle = body.len() / 2;
-        stream.write_all(&body[..middle]).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        stream.write_all(&body[middle..]).unwrap();
-    } else {
-        stream.write_all(body).unwrap();
-    }
-
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).unwrap();
-
-    let end = bytes
-        .windows(4)
-        .position(|part| part == b"\r\n\r\n")
-        .unwrap();
-    let head = std::str::from_utf8(&bytes[..end]).unwrap();
-    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let value = serde_json::from_slice(&bytes[end + 4..]).unwrap_or(Value::Null);
-
-    (status, value)
-}
+use harness::{
+    Database, Service, request, request_with_content_type, request_with_idempotency_key,
+};
+use serde_json::json;
 
 #[test]
 fn concurrent_debits_across_processes_are_atomic_and_survive_restart() {
@@ -189,14 +37,16 @@ fn concurrent_debits_across_processes_are_atomic_and_survive_restart() {
                         }
 
                         let body = br#"{"amount":1000,"kind":"debit","description":"purchase"}"#;
+                        let key = format!("debit-{index}");
                         let deadline = std::time::Instant::now() + Duration::from_secs(5);
                         let status = loop {
-                            let (status, _) = request(
+                            let (status, _) = request_with_idempotency_key(
                                 addresses[index % 2],
                                 "POST",
                                 "/accounts/1/transactions",
                                 body,
                                 false,
+                                &key,
                             );
 
                             if status != 503 {
@@ -409,6 +259,7 @@ fn incomplete_upload_saturation_recovers_after_disconnects() {
                 b"POST /accounts/1/transactions HTTP/1.1\r\n\
                   Host: localhost\r\n\
                   Content-Type: application/json\r\n\
+                  Idempotency-Key: abandoned-upload\r\n\
                   Expect: 100-continue\r\n\
                   Content-Length: 1\r\n\r\n",
             )
@@ -481,6 +332,7 @@ fn sigterm_drains_an_admitted_upload_before_exiting() {
         "POST /accounts/1/transactions HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
+         Idempotency-Key: graceful-write\r\n\
          Expect: 100-continue\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",

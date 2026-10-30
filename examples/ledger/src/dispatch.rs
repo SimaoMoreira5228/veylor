@@ -18,8 +18,17 @@ struct Pending {
     token: ConnectionToken,
     account: i64,
     payment: bool,
+    idempotency_key: [u8; 64],
+    idempotency_key_len: usize,
     body: [u8; BODY_CAP],
     used: usize,
+}
+
+struct RequestInfo {
+    account: i64,
+    payment: bool,
+    idempotency_key: [u8; 64],
+    idempotency_key_len: usize,
 }
 
 pub fn run(host: HostHandle, mut store: Store, stopped: Arc<AtomicBool>) {
@@ -65,7 +74,7 @@ pub fn run(host: HostHandle, mut store: Store, stopped: Arc<AtomicBool>) {
             }
 
             let method = &methods[event.method_offset..event.method_offset + event.method_len];
-            let (account, payment) = match request(
+            let request = match request(
                 &host,
                 event.token,
                 method,
@@ -81,8 +90,10 @@ pub fn run(host: HostHandle, mut store: Store, stopped: Arc<AtomicBool>) {
 
             pending.push(Pending {
                 token: event.token,
-                account,
-                payment,
+                account: request.account,
+                payment: request.payment,
+                idempotency_key: request.idempotency_key,
+                idempotency_key_len: request.idempotency_key_len,
                 body: [0; BODY_CAP],
                 used: 0,
             });
@@ -119,6 +130,12 @@ pub fn run(host: HostHandle, mut store: Store, stopped: Arc<AtomicBool>) {
                     422,
                     b"{\"error\":\"invalid transaction\"}",
                 ),
+                Err(409) => reply(
+                    &host,
+                    request.token,
+                    409,
+                    b"{\"error\":\"idempotency key reused\"}",
+                ),
                 Err(404) => reply(
                     &host,
                     request.token,
@@ -149,7 +166,11 @@ fn execute(store: &mut Store, request: &Pending, response: &mut [u8]) -> Result<
     let payment = serde_json::from_slice::<Payment<'_>>(body).map_err(|_| 422u16)?;
 
     let balance = store
-        .apply(request.account, &payment)
+        .apply(
+            request.account,
+            &request.idempotency_key[..request.idempotency_key_len],
+            &payment,
+        )
         .map_err(|error| error_status(&error))?;
 
     encode(&balance, response)
@@ -168,7 +189,7 @@ fn request(
     method: &[u8],
     headers: &mut [RequestHeader],
     bytes: &mut [u8],
-) -> Result<(i64, bool), u16> {
+) -> Result<RequestInfo, u16> {
     let head = match host.request_head(token, headers, bytes) {
         Ok(head) => head,
         Err(RequestHeadError::Capacity { .. }) => return Err(431),
@@ -185,12 +206,52 @@ fn request(
         .filter(|account| *account > 0)
         .ok_or(404u16)?;
     let payment = method == b"POST";
+    let mut key = None;
+    if payment {
+        for header in &headers[..head.header_count] {
+            if !span_bytes(bytes, header.name).eq_ignore_ascii_case(b"idempotency-key") {
+                continue;
+            }
 
-    if payment && !json_content_type(headers, head.header_count, bytes) {
-        return Err(415);
+            if key.is_some() {
+                return Err(422);
+            }
+
+            key = Some(span_bytes(bytes, header.value).trim_ascii());
+        }
+
+        let value = key.filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+        let Some(value) = value else {
+            return Err(422);
+        };
+
+        if !json_content_type(headers, head.header_count, bytes) {
+            return Err(415);
+        }
+
+        let mut idempotency_key = [0; 64];
+        idempotency_key[..value.len()].copy_from_slice(value);
+
+        return Ok(RequestInfo {
+            account,
+            payment,
+            idempotency_key,
+            idempotency_key_len: value.len(),
+        });
     }
 
-    Ok((account, payment))
+    Ok(RequestInfo {
+        account,
+        payment,
+        idempotency_key: [0; 64],
+        idempotency_key_len: 0,
+    })
 }
 
 fn json_content_type(headers: &[RequestHeader], count: usize, bytes: &[u8]) -> bool {
@@ -225,8 +286,10 @@ fn span_bytes(bytes: &[u8], span: RequestSpan) -> &[u8] {
 fn error_body(status: u16) -> &'static [u8] {
     match status {
         400 => b"{\"error\":\"bad request\"}",
+        409 => b"{\"error\":\"idempotency key reused\"}",
         404 => b"{\"error\":\"account not found\"}",
         415 => b"{\"error\":\"expected JSON\"}",
+        422 => b"{\"error\":\"invalid idempotency key\"}",
         431 => b"{\"error\":\"request headers too large\"}",
         _ => b"{\"error\":\"request unavailable\"}",
     }
@@ -236,6 +299,8 @@ fn error_status(error: &StoreError) -> u16 {
     match error {
         StoreError::Missing => 404,
         StoreError::Rejected => 422,
+        StoreError::KeyConflict => 409,
+        StoreError::Corrupt => 500,
         StoreError::Busy => 503,
         StoreError::Database(error) => {
             eprintln!("database operation failed: {error}");
@@ -248,6 +313,7 @@ fn error_status(error: &StoreError) -> u16 {
 fn reply(host: &HostHandle, token: ConnectionToken, status: u16, body: &[u8]) {
     let reason = match status {
         200 => b"OK".as_slice(),
+        409 => b"Conflict",
         404 => b"Not Found",
         415 => b"Unsupported Media Type",
         422 => b"Unprocessable Content",
