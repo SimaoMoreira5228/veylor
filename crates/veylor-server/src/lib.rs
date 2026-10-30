@@ -20,7 +20,9 @@ pub use h2::{
 pub use host::{
     BodyPull, CancelOutcome, EventSlot, HOST_MAX_METHOD_BYTES, HOST_MAX_PATH_BYTES,
     HOST_MAX_REASON_BYTES, HOST_QUEUE_DEPTH, HostCounters, HostEventKind, HostHandle, HostShared,
-    MAX_STAGED_RESPONSE_BYTES, MAX_STAGED_RESPONSE_HEADERS, PollReport, RespondOutcome,
+    MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_HEADERS, MAX_STAGED_RESPONSE_BYTES,
+    MAX_STAGED_RESPONSE_HEADERS, PollReport, RequestHeadError, RequestHeadReport, RequestHeader,
+    RequestSpan, RespondOutcome,
 };
 pub use static_files::{
     FileMounts, FilePlan, FileReject, MountError, RangeApply, content_type_for_name,

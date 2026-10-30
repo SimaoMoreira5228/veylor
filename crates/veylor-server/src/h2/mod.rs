@@ -1,4 +1,5 @@
 use core::mem;
+use std::borrow::Cow;
 
 use veylor_http2::{
     ControlFrameWriter, ErrorCode, FeedStatus, H2C_GOAWAY_LEN, H2FrameAction, H2ServerDriver,
@@ -20,6 +21,7 @@ pub(crate) mod turn;
 // file-mount assembly (range planning, HEADERS emit, DATA pump).
 mod file;
 mod flush;
+mod pending;
 mod routes;
 mod send;
 mod serve;
@@ -152,6 +154,7 @@ pub struct H2Conn<'a> {
     // NOTE: file-mount streaming state beside the driver (projection-adjacent, not a third
     // route table): one entry per servable stream at most, plus a single OUTPUT_CAP chunk
     // scratch reused every turn, so file bytes frame in bounded slices and never stage whole.
+    pending_responses: pending::PendingResponses,
     file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
     file_scratch: Box<[u8; crate::connection::OUTPUT_CAP]>,
 }
@@ -177,6 +180,7 @@ impl<'a> H2Conn<'a> {
             phase,
             settings_sent: false,
             terminal,
+            pending_responses: pending::PendingResponses::new(),
             file_transfers: Box::new(std::array::from_fn(|_| None)),
             file_scratch: Box::new([0; crate::connection::OUTPUT_CAP]),
         }
@@ -205,6 +209,14 @@ impl<'a> H2Conn<'a> {
 
     pub const fn staged_len(&self) -> usize {
         self.staged
+    }
+
+    pub fn set_response_write_clock(&mut self, now_ns: u64, timeout_ns: u64) {
+        self.pending_responses.set_time(now_ns, timeout_ns);
+    }
+
+    pub fn has_pending_responses(&self) -> bool {
+        !self.pending_responses.is_empty()
     }
 
     pub fn flood_counters(&self) -> (u32, u32) {
@@ -263,10 +275,22 @@ impl<'a> H2Conn<'a> {
         self.step_inner(output, routes, Some(ctx))
     }
 
+    pub fn step_host_timed(
+        &mut self,
+        output: &mut [u8],
+        routes: &FrozenRoutesView<'_>,
+        ctx: H2HostCtx<'_>,
+        now_ns: u64,
+        response_write_ns: u64,
+    ) -> StepOutcome {
+        self.pending_responses.set_time(now_ns, response_write_ns);
+        self.step_inner(output, routes, Some(ctx))
+    }
+
     // NOTE: host-parked streams leave their response to apply_staged; abandoned parks hold no
     // worker timer here (transport-neutral driver owns none) and time out in the turn on the
     // connection-scoped body-progress activity deadline, which GOAWAY-drains like any idle conn.
-    pub fn apply_staged(&mut self, output: &mut [u8], staged: &StagedWork) -> StepOutcome {
+    pub fn apply_staged(&mut self, output: &mut [u8], staged: StagedWork) -> StepOutcome {
         let mut outcome = StepOutcome::default();
         if self.terminal {
             outcome.closed = true;
@@ -299,21 +323,25 @@ impl<'a> H2Conn<'a> {
         used += grant_window(server, stream, owed, &mut output[used..]);
         let mut extra = [(&b""[..], &b""[..]); crate::host::MAX_STAGED_RESPONSE_HEADERS];
         let extra_len = crate::h2::routes::project_extra_headers(&mut extra, &staged.headers);
+        let response_end = staged.body.is_empty();
+        let response_body = Cow::Owned(staged.body);
         match send::send_full(
             server,
             stream,
             staged.status,
-            &staged.body,
+            response_body,
             None,
             false,
             &extra[..extra_len],
-            staged.body.is_empty(),
+            response_end,
             true,
             &mut output[..],
             &mut used,
+            &mut self.pending_responses,
         ) {
-            Ok(()) => {
-                outcome.served += 1;
+            Ok(complete) => {
+                outcome.served += u16::from(complete);
+                outcome.pending = !complete;
                 outcome.written = used;
             }
             Err(ErrorCode::RefusedStream) => {
@@ -386,6 +414,23 @@ impl<'a> H2Conn<'a> {
                 return outcome;
             }
         };
+        let (expired_written, expired_count) =
+            self.pending_responses.expire(server, &mut output[used..]);
+        used += expired_written;
+        outcome.refused += expired_count;
+
+        match self.pending_responses.pump(server, output, &mut used) {
+            Ok((completed, pending)) => {
+                outcome.served += completed;
+                outcome.pending |= pending;
+            }
+            Err(code) => {
+                self.fail(code, output, &mut used, &mut outcome);
+                outcome.written = used;
+                return outcome;
+            }
+        }
+
         let mut serve = serve::Serve {
             server,
             headers: &*self.headers,
@@ -396,6 +441,7 @@ impl<'a> H2Conn<'a> {
             output,
             used: &mut used,
             outcome: &mut outcome,
+            pending: &mut self.pending_responses,
             files: &mut self.file_transfers,
             scratch: &mut self.file_scratch[..],
         };

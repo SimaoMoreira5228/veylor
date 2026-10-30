@@ -9,11 +9,16 @@ use veylor_http1::{is_token, valid_field_value};
 use veylor_runtime::{ConnectionToken, WakeHandle};
 use veylor_tls::{CertificateDer, PrivateKeyDer, TlsAcceptor, TlsError};
 
+mod request;
 mod signals;
 mod staged;
 
 // NOTE: advisory signal staging (BodyAvailable/Writable stage, admission rollback, signal
 // retire) lives in signals.rs; re-exported here so existing crate::host:: paths resolve.
+pub use request::{
+    MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_HEADERS, RequestHeadError, RequestHeadReport,
+    RequestHeader, RequestSpan,
+};
 pub(crate) use signals::stage_body_available;
 
 // NOTE: park/stage/take booking lives in staged.rs; re-exported here so existing

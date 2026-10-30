@@ -37,21 +37,16 @@ fn main() -> Result<(), String> {
         .register_route(b"GET", b"/ready", 200, b"OK", b"ready\n", 0)
         .map_err(|error| format!("readiness: {error:?}"))?;
 
-    for id in 1..=5 {
-        let transaction_path = format!("/accounts/{id}/transactions");
-        server
-            .register_managed(
-                b"POST",
-                transaction_path.as_bytes(),
-                dispatch::BODY_CAP as u64,
-            )
-            .map_err(|error| format!("register transactions: {error:?}"))?;
-
-        let statement_path = format!("/accounts/{id}/statement");
-        server
-            .register_managed(b"GET", statement_path.as_bytes(), 0)
-            .map_err(|error| format!("register statement: {error:?}"))?;
-    }
+    server
+        .register_managed(
+            b"POST",
+            b"/accounts/:account/transactions",
+            dispatch::BODY_CAP as u64,
+        )
+        .map_err(|error| format!("register transactions: {error:?}"))?;
+    server
+        .register_managed(b"GET", b"/accounts/:account/statement", 0)
+        .map_err(|error| format!("register statement: {error:?}"))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = Arc::clone(&shutdown);

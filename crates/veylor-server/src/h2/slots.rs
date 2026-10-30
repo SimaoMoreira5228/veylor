@@ -179,8 +179,9 @@ pub(crate) fn sweep_deadlines(metas: &mut H2MetaSlots, now_ns: u64, timeouts: Co
 }
 
 pub(crate) fn idle_for_drain(meta: &H2Meta, conn: Option<&H2Conn<'_>>) -> bool {
-    conn.is_some_and(|active| active.handshake_complete() && active.staged_len() == 0)
-        && !meta.pending_unflushed()
+    conn.is_some_and(|active| {
+        active.handshake_complete() && active.staged_len() == 0 && !active.has_pending_responses()
+    }) && !meta.pending_unflushed()
         && !meta.tls_unflushed()
 }
 

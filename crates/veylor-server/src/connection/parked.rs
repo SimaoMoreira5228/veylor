@@ -375,6 +375,12 @@ pub(crate) fn park_request(
         return ExchangeOutcome::Close(ConnClose::TransportError);
     };
     let input = &input[..len];
+    let Some(headers) = conn.headers.as_ref() else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
+    let Some(headers) = headers.get(..head.header_count) else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
     let method_len = head.method(input).map(|method| method.len()).unwrap_or(0);
     let target_len = head.target(input).map(|target| target.len()).unwrap_or(0);
     if method_len > HOST_MAX_METHOD_BYTES || method_len == 0 || target_len == 0 {
@@ -418,7 +424,16 @@ pub(crate) fn park_request(
     snapshot[..method_len]
         .copy_from_slice(&input[head.method.offset..head.method.offset + method_len]);
     let target_start = head.target.offset;
-    let event_token = match host.try_park(
+    let request_headers = headers.iter().map(|header| {
+        let name_end = header.name.offset.checked_add(header.name.length)?;
+        let value_end = header.value.offset.checked_add(header.value.length)?;
+
+        Some((
+            input.get(header.name.offset..name_end)?,
+            input.get(header.value.offset..value_end)?,
+        ))
+    });
+    let event_token = match host.try_park_with_request(
         worker_id,
         token,
         route_id,
@@ -426,6 +441,8 @@ pub(crate) fn park_request(
         &input[target_start..target_start + target_len],
         body_total,
         &[],
+        None,
+        request_headers,
     ) {
         Ok(event_token) => event_token,
         Err(ParkError::Full) => return ExchangeOutcome::Close(ConnClose::QueueFull),
@@ -575,8 +592,10 @@ impl ParkedEntry {
             stream_cmd: None,
             stream: None,
             body_total,
+            body_limit: None,
             body: Vec::new(),
             body_pulled: 0,
+            request: None,
             trailers: None,
             trailer_allow: trailer_allow.to_vec(),
         }

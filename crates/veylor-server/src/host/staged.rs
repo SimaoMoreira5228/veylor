@@ -6,6 +6,7 @@ use crate::connection::parked::BodyPushOutcome;
 use crate::connection::{pull_staged_body, push_staged_body};
 use crate::static_routes::MAX_RESPONSE_BODY;
 
+use super::request::RequestSnapshot;
 use super::signals::{
     retire_signals, retract_body_append, stage_body_available, stage_writable_locked,
 };
@@ -35,8 +36,10 @@ pub(crate) struct ParkedEntry {
     pub(crate) stream_cmd: Option<crate::connection::parked::StreamCmd>,
     pub(crate) stream: Option<crate::connection::parked::StreamState>,
     pub(crate) body_total: u64,
+    pub(crate) body_limit: Option<u64>,
     pub(crate) body: Vec<u8>,
     pub(crate) body_pulled: u64,
+    pub(crate) request: Option<RequestSnapshot>,
     pub(crate) trailers: Option<Vec<crate::connection::trailers::StagedTrailer>>,
     pub(crate) trailer_allow: Vec<Vec<u8>>,
 }
@@ -67,6 +70,32 @@ impl HostShared {
         body_total: u64,
         trailer_allow: &[Vec<u8>],
     ) -> Result<ConnectionToken, ParkError> {
+        self.try_park_inner(
+            worker_id,
+            token,
+            route_id,
+            method,
+            path,
+            body_total,
+            trailer_allow,
+            None,
+            || Ok(None),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_park_with_request<'a>(
+        &self,
+        worker_id: u32,
+        token: ConnectionToken,
+        route_id: u64,
+        method: &[u8],
+        path: &[u8],
+        body_total: u64,
+        trailer_allow: &[Vec<u8>],
+        body_limit: Option<u64>,
+        headers: impl Iterator<Item = Option<(&'a [u8], &'a [u8])>> + Clone,
+    ) -> Result<ConnectionToken, ParkError> {
         if method.is_empty()
             || method.len() > HOST_MAX_METHOD_BYTES
             || path.is_empty()
@@ -74,6 +103,45 @@ impl HostShared {
         {
             return Err(ParkError::SnapshotTooLarge);
         }
+
+        self.try_park_inner(
+            worker_id,
+            token,
+            route_id,
+            method,
+            path,
+            body_total,
+            trailer_allow,
+            body_limit,
+            || {
+                RequestSnapshot::new(path, headers)
+                    .map(Some)
+                    .ok_or(ParkError::SnapshotTooLarge)
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_park_inner(
+        &self,
+        worker_id: u32,
+        token: ConnectionToken,
+        route_id: u64,
+        method: &[u8],
+        path: &[u8],
+        body_total: u64,
+        trailer_allow: &[Vec<u8>],
+        body_limit: Option<u64>,
+        request_snapshot: impl FnOnce() -> Result<Option<RequestSnapshot>, ParkError>,
+    ) -> Result<ConnectionToken, ParkError> {
+        if method.is_empty()
+            || method.len() > HOST_MAX_METHOD_BYTES
+            || path.is_empty()
+            || path.len() > HOST_MAX_PATH_BYTES
+        {
+            return Err(ParkError::SnapshotTooLarge);
+        }
+
         let outcome = self.with_inner(|inner| {
             let worker = worker_id as usize;
             let slot = token.slot as usize;
@@ -90,6 +158,12 @@ impl HostShared {
                 inner.counters.queue_full += 1;
                 return (Err(ParkError::Full), None);
             }
+
+            let request = match request_snapshot() {
+                Ok(request) => request,
+                Err(error) => return (Err(error), None),
+            };
+
             let seq = inner.seqs[worker][slot].wrapping_add(1);
             let seq = if seq == 0 { 1 } else { seq };
             inner.seqs[worker][slot] = seq;
@@ -111,12 +185,10 @@ impl HostShared {
             event.method[..method.len()].copy_from_slice(method);
             event.path[..path.len()].copy_from_slice(path);
             inner.events[worker].push_back(event);
-            inner.parked[worker][slot] = Some(ParkedEntry::new(
-                event_token,
-                body_total,
-                method,
-                trailer_allow,
-            ));
+            let mut parked = ParkedEntry::new(event_token, body_total, method, trailer_allow);
+            parked.body_limit = body_limit;
+            parked.request = request;
+            inner.parked[worker][slot] = Some(parked);
             inner.counters.parks += 1;
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (Ok(event_token), waker)
@@ -358,7 +430,7 @@ impl HostShared {
             .unwrap_or(0)
     }
 
-    fn note_staged(&self, worker: usize) {
+    pub(crate) fn note_staged(&self, worker: usize) {
         if let Some(epoch) = self.staged_epoch.get(worker) {
             epoch.fetch_add(1, Ordering::Release);
         }

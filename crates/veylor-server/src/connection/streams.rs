@@ -131,6 +131,40 @@ pub(crate) fn take_stream_cmd(inner: &mut HostInner, token: ConnectionToken) -> 
 }
 
 impl HostShared {
+    pub(crate) fn defer_stream_write(&self, token: ConnectionToken, chunk: Vec<u8>) -> bool {
+        if chunk.is_empty() || chunk.len() > MAX_STREAM_WRITE {
+            return false;
+        }
+
+        let Some((queued, waker)) = self.with_inner(|inner| {
+            let Some(entry) = stream_entry(inner, token) else {
+                return (false, None);
+            };
+            let open = entry.stream.as_ref().is_some_and(|stream| stream.head_sent);
+            if !open || entry.stream_cmd.is_some() || entry.staged.is_some() {
+                return (false, None);
+            }
+
+            entry.stream_cmd = Some(StreamCmd::Write { chunk });
+            let waker = inner
+                .wakers
+                .get(token.worker_id as usize)
+                .and_then(Clone::clone);
+            (true, waker)
+        }) else {
+            return false;
+        };
+
+        if queued {
+            self.note_staged(token.worker_id as usize);
+            if let Some(waker) = waker {
+                let _ = waker.wake();
+            }
+        }
+
+        queued
+    }
+
     pub fn begin_stream(
         &self,
         token: ConnectionToken,

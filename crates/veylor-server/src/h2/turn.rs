@@ -345,7 +345,13 @@ pub(crate) fn pump_slot(
             host: turn.host,
             base,
         };
-        let outcome = live.step_host(pending_spare(meta), turn.routes, ctx);
+        let outcome = live.step_host_timed(
+            pending_spare(meta),
+            turn.routes,
+            ctx,
+            turn.now_ns,
+            turn.timeouts.response_write_ns,
+        );
         turn.counts.h2_served += u64::from(outcome.served);
         turn.counts.h2_refused += u64::from(outcome.refused);
         meta.pending_len += outcome.written;
@@ -491,6 +497,7 @@ pub(crate) fn project_routes<'a>(
             body: &route.body,
             gzip_body: route.gzip_body.as_deref(),
             managed: route.managed,
+            max_body_bytes: route.max_body_bytes,
             file_root: route.file_root.as_deref(),
             trailers: &route.trailers,
         })

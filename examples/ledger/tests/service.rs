@@ -116,6 +116,17 @@ fn request(
     body: &[u8],
     fragmented: bool,
 ) -> (u16, Value) {
+    request_with_content_type(address, method, path, "application/json", body, fragmented)
+}
+
+fn request_with_content_type(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    fragmented: bool,
+) -> (u16, Value) {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -127,7 +138,7 @@ fn request(
     let head = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
         body.len(),
@@ -312,6 +323,24 @@ fn validation_fragmentation_and_integer_overflow_preserve_state() {
 
     let (status, _) = request(service.address, "GET", "/accounts/6/statement", b"", false);
     assert_eq!(status, 404);
+    assert_eq!(
+        request(service.address, "GET", "/accounts/10/statement", b"", false).0,
+        404,
+        "the full route capture is the account id, not its first digit"
+    );
+
+    let body = br#"{"amount":1,"kind":"credit","description":"no type"}"#;
+    let (status, _) = request_with_content_type(
+        service.address,
+        "POST",
+        "/accounts/3/transactions",
+        "text/plain",
+        body,
+        false,
+    );
+    assert_eq!(status, 415);
+    let (_, statement) = request(service.address, "GET", "/accounts/3/statement", b"", false);
+    assert_eq!(statement["balance"], 1);
 
     let (status, _) = request(
         service.address,
@@ -379,6 +408,7 @@ fn incomplete_upload_saturation_recovers_after_disconnects() {
             .write_all(
                 b"POST /accounts/1/transactions HTTP/1.1\r\n\
                   Host: localhost\r\n\
+                  Content-Type: application/json\r\n\
                   Expect: 100-continue\r\n\
                   Content-Length: 1\r\n\r\n",
             )
@@ -450,6 +480,7 @@ fn sigterm_drains_an_admitted_upload_before_exiting() {
     let head = format!(
         "POST /accounts/1/transactions HTTP/1.1\r\n\
          Host: localhost\r\n\
+         Content-Type: application/json\r\n\
          Expect: 100-continue\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",

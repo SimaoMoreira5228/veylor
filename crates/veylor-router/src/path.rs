@@ -119,6 +119,14 @@ pub(crate) fn compare_patterns(left: &[u8], right: &[u8]) -> Ordering {
     }
 }
 
+pub fn compare_route_patterns(left: &[u8], right: &[u8]) -> Ordering {
+    compare_patterns(left, right)
+}
+
+pub fn valid_route_pattern(path: &[u8]) -> bool {
+    inspect_pattern(path).is_some()
+}
+
 pub(crate) fn match_pattern(
     pattern: &[u8],
     path: &[u8],
@@ -183,6 +191,24 @@ pub(crate) fn match_pattern(
         pattern_start = pattern_end + 1;
         path_start = path_end + 1;
     }
+}
+
+pub fn match_route(
+    pattern: &[u8],
+    target: &[u8],
+    captures: &mut [RouteCapture; MAX_ROUTE_CAPTURES],
+) -> Option<usize> {
+    let max = inspect_pattern(pattern)?;
+    if target.first() != Some(&b'/') || max > captures.len() {
+        return None;
+    }
+
+    match_pattern(
+        pattern,
+        target.split(|byte| *byte == b'?').next()?,
+        0,
+        captures,
+    )
 }
 
 pub(crate) fn request_path<'a>(

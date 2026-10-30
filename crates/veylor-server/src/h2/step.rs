@@ -1,5 +1,6 @@
 use veylor_http2::{
-    ErrorCode, H2ServerDriver, HeadersFrameWriter, StreamState, encode_header_block,
+    DataWriteError, ErrorCode, H2ServerDriver, HeadersFrameWriter, ServerError, StreamState,
+    encode_header_block,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -91,9 +92,7 @@ pub(crate) fn apply_h2_streams(
                         Some(StreamCmd::Write { chunk }) => Some(chunk.len()),
                         _ => None,
                     };
-                    if let Some(cmd) = take_stream_cmd(inner, token) {
-                        found = Some((token, write, cmd));
-                    }
+                    found = Some((token, write));
                 }
                 continue;
             }
@@ -119,7 +118,7 @@ pub(crate) fn apply_h2_streams(
     for token in rearmed[..rearmed_len].iter().flatten() {
         host.stage_writable(*token);
     }
-    let Some((token, write, cmd)) = found else {
+    let Some((token, write)) = found else {
         return false;
     };
     let stream = token.stream_id;
@@ -132,14 +131,24 @@ pub(crate) fn apply_h2_streams(
     let credit = found
         .filter(|found| found.state != StreamState::Closed)
         .map(|found| found.send_window.value());
-    if let Some(len) = write {
-        let room = len + 64 <= spare;
-        let send = server.driver().connection_send_window().value() >= len as i64;
-        let flow = credit.is_some_and(|window| window >= len as i64);
-        if !room || !send || (!flow && credit.is_some()) {
+    if write.is_some() {
+        let send = server.driver().connection_send_window().value();
+        let flow = credit.unwrap_or(0);
+        if spare < 10 || send <= 0 || flow <= 0 {
             return false;
         }
     }
+
+    let Some((cmd, _)) = host.with_inner(|inner| {
+        let command = take_stream_cmd(inner, token);
+        (command, None)
+    }) else {
+        return false;
+    };
+    let Some(cmd) = cmd else {
+        return false;
+    };
+
     let spare = slots::pending_spare(meta);
     let step = match cmd {
         StreamCmd::Begin {
@@ -173,6 +182,8 @@ pub(crate) fn apply_h2_streams(
         StreamCmd::Write { chunk } => {
             let mut used = 0;
             let mut off = 0;
+            let mut failed = false;
+
             while off < chunk.len() {
                 match server.send_data(stream, &chunk[off..], false, &mut spare[used..]) {
                     Ok(sent) => {
@@ -182,17 +193,43 @@ pub(crate) fn apply_h2_streams(
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(ServerError::Data(DataWriteError::NoSendCredit)) => break,
+                    Err(ServerError::StreamClosed | ServerError::UnknownStream) => {
+                        failed = true;
+                        break;
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
                 }
             }
-            if off == chunk.len() {
+            if failed {
+                match abort_stream(server, host, token, fail, &mut spare[used..]) {
+                    StreamStep::Dead { used: reset } => StreamStep::Dead { used: used + reset },
+                    done => done,
+                }
+            } else if off == chunk.len() {
                 StreamStep::Done {
                     used,
                     served: false,
                     refused: false,
                 }
             } else {
-                abort_stream(server, host, token, fail, slots::pending_spare(meta))
+                let mut remainder = chunk;
+                remainder.drain(..off);
+                if !host.defer_stream_write(token, remainder) {
+                    match abort_stream(server, host, token, fail, &mut spare[used..]) {
+                        StreamStep::Dead { used: reset } => StreamStep::Dead { used: used + reset },
+                        done => done,
+                    }
+                } else {
+                    StreamStep::Done {
+                        used,
+                        served: false,
+                        refused: false,
+                    }
+                }
             }
         }
         StreamCmd::End => match server.send_data(stream, b"", true, spare) {

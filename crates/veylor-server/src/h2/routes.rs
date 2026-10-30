@@ -1,7 +1,9 @@
+use std::cmp::Ordering;
 use std::path::Path;
 
 use veylor_http1::{ALLOW_METHODS, is_token, join_allow_value};
 use veylor_http2::{H2ServerDriver, HpackHeader};
+use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route};
 
 use crate::static_files::{FileMounts, FilePlan, FileReject};
 use crate::static_routes::{
@@ -45,6 +47,7 @@ pub struct FrozenRoute<'a> {
     pub body: &'a [u8],
     pub gzip_body: Option<&'a [u8]>,
     pub managed: bool,
+    pub max_body_bytes: u64,
     pub file_root: Option<&'a Path>,
     pub trailers: &'a [Vec<u8>],
 }
@@ -70,6 +73,30 @@ pub struct FrozenRoutesView<'a> {
 
 pub(crate) type StaticContent<'a> = (u16, &'a [u8], Option<&'a [u8]>);
 
+#[derive(Clone, Copy)]
+enum RouteSelection {
+    Static(usize),
+    Native(usize),
+}
+
+fn route_matches(pattern: &[u8], target: &[u8]) -> bool {
+    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+    match_route(pattern, target, &mut captures).is_some()
+}
+
+fn select_route<'a>(
+    selected: &mut Option<(&'a [u8], RouteSelection)>,
+    pattern: &'a [u8],
+    candidate: RouteSelection,
+) {
+    if selected
+        .as_ref()
+        .is_none_or(|(current, _)| compare_route_patterns(pattern, current) == Ordering::Less)
+    {
+        *selected = Some((pattern, candidate));
+    }
+}
+
 impl<'a> FrozenRoutesView<'a> {
     pub fn new(routes: &'a [FrozenRoute<'a>]) -> Result<Self, RouteBuildError> {
         if routes.len() > MAX_ROUTES {
@@ -85,8 +112,11 @@ impl<'a> FrozenRoutesView<'a> {
             if route.method.is_empty()
                 || !route.method.iter().copied().all(is_token)
                 || route.path.is_empty()
+                || !veylor_router::valid_route_pattern(route.path)
                 || !(200..=599).contains(&route.status)
                 || route.status == 204
+                || (route.managed && !route.body.is_empty())
+                || (!route.managed && route.max_body_bytes != 0)
             {
                 return Err(RouteBuildError::Invalid);
             }
@@ -99,7 +129,7 @@ impl<'a> FrozenRoutesView<'a> {
                 && routes[..index].iter().any(|prev| {
                     prev.file_root.is_none()
                         && prev.method == routes[index].method
-                        && prev.path == routes[index].path
+                        && compare_route_patterns(prev.path, routes[index].path) == Ordering::Equal
                 })
         }) {
             return Err(RouteBuildError::Duplicate);
@@ -120,22 +150,30 @@ impl<'a> FrozenRoutesView<'a> {
         for native in natives {
             let bad = native.method.is_empty() || native.path.is_empty();
             let token = !native.method.iter().copied().all(is_token);
-            if bad || token {
+            let path = !veylor_router::valid_route_pattern(native.path);
+            if bad || token || path {
                 return Err(RouteBuildError::Invalid);
             }
         }
         if (1..natives.len()).any(|index| {
             natives[..index].iter().any(|prev| {
-                prev.method == natives[index].method && prev.path == natives[index].path
+                prev.method == natives[index].method
+                    && compare_route_patterns(prev.path, natives[index].path) == Ordering::Equal
             })
         }) {
             return Err(RouteBuildError::Duplicate);
+        }
+        if natives.iter().any(|native| {
+            let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+            match_route(native.path, native.path, &mut captures).is_none()
+        }) {
+            return Err(RouteBuildError::Invalid);
         }
         let overlap = natives.iter().any(|native| {
             self.routes.iter().any(|route| {
                 route.file_root.is_none()
                     && route.method == native.method
-                    && route.path == native.path
+                    && compare_route_patterns(route.path, native.path) == Ordering::Equal
             })
         });
         if overlap {
@@ -146,18 +184,54 @@ impl<'a> FrozenRoutesView<'a> {
     }
 
     pub(crate) fn find(&self, method: &[u8], path: &[u8]) -> Option<usize> {
-        let exact = self.routes.iter().position(|route| {
-            route.file_root.is_none() && route.method == method && route.path == path
-        });
-        if exact.is_some() {
-            return exact;
-        }
-        if method != b"HEAD" {
+        let RouteSelection::Static(index) = self.select(method, path)? else {
             return None;
+        };
+
+        Some(index)
+    }
+
+    fn select(&self, method: &[u8], path: &[u8]) -> Option<RouteSelection> {
+        let mut selected = None;
+        for (index, route) in self.routes.iter().enumerate() {
+            if route.file_root.is_some() || route.method != method {
+                continue;
+            }
+            if route_matches(route.path, path) {
+                select_route(&mut selected, route.path, RouteSelection::Static(index));
+            }
         }
-        self.routes.iter().position(|route| {
-            route.file_root.is_none() && route.method == b"GET" && route.path == path
-        })
+        for (index, route) in self.natives.iter().enumerate() {
+            if route.method == method && route_matches(route.path, path) {
+                select_route(&mut selected, route.path, RouteSelection::Native(index));
+            }
+        }
+        if selected.is_none() && method == b"HEAD" {
+            for (index, route) in self.routes.iter().enumerate() {
+                if route.file_root.is_none()
+                    && route.method == b"GET"
+                    && route_matches(route.path, path)
+                {
+                    select_route(&mut selected, route.path, RouteSelection::Static(index));
+                }
+            }
+            for (index, route) in self.natives.iter().enumerate() {
+                if route.method == b"GET" && route_matches(route.path, path) {
+                    select_route(&mut selected, route.path, RouteSelection::Native(index));
+                }
+            }
+        }
+
+        selected.map(|(_, route)| route)
+    }
+
+    pub(crate) fn managed_body_limit(&self, method: &[u8], path: &[u8]) -> Option<u64> {
+        let RouteSelection::Static(index) = self.select(method, path)? else {
+            return None;
+        };
+        let route = &self.routes[index];
+
+        route.managed.then_some(route.max_body_bytes)
     }
 
     pub(crate) fn accepts_gzip<'b, 't, 'd, 'e>(
@@ -192,19 +266,25 @@ impl<'a> FrozenRoutesView<'a> {
         method: &[u8],
         path: &[u8],
     ) -> Option<(NativeHandler, usize, bool)> {
-        let direct = self
+        let selected = match self.select(method, path)? {
+            RouteSelection::Static(index) => self.routes[index].path,
+            RouteSelection::Native(index) => self.natives[index].path,
+        };
+        let native = self
             .natives
             .iter()
-            .find(|native| native.method == method && native.path == path);
-        let fallback = direct.is_none() && method == b"HEAD";
-        let found = if fallback {
-            self.natives
-                .iter()
-                .find(|native| native.method == b"GET" && native.path == path)
-        } else {
-            direct
-        };
-        found.map(|native| (native.handler, native.user_data, native.gzip))
+            .find(|route| route.method == method && route.path == selected)
+            .or_else(|| {
+                (method == b"HEAD")
+                    .then(|| {
+                        self.natives
+                            .iter()
+                            .find(|route| route.method == b"GET" && route.path == selected)
+                    })
+                    .flatten()
+            })?;
+
+        Some((native.handler, native.user_data, native.gzip))
     }
 
     // NOTE: miss-only path scan, so hits return with no extra work: one bounded pass
@@ -215,11 +295,13 @@ impl<'a> FrozenRoutesView<'a> {
         let statics = self
             .routes
             .iter()
-            .any(|route| route.file_root.is_none() && route.path == path);
+            .any(|route| route.file_root.is_none() && route_matches(route.path, path));
         if statics {
             return true;
         }
-        self.natives.iter().any(|native| native.path == path)
+        self.natives
+            .iter()
+            .any(|native| route_matches(native.path, path))
     }
 
     // NOTE: Allow companion to has_path_match for 405 assembly: same frozen slots and
@@ -232,7 +314,7 @@ impl<'a> FrozenRoutesView<'a> {
             if route.file_root.is_some() {
                 continue;
             }
-            if route.path != path {
+            if !route_matches(route.path, path) {
                 continue;
             }
             if out[..count].contains(&route.method) {
@@ -245,7 +327,7 @@ impl<'a> FrozenRoutesView<'a> {
             count += 1;
         }
         for native in self.natives.iter() {
-            if native.path != path {
+            if !route_matches(native.path, path) {
                 continue;
             }
             if out[..count].contains(&native.method) {
@@ -317,19 +399,12 @@ impl<'a> FrozenRoutesView<'a> {
     // HEAD-to-GET), empty when the route is gone so trailer staging fails closed without
     // disturbing the body path. Mirrors StaticRoutes::managed_trailers field for field.
     pub(crate) fn managed_trailers(&self, method: &[u8], path: &[u8]) -> &[Vec<u8>] {
-        let found = self.routes.iter().find(|route| {
-            route.file_root.is_none() && route.method == method && route.path == path
-        });
+        let found = self
+            .find(method, path)
+            .map(|index| &self.routes[index])
+            .filter(|route| route.managed);
         match found {
             Some(route) => route.trailers,
-            None if method == b"HEAD" => self
-                .routes
-                .iter()
-                .find(|route| {
-                    route.file_root.is_none() && route.method == b"GET" && route.path == path
-                })
-                .map(|route| route.trailers)
-                .unwrap_or(&[]),
             None => &[],
         }
     }
@@ -407,6 +482,7 @@ mod tests {
                 body: b"a",
                 gzip_body: None,
                 managed: false,
+                max_body_bytes: 0,
                 file_root: None,
                 trailers: &[],
             },
@@ -417,6 +493,7 @@ mod tests {
                 body: b"b",
                 gzip_body: None,
                 managed: false,
+                max_body_bytes: 0,
                 file_root: None,
                 trailers: &[],
             },
@@ -427,6 +504,7 @@ mod tests {
                 body: b"c",
                 gzip_body: None,
                 managed: false,
+                max_body_bytes: 0,
                 file_root: None,
                 trailers: &[],
             },
@@ -437,6 +515,7 @@ mod tests {
                 body: b"",
                 gzip_body: None,
                 managed: false,
+                max_body_bytes: 0,
                 file_root: Some(file_root),
                 trailers: &[],
             },

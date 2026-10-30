@@ -1046,11 +1046,12 @@ pub(crate) fn apply_h2_staged(
         let Some(live) = conn.as_mut().filter(|active| !active.is_closed()) else {
             continue;
         };
-        let outcome = live.apply_staged(h2_slots::pending_spare(meta), &work);
+        let was_cancel = work.cancel;
+        let outcome = live.apply_staged(h2_slots::pending_spare(meta), work);
         meta.pending_len += outcome.written;
         turn.counts.h2_served += u64::from(outcome.served);
         turn.counts.h2_refused += u64::from(outcome.refused);
-        if work.cancel {
+        if was_cancel {
             turn.counts.h2_refused += 1;
         }
         applied = true;

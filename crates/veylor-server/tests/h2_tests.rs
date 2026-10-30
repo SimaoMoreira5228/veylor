@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -25,6 +26,9 @@ use veylor_server::{
     h2::{FrozenNativeRoute, HEADER_BLOCK_CAP, HEADER_SLOTS, STREAM_SLOTS},
 };
 
+#[path = "h2_tests/managed_requests.rs"]
+mod h2_managed_requests;
+
 const DEADLINE: Duration = Duration::from_secs(5);
 
 static ROUTES: [FrozenRoute<'static>; 2] = [
@@ -32,9 +36,10 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         method: b"GET",
         path: b"/hello",
         status: 200,
-        body: b"hello",
+        body: b"",
         gzip_body: None,
         managed: true,
+        max_body_bytes: 32_768,
         file_root: None,
         trailers: &[],
     },
@@ -45,6 +50,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
         body: b"",
         gzip_body: None,
         managed: false,
+        max_body_bytes: 0,
         file_root: None,
         trailers: &[],
     },
@@ -275,10 +281,79 @@ struct Response {
 }
 
 fn read_response(stream: &mut TcpStream, id: u32) -> Response {
+    let (mut response, headers_ended_stream) = read_response_headers(stream, id);
+    let mut body = Vec::new();
+    if !headers_ended_stream {
+        loop {
+            let (header, payload) = read_frame(stream);
+            assert_eq!(header.stream_id, id);
+            assert_eq!(header.frame_type, FrameType::Data);
+            body.extend_from_slice(&payload);
+            if header.flags & DATA_FLAG_END_STREAM != 0 {
+                break;
+            }
+        }
+    }
+    response.body = body;
+    response
+}
+
+fn read_response_body(stream: &mut TcpStream, id: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    loop {
+        let (header, payload) = read_frame(stream);
+        assert_eq!(header.stream_id, id);
+        assert_eq!(header.frame_type, FrameType::Data);
+        body.extend_from_slice(&payload);
+
+        if header.flags & DATA_FLAG_END_STREAM != 0 {
+            return body;
+        }
+    }
+}
+
+fn read_response_bodies(stream: &mut TcpStream, streams: &[u32]) -> HashMap<u32, Vec<u8>> {
+    let mut bodies = HashMap::new();
+    let mut ended = HashSet::new();
+
+    while ended.len() < streams.len() {
+        let (header, payload) = read_frame(stream);
+        if matches!(
+            header.frame_type,
+            FrameType::Settings | FrameType::WindowUpdate
+        ) {
+            continue;
+        }
+
+        assert!(streams.contains(&header.stream_id));
+        assert_eq!(header.frame_type, FrameType::Data);
+        bodies
+            .entry(header.stream_id)
+            .or_insert_with(Vec::new)
+            .extend_from_slice(&payload);
+
+        if header.flags & DATA_FLAG_END_STREAM != 0 {
+            ended.insert(header.stream_id);
+        }
+    }
+
+    bodies
+}
+
+fn read_response_headers(stream: &mut TcpStream, id: u32) -> (Response, bool) {
     let mut block = Vec::new();
     let mut headers_ended_stream = false;
     loop {
         let (header, payload) = read_frame(stream);
+
+        if matches!(
+            header.frame_type,
+            FrameType::Settings | FrameType::WindowUpdate
+        ) {
+            continue;
+        }
+
         assert_eq!(header.stream_id, id);
         match header.frame_type {
             FrameType::Headers => {
@@ -298,20 +373,8 @@ fn read_response(stream: &mut TcpStream, id: u32) -> Response {
         }
     }
     let mut response = decode_response(&block);
-    let mut body = Vec::new();
-    if !headers_ended_stream {
-        loop {
-            let (header, payload) = read_frame(stream);
-            assert_eq!(header.stream_id, id);
-            assert_eq!(header.frame_type, FrameType::Data);
-            body.extend_from_slice(&payload);
-            if header.flags & DATA_FLAG_END_STREAM != 0 {
-                break;
-            }
-        }
-    }
-    response.body = body;
-    response
+    response.body.clear();
+    (response, headers_ended_stream)
 }
 
 fn decode_response(block: &[u8]) -> Response {
@@ -460,6 +523,16 @@ fn read_response_stateful(
     if !headers_ended_stream {
         loop {
             let (header, payload) = read_frame(stream);
+
+            if header.stream_id == 0
+                && matches!(
+                    header.frame_type,
+                    FrameType::Settings | FrameType::WindowUpdate
+                )
+            {
+                continue;
+            }
+
             assert_eq!(header.stream_id, id);
             assert_eq!(header.frame_type, FrameType::Data);
             body.extend_from_slice(&payload);
@@ -1259,6 +1332,7 @@ fn route_view_rejects_bad_input() {
         body: b"",
         gzip_body: None,
         managed: false,
+        max_body_bytes: 0,
         file_root: None,
         trailers: &[],
     };
@@ -1273,6 +1347,7 @@ fn route_view_rejects_bad_input() {
         body: b"x",
         gzip_body: None,
         managed: false,
+        max_body_bytes: 0,
         file_root: None,
         trailers: &[],
     };
@@ -1287,6 +1362,7 @@ fn route_view_rejects_bad_input() {
         body: &[0; 4097],
         gzip_body: None,
         managed: false,
+        max_body_bytes: 0,
         file_root: None,
         trailers: &[],
     };
@@ -1301,6 +1377,7 @@ fn route_view_rejects_bad_input() {
         body: b"a",
         gzip_body: None,
         managed: false,
+        max_body_bytes: 0,
         file_root: None,
         trailers: &[],
     };
@@ -1311,6 +1388,7 @@ fn route_view_rejects_bad_input() {
         body: b"b",
         gzip_body: None,
         managed: false,
+        max_body_bytes: 0,
         file_root: None,
         trailers: &[],
     };
@@ -1331,6 +1409,7 @@ fn route_view_rejects_bad_input() {
             body: b"x",
             gzip_body: None,
             managed: false,
+            max_body_bytes: 0,
             file_root: None,
             trailers: &[],
         })
@@ -1529,7 +1608,8 @@ fn host_park_poll_respond_round_trip() {
         assert_eq!(staged.len(), 1);
         assert!(!staged[0].cancel);
         let mut output = [0u8; 16384];
-        let applied = conn.apply_staged(&mut output, &staged[0]);
+        let work = staged.into_iter().next().expect("staged response");
+        let applied = conn.apply_staged(&mut output, work);
         assert_eq!(applied.served, 1);
         server
             .write_all(&output[..applied.written])
@@ -1561,7 +1641,8 @@ fn host_cancel_mid_park_rsts_sibling_unaffected() {
         assert_eq!(staged.len(), 1);
         assert!(staged[0].cancel);
         let mut output = [0u8; 16384];
-        let applied = conn.apply_staged(&mut output, &staged[0]);
+        let work = staged.into_iter().next().expect("staged cancellation");
+        let applied = conn.apply_staged(&mut output, work);
         server
             .write_all(&output[..applied.written])
             .expect("flush cancel");
@@ -1605,7 +1686,8 @@ fn host_stale_replay_and_duplicate_fail_closed() {
         let (staged, _) = shared.take_staged(0);
         assert_eq!(staged.len(), 1);
         let mut output = [0u8; 16384];
-        let applied = conn.apply_staged(&mut output, &staged[0]);
+        let work = staged.into_iter().next().expect("staged response");
+        let applied = conn.apply_staged(&mut output, work);
         server
             .write_all(&output[..applied.written])
             .expect("flush staged");
@@ -1640,7 +1722,18 @@ fn host_unknown_path_stays_sync_404() {
 
 #[test]
 fn host_request_body_refused_without_staging() {
-    let view = FrozenRoutesView::new(&ROUTES).expect("frozen routes");
+    static STATIC: [FrozenRoute<'static>; 1] = [FrozenRoute {
+        method: b"GET",
+        path: b"/hello",
+        status: 200,
+        body: b"hello",
+        gzip_body: None,
+        managed: false,
+        max_body_bytes: 0,
+        file_root: None,
+        trailers: &[],
+    }];
+    let view = FrozenRoutesView::new(&STATIC).expect("frozen routes");
     with_rig(|conn, shared, client, server| {
         rig_handshake(conn, client, server, &view);
         let ctx = H2HostCtx {
@@ -1970,10 +2063,14 @@ fn h2_managed_teardown_unparks_parked_stream() {
 }
 // NOTE: managed H2 request-body tests: fixed-length POST bodies stage per parked stream,
 // the host pulls them with pull-observed completion, and drained bytes reopen both flow
-// windows (grant-on-consume). H2 has no chunked coding: END_STREAM on DATA frames the
-// body, so unknown-length bodies stay refused and trailers are stream errors.
+// windows (grant-on-consume). H2 has no chunked coding: END_STREAM on DATA frames an
+// unknown-length body, which the managed route cap bounds while data arrives.
 
 fn managed_h2_body_server() -> RunningServer {
+    managed_h2_body_server_with_cap(H2_BODY_CAP)
+}
+
+fn managed_h2_body_server_with_cap(max_body_bytes: u64) -> RunningServer {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let config = ServerConfig {
         h2c_port: Some(0),
@@ -1991,8 +2088,11 @@ fn managed_h2_body_server() -> RunningServer {
         )
         .expect("register hello");
     server
-        .register_managed(b"POST", b"/upload", MAX_STATIC_BODY_BYTES)
+        .register_managed(b"POST", b"/upload", max_body_bytes)
         .expect("register upload");
+    server
+        .register_managed(b"GET", b"/accounts/:id/statement", 0)
+        .expect("register managed statement");
     server.start().expect("start server")
 }
 
@@ -2221,31 +2321,6 @@ fn h2_managed_post_stages_pullable_body() {
 }
 
 #[test]
-fn h2_managed_over_cap_body_refused_stream_survives() {
-    let server = managed_h2_body_server();
-    let mut stream = h2_connect(&server);
-    handshake(&mut stream);
-    send_headers_len(
-        &mut stream,
-        1,
-        b"POST",
-        b"/upload",
-        Some(H2_BODY_CAP + 1),
-        false,
-    );
-    let (id, code) = read_rst(&mut stream);
-    assert_eq!(id, 1);
-    assert_eq!(code, ErrorCode::RefusedStream);
-    send_headers(&mut stream, 3, b"GET", b"/hello", true);
-    let sibling = read_response(&mut stream, 3);
-    assert_eq!(sibling.status, 200);
-    assert_eq!(sibling.body, b"hello");
-    let counts = stop_join(server);
-    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
-    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
-}
-
-#[test]
 fn h2_managed_window_reopens_after_drain() {
     let server = managed_h2_body_server();
     let host = server.host();
@@ -2405,10 +2480,7 @@ fn h2_oversize_request_header_block_resets_stream_and_spares_connection() {
 }
 
 #[test]
-fn h2_zero_window_static_body_refuses_stream_and_spares_connection() {
-    // NOTE: a peer that never opens its send window (INITIAL_WINDOW_SIZE 0 is
-    // explicit flow control, not misbehavior) must get a per-stream refusal it
-    // may retry, never a connection teardown with a truncated response.
+fn h2_static_response_waits_for_stream_window_update() {
     let server = h2_server();
     let mut stream = h2_connect(&server);
     handshake(&mut stream);
@@ -2417,23 +2489,134 @@ fn h2_zero_window_static_body_refuses_stream_and_spares_connection() {
     assert_eq!(header.frame_type, FrameType::Settings);
     assert_ne!(header.flags & SETTINGS_ACK, 0);
     send_headers(&mut stream, 1, b"GET", b"/hello", true);
-    let (id, code) = read_rst(&mut stream);
-    assert_eq!(id, 1);
-    assert_eq!(code, ErrorCode::RefusedStream);
+
+    let (head, ended) = read_response_headers(&mut stream, 1);
+    assert_eq!(head.status, 200);
+    assert_eq!(head.content_length, 5);
+    assert!(!ended);
+
+    send_window_update(&mut stream, 1, 5);
+    assert_eq!(read_response_body(&mut stream, 1), b"hello");
+
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_stalled_fixed_response_resets_only_its_stream_after_write_timeout() {
+    let server_address = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        timeouts: ConnectionTimeouts {
+            response_write_ns: 50_000_000,
+            ..ConnectionTimeouts::production()
+        },
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(server_address, config).expect("bind loopback");
+    server
+        .register_route(
+            b"GET",
+            b"/body",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register response");
+    server
+        .register_route(b"GET", b"/empty", 200, b"OK", b"", MAX_STATIC_BODY_BYTES)
+        .expect("register empty response");
+    let server = server.start().expect("start server");
+    let mut stream = h2_connect(&server);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    handshake(&mut stream);
+
+    write_frame(&mut stream, FrameType::Settings, 0, 0, &[0, 4, 0, 0, 0, 0]);
+    let (settings, _) = read_frame(&mut stream);
+    assert_eq!(settings.frame_type, FrameType::Settings);
+    assert_ne!(settings.flags & SETTINGS_ACK, 0);
+
+    send_headers(&mut stream, 1, b"GET", b"/body", true);
+    let (response, ended) = read_response_headers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert!(!ended);
+
+    let (stream_id, code) = read_rst(&mut stream);
+    assert_eq!(stream_id, 1);
+    assert_eq!(code, ErrorCode::Cancel);
+
     send_headers(&mut stream, 3, b"GET", b"/empty", true);
     let sibling = read_response(&mut stream, 3);
     assert_eq!(sibling.status, 200);
-    assert_eq!(sibling.body, b"");
+    assert!(sibling.body.is_empty());
+
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
     assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
 }
 
 #[test]
-fn h2_zero_window_staged_body_refuses_stream_and_spares_connection() {
-    // NOTE: same pre-flight rule on the managed staged path: the host already
-    // answered, so tearing down the connection would drop a good response and
-    // seven innocent siblings; the stream RSTs and a later POST still serves.
+fn h2_fixed_responses_resume_after_connection_window_update() {
+    let mut server = Server::bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        ServerConfig {
+            h2c_port: Some(0),
+            ..ServerConfig::default()
+        },
+    )
+    .expect("bind loopback");
+    let body = [b'x'; 4096];
+    server
+        .register_route(b"GET", b"/body", 200, b"OK", &body, MAX_STATIC_BODY_BYTES)
+        .expect("register body");
+    let server = server.start().expect("start server");
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+
+    for id in (1..=29).step_by(2) {
+        send_headers(&mut stream, id, b"GET", b"/body", true);
+        let response = read_response(&mut stream, id);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, body);
+    }
+
+    send_headers(&mut stream, 31, b"GET", b"/body", true);
+    let (sixteenth, ended) = read_response_headers(&mut stream, 31);
+    assert_eq!(sixteenth.status, 200);
+    assert_eq!(sixteenth.content_length, body.len() as u64);
+    assert!(!ended);
+
+    let (header, first_payload) = read_frame(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Data);
+    assert_eq!(header.stream_id, 31);
+    assert_eq!(header.flags & DATA_FLAG_END_STREAM, 0);
+    assert_eq!(first_payload.len(), 4095);
+    assert!(first_payload.iter().all(|byte| *byte == b'x'));
+
+    send_headers(&mut stream, 33, b"GET", b"/body", true);
+    let (seventeenth, ended) = read_response_headers(&mut stream, 33);
+    assert_eq!(seventeenth.status, 200);
+    assert!(!ended);
+
+    send_window_update(&mut stream, 0, 8192);
+    send_window_update(&mut stream, 31, 1);
+    send_window_update(&mut stream, 33, 4096);
+
+    let bodies = read_response_bodies(&mut stream, &[31, 33]);
+    assert_eq!(bodies[&31].as_slice(), b"x");
+    assert_eq!(bodies[&33].as_slice(), &body);
+
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 17, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_staged_responses_on_siblings_resume_independently() {
     let server = managed_h2_body_server();
     let host = server.host();
     let mut stream = h2_connect(&server);
@@ -2442,6 +2625,7 @@ fn h2_zero_window_staged_body_refuses_stream_and_spares_connection() {
     let (header, _) = read_frame(&mut stream);
     assert_eq!(header.frame_type, FrameType::Settings);
     assert_ne!(header.flags & SETTINGS_ACK, 0);
+
     send_headers_len(&mut stream, 1, b"POST", b"/upload", Some(4), false);
     write_frame(
         &mut stream,
@@ -2455,9 +2639,7 @@ fn h2_zero_window_staged_body_refuses_stream_and_spares_connection() {
         host.respond(event.token, 200, b"OK", b"late"),
         RespondOutcome::Ok
     );
-    let (id, code) = read_rst(&mut stream);
-    assert_eq!(id, 1);
-    assert_eq!(code, ErrorCode::RefusedStream);
+
     send_headers_len(&mut stream, 3, b"POST", b"/upload", Some(4), false);
     write_frame(
         &mut stream,
@@ -2471,12 +2653,68 @@ fn h2_zero_window_staged_body_refuses_stream_and_spares_connection() {
         host.respond(event.token, 200, b"OK", b"late"),
         RespondOutcome::Ok
     );
-    let (id, code) = read_rst(&mut stream);
-    assert_eq!(id, 3);
-    assert_eq!(code, ErrorCode::RefusedStream);
+
+    let (first, first_end) = read_response_headers(&mut stream, 1);
+    let (second, second_end) = read_response_headers(&mut stream, 3);
+    assert_eq!(first.status, 200);
+    assert_eq!(second.status, 200);
+    assert_eq!(first.content_length, 4);
+    assert_eq!(second.content_length, 4);
+    assert!(!first_end);
+    assert!(!second_end);
+
+    send_window_update(&mut stream, 3, 4);
+    assert_eq!(read_response_body(&mut stream, 3), b"late");
+
+    send_window_update(&mut stream, 1, 4);
+    assert_eq!(read_response_body(&mut stream, 1), b"late");
+
     let counts = stop_join(server);
-    assert_eq!(counts.h2_served, 0, "counts: {counts:?}");
-    assert_eq!(counts.h2_refused, 2, "counts: {counts:?}");
+    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_managed_stream_write_survives_a_zero_window_until_credit_arrives() {
+    let server = managed_h2_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+
+    write_frame(&mut stream, FrameType::Settings, 0, 0, &[0, 4, 0, 0, 0, 0]);
+    let (settings, _) = read_frame(&mut stream);
+    assert_eq!(settings.frame_type, FrameType::Settings);
+    assert_ne!(settings.flags & SETTINGS_ACK, 0);
+
+    send_headers(&mut stream, 1, b"GET", b"/work", true);
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.begin_stream(event.token, 200, b"OK"),
+        RespondOutcome::Ok
+    );
+    spin_until(|| host.is_writable(event.token));
+    assert_eq!(
+        host.write_stream(event.token, b"retained"),
+        RespondOutcome::Ok
+    );
+
+    send_window_update(&mut stream, 1, 8);
+    spin_until(|| host.is_writable(event.token));
+
+    assert_eq!(
+        host.end_stream_with_trailers(event.token, &[]),
+        RespondOutcome::Ok
+    );
+    spin_until(|| !host.is_writable(event.token));
+
+    let (response, trailers) = read_response_with_trailers(&mut stream, 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"retained");
+    assert!(trailers.is_empty());
+
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 0, "counts: {counts:?}");
 }
 
 #[test]
@@ -3769,6 +4007,7 @@ static H2N_PRE_ROUTES: [FrozenRoute<'static>; 1] = [FrozenRoute {
     body: b"static-head",
     gzip_body: None,
     managed: false,
+    max_body_bytes: 0,
     file_root: None,
     trailers: &[],
 }];
@@ -4187,7 +4426,8 @@ fn h2_managed_respond_204_serves_status_only() {
         let (staged, _) = shared.take_staged(0);
         assert_eq!(staged.len(), 1);
         let mut output = [0u8; 16384];
-        let applied = conn.apply_staged(&mut output, &staged[0]);
+        let work = staged.into_iter().next().expect("staged response");
+        let applied = conn.apply_staged(&mut output, work);
         assert_eq!(applied.served, 1);
         server
             .write_all(&output[..applied.written])

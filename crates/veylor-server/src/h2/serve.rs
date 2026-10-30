@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use veylor_http1::{ALLOW_BYTES, is_token, prohibited_request_trailer};
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HeaderRange, HpackHeader, ServerError, ValidatedServerRequest,
@@ -15,6 +17,7 @@ use crate::static_routes::{
 };
 
 use super::file::FileDecision;
+use super::pending::PendingResponses;
 use super::routes::{
     FrozenRoutesView, MAX_REQUEST_TARGET_BYTES, NOT_FOUND_BODY, URI_TOO_LONG_BODY,
 };
@@ -33,6 +36,7 @@ pub(crate) struct Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
     pub(crate) output: &'o mut [u8],
     pub(crate) used: &'o mut usize,
     pub(crate) outcome: &'o mut StepOutcome,
+    pub(crate) pending: &'o mut PendingResponses,
     pub(crate) files: &'o mut [Option<H2FileTransfer>; STREAM_SLOTS],
     pub(crate) scratch: &'o mut [u8],
 }
@@ -135,7 +139,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 self.server,
                 stream,
                 invoked.status,
-                body,
+                Cow::Borrowed(body),
                 content_encoding,
                 vary,
                 &[],
@@ -143,6 +147,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 false,
                 self.output,
                 self.used,
+                self.pending,
             );
             if refused.is_err() {
                 return self.fail(ErrorCode::InternalError);
@@ -153,7 +158,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             self.server,
             stream,
             invoked.status,
-            body,
+            Cow::Borrowed(body),
             content_encoding,
             vary,
             &[],
@@ -161,8 +166,12 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             true,
             self.output,
             self.used,
+            self.pending,
         ) {
-            Ok(()) => self.outcome.served += 1,
+            Ok(complete) => {
+                self.outcome.served += u16::from(complete);
+                self.outcome.pending |= !complete;
+            }
             Err(ErrorCode::RefusedStream) => {
                 self.deny(stream, ErrorCode::RefusedStream, false);
             }
@@ -199,6 +208,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 false,
                 self.output,
                 self.used,
+                self.pending,
             )
             .is_err()
             {
@@ -214,8 +224,12 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             true,
             self.output,
             self.used,
+            self.pending,
         ) {
-            Ok(()) => self.outcome.served += 1,
+            Ok(complete) => {
+                self.outcome.served += u16::from(complete);
+                self.outcome.pending |= !complete;
+            }
             Err(ErrorCode::RefusedStream) => {
                 self.deny(stream, ErrorCode::RefusedStream, false);
             }
@@ -287,6 +301,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     return (H2Trailer::Stream(ErrorCode::ProtocolError), None);
                 }
             }
+            if end && entry.body_total == u64::MAX {
+                entry.body_total = entry.body_pulled + entry.body.len() as u64;
+            }
             let fields = entry.trailers.get_or_insert_with(Vec::new);
             for (name, value) in &staged {
                 fields.push(StagedTrailer {
@@ -356,7 +373,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                             self.server,
                             stream,
                             414,
-                            URI_TOO_LONG_BODY,
+                            Cow::Borrowed(URI_TOO_LONG_BODY),
                             None,
                             false,
                             &[],
@@ -364,6 +381,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                             false,
                             self.output,
                             self.used,
+                            self.pending,
                         )
                         .is_err()
                         {
@@ -375,7 +393,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         self.server,
                         stream,
                         414,
-                        URI_TOO_LONG_BODY,
+                        Cow::Borrowed(URI_TOO_LONG_BODY),
                         None,
                         false,
                         &[],
@@ -383,8 +401,12 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         true,
                         self.output,
                         self.used,
+                        self.pending,
                     ) {
-                        Ok(()) => self.outcome.served += 1,
+                        Ok(complete) => {
+                            self.outcome.served += u16::from(complete);
+                            self.outcome.pending |= !complete;
+                        }
                         Err(ErrorCode::RefusedStream) => {
                             self.deny(stream, ErrorCode::RefusedStream, false);
                         }
@@ -398,15 +420,31 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         if end && declared.unwrap_or(0) > 0 {
                             return self.deny(stream, ErrorCode::ProtocolError, false);
                         }
-                        if end || declared.is_some() {
-                            let capped = declared.unwrap_or(0) <= H2_BODY_CAP;
-                            if capped
-                                && park_stream(ctx, self.routes, stream, request, self.outcome)
-                            {
-                                return;
-                            }
+                        let Some(body_limit) = self.routes.managed_body_limit(request.method, path)
+                        else {
                             return self.deny(stream, ErrorCode::RefusedStream, false);
+                        };
+                        let body_limit = body_limit.min(H2_BODY_CAP);
+
+                        if declared.is_some_and(|length| length > body_limit) {
+                            self.serve_managed_body_too_large(stream, is_head);
+                            return;
                         }
+
+                        if park_stream(
+                            ctx,
+                            self.routes,
+                            stream,
+                            request,
+                            end,
+                            body_limit,
+                            fields,
+                            self.server,
+                            self.outcome,
+                        ) {
+                            return;
+                        }
+                        return self.deny(stream, ErrorCode::RefusedStream, false);
                     }
                 }
                 if let Some((handler, user_data, gzip)) =
@@ -473,7 +511,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                                 self.server,
                                 stream,
                                 413,
-                                b"Payload Too Large",
+                                Cow::Borrowed(b"Payload Too Large"),
                                 None,
                                 false,
                                 &[],
@@ -481,8 +519,12 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                                 true,
                                 self.output,
                                 self.used,
+                                self.pending,
                             ) {
-                                Ok(()) => self.outcome.served += 1,
+                                Ok(complete) => {
+                                    self.outcome.served += u16::from(complete);
+                                    self.outcome.pending |= !complete;
+                                }
                                 Err(ErrorCode::RefusedStream) => {
                                     self.deny(stream, ErrorCode::RefusedStream, false);
                                 }
@@ -510,7 +552,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         self.server,
                         stream,
                         status,
-                        body,
+                        Cow::Borrowed(body),
                         encoding,
                         vary,
                         &[],
@@ -518,6 +560,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         false,
                         self.output,
                         self.used,
+                        self.pending,
                     )
                     .is_err()
                     {
@@ -529,7 +572,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     self.server,
                     stream,
                     status,
-                    body,
+                    Cow::Borrowed(body),
                     encoding,
                     vary,
                     &[],
@@ -537,8 +580,12 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     true,
                     self.output,
                     self.used,
+                    self.pending,
                 ) {
-                    Ok(()) => self.outcome.served += 1,
+                    Ok(complete) => {
+                        self.outcome.served += u16::from(complete);
+                        self.outcome.pending |= !complete;
+                    }
                     Err(ErrorCode::RefusedStream) => {
                         self.deny(stream, ErrorCode::RefusedStream, false);
                     }
@@ -555,7 +602,16 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 match push_h2_data(ctx, stream, bytes, end) {
                     H2DataOutcome::Stored => {}
                     H2DataOutcome::Short => self.deny(stream, ErrorCode::ProtocolError, false),
-                    H2DataOutcome::Over => self.deny(stream, ErrorCode::FlowControlError, false),
+                    H2DataOutcome::OverLimit => {
+                        let slot = ctx.base.slot + ((stream >> 1) as usize % STREAM_SLOTS) as u32;
+                        ctx.host.unpark_closed(ctx.base.worker_id, slot);
+                        self.deny(stream, ErrorCode::Cancel, false);
+                    }
+                    H2DataOutcome::OverDeclared => {
+                        let slot = ctx.base.slot + ((stream >> 1) as usize % STREAM_SLOTS) as u32;
+                        ctx.host.unpark_closed(ctx.base.worker_id, slot);
+                        self.deny(stream, ErrorCode::FlowControlError, false);
+                    }
                     H2DataOutcome::Gone => self.deny(stream, ErrorCode::RefusedStream, false),
                 }
             }
@@ -563,18 +619,50 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             StreamEvent::PeerGoAway => self.outcome.closed = true,
         }
     }
+
+    fn serve_managed_body_too_large(&mut self, stream: u32, is_head: bool) {
+        match send_full(
+            self.server,
+            stream,
+            413,
+            Cow::Borrowed(b"Payload Too Large"),
+            None,
+            false,
+            &[],
+            is_head,
+            !is_head,
+            self.output,
+            self.used,
+            self.pending,
+        ) {
+            Ok(complete) => {
+                self.outcome.served += u16::from(complete);
+                self.outcome.pending |= !complete;
+            }
+            Err(code) => self.fail(code),
+        }
+    }
 }
 
 // NOTE: queue-full split: H1 closes the conn when the host queue is full, but one H2 conn
 // carries siblings, so a refused park RSTs only its stream and multiplexing continues.
+#[allow(clippy::too_many_arguments)]
 fn park_stream(
     ctx: H2HostCtx<'_>,
     routes: &FrozenRoutesView<'_>,
     stream: u32,
     request: ValidatedServerRequest<'_>,
+    end: bool,
+    body_limit: u64,
+    headers: &[HpackHeader],
+    server: &H2ServerDriver<'_, '_, '_, '_>,
     outcome: &mut StepOutcome,
 ) -> bool {
-    let total = request.content_length.unwrap_or(0);
+    let total = match request.content_length {
+        Some(total) => total,
+        None if end => 0,
+        None => u64::MAX,
+    };
     let path = request.path.unwrap_or(b"/");
     let route_id = routes.find(request.method, path).map(|index| index as u64);
     let route_id = route_id.unwrap_or(u64::MAX);
@@ -586,7 +674,11 @@ fn park_stream(
         slot: ctx.base.slot + sub as u32,
         ..ctx.base
     };
-    match ctx.host.try_park(
+    let request_headers = headers
+        .iter()
+        .map(|header| server.driver().resolve_header(*header));
+
+    match ctx.host.try_park_with_request(
         ctx.base.worker_id,
         base,
         route_id,
@@ -594,6 +686,8 @@ fn park_stream(
         path,
         total,
         trailers,
+        Some(body_limit),
+        request_headers,
     ) {
         Ok(_) => {
             outcome.parked += 1;
@@ -645,7 +739,8 @@ pub(crate) fn valid_trailer_field(name: &[u8], value: &[u8]) -> bool {
 enum H2DataOutcome {
     Stored,
     Short,
-    Over,
+    OverLimit,
+    OverDeclared,
     Gone,
 }
 
@@ -661,13 +756,21 @@ fn push_h2_data(ctx: H2HostCtx<'_>, stream: u32, bytes: &[u8], end: bool) -> H2D
         let Some(live) = live else {
             return (H2DataOutcome::Gone, None);
         };
-        let room = live
-            .body_total
-            .saturating_sub(live.body_pulled + live.body.len() as u64);
+        let received = live.body_pulled + live.body.len() as u64;
+        if live
+            .body_limit
+            .is_some_and(|limit| received.saturating_add(bytes.len() as u64) > limit)
+        {
+            return (H2DataOutcome::OverLimit, None);
+        }
+        let room = live.body_total.saturating_sub(received);
         let fit = room.min(bytes.len() as u64) as usize;
-        live.body.extend_from_slice(&bytes[..fit]);
         if fit < bytes.len() {
-            return (H2DataOutcome::Over, None);
+            return (H2DataOutcome::OverDeclared, None);
+        }
+        live.body.extend_from_slice(bytes);
+        if end && live.body_total == u64::MAX {
+            live.body_total = received + bytes.len() as u64;
         }
         if end && live.body_pulled + live.body.len() as u64 != live.body_total {
             return (H2DataOutcome::Short, None);

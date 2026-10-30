@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use veylor_http1::{CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES};
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackRepresentation, status_sheds_length,
@@ -6,6 +8,7 @@ use veylor_http2::{
 use crate::static_files::{FilePlan, HTTP_DATE_BYTES, write_http_date};
 use crate::static_routes::now_http_date;
 
+use super::pending::PendingResponses;
 use super::routes::{MAX_BEGIN_FIELDS, MAX_RESPONSE_FIELDS, METHOD_NOT_ALLOWED_BODY};
 use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 
@@ -192,11 +195,11 @@ pub(crate) fn send_begin(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn send_full(
+pub(crate) fn send_full<'body>(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
     status: u16,
-    body: &[u8],
+    body: Cow<'body, [u8]>,
     content_encoding: Option<&[u8]>,
     vary: bool,
     extra: &[(&[u8], &[u8])],
@@ -204,35 +207,26 @@ pub(crate) fn send_full(
     send_body: bool,
     output: &mut [u8],
     used: &mut usize,
-) -> Result<(), ErrorCode> {
+    pending: &mut PendingResponses,
+) -> Result<bool, ErrorCode> {
     // NOTE: 204-only fast path (END_STREAM shape, not the shared length rule): 204 answers
     // :status plus Date with END_STREAM and never DATA through send_status_only, so it never
     // reaches the length gate below. status_sheds_length still covers it, and the gate below
     // agrees because 204 cannot fall through.
     if status == 204 {
-        return send_status_only(server, stream, status, output, used);
+        send_status_only(server, stream, status, output, used)?;
+        return Ok(true);
     }
     // NOTE: a 304 never carries a body (RFC 9110 8.6 forbids the bytes; H1 drops them in
     // the shared sender the same way). Shed any staged body here so neither native nor
     // managed senders can emit DATA after the terminal HEADERS, and close the stream on
     // the head itself.
-    let (body, end_stream) = if status == 304 {
-        (&[][..], true)
+    let (body, end_stream): (Cow<'body, [u8]>, bool) = if status == 304 {
+        (Cow::Borrowed(&[]), true)
     } else {
         (body, end_stream)
     };
-    // NOTE: pre-flight the whole body against both send windows before staging anything:
-    // a peer that shrank (or never opened) its windows gets a per-stream refusal it may
-    // retry, never a torn-down connection or a truncated response. Zero output has been
-    // staged at this point, so refusing is side-effect free; the DATA loop below can no
-    // longer hit NoSendCredit because only our own exact debits move the windows.
-    if !end_stream
-        && send_body
-        && !body.is_empty()
-        && !response_fits_window(server, stream, body.len())
-    {
-        return Err(ErrorCode::RefusedStream);
-    }
+    let body_bytes = body.as_ref();
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut length_buf = [0; DECIMAL_CAP];
@@ -243,7 +237,7 @@ pub(crate) fn send_full(
     response_fields[1] = field(b"date", &now_buf[..now_len]);
     let mut field_count = 2;
     if !status_sheds_length(status) {
-        let length_len = push_decimal(&mut length_buf, body.len() as u64);
+        let length_len = push_decimal(&mut length_buf, body_bytes.len() as u64);
         response_fields[field_count] = field(b"content-length", &length_buf[..length_len]);
         field_count += 1;
     }
@@ -273,32 +267,11 @@ pub(crate) fn send_full(
         )
         .map_err(|_| ErrorCode::InternalError)?;
     *used += sent.writer.pending_bytes().len();
-    if end_stream || !send_body {
-        return Ok(());
+    if end_stream || !send_body || body_bytes.is_empty() {
+        return Ok(true);
     }
-    let mut offset = 0;
-    while offset < body.len() {
-        let room = output.len() - *used;
-        if room < 10 {
-            return Err(ErrorCode::EnhanceYourCalm);
-        }
-        let take = (body.len() - offset).min(room - 9);
-        let last = offset + take == body.len();
-        let sent = server
-            .send_data(
-                stream,
-                &body[offset..offset + take],
-                last,
-                &mut output[*used..],
-            )
-            .map_err(|_| ErrorCode::FlowControlError)?;
-        if sent.frame.payload_length == 0 {
-            return Err(ErrorCode::FlowControlError);
-        }
-        *used += sent.writer.pending_bytes().len();
-        offset += sent.frame.payload_length;
-    }
-    Ok(())
+
+    pending.send(server, stream, body, output, used)
 }
 
 // NOTE: 405 HEADERS assembly beside send_full: :status plus Date plus content-length
@@ -315,13 +288,8 @@ pub(crate) fn send_method_not_allowed(
     send_body: bool,
     output: &mut [u8],
     used: &mut usize,
-) -> Result<(), ErrorCode> {
-    if !end_stream
-        && send_body
-        && !response_fits_window(server, stream, METHOD_NOT_ALLOWED_BODY.len())
-    {
-        return Err(ErrorCode::RefusedStream);
-    }
+    pending: &mut PendingResponses,
+) -> Result<bool, ErrorCode> {
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, 405);
     let mut length_buf = [0; DECIMAL_CAP];
@@ -346,31 +314,16 @@ pub(crate) fn send_method_not_allowed(
         .map_err(|_| ErrorCode::InternalError)?;
     *used += sent.writer.pending_bytes().len();
     if end_stream || !send_body {
-        return Ok(());
+        return Ok(true);
     }
-    let mut offset = 0;
-    while offset < METHOD_NOT_ALLOWED_BODY.len() {
-        let room = output.len() - *used;
-        if room < 10 {
-            return Err(ErrorCode::EnhanceYourCalm);
-        }
-        let take = (METHOD_NOT_ALLOWED_BODY.len() - offset).min(room - 9);
-        let last = offset + take == METHOD_NOT_ALLOWED_BODY.len();
-        let sent = server
-            .send_data(
-                stream,
-                &METHOD_NOT_ALLOWED_BODY[offset..offset + take],
-                last,
-                &mut output[*used..],
-            )
-            .map_err(|_| ErrorCode::FlowControlError)?;
-        if sent.frame.payload_length == 0 {
-            return Err(ErrorCode::FlowControlError);
-        }
-        *used += sent.writer.pending_bytes().len();
-        offset += sent.frame.payload_length;
-    }
-    Ok(())
+
+    pending.send(
+        server,
+        stream,
+        Cow::Borrowed(METHOD_NOT_ALLOWED_BODY),
+        output,
+        used,
+    )
 }
 
 pub(crate) fn send_options(
@@ -405,24 +358,6 @@ pub(crate) fn send_options(
         .map_err(|_| ErrorCode::InternalError)?;
     *used += sent.writer.pending_bytes().len();
     Ok(())
-}
-
-// NOTE: single pre-flight gate for the H2 response senders below: the whole body must
-// fit both send windows before anything is staged, so a stalled peer gets a per-stream
-// refusal instead of a torn-down connection. Unknown streams read as zero credit, which
-// the callers map to a silent drop through their usual closed/unknown handling.
-fn response_fits_window(
-    server: &H2ServerDriver<'_, '_, '_, '_>,
-    stream: u32,
-    body_len: usize,
-) -> bool {
-    let need = body_len as u64;
-    let connection_open =
-        u64::try_from(server.driver().connection_send_window().value()).unwrap_or(0);
-    let stream_open = server.driver().streams().find(stream).map_or(0, |found| {
-        u64::try_from(found.send_window.value()).unwrap_or(0)
-    });
-    connection_open >= need && stream_open >= need
 }
 
 pub(crate) fn field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
