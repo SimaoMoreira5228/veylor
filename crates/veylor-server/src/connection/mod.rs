@@ -1,8 +1,14 @@
+pub(crate) mod file;
 pub(crate) mod parked;
 pub(crate) mod streams;
 pub(crate) mod tls;
 pub(crate) mod trailers;
 
+#[cfg(target_os = "linux")]
+use file::sendfile_file_chunk;
+#[cfg(target_os = "linux")]
+pub use file::{FD_CACHE_ENTRIES, FdCache};
+use file::{FileTransfer, stage_file_chunk};
 pub(crate) use parked::{pull_staged_body, push_staged_body};
 pub use trailers::{TrailerOutcome, TrailerReport};
 
@@ -16,8 +22,6 @@ use veylor_runtime::{
 use veylor_tls::TlsConn;
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
-use crate::static_files::FilePlan;
-use crate::static_files::read_chunk;
 use crate::static_routes::{
     EncodedStaticResponse, RouteBuildError, StaticRoutes, respond_bad_request,
     respond_expectation_failed, respond_request_header_fields_too_large, respond_to_head,
@@ -34,9 +38,6 @@ pub const HEADER_SLOTS: usize = 100;
 // NOTE: minimal request-line frame around a target (1-byte method + 2 spaces + 8-byte version);
 // a target side longer than the line limit behind this frame is target-caused (RFC 9110 15.5.15).
 const MIN_REQUEST_LINE_FRAME: usize = 11;
-// NOTE: single-entry fd cache (Linux); one handle per conn bounds fds, replace evicts.
-#[cfg(target_os = "linux")]
-pub const FD_CACHE_ENTRIES: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnPhase {
@@ -79,62 +80,6 @@ pub enum ConnClose {
     TransportError,
     Shutdown,
     Completed,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct FileTransfer {
-    plan: FilePlan,
-    offset: u64,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Default)]
-pub struct FdCache {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    mtime: Option<std::time::SystemTime>,
-    file: Option<std::fs::File>,
-    opens: u64,
-}
-
-#[cfg(target_os = "linux")]
-impl FdCache {
-    // NOTE: TOCTOU honesty: plan-time validation stays the boundary; the fresh fd's dev+ino must match the plan's
-    // resolve-time pair, so a stat/open swap fails closed (drop + error) instead of serving unapproved bytes. Hit path
-    // serves the held fd on path-stat match alone; same-inode mutation keeps the clamp/short-read rules below.
-    pub fn opens(&self) -> u64 {
-        self.opens
-    }
-    pub fn cached(&mut self, plan: &FilePlan) -> std::io::Result<&std::fs::File> {
-        let meta = std::fs::metadata(&plan.fs_path)?;
-        let hit = self.file.is_some() && (self.dev, self.ino) == file_key(&meta);
-        let hit = hit && self.size == meta.len() && self.mtime == meta.modified().ok();
-        if !hit {
-            let file = std::fs::File::open(&plan.fs_path)?;
-            let fresh = file.metadata()?;
-            if file_key(&fresh) != plan.identity() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "file replaced underfoot",
-                ));
-            }
-            (self.dev, self.ino) = file_key(&fresh);
-            self.size = fresh.len();
-            self.mtime = fresh.modified().ok();
-            self.file = Some(file);
-            self.opens += 1;
-        }
-        self.file
-            .as_ref()
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn file_key(meta: &std::fs::Metadata) -> (u64, u64) {
-    let dev = std::os::unix::fs::MetadataExt::dev(meta);
-    (dev, std::os::unix::fs::MetadataExt::ino(meta))
 }
 
 pub struct ConnState {
@@ -836,86 +781,6 @@ fn encode_static(
         Err(RouteBuildError::NativePanic) => ExchangeOutcome::Close(ConnClose::ProtocolError),
         Err(_) => ExchangeOutcome::Close(ConnClose::ResponseOverflow),
     }
-}
-
-// NOTE: truncation rule: read_chunk clamps to the plan remainder, so over-long reads
-// cannot happen; a zero-byte read before plan size means the file shrank underfoot and
-// fails the transfer closed, never as a short success. Each stage re-opens the file
-// (no fd cache yet); EPIPE and backpressure stay in the dispatch mapping, and Rust
-// ignores SIGPIPE process-wide, so a closed receiver closes as PeerClosed, never a
-// signal. Partial short reads advance the offset and resume on the next turn.
-fn stage_file_chunk(conn: &mut ConnState) -> Result<(), ConnClose> {
-    let Some(transfer) = conn.file.as_mut() else {
-        return Err(ConnClose::TransportError);
-    };
-    if transfer.offset >= transfer.plan.size {
-        return Ok(());
-    }
-    let width = (transfer.plan.size - transfer.offset).min(OUTPUT_CAP as u64) as usize;
-    let Some(output) = conn.output.as_mut() else {
-        return Err(ConnClose::TransportError);
-    };
-    match read_chunk(&transfer.plan, transfer.offset, &mut output[..width]) {
-        Ok(0) => Err(ConnClose::TransportError),
-        Ok(staged) => {
-            transfer.offset += staged as u64;
-            conn.out_len = staged;
-            conn.out_sent = 0;
-            conn.write_blocked = false;
-            conn.read_ready = true;
-            Ok(())
-        }
-        Err(_) => Err(ConnClose::TransportError),
-    }
-}
-
-// NOTE: a shrink racing a send can zero-fill inside the plan bounds, where read_chunk would
-// serve a short read instead. Either way the offset stalls below plan size and fails closed.
-// Bytes past plan.size never serve (count clamp) and only this file's pages ever map.
-#[cfg(target_os = "linux")]
-fn sendfile_file_chunk(conn: &mut ConnState, byte_budget: u64) -> Result<u64, ConnClose> {
-    let Some(transfer) = conn.file.as_ref() else {
-        return Err(ConnClose::TransportError);
-    };
-    if transfer.offset >= transfer.plan.size {
-        return Ok(0);
-    }
-    if transfer.plan.multipart {
-        return stage_file_chunk(conn).map(|_| 0); // NOTE: framing interleaves file bytes
-    }
-    let rest = transfer.plan.size - transfer.offset;
-    let width = std::cmp::min(std::cmp::min(rest, OUTPUT_CAP as u64), byte_budget) as usize;
-    if width == 0 || conn.write_blocked {
-        return Ok(0);
-    }
-    let file = conn
-        .file_cache
-        .cached(&transfer.plan)
-        .map_err(|_| ConnClose::TransportError)?;
-    let mut cursor = transfer.plan.start + transfer.offset;
-    for _ in 0..2 {
-        match rustix::fs::sendfile(&conn.stream, file, Some(&mut cursor), width) {
-            Ok(sent) => {
-                if sent == 0 {
-                    return Err(ConnClose::TransportError);
-                }
-                let Some(transfer) = conn.file.as_mut() else {
-                    return Err(ConnClose::TransportError);
-                };
-                transfer.offset = cursor - transfer.plan.start;
-                return Ok(sent as u64);
-            }
-            Err(error) if error == rustix::io::Errno::INTR => continue,
-            Err(error) if error == rustix::io::Errno::AGAIN => {
-                conn.write_blocked = true;
-                return Ok(0);
-            }
-            Err(error) if error == rustix::io::Errno::PIPE => return Err(ConnClose::PeerClosed),
-            Err(error) if error == rustix::io::Errno::CONNRESET => return Err(ConnClose::Reset),
-            Err(_) => return Err(ConnClose::TransportError),
-        }
-    }
-    Ok(0)
 }
 
 fn send_bad_request(conn: &mut ConnState) {
