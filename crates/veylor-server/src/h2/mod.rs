@@ -13,16 +13,19 @@ use crate::host::{HostShared, StagedWork};
 // step driver above stays transport-neutral; turn.rs owns the sockets,
 // listeners, and timers that drive it.
 pub(crate) mod turn;
-// NOTE: seam: routes owns the static table plus sync response assembly, serve owns
-// per-event stream serving (host parks, trailers, streaming writes), and file owns
+// NOTE: seam: routes owns the static table plus match policy, send owns sync wire
+// assembly, serve owns per-event stream serving (host parks, trailers, streaming
+// writes), step owns the staged step draining one queued host command, and file owns
 // file-mount assembly (range planning, HEADERS emit, DATA pump).
 mod file;
 mod routes;
+mod send;
 mod serve;
+mod step;
 
 pub(crate) use file::H2FileTransfer;
 pub use routes::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
-pub(crate) use serve::apply_h2_streams;
+pub(crate) use step::apply_h2_streams;
 
 pub const INPUT_STAGING_CAP: usize = 16_384 + 64;
 pub const STREAM_SLOTS: usize = 32;
@@ -281,7 +284,7 @@ impl<'a> H2Conn<'a> {
         used += grant_window(server, stream, owed, &mut output[used..]);
         let mut extra = [(&b""[..], &b""[..]); crate::host::MAX_STAGED_RESPONSE_HEADERS];
         let extra_len = crate::h2::routes::project_extra_headers(&mut extra, &staged.headers);
-        match routes::send_full(
+        match send::send_full(
             server,
             stream,
             staged.status,

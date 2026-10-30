@@ -11,7 +11,7 @@ use crate::static_files::{FilePlan, FileReject, RangeApply, parse_http_date, rea
 use crate::static_routes::MAX_STATIC_BODY_BYTES;
 
 use super::STREAM_SLOTS;
-use super::routes::{FileHead, send_file_head};
+use super::send::{FileHead, send_file_head};
 use super::serve::Serve;
 
 // NOTE: per-stream file progress: the plan owns its fs path, offset counts plan-relative

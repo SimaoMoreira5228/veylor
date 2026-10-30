@@ -4,6 +4,8 @@ mod api;
 mod dispatch;
 #[allow(unsafe_code)]
 mod native;
+#[allow(unsafe_code)]
+mod register;
 
 #[cfg(test)]
 #[allow(unsafe_code)]
@@ -12,14 +14,8 @@ mod tests;
 pub use api::{
     vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_enable_tls,
     vyl_managed_static_h2c_addr, vyl_managed_static_join, vyl_managed_static_local_addr,
-    vyl_managed_static_new, vyl_managed_static_register_file_mount,
-    vyl_managed_static_register_managed_route,
-    vyl_managed_static_register_managed_route_with_trailers,
-    vyl_managed_static_register_static_route,
-    vyl_managed_static_register_static_route_with_body_cap,
-    vyl_managed_static_register_static_route_with_gzip, vyl_managed_static_rotate_tls,
-    vyl_managed_static_set_worker_count, vyl_managed_static_start,
-    vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
+    vyl_managed_static_new, vyl_managed_static_rotate_tls, vyl_managed_static_set_worker_count,
+    vyl_managed_static_start, vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
     vyl_managed_static_host_begin_stream, vyl_managed_static_host_begin_stream_with_headers,
@@ -33,6 +29,13 @@ pub use native::{
     VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn, VylManagedStaticNativeRequest,
     VylManagedStaticNativeResponse, vyl_managed_static_register_native_route,
     vyl_managed_static_register_native_route_with_gzip,
+};
+pub use register::{
+    vyl_managed_static_register_file_mount, vyl_managed_static_register_managed_route,
+    vyl_managed_static_register_managed_route_with_trailers,
+    vyl_managed_static_register_static_route,
+    vyl_managed_static_register_static_route_with_body_cap,
+    vyl_managed_static_register_static_route_with_gzip,
 };
 use veylor_server::{CloseCounts, NativeHandler, RunningServer, Server, ServerConfig};
 
