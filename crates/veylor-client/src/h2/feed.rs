@@ -116,8 +116,8 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
     }
 
     pub fn finish_batch(&mut self) {
-        // NOTE: header counts and bytes stay readable for classification until the next poll,
-        // mirroring the previous FFI retention contract.
+        // NOTE: header counts and bytes stay readable for classification until the next poll:
+        // the FFI host translates the batch first and clears it after.
         self.feed_action_count = 0;
         self.feed_pending = false;
     }

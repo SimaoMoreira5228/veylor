@@ -435,7 +435,7 @@ pub(crate) fn park_request(
             // Date and close exactly like the static path instead of closing silent;
             // other snapshot overflows (method) keep the silent transport close.
             if target_len > crate::host::HOST_MAX_PATH_BYTES {
-                super::send_uri_too_long(conn);
+                super::exchange::send_uri_too_long(conn);
                 return ExchangeOutcome::Responded;
             }
             return ExchangeOutcome::Close(ConnClose::TransportError);

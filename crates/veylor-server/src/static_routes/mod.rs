@@ -461,6 +461,7 @@ pub(crate) fn valid_reason(reason: &[u8]) -> bool {
         })
 }
 
+mod file;
 mod gzip;
 mod native;
 mod respond;
