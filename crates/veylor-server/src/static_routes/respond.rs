@@ -7,7 +7,7 @@ use veylor_http1::{
 };
 use veylor_router::{RouteCapture, RouteError, RouteKind, RouteTable};
 
-use crate::connection::field;
+use crate::connection::trailers::field;
 use crate::static_files::{
     FilePlan, FileReject, HTTP_DATE_BYTES, RangeApply, parse_http_date, write_http_date,
 };

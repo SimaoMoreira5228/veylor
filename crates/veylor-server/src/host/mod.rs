@@ -112,7 +112,7 @@ pub(crate) struct ParkedEntry {
     pub(crate) body_total: u64,
     pub(crate) body: Vec<u8>,
     pub(crate) body_pulled: u64,
-    pub(crate) trailers: Option<Vec<crate::connection::StagedTrailer>>,
+    pub(crate) trailers: Option<Vec<crate::connection::trailers::StagedTrailer>>,
     pub(crate) trailer_allow: Vec<Vec<u8>>,
 }
 

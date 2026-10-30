@@ -14,10 +14,8 @@ use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::now_http_date;
 
 use super::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
-use super::{
-    ConnClose, ConnPhase, ConnState, OUTPUT_CAP, PumpOutcome, PumpProgress, StagedTrailer, field,
-    trailer_allowed,
-};
+use super::trailers::{StagedTrailer, field, trailer_allowed};
+use super::{ConnClose, ConnPhase, ConnState, OUTPUT_CAP, PumpOutcome, PumpProgress};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BodyPushOutcome {

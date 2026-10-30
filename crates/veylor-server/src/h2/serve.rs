@@ -5,10 +5,10 @@ use veylor_http2::{
 };
 use veylor_runtime::ConnectionToken;
 
-use crate::connection::StagedTrailer;
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::streams::{StreamCmd, take_stream_cmd};
-use crate::connection::trailer_allowed;
+use crate::connection::trailers::StagedTrailer;
+use crate::connection::trailers::trailer_allowed;
 use crate::host::{HOST_MAX_REASON_BYTES, HostShared};
 use crate::static_files::FileReject;
 use crate::static_routes::{

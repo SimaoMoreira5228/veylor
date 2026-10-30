@@ -12,8 +12,9 @@ use super::{
     FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP,
     MAX_H2_CONNS, STREAM_SLOTS,
 };
-use crate::connection::{
-    ConnClose, TlsWriteOutcome, tls_encrypt_bytes, tls_read_decrypted, tls_write_once,
+use crate::connection::ConnClose;
+use crate::connection::tls::{
+    TlsWriteOutcome, tls_encrypt_bytes, tls_read_decrypted, tls_write_once,
 };
 use crate::host::{HostShared, StagedWork};
 use crate::static_routes::MAX_RESPONSE_BODY;

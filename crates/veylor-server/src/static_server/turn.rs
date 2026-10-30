@@ -11,9 +11,8 @@ use veylor_runtime::{
     WAKE_TOKEN, Worker, WorkerError, WorkerStorage,
 };
 
-use crate::connection::{
-    ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection, tls_alpn_is_h2,
-};
+use crate::connection::tls::tls_alpn_is_h2;
+use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
 use crate::h2::H2Conn;
 use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps, move_h2_tls_slot};
 use crate::host::{HostShared, StagedWork};

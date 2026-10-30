@@ -13,10 +13,10 @@ use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::{encode_continue, now_http_date, respond_payload_too_large};
 
 use super::streams::{apply_stream_cmd, decode_chunked, take_stream_cmd};
+use super::tls::{tls_encrypt_output, tls_flush_pending, tls_generate_flight, tls_read_available};
+use super::trailers::{TrailerOutcome, TrailerReport, connection_value};
 use super::{
     ConnClose, ConnPhase, ConnState, ExchangeOutcome, INPUT_CAP, PumpOutcome, PumpProgress,
-    TrailerOutcome, TrailerReport, connection_value, tls_encrypt_output, tls_flush_pending,
-    tls_generate_flight, tls_read_available,
 };
 
 pub(crate) use super::streams::{BodyPushOutcome, StreamCmd, StreamState, push_staged_body};
