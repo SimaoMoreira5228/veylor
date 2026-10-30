@@ -221,6 +221,13 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         let Some(ctx) = self.host else {
             return H2Trailer::Conn;
         };
+        // NOTE: a trailer block without END_STREAM is malformed framing (RFC 9113 §8.1),
+        // never a partial trailer set: the client receive side already rejects the same
+        // shape as TrailerNotFinal, so the server RSTs here instead of staging trailers
+        // before content-end.
+        if !end {
+            return H2Trailer::Stream(ErrorCode::ProtocolError);
+        }
         let Some(fields) = self.headers.get(range.start..range.start + range.count) else {
             return H2Trailer::Conn;
         };

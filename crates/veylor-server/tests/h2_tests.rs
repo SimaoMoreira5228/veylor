@@ -2046,6 +2046,25 @@ fn send_trailers(stream: &mut TcpStream, id: u32, fields: &[(&'static [u8], &'st
     write_frame(stream, FrameType::Headers, flags, id, &block[..len]);
 }
 
+fn send_open_trailers(stream: &mut TcpStream, id: u32, fields: &[(&'static [u8], &'static [u8])]) {
+    let encoded: Vec<HpackFieldToEncode<'_>> = fields
+        .iter()
+        .map(|(name, value)| field(name, value))
+        .collect();
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 512];
+    let len = encode_header_block(&encoded, &mut encoder, &mut block).expect("encode block");
+    write_frame(
+        stream,
+        FrameType::Headers,
+        HEADERS_FLAG_END_HEADERS,
+        id,
+        &block[..len],
+    );
+}
+
 fn pull_all(host: &HostHandle, token: ConnectionToken) -> Vec<u8> {
     let deadline = Instant::now() + DEADLINE;
     let mut body = Vec::new();
@@ -2289,6 +2308,40 @@ fn h2_managed_trailers_refused_stream_survives() {
     assert_eq!(sibling.status, 200);
     assert_eq!(sibling.body, b"hello");
     stop_join(server);
+}
+
+#[test]
+fn h2_managed_nonfinal_trailer_headers_reset_protocol_error() {
+    // NOTE: a trailer block without END_STREAM is malformed framing (RFC 9113 §8.1),
+    // not a slow trailer set: the server must RST the stream with PROTOCOL_ERROR
+    // instead of staging trailers before content-end. The allowlisted name matters:
+    // unlisted names already RST at the allowlist gate, which would mask this path.
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_managed_with_trailers(b"POST", b"/t", MAX_STATIC_BODY_BYTES, &[b"x-sum"])
+        .expect("register trailer route");
+    let server = server.start().expect("start server");
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    send_headers_len(&mut stream, 1, b"POST", b"/t", Some(4), false);
+    write_frame(&mut stream, FrameType::Data, 0, 1, b"data");
+    let (_event, _, _) = poll_h2_request(&host);
+    send_open_trailers(&mut stream, 1, &[(b"x-sum", b"1")]);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::ProtocolError);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 0, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
 }
 
 #[test]
@@ -4219,6 +4272,128 @@ fn h2_file_mount_streams_large_file_across_turns() {
     assert_eq!(got.content_length, 20_000);
     assert_eq!(got.body, bytes);
     assert_eq!(got.content_type, b"application/octet-stream");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn h2_file_mount_large_file_survives_default_window_without_client_topups() {
+    let root = file_mount_root("window");
+    let mut bytes = vec![0u8; 100_000];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    std::fs::write(root.join("big.bin"), &bytes).expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+    send_headers(&mut client, 1, b"GET", b"/assets/big.bin", true);
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut block = Vec::new();
+    let mut body = Vec::new();
+    let mut headers_complete = false;
+    let mut end_stream = false;
+    while !headers_complete {
+        let (header, payload) = read_frame(&mut client);
+        match header.frame_type {
+            FrameType::Headers => {
+                assert_eq!(header.stream_id, 1);
+                block.extend_from_slice(&payload);
+                if header.flags & HEADERS_FLAG_END_HEADERS != 0 {
+                    headers_complete = true;
+                }
+            }
+            FrameType::Continuation => {
+                assert_eq!(header.stream_id, 1);
+                block.extend_from_slice(&payload);
+                if header.flags & CONTINUATION_FLAG_END_HEADERS != 0 {
+                    headers_complete = true;
+                }
+            }
+            FrameType::Settings | FrameType::WindowUpdate | FrameType::Ping => {}
+            FrameType::GoAway => {
+                let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
+                panic!(
+                    "connection torn down before headers complete: error={:?}",
+                    goaway.error_code,
+                );
+            }
+            found => panic!("unexpected frame: {found:?}"),
+        }
+    }
+    let response = decode_with(&mut dec, &block);
+    assert_eq!(response.status, 200);
+    // NOTE: the default 65,535-octet flow-control window bounds what a passive peer
+    // receives unprompted; the stalled server must wait for WINDOW_UPDATE, not fail.
+    while body.len() < 65_535 {
+        let (header, payload) = read_frame(&mut client);
+        match header.frame_type {
+            FrameType::Data => {
+                assert_eq!(header.stream_id, 1);
+                assert!(
+                    header.flags & DATA_FLAG_END_STREAM == 0,
+                    "response ended early at {} bytes",
+                    body.len(),
+                );
+                body.extend_from_slice(&payload);
+            }
+            FrameType::GoAway => {
+                let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
+                panic!(
+                    "connection torn down mid-body: error={:?} body_bytes={}",
+                    goaway.error_code,
+                    body.len(),
+                );
+            }
+            FrameType::Settings | FrameType::WindowUpdate | FrameType::Ping => {}
+            found => panic!("unexpected frame: {found:?}"),
+        }
+    }
+    assert_eq!(body.len(), 65_535);
+    write_frame(
+        &mut client,
+        FrameType::WindowUpdate,
+        0,
+        1,
+        &100_000u32.to_be_bytes(),
+    );
+    write_frame(
+        &mut client,
+        FrameType::WindowUpdate,
+        0,
+        0,
+        &100_000u32.to_be_bytes(),
+    );
+    while !end_stream {
+        let (header, payload) = read_frame(&mut client);
+        match header.frame_type {
+            FrameType::Data => {
+                assert_eq!(header.stream_id, 1);
+                body.extend_from_slice(&payload);
+                if header.flags & DATA_FLAG_END_STREAM != 0 {
+                    end_stream = true;
+                }
+            }
+            FrameType::GoAway => {
+                let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
+                panic!(
+                    "connection torn down mid-body: error={:?} body_bytes={}",
+                    goaway.error_code,
+                    body.len(),
+                );
+            }
+            FrameType::Settings | FrameType::WindowUpdate | FrameType::Ping => {}
+            found => panic!("unexpected frame: {found:?}"),
+        }
+    }
+    assert_eq!(response.body, Vec::new());
+    assert_eq!(body, bytes);
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
     let _ = std::fs::remove_dir_all(&root);

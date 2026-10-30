@@ -1,3 +1,4 @@
+use crate::body::prohibited_request_trailer;
 use crate::fields::is_token;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,11 +381,7 @@ fn validate_trailer(field: &Field<'_>) -> Result<(), RequestEncodeError> {
     }) {
         return Err(RequestEncodeError::InvalidField);
     }
-    if field.name.eq_ignore_ascii_case(b"content-length")
-        || field.name.eq_ignore_ascii_case(b"transfer-encoding")
-        || field.name.eq_ignore_ascii_case(b"host")
-        || field.name.eq_ignore_ascii_case(b"trailer")
-    {
+    if prohibited_request_trailer(field.name) {
         return Err(RequestEncodeError::InvalidFramingField);
     }
     Ok(())
@@ -558,6 +555,31 @@ mod tests {
             Err(RequestEncodeError::Invalid)
         );
         assert_eq!(required_length, 0);
+    }
+
+    #[test]
+    fn rejects_request_trailer_names_forbidden_to_senders() {
+        for name in [
+            &b"Authorization"[..],
+            &b"Connection"[..],
+            &b"Content-Type"[..],
+            &b"Expect"[..],
+            &b"Proxy-Authorization"[..],
+            &b"TE"[..],
+            &b"Upgrade"[..],
+        ] {
+            let trailers = [Field { name, value: b"x" }];
+            let mut output = [0xaa; 64];
+            let mut required_length = 0;
+
+            assert_eq!(
+                finish_chunks_with_required_length(&trailers, &mut output, &mut required_length),
+                Err(RequestEncodeError::InvalidFramingField),
+                "trailer {name:?} must be rejected",
+            );
+            assert_eq!(required_length, 0);
+            assert!(output.iter().all(|byte| *byte == 0xaa));
+        }
     }
 
     #[test]

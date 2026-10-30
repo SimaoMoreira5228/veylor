@@ -5,7 +5,9 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::time::SystemTime;
 
-use veylor_http2::{ErrorCode, H2ServerDriver, HpackHeader, StreamState};
+use veylor_http2::{
+    DataWriteError, ErrorCode, H2ServerDriver, HpackHeader, ServerError, StreamState,
+};
 
 use crate::static_files::{FilePlan, FileReject, RangeApply, parse_http_date, read_chunk};
 use crate::static_routes::MAX_STATIC_BODY_BYTES;
@@ -395,8 +397,9 @@ enum FileSlot {
 // NOTE: bounded file DATA framing through the shared chunk scratch: each iteration stages
 // at most one scratch slice and frames exactly one DATA frame, so output room (the turn
 // budget) bounds a step and the plan window bounds the stream. A short read means the file
-// shrank underfoot and fails closed like the H1 truncation rule; an exhausted window or a
-// refused frame fails the same way the static DATA path does, never as wrong bytes.
+// shrank underfoot and fails closed like the H1 truncation rule; a refused frame fails
+// the same way the static DATA path does, never as wrong bytes. An exhausted send window
+// instead defers (More): the transfer keeps its offset and retries on WINDOW_UPDATE.
 // NOTE: plain windows read through the transfer's retained fd; multipart keeps the
 // per-chunk open+seek+read helper because its assembler (boundary framing interleaved
 // with file windows) lives in static_files, and duplicating it here would double the
@@ -445,6 +448,11 @@ fn pump_file_data(
                 }
                 transfer.offset += sent.frame.payload_length as u64;
             }
+            // NOTE: credit exhaustion is backpressure, not a peer error: the transfer keeps
+            // its offset and the slot retries when WINDOW_UPDATE arrives (readable re-drives
+            // the pump), so a passive peer or a zero window stalls instead of tearing down
+            // the connection. Every other send failure still fails closed below.
+            Err(ServerError::Data(DataWriteError::NoSendCredit)) => return FilePump::More,
             Err(_) => return FilePump::Fail(ErrorCode::FlowControlError),
         }
     }

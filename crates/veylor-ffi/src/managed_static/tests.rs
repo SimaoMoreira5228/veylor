@@ -368,6 +368,27 @@ fn rejects_invalid_configs_before_touching_anything() {
     );
     assert!(null_server.is_null());
 
+    #[repr(C)]
+    struct ShortConfig {
+        abi_version: u32,
+        struct_size: usize,
+    }
+
+    let short = ShortConfig {
+        abi_version: VYL_MANAGED_STATIC_ABI_VERSION,
+        struct_size: std::mem::size_of::<ShortConfig>(),
+    };
+    assert_eq!(
+        unsafe {
+            vyl_managed_static_new(
+                &short as *const ShortConfig as *const VylManagedStaticConfig,
+                &mut null_server,
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    assert!(null_server.is_null());
+
     for mutator in [
         (|config: &mut VylManagedStaticConfig| config.request_head_timeout_ns = 0)
             as fn(&mut VylManagedStaticConfig),

@@ -444,6 +444,17 @@ fn encodes_chunked_response_data_and_safe_trailers() {
         Err(ResponseEncodeError::InvalidFramingField)
     );
     assert!(output.iter().all(|byte| *byte == 0xa5));
+
+    let framing = [Field {
+        name: b"Content-Length",
+        value: b"5",
+    }];
+    output.fill(0xa5);
+    assert_eq!(
+        encode_response_final_chunk(&framing, &mut output),
+        Err(ResponseEncodeError::InvalidFramingField)
+    );
+    assert!(output.iter().all(|byte| *byte == 0xa5));
     assert_eq!(
         encode_response_chunk(b"Wiki", &mut output[..4]),
         Err(ResponseEncodeError::BufferTooSmall)

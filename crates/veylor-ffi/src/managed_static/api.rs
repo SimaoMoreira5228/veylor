@@ -5,6 +5,7 @@ use std::slice;
 
 use veylor_server::{MAX_WORKERS, Server, in_native_handler};
 
+use super::VYL_MANAGED_STATIC_ABI_VERSION;
 use super::{ManagedStaticState, ReadyServer, VylManagedStaticCloseCounts, VylManagedStaticConfig};
 use super::{VylManagedStaticServer, server_error_to_result};
 use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
@@ -33,7 +34,22 @@ unsafe fn create_server(
     unsafe {
         out_server.write(ptr::null_mut());
     }
-    let owned = unsafe { *config };
+    let owned = {
+        // NOTE: the documented contract promises only the two prefix fields readable, so the
+        // version/size gate runs on address-of reads before the whole struct is copied.
+        let (abi_version, struct_size) = unsafe {
+            (
+                ptr::addr_of!((*config).abi_version).read(),
+                ptr::addr_of!((*config).struct_size).read(),
+            )
+        };
+        if abi_version != VYL_MANAGED_STATIC_ABI_VERSION
+            || struct_size != std::mem::size_of::<VylManagedStaticConfig>()
+        {
+            return VylResult::InvalidArgument;
+        }
+        unsafe { *config }
+    };
     let (server_config, port) = match owned.to_server_config() {
         Ok(config) => config,
         Err(error) => return error,

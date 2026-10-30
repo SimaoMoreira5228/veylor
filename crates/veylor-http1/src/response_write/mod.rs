@@ -98,6 +98,7 @@ fn prohibited_response_trailer(name: &[u8]) -> bool {
         b"cache-control",
         b"connection",
         b"content-encoding",
+        b"content-length",
         b"content-range",
         b"content-type",
         b"date",
