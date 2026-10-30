@@ -15,7 +15,8 @@ use crate::host::{HostShared, StagedWork};
 pub(crate) mod turn;
 // NOTE: seam: routes owns the static table plus match policy, send owns sync wire
 // assembly, serve owns per-event stream serving (host parks, trailers, streaming
-// writes), step owns the staged step draining one queued host command, and file owns
+// writes), step owns the staged step draining one queued host command, slots owns
+// the per-worker slot table, flush owns socket flush pacing, and file owns
 // file-mount assembly (range planning, HEADERS emit, DATA pump).
 mod file;
 mod flush;
