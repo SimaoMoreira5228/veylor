@@ -159,9 +159,10 @@ fn error_status(error: &StoreError) -> u16 {
     match error {
         StoreError::Missing => 404,
         StoreError::Rejected => 422,
+        StoreError::Busy => 503,
         StoreError::Database(error) => {
             eprintln!("database operation failed: {error}");
-            503
+            500
         }
         StoreError::Clock => 500,
     }

@@ -178,13 +178,26 @@ fn concurrent_debits_across_processes_are_atomic_and_survive_restart() {
                         }
 
                         let body = br#"{"amount":1000,"kind":"debit","description":"purchase"}"#;
-                        let (status, _) = request(
-                            addresses[index % 2],
-                            "POST",
-                            "/accounts/1/transactions",
-                            body,
-                            false,
-                        );
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        let status = loop {
+                            let (status, _) = request(
+                                addresses[index % 2],
+                                "POST",
+                                "/accounts/1/transactions",
+                                body,
+                                false,
+                            );
+
+                            if status != 503 {
+                                break status;
+                            }
+
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "database contention did not clear"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        };
 
                         match status {
                             200 => {
@@ -308,6 +321,43 @@ fn validation_fragmentation_and_integer_overflow_preserve_state() {
         false,
     );
     assert_eq!(status, 413);
+}
+
+#[test]
+fn database_writer_contention_returns_without_blocking_other_requests() {
+    let database = Database::new();
+    let service = Service::start(&database.file());
+    let lock = rusqlite::Connection::open(database.file()).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let payment = br#"{"amount":10,"kind":"credit","description":"retry"}"#;
+    let (status, _) = request(
+        service.address,
+        "POST",
+        "/accounts/1/transactions",
+        payment,
+        false,
+    );
+    assert_eq!(status, 503);
+
+    let (status, statement) = request(service.address, "GET", "/accounts/1/statement", b"", false);
+    assert_eq!(status, 200);
+    assert_eq!(statement["balance"], 0);
+
+    lock.execute_batch("ROLLBACK").unwrap();
+
+    let (status, _) = request(
+        service.address,
+        "POST",
+        "/accounts/1/transactions",
+        payment,
+        false,
+    );
+    assert_eq!(status, 200);
+
+    let (_, statement) = request(service.address, "GET", "/accounts/1/statement", b"", false);
+    assert_eq!(statement["balance"], 10);
+    assert_eq!(statement["transactions"].as_array().unwrap().len(), 1);
 }
 
 #[test]

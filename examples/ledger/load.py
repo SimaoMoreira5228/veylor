@@ -92,11 +92,21 @@ def run(args, targets):
                     raise ValueError("invalid balance response")
 
             return str(response.status), time.perf_counter() - scheduled
-        except (OSError, http.client.HTTPException, ValueError):
+        except TimeoutError:
             connection.close()
             local.connections.pop(key, None)
 
-            return "transport_or_response_error", time.perf_counter() - scheduled
+            return "client_timeout", time.perf_counter() - scheduled
+        except (OSError, http.client.HTTPException):
+            connection.close()
+            local.connections.pop(key, None)
+
+            return "transport_error", time.perf_counter() - scheduled
+        except ValueError:
+            connection.close()
+            local.connections.pop(key, None)
+
+            return "invalid_response", time.perf_counter() - scheduled
 
     statuses = Counter()
     latencies = []

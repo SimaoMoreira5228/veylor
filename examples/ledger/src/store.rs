@@ -59,13 +59,14 @@ pub struct Statement {
 pub enum StoreError {
     Missing,
     Rejected,
+    Busy,
     Database(rusqlite::Error),
     Clock,
 }
 
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Database(error)
+        database_error(error)
     }
 }
 
@@ -108,6 +109,8 @@ impl Store {
             )?;
         }
 
+        connection.busy_timeout(Duration::ZERO)?;
+
         Ok(Self { connection })
     }
 
@@ -119,7 +122,8 @@ impl Store {
         let timestamp = now_ms()?;
         let transaction = self
             .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
 
         let current = transaction
             .query_row(
@@ -134,7 +138,8 @@ impl Store {
                     })
                 },
             )
-            .optional()?
+            .optional()
+            .map_err(database_error)?
             .ok_or(StoreError::Missing)?;
 
         let (next, kind) = match payment.kind {
@@ -145,25 +150,29 @@ impl Store {
             .filter(|value| *value >= -current.limit)
             .ok_or(StoreError::Rejected)?;
 
-        transaction.execute(
-            "UPDATE accounts
+        transaction
+            .execute(
+                "UPDATE accounts
              SET balance = ?1
              WHERE id = ?2",
-            params![next, id],
-        )?;
-        transaction.execute(
-            "INSERT INTO transactions (account_id, amount, kind, description, created_at_ms)
+                params![next, id],
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO transactions (account_id, amount, kind, description, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id,
-                payment.amount,
-                kind,
-                payment.description.as_ref(),
-                timestamp,
-            ],
-        )?;
+                params![
+                    id,
+                    payment.amount,
+                    kind,
+                    payment.description.as_ref(),
+                    timestamp,
+                ],
+            )
+            .map_err(database_error)?;
 
-        transaction.commit()?;
+        transaction.commit().map_err(database_error)?;
 
         Ok(Balance {
             balance: next,
@@ -225,6 +234,20 @@ impl Store {
             generated_at_ms,
             transactions,
         })
+    }
+}
+
+fn database_error(error: rusqlite::Error) -> StoreError {
+    match &error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            StoreError::Busy
+        }
+        _ => StoreError::Database(error),
     }
 }
 
