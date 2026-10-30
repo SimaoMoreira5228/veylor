@@ -9,7 +9,8 @@ use veylor_server::{
 use super::VylManagedStaticServer;
 use super::{
     ManagedStaticState, VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE, VYL_MANAGED_STATIC_EVENT_REQUEST,
-    VYL_MANAGED_STATIC_EVENT_SHUTDOWN, VYL_MANAGED_STATIC_EVENT_WRITABLE, VylManagedStaticEvent,
+    VYL_MANAGED_STATIC_EVENT_SHUTDOWN, VYL_MANAGED_STATIC_EVENT_TUNNEL_CLOSED,
+    VYL_MANAGED_STATIC_EVENT_TUNNEL_DATA, VYL_MANAGED_STATIC_EVENT_WRITABLE, VylManagedStaticEvent,
     VylManagedStaticPollReport, VylManagedStaticToken, VylManagedStaticTrailerReport,
 };
 use crate::abi::{VylBytes, VylField, VylResult, catch_ffi, slice_length_valid};
@@ -17,19 +18,6 @@ use crate::abi::{VylBytes, VylField, VylResult, catch_ffi, slice_length_valid};
 // NOTE: mirrors the `veylor-server` staged response-trailer bounds; enforced here before any copy.
 pub(super) const MAX_RESPONSE_TRAILER_FIELDS: usize = 8;
 pub(super) const MAX_RESPONSE_TRAILER_BYTES: usize = 1024;
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_poll_events(
@@ -120,13 +108,6 @@ unsafe fn poll_events(
     VylResult::Ok
 }
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_respond(
     server: *mut VylManagedStaticServer,
@@ -166,13 +147,6 @@ unsafe fn host_respond(
             .respond(token_to_server(token), status, reason, body),
     )
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_respond_with_headers(
@@ -256,10 +230,6 @@ unsafe fn host_respond_with_headers(
     ))
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_cancel(
     server: *mut VylManagedStaticServer,
@@ -285,13 +255,6 @@ unsafe fn host_cancel(
         CancelOutcome::Invalid => VylResult::InvalidArgument,
     }
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_pull_body(
@@ -348,17 +311,6 @@ pub(super) fn respond_outcome_to_result(outcome: RespondOutcome) -> VylResult {
         RespondOutcome::WouldBlock => VylResult::WouldBlock,
     }
 }
-
-
-
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_pull_trailers(
@@ -459,6 +411,8 @@ pub(super) fn event_from_slot(slot: EventSlot) -> VylManagedStaticEvent {
         HostEventKind::Shutdown => VYL_MANAGED_STATIC_EVENT_SHUTDOWN,
         HostEventKind::BodyAvailable => VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE,
         HostEventKind::Writable => VYL_MANAGED_STATIC_EVENT_WRITABLE,
+        HostEventKind::TunnelData => VYL_MANAGED_STATIC_EVENT_TUNNEL_DATA,
+        HostEventKind::TunnelClosed => VYL_MANAGED_STATIC_EVENT_TUNNEL_CLOSED,
     };
     VylManagedStaticEvent {
         kind,

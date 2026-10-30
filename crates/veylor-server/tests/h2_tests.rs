@@ -10,19 +10,19 @@ use veylor_http2::{
     DEFAULT_MAX_FRAME_SIZE, ErrorCode, FRAME_HEADER_LEN, FrameHeader, FrameType, H2Role,
     HEADERS_FLAG_END_HEADERS, HEADERS_FLAG_END_STREAM, HpackEntrySlot, HpackFieldToEncode,
     HpackHeader, HpackRepresentation, HpackTable, SETTINGS_ACK, SETTINGS_ENTRY_LEN,
-    SETTINGS_MAX_CONCURRENT_STREAMS, StreamSlot, StreamTable, decode_frame_header,
-    decode_goaway_payload, decode_header_block, decode_rst_stream_payload, encode_frame_header,
-    encode_header_block,
+    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_HEADER_LIST_SIZE, StreamSlot, StreamTable,
+    decode_frame_header, decode_goaway_payload, decode_header_block, decode_rst_stream_payload,
+    encode_frame_header, encode_header_block,
 };
 use veylor_runtime::{ConnectionTimeouts, ConnectionToken};
 
 type TrailerFields = Vec<(Vec<u8>, Vec<u8>)>;
 use veylor_server::{
     ACK_SLOTS, CancelOutcome, CloseCounts, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES,
-    ENCODE_ENTRIES, EventSlot, FrozenRoute, FrozenRoutesView, H2_BODY_CAP, H2Conn, H2HostCtx,
-    HostEventKind, HostHandle, HostShared, INPUT_STAGING_CAP, MAX_ROUTES, MAX_STATIC_BODY_BYTES,
-    NativeRequestView, NativeResponseOut, RespondOutcome, RouteBuildError, RunningServer, Server,
-    ServerConfig,
+    ENCODE_ENTRIES, EventSlot, FrozenRoute, FrozenRoutesView, H2_BODY_CAP,
+    H2C_MAX_HEADER_LIST_SIZE, H2Conn, H2HostCtx, HostEventKind, HostHandle, HostShared,
+    INPUT_STAGING_CAP, MAX_ROUTES, MAX_STATIC_BODY_BYTES, NativeRequestView, NativeResponseOut,
+    RespondOutcome, RouteBuildError, RunningServer, Server, ServerConfig,
     h2::{FrozenNativeRoute, HEADER_BLOCK_CAP, HEADER_SLOTS, STREAM_SLOTS},
 };
 
@@ -162,9 +162,7 @@ fn try_read_frame(stream: &mut TcpStream) -> Option<(FrameHeader, Vec<u8>)> {
     Some((header, payload))
 }
 
-// NOTE: settings-capturing handshake beside handshake(): the ceiling pin asserts the advertised
-// SETTINGS_MAX_CONCURRENT_STREAMS wire value, so the preface exchange returns it to the caller.
-fn handshake_advertised_max(stream: &mut TcpStream) -> u32 {
+fn handshake_advertised_setting(stream: &mut TcpStream, setting_id: u16) -> u32 {
     stream
         .write_all(CLIENT_CONNECTION_PREFACE)
         .expect("write magic");
@@ -176,7 +174,7 @@ fn handshake_advertised_max(stream: &mut TcpStream) -> u32 {
     for entry in payload.chunks_exact(SETTINGS_ENTRY_LEN) {
         let id = u16::from_be_bytes([entry[0], entry[1]]);
         let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
-        if id == SETTINGS_MAX_CONCURRENT_STREAMS {
+        if id == setting_id {
             advertised = Some(value);
         }
     }
@@ -184,7 +182,7 @@ fn handshake_advertised_max(stream: &mut TcpStream) -> u32 {
     let (header, _) = read_frame(stream);
     assert_eq!(header.frame_type, FrameType::Settings);
     assert_eq!(header.flags & SETTINGS_ACK, SETTINGS_ACK);
-    advertised.expect("server advertises max_concurrent_streams")
+    advertised.expect("server advertises requested setting")
 }
 
 fn send_headers(
@@ -258,7 +256,18 @@ fn send_header_fields(
     let mut scratch = [0; 512];
     let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
     let mut block = [0; 2048];
-    let len = encode_header_block(fields, &mut encoder, &mut block).expect("encode block");
+    send_encoded_headers(stream, id, fields, end, &mut encoder, &mut block);
+}
+
+fn send_encoded_headers(
+    stream: &mut TcpStream,
+    id: u32,
+    fields: &[HpackFieldToEncode<'_>],
+    end: bool,
+    encoder: &mut HpackTable<'_>,
+    block: &mut [u8],
+) {
+    let len = encode_header_block(fields, encoder, block).expect("encode block");
     let mut flags = HEADERS_FLAG_END_HEADERS;
     if end {
         flags |= HEADERS_FLAG_END_STREAM;
@@ -1921,7 +1930,7 @@ fn h2_stream_ceiling_refuses_33rd_and_recycles() {
     let server = managed_h2_server();
     let host = server.host();
     let mut client = h2_connect(&server);
-    let advertised = handshake_advertised_max(&mut client);
+    let advertised = handshake_advertised_setting(&mut client, SETTINGS_MAX_CONCURRENT_STREAMS);
     assert_eq!(advertised, STREAM_SLOTS as u32);
     for n in 0..STREAM_SLOTS {
         send_headers(&mut client, (2 * n + 1) as u32, b"GET", b"/work", true);
@@ -2442,10 +2451,7 @@ fn h2_managed_nonfinal_trailer_headers_reset_protocol_error() {
 }
 
 #[test]
-fn h2_oversize_request_header_block_resets_stream_and_spares_connection() {
-    // NOTE: a header block past the advertised 16,384-octet cap is a per-stream
-    // refusal, not a connection kill: the overflow RSTs only its stream while a
-    // sibling exchange on the same connection still serves.
+fn h2_oversize_request_header_block_fails_connection_with_compression_error() {
     let server = managed_h2_body_server();
     let mut stream = h2_connect(&server);
     handshake(&mut stream);
@@ -2468,13 +2474,106 @@ fn h2_oversize_request_header_block_resets_stream_and_spares_connection() {
         fields.push((name.as_bytes(), value.as_bytes()));
     }
     send_fragmented_headers(&mut stream, 1, &fields);
+    let (_, code) = read_goaway(&mut stream);
+    assert_eq!(code, ErrorCode::CompressionError);
+    read_eof(&mut stream);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 0, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_advertises_and_enforces_header_list_limit() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    let advertised = handshake_advertised_setting(&mut stream, SETTINGS_MAX_HEADER_LIST_SIZE);
+    assert_eq!(advertised, H2C_MAX_HEADER_LIST_SIZE);
+
+    let names: Vec<String> = (0..38).map(|index| format!("x-pad-{index:02}")).collect();
+    let values = vec!["v".repeat(400); names.len()];
+    let mut fields = vec![
+        field(b":method", b"GET"),
+        field(b":scheme", b"http"),
+        field(b":path", b"/hello"),
+        field(b":authority", b"localhost"),
+    ];
+    for (name, value) in names.iter().zip(values.iter()) {
+        fields.push(field(name.as_bytes(), value.as_bytes()));
+    }
+
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 16_384];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; HEADER_BLOCK_CAP];
+    send_encoded_headers(&mut stream, 1, &fields, true, &mut encoder, &mut block);
     let (id, code) = read_rst(&mut stream);
     assert_eq!(id, 1);
     assert_eq!(code, ErrorCode::RefusedStream);
+
     send_headers(&mut stream, 3, b"GET", b"/hello", true);
     let sibling = read_response(&mut stream, 3);
     assert_eq!(sibling.status, 200);
-    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_header_slot_overflow_resets_stream_and_keeps_hpack_state() {
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+
+    let names: Vec<String> = (0..60).map(|index| format!("x-{index:02}")).collect();
+    let mut fields = vec![
+        field(b":method", b"GET"),
+        field(b":scheme", b"http"),
+        field(b":path", b"/hello"),
+        field(b":authority", b"localhost"),
+    ];
+    for name in &names {
+        fields.push(field(name.as_bytes(), b""));
+    }
+    fields.push(HpackFieldToEncode {
+        name: b"x-state",
+        value: b"preserved",
+        representation: HpackRepresentation::Incremental,
+        huffman_name: false,
+        huffman_value: false,
+    });
+
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 2_048];
+    send_encoded_headers(&mut stream, 1, &fields, true, &mut encoder, &mut block);
+
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::RefusedStream);
+
+    let sibling_fields = [
+        field(b":method", b"GET"),
+        field(b":scheme", b"http"),
+        field(b":path", b"/hello"),
+        field(b":authority", b"localhost"),
+        HpackFieldToEncode {
+            name: b"x-state",
+            value: b"preserved",
+            representation: HpackRepresentation::Default,
+            huffman_name: false,
+            huffman_value: false,
+        },
+    ];
+    send_encoded_headers(
+        &mut stream,
+        3,
+        &sibling_fields,
+        true,
+        &mut encoder,
+        &mut block,
+    );
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
@@ -2896,7 +2995,7 @@ fn h2_managed_short_body_reset_stream_survives() {
 // plus section 8.1.1 (length mismatch is stream-only): DATA past the admitted body window
 // RSTs only its stream and the sibling serves cleanly on the surviving connection.
 #[test]
-fn h2_adversarial_data_over_body_resets_flow_control() {
+fn h2_adversarial_data_over_body_resets_protocol_error() {
     let server = managed_h2_body_server();
     let mut stream = h2_connect(&server);
     handshake(&mut stream);
@@ -2910,7 +3009,7 @@ fn h2_adversarial_data_over_body_resets_flow_control() {
     );
     let (id, code) = read_rst(&mut stream);
     assert_eq!(id, 1);
-    assert_eq!(code, ErrorCode::FlowControlError);
+    assert_eq!(code, ErrorCode::ProtocolError);
     send_headers(&mut stream, 3, b"GET", b"/hello", true);
     let sibling = read_response(&mut stream, 3);
     assert_eq!(sibling.status, 200);
@@ -3034,12 +3133,11 @@ fn h2_adversarial_window_update_closed_ignored() {
     assert_eq!(counts.shutdown, 1);
 }
 
-// NOTE: RFC 9113 section 4.3 (a field block the endpoint does not decompress is refused
-// per stream, not per connection): 12000 plus 5000 fragment octets breach the 16384
-// assembler cap before completion, so only stream 1 RSTs with REFUSED_STREAM while the
-// sibling exchange on a fresh stream still serves.
+// NOTE: RFC 9113 section 4.3 requires decompression even for discarded blocks. The 12,000
+// plus 5,000 fragment octets exceed the assembly cap before completion, so the connection
+// fails with COMPRESSION_ERROR instead of continuing with HPACK state out of sync.
 #[test]
-fn h2_adversarial_oversized_header_block_resets_stream() {
+fn h2_adversarial_oversized_header_block_fails_connection() {
     let server = h2_server();
     let mut stream = h2_connect(&server);
     handshake(&mut stream);
@@ -3053,13 +3151,10 @@ fn h2_adversarial_oversized_header_block_resets_stream() {
         1,
         &second,
     );
-    let (id, code) = read_rst(&mut stream);
-    assert_eq!(id, 1);
-    assert_eq!(code, ErrorCode::RefusedStream);
-    send_headers(&mut stream, 3, b"GET", b"/hello", true);
-    let sibling = read_response(&mut stream, 3);
-    assert_eq!(sibling.status, 200);
-    assert_eq!(sibling.body, b"hello");
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(last, 1);
+    assert_eq!(code, ErrorCode::CompressionError);
+    read_eof(&mut stream);
     stop_join(server);
 }
 
@@ -3158,7 +3253,7 @@ fn h2_adversarial_priority_idle_is_noop() {
 // STREAM_CLOSED) with section 8.1 trailer shape: the late HEADERS RSTs only its stream and
 // the sibling serves on the surviving connection.
 #[test]
-fn h2_adversarial_trailer_after_close_resets_stream_closed() {
+fn h2_adversarial_trailer_after_close_goes_away_stream_closed() {
     let server = h2_server();
     let mut stream = h2_connect(&server);
     handshake(&mut stream);
@@ -3167,15 +3262,12 @@ fn h2_adversarial_trailer_after_close_resets_stream_closed() {
     assert_eq!(first.status, 200);
     assert_eq!(first.body, b"hello");
     send_trailers(&mut stream, 1, &[(b"x-checksum", b"yes")]);
-    let (id, code) = read_rst(&mut stream);
-    assert_eq!(id, 1);
+    let (last, code) = read_goaway(&mut stream);
+    assert_eq!(last, 1);
     assert_eq!(code, ErrorCode::StreamClosed);
-    send_headers(&mut stream, 3, b"GET", b"/empty", true);
-    let sibling = read_response(&mut stream, 3);
-    assert_eq!(sibling.status, 200);
-    assert!(sibling.body.is_empty());
+    read_eof(&mut stream);
     let counts = stop_join(server);
-    assert_eq!(counts.h2_served, 2, "counts: {counts:?}");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
 }
 
 fn spin_until(mut ready: impl FnMut() -> bool) {
@@ -4052,7 +4144,7 @@ fn h2n_respond(
     if response.is_null() {
         return 1;
     }
-    
+
     let out = unsafe { &mut *response };
     out.status = status;
     out.reason = reason.as_ptr();
@@ -4080,7 +4172,7 @@ unsafe extern "C" fn h2n_record(
     if request.is_null() {
         return 1;
     }
-    
+
     let view = unsafe { &*request };
     let method = unsafe { std::slice::from_raw_parts(view.method, view.method_len) }.to_vec();
     let path = unsafe { std::slice::from_raw_parts(view.path, view.path_len) }.to_vec();
@@ -4558,7 +4650,7 @@ unsafe extern "C" fn live_native_hello(
     if request.is_null() || response.is_null() {
         return 1;
     }
-    
+
     let out = unsafe { &mut *response };
     out.status = 200;
     out.reason = b"OK".as_ptr();

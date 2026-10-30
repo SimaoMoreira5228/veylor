@@ -41,13 +41,16 @@ pub(super) fn respond_native(
     gzip: bool,
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     if head.is_chunked {
-        return reject_payload(output, method);
+        return reject_payload(output, method, request_version);
     }
     let declared = head.content_length.unwrap_or(0);
     let drain_total = match head.content_length {
         Some(length) if length > MAX_STATIC_BODY_BYTES => {
-            return reject_payload(output, method);
+            return reject_payload(output, method, request_version);
         }
         Some(length) => length,
         None => 0,
@@ -131,6 +134,7 @@ pub(super) fn respond_native(
     };
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status,
         reason,
@@ -242,9 +246,6 @@ fn invoke_native(
     request: &NativeRequestView,
     response: &mut NativeResponseOut,
 ) -> i32 {
-    
-
-
     unsafe { handler(user_data as *mut std::ffi::c_void, request, response) }
 }
 
@@ -258,7 +259,6 @@ fn copy_handler_bytes(src: *const u8, len: usize, dst: &mut [u8]) -> bool {
     if len > dst.len() || src.is_null() {
         return false;
     }
-    
 
     unsafe {
         dst[..len].copy_from_slice(std::slice::from_raw_parts(src, len));
@@ -296,7 +296,7 @@ mod tests {
         if request.is_null() || response.is_null() {
             return 1;
         }
-        
+
         let view = unsafe { &*request };
         let out = unsafe { &mut *response };
         let body = if view.body.is_null() || view.body_len == 0 {

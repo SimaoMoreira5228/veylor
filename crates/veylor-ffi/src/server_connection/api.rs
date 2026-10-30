@@ -66,10 +66,6 @@ struct ServerResponseHeadArguments {
     out_required: *mut usize,
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_new(
     out_connection: *mut *mut VylServerConnection,
@@ -94,14 +90,6 @@ unsafe fn create_connection(out_connection: *mut *mut VylServerConnection) -> Vy
     }
     VylResult::Ok
 }
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_parse_head(
@@ -193,14 +181,6 @@ unsafe fn parse_request_head(
         Err(error) => map_error(error),
     }
 }
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_encode_response_head(
@@ -412,10 +392,6 @@ unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResult> {
     Ok(unsafe { slice::from_raw_parts(bytes.data, bytes.length) })
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_reset(
     connection: *mut VylServerConnection,
@@ -437,11 +413,6 @@ unsafe fn reset_connection(connection: *mut VylServerConnection) -> VylResult {
         Err(error) => map_error(error),
     }
 }
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_destroy(

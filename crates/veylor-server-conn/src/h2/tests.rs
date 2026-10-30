@@ -121,7 +121,10 @@ fn client_settings_handshake(
 
     let mut settings = [0u8; 64];
     let out = server.send_settings(&[], &mut settings).expect("settings");
-    assert!(out.written > 0);
+    assert_eq!(
+        &settings[..out.written],
+        &[0, 0, 6, 0x04, 0, 0, 0, 0, 0, 0, 6, 0, 0, 8, 64]
+    );
     assert_eq!(server.acknowledge(out.written), Ok(0));
 
     let mut cactions = [None; 16];
@@ -140,6 +143,50 @@ fn client_settings_handshake(
         .poll_feed(&ack_frame, &mut scratch)
         .expect("client ack");
     assert_eq!(batch.status, BatchStatus::NeedMore);
+}
+
+#[test]
+fn server_settings_match_fixed_header_field_capacity() {
+    fixture!(tables, server);
+    let mut output = [0u8; 128];
+    let too_large = [veylor_http2::SettingsParameter {
+        id: veylor_http2::SETTINGS_MAX_HEADER_LIST_SIZE,
+        value: super::MAX_HEADER_LIST_SIZE + 1,
+    }];
+    assert_eq!(
+        server.send_settings(&too_large, &mut output),
+        Err(H2ServerError::InvalidArgument)
+    );
+
+    let sent = server
+        .send_settings(&[], &mut output)
+        .expect("default settings");
+    assert_eq!(sent.written, 15);
+    assert_eq!(
+        &output[..sent.written],
+        &[0, 0, 6, 0x04, 0, 0, 0, 0, 0, 0, 6, 0, 0, 8, 64]
+    );
+    assert_eq!(server.acknowledge(sent.written), Ok(0));
+    assert_eq!(
+        server
+            .driver
+            .driver()
+            .streams()
+            .local_settings()
+            .max_header_list_size,
+        super::MAX_HEADER_LIST_SIZE
+    );
+
+    let full = [veylor_http2::SettingsParameter {
+        id: veylor_http2::SETTINGS_HEADER_TABLE_SIZE,
+        value: 4_096,
+    }; super::MAX_SETTINGS];
+    let sent = server
+        .send_settings(&full, &mut output)
+        .expect("full caller settings plus default")
+        .written;
+    assert_eq!(sent, 63);
+    assert_eq!(server.acknowledge(sent), Ok(0));
 }
 
 fn acked(server: &mut H2ServerConnection<'_, '_>, written: usize) {
@@ -314,7 +361,7 @@ fn rejects_invalid_inputs_and_pending_state() {
     );
     assert_eq!(
         server.send_settings(&[], &mut [0u8; 2]),
-        Err(H2ServerError::BufferTooSmall { required: 9 })
+        Err(H2ServerError::BufferTooSmall { required: 15 })
     );
     let out = server.send_settings(&[], &mut output).expect("settings");
     assert_eq!(

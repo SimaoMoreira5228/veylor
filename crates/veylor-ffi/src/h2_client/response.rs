@@ -1,12 +1,6 @@
 use super::{VylH2Client, split_error};
 use crate::abi::{VylH2ResponseClass, VylResult, catch_ffi};
 
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_client_classify_headers(
     handle: *mut VylH2Client,
@@ -87,11 +81,6 @@ unsafe fn classify_headers(
         Err(error) => split_error(error).0,
     }
 }
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_client_account_data(

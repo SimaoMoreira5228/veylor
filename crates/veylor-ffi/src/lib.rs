@@ -1,3 +1,4 @@
+#![allow(clippy::missing_safety_doc)]
 mod abi;
 mod client_connection;
 mod h2_client;
@@ -6,8 +7,9 @@ mod managed_static;
 mod server_connection;
 
 pub use abi::{
-    VylBytes, VylField, VylH2Action, VylH2ActionKind, VylH2Field, VylH2FieldToEncode,
-    VylH2ResponseClass, VylH2Setting, VylH2ValidatedRequest, VylHeader, VylResult, VylSpan,
+    VYL_H2_MAX_HEADER_LIST_SIZE, VylBytes, VylField, VylH2Action, VylH2ActionKind, VylH2Field,
+    VylH2FieldToEncode, VylH2ResponseClass, VylH2Setting, VylH2ValidatedRequest, VylHeader,
+    VylResult, VylSpan,
 };
 pub use client_connection::{
     VYL_HTTP1_MAX_REQUEST_FIELDS, VYL_HTTP1_RESPONSE_CONNECTION_CLOSE,
@@ -38,6 +40,7 @@ pub use h2_server::{
 pub use managed_static::{
     VYL_MANAGED_STATIC_ABI_VERSION, VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE,
     VYL_MANAGED_STATIC_EVENT_REQUEST, VYL_MANAGED_STATIC_EVENT_SHUTDOWN,
+    VYL_MANAGED_STATIC_EVENT_TUNNEL_CLOSED, VYL_MANAGED_STATIC_EVENT_TUNNEL_DATA,
     VYL_MANAGED_STATIC_EVENT_WRITABLE, VylManagedStaticCloseCounts, VylManagedStaticConfig,
     VylManagedStaticEvent, VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn,
     VylManagedStaticNativeRequest, VylManagedStaticNativeResponse, VylManagedStaticPollReport,
@@ -48,7 +51,10 @@ pub use managed_static::{
     vyl_managed_static_host_end_stream, vyl_managed_static_host_end_stream_with_trailers,
     vyl_managed_static_host_is_writable, vyl_managed_static_host_pull_body,
     vyl_managed_static_host_pull_trailers, vyl_managed_static_host_respond,
-    vyl_managed_static_host_respond_with_headers, vyl_managed_static_host_write_stream,
+    vyl_managed_static_host_respond_with_headers, vyl_managed_static_host_tunnel_close,
+    vyl_managed_static_host_tunnel_read, vyl_managed_static_host_tunnel_write,
+    vyl_managed_static_host_upgrade_websocket,
+    vyl_managed_static_host_upgrade_websocket_with_protocol, vyl_managed_static_host_write_stream,
     vyl_managed_static_join, vyl_managed_static_local_addr, vyl_managed_static_new,
     vyl_managed_static_poll_events, vyl_managed_static_register_file_mount,
     vyl_managed_static_register_managed_route,

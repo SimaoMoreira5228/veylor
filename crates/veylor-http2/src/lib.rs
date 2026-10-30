@@ -56,6 +56,9 @@ pub use hpack::{
     encode_huffman, encode_indexed_header, encode_literal_header,
     encode_pending_table_size_updates, encode_table_size_update,
 };
+
+pub const HEADER_FIELD_SIZE_OVERHEAD: u64 = 32;
+pub const MIN_HEADER_FIELD_SIZE: u64 = HEADER_FIELD_SIZE_OVERHEAD + 1;
 pub use service::{
     MAX_STREAM_WRITE, MAX_TRAILERS, METHOD_CAP, RecordRef, RequestTrailer, ResponsePhase,
     RouteSnapshot, STAGED_BODY_CAP, ServiceBodyPolicy, ServiceError, ServiceStreams, StagedDrain,

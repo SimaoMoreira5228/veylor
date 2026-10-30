@@ -292,6 +292,9 @@ pub(crate) fn apply_h2_streams(
                 }
             }
         }
+        StreamCmd::Upgrade { .. } => {
+            abort_stream(server, host, token, fail, slots::pending_spare(meta))
+        }
         StreamCmd::Cancel => {
             let used =
                 match server.rst_stream(stream, ErrorCode::Cancel, slots::pending_spare(meta)) {

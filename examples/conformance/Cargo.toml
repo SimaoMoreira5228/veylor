@@ -1,0 +1,13 @@
+[package]
+name = "veylor-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+veylor-runtime = { version = "0.1.0", path = "../../crates/veylor-runtime" }
+veylor-server = { version = "0.1.0", path = "../../crates/veylor-server" }
+
+[lints]
+workspace = true

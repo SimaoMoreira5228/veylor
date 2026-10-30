@@ -1,17 +1,4 @@
 #![no_main]
-
-
-
-
-
-
-
-
-
-
-
-
-
 use libfuzzer_sys::fuzz_target;
 use veylor_http2::{
     DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, FramePayloadError, FrameType, GOAWAY_FIXED_LEN,

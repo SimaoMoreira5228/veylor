@@ -7,16 +7,6 @@ use super::api::read_bytes;
 use super::{ManagedStaticState, ReadyRouteOp, VylManagedStaticServer, server_error_to_result};
 use crate::abi::{VylBytes, VylResult, catch_ffi};
 
-
-
-
-
-
-
-
-
-
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VylManagedStaticNativeRequest {
@@ -29,7 +19,6 @@ pub struct VylManagedStaticNativeRequest {
     pub body: *const u8,
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VylManagedStaticNativeResponse {
@@ -40,13 +29,11 @@ pub struct VylManagedStaticNativeResponse {
     pub body_len: usize,
 }
 
-
 pub type VylManagedStaticNativeHandlerFn = unsafe extern "C" fn(
     *mut c_void,
     *const VylManagedStaticNativeRequest,
     *mut VylManagedStaticNativeResponse,
 ) -> i32;
-
 
 pub type VylManagedStaticNativeHandler = Option<VylManagedStaticNativeHandlerFn>;
 
@@ -68,27 +55,6 @@ const _: () =
 // NOTE: the server registry carries the handler address plus an opaque user_data word, so
 // no slot pool, trampoline table, or process-global state is needed: the C handler converts
 // once here and user_data round-trips through the server untouched.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_native_route(
@@ -126,9 +92,6 @@ unsafe fn register_native_route(
         Ok(path) => path,
         Err(error) => return error,
     };
-    
-
-
 
     let handler = convert_handler(handler);
     match ready
@@ -148,12 +111,6 @@ unsafe fn register_native_route(
         Err(error) => server_error_to_result(error),
     }
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_native_route_with_gzip(
@@ -211,8 +168,5 @@ unsafe fn register_native_gzip_route(
 }
 
 fn convert_handler(handler: VylManagedStaticNativeHandlerFn) -> NativeHandler {
-    
-
-
     unsafe { std::mem::transmute::<VylManagedStaticNativeHandlerFn, NativeHandler>(handler) }
 }

@@ -1,5 +1,4 @@
 #![cfg(unix)]
-
 mod harness;
 
 use std::io::{Read, Write};

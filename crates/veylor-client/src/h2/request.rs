@@ -91,11 +91,6 @@ fn map_data_error(error: DataWriteError, required: &mut usize) -> H2ClientError 
 }
 
 impl<'c, 'b> H2ClientConnection<'c, 'b> {
-    
-    
-    
-    
-    
     pub fn check_start_request(&self) -> Result<(), H2ClientError> {
         self.ensure_writable()?;
         if self.response_len >= MAX_RESPONSES {

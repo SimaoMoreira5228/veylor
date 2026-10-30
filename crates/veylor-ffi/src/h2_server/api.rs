@@ -39,10 +39,6 @@ fn report_write(
     }
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_new(out_handle: *mut *mut VylH2Server) -> VylResult {
     catch_ffi(|| unsafe { create_handle(out_handle) })
@@ -129,11 +125,6 @@ unsafe fn build_tables(handle: *mut VylH2Server) -> H2ServerTables<'static> {
     )
 }
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_cancel(handle: *mut VylH2Server) -> VylResult {
     catch_ffi(|| unsafe { cancel_handle(handle) })
@@ -151,11 +142,6 @@ unsafe fn cancel_handle(handle: *mut VylH2Server) -> VylResult {
     VylResult::Ok
 }
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_destroy(handle: *mut VylH2Server) -> VylResult {
     catch_ffi(|| unsafe { destroy_handle(handle) })
@@ -169,13 +155,6 @@ unsafe fn destroy_handle(handle: *mut VylH2Server) -> VylResult {
     }
     VylResult::Ok
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_settings(
@@ -261,11 +240,6 @@ unsafe fn send_settings(
     )
 }
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_acknowledge(
     handle: *mut VylH2Server,
@@ -304,12 +278,6 @@ unsafe fn acknowledge(
     }
 }
 
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_settings_ack(
     handle: *mut VylH2Server,
@@ -332,12 +300,6 @@ pub unsafe extern "C" fn vyl_h2_server_send_settings_ack(
         )
     })
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_ping_ack(
@@ -362,12 +324,6 @@ pub unsafe extern "C" fn vyl_h2_server_send_ping_ack(
         )
     })
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_window_update(

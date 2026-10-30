@@ -268,7 +268,6 @@ fn reuse_verdict_follows_shared_keep_alive_policy() {
     // stay local (engine state machine, not policy).
     use veylor_http1::{ConnectionHeader, can_reuse_after_response, response_permits_reuse};
 
-    
     let mut connection = ServerConnection::new();
     let input = get();
     let mut headers = [Header::default(); 4];
@@ -286,7 +285,6 @@ fn reuse_verdict_follows_shared_keep_alive_policy() {
         can_reuse_after_response(false, ConnectionHeader::Omit, false, true)
     );
 
-    
     let mut connection = ServerConnection::new();
     let input = post();
     let mut headers = [Header::default(); 4];
@@ -311,7 +309,6 @@ fn reuse_verdict_follows_shared_keep_alive_policy() {
         can_reuse_after_response(false, ConnectionHeader::Close, false, false)
     );
 
-    
     let mut connection = ServerConnection::new();
     let input = get();
     let mut headers = [Header::default(); 4];
@@ -332,7 +329,6 @@ fn reuse_verdict_follows_shared_keep_alive_policy() {
         can_reuse_after_response(false, ConnectionHeader::Close, false, true)
     );
 
-    
     assert!(can_reuse_after_response(
         false,
         ConnectionHeader::Omit,
@@ -404,6 +400,42 @@ fn small_outputs_report_required_capacity() {
         panic!("expected BufferTooSmall, got {error:?}");
     };
     assert!(required > 4);
+}
+
+#[test]
+fn http10_response_keeps_http10_connection_semantics_and_rejects_chunked() {
+    let input = b"GET / HTTP/1.0\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n";
+    let mut headers = [Header::default(); 4];
+    let mut connection = ServerConnection::new();
+    connection.parse_head(input, &mut headers).unwrap();
+    let params = crate::ResponseHeadParams {
+        status: 200,
+        reason: b"OK",
+        fields: &[],
+        framing: ResponseFraming::Chunked,
+        content_length: 0,
+        request_body_complete: true,
+        response_close: false,
+    };
+    let mut output = [0xa5; 128];
+
+    assert_eq!(
+        connection.encode_response_head(input, &headers, params, &mut output),
+        Err(ServerError::InvalidArgument)
+    );
+    assert!(output.iter().all(|byte| *byte == 0xa5));
+
+    let mut connection = ServerConnection::new();
+    connection.parse_head(input, &mut headers).unwrap();
+    let head = connection
+        .encode_response_head(input, &headers, plain(200), &mut output)
+        .unwrap();
+    assert!(output[..head.written].starts_with(b"HTTP/1.0 200 OK\r\n"));
+    assert!(
+        output[..head.written]
+            .windows(b"Connection: keep-alive\r\n".len())
+            .any(|window| window == b"Connection: keep-alive\r\n")
+    );
 }
 
 #[test]

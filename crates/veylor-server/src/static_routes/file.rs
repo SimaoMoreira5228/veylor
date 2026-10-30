@@ -23,12 +23,15 @@ pub(crate) fn respond_file(
     let Some((method, path)) = file_target(head, input) else {
         return Ok(None);
     };
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     if head.is_chunked {
-        return Ok(Some(reject_payload(output, method)?));
+        return Ok(Some(reject_payload(output, method, request_version)?));
     }
     let drain_total = match head.content_length {
         Some(length) if length > MAX_STATIC_BODY_BYTES => {
-            return Ok(Some(reject_payload(output, method)?));
+            return Ok(Some(reject_payload(output, method, request_version)?));
         }
         Some(length) => length,
         None => 0,
@@ -60,7 +63,9 @@ pub(crate) fn respond_file(
     }
     let mut plan = match routes.files.resolve(method, path) {
         Ok(plan) => plan,
-        Err(FileReject::TooLarge) => return Ok(Some(reject_payload(output, method)?)),
+        Err(FileReject::TooLarge) => {
+            return Ok(Some(reject_payload(output, method, request_version)?));
+        }
         Err(FileReject::NotFound | FileReject::Forbidden | FileReject::NotAFile) => {
             return Ok(None);
         }
@@ -171,6 +176,7 @@ pub(crate) fn respond_file(
     };
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status,
         reason,
@@ -221,6 +227,9 @@ fn respond_not_modified(
     interim_len: usize,
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     let mut date = [0u8; HTTP_DATE_BYTES];
     let date_len = write_http_date(plan.mtime, &mut date);
     let mut now = [0u8; HTTP_DATE_BYTES];
@@ -239,6 +248,7 @@ fn respond_not_modified(
         connection_header_for_response(head, input, 304, ResponseFraming::FixedLength, true, false);
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status: 304,
         reason: b"Not Modified",
@@ -270,6 +280,9 @@ fn respond_range_unsatisfiable(
     interim_len: usize,
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     let mut value = [0u8; CONTENT_RANGE_BYTES];
     let value_len = write_content_range(&mut value, None, plan.total);
     let mut now = [0u8; HTTP_DATE_BYTES];
@@ -288,6 +301,7 @@ fn respond_range_unsatisfiable(
         connection_header_for_response(head, input, 416, ResponseFraming::FixedLength, true, true);
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status: 416,
         reason: b"Range Not Satisfiable",

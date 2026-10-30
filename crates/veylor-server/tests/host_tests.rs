@@ -399,9 +399,8 @@ fn managed_parked_http10_keep_alive_echoes_and_reuses() {
 }
 
 #[test]
-fn managed_stream_begin_http10_keep_alive_echoes() {
-    // NOTE: same drift alarm as above for the streaming Begin arm: the head must carry the
-    // shared keep-alive verdict so an HTTP/1.0 client reuses instead of closing.
+fn managed_stream_http10_uses_close_delimited_response() {
+    // NOTE: HTTP/1.0 has no chunked framing, so streamed responses use close-delimited bodies.
     let server = default_managed_server();
     let host = server.host();
     let mut stream = connect(&server);
@@ -414,16 +413,24 @@ fn managed_stream_begin_http10_keep_alive_echoes() {
         RespondOutcome::Ok
     );
     wait_writable(&host, event.token);
+    assert_eq!(host.write_stream(event.token, b""), RespondOutcome::Invalid);
+    assert_eq!(host.write_stream(event.token, b"body"), RespondOutcome::Ok);
+    wait_writable(&host, event.token);
     assert_eq!(host.end_stream(event.token), RespondOutcome::Ok);
     let head = read_raw_head(&mut stream);
     let text = String::from_utf8(head).expect("head utf8");
     assert!(
-        text.to_ascii_lowercase().contains("connection: keep-alive"),
-        "stream Begin echoes keep-alive: {text}"
+        text.starts_with("HTTP/1.0 200 OK\r\n"),
+        "stream Begin uses HTTP/1.0: {text}"
     );
-    let mut terminal = [0; 5];
-    stream.read_exact(&mut terminal).expect("terminal");
-    assert_eq!(&terminal, b"0\r\n\r\n");
+    assert!(text.to_ascii_lowercase().contains("connection: close"));
+    assert!(!text.to_ascii_lowercase().contains("transfer-encoding"));
+    assert!(!text.to_ascii_lowercase().contains("content-length"));
+    let mut body = [0; 4];
+    stream.read_exact(&mut body).expect("body");
+    assert_eq!(&body, b"body");
+    let mut tail = [0; 1];
+    assert_eq!(stream.read(&mut tail).expect("close-delimited eof"), 0);
     server.stop_accepting();
     let _ = server.join().expect("join server");
 }

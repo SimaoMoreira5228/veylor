@@ -8,6 +8,8 @@ mod native;
 mod register;
 #[allow(unsafe_code)]
 mod stream;
+#[allow(unsafe_code)]
+mod tunnel;
 
 #[cfg(test)]
 #[allow(unsafe_code)]
@@ -36,22 +38,34 @@ pub use register::{
     vyl_managed_static_register_static_route_with_body_cap,
     vyl_managed_static_register_static_route_with_gzip,
 };
+use std::net::{IpAddr, SocketAddr};
+use std::slice;
 pub use stream::{
     vyl_managed_static_host_begin_stream, vyl_managed_static_host_begin_stream_with_headers,
     vyl_managed_static_host_end_stream, vyl_managed_static_host_end_stream_with_trailers,
     vyl_managed_static_host_is_writable, vyl_managed_static_host_write_stream,
 };
-use veylor_server::{CloseCounts, NativeHandler, RunningServer, Server, ServerConfig};
+pub use tunnel::{
+    vyl_managed_static_host_tunnel_close, vyl_managed_static_host_tunnel_read,
+    vyl_managed_static_host_tunnel_write, vyl_managed_static_host_upgrade_websocket,
+    vyl_managed_static_host_upgrade_websocket_with_protocol,
+};
+
+use veylor_server::{
+    CloseCounts, MAX_CONNECTIONS, MAX_WORKERS, NativeHandler, RunningServer, Server, ServerConfig,
+};
 
 use crate::abi::VylResult;
 
-pub const VYL_MANAGED_STATIC_ABI_VERSION: u32 = 1;
+pub const VYL_MANAGED_STATIC_ABI_VERSION: u32 = 2;
 pub const VYL_MANAGED_STATIC_EVENT_REQUEST: u32 = 0;
 pub const VYL_MANAGED_STATIC_EVENT_SHUTDOWN: u32 = 1;
 // NOTE: V1 structs stay size-pinned: both reuse VylManagedStaticEvent fields (see the
 // struct docs), never grow it.
 pub const VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE: u32 = 2;
 pub const VYL_MANAGED_STATIC_EVENT_WRITABLE: u32 = 3;
+pub const VYL_MANAGED_STATIC_EVENT_TUNNEL_DATA: u32 = 4;
+pub const VYL_MANAGED_STATIC_EVENT_TUNNEL_CLOSED: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +84,9 @@ pub struct VylManagedStaticConfig {
     pub poll_wait_ms: i32,
     pub port: u16,
     pub reserved: u32,
+    pub address: crate::abi::VylBytes,
+    pub max_connections: u64,
+    pub worker_count: u64,
 }
 
 #[repr(C)]
@@ -221,8 +238,9 @@ impl ReadyRouteOp {
     }
 }
 
+#[allow(unsafe_code)]
 impl VylManagedStaticConfig {
-    pub(super) fn to_server_config(self) -> Result<(ServerConfig, u16), VylResult> {
+    pub(super) fn to_server_config(self) -> Result<(ServerConfig, SocketAddr), VylResult> {
         if self.abi_version != VYL_MANAGED_STATIC_ABI_VERSION {
             return Err(VylResult::InvalidArgument);
         }
@@ -266,7 +284,37 @@ impl VylManagedStaticConfig {
             usize::try_from(self.max_events_per_turn).map_err(|_| VylResult::InvalidArgument)?;
         config.turn.byte_budget_per_turn = self.byte_budget_per_turn;
         config.poll_wait_ms = self.poll_wait_ms;
-        Ok((config, self.port))
+
+        let address = if self.address.length == 0 {
+            IpAddr::from(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            if self.address.data.is_null() || self.address.length > 64 {
+                return Err(VylResult::InvalidArgument);
+            }
+            let bytes = unsafe { slice::from_raw_parts(self.address.data, self.address.length) };
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|text| text.parse::<IpAddr>().ok())
+                .ok_or(VylResult::InvalidArgument)?
+        };
+
+        if self.max_connections != 0 {
+            let limit = usize::try_from(self.max_connections)
+                .ok()
+                .filter(|value| (1..=MAX_CONNECTIONS).contains(value))
+                .ok_or(VylResult::InvalidArgument)?;
+            config.max_connections = limit;
+        }
+
+        if self.worker_count != 0 {
+            let count = usize::try_from(self.worker_count)
+                .ok()
+                .filter(|value| (1..=MAX_WORKERS).contains(value))
+                .ok_or(VylResult::InvalidArgument)?;
+            config.worker_count = count;
+        }
+
+        Ok((config, SocketAddr::new(address, self.port)))
     }
 }
 
@@ -292,9 +340,6 @@ const _: () = assert!(std::mem::size_of::<VylManagedStaticToken>() == 4 * 4 + 8 
 const _: () = assert!(std::mem::size_of::<VylManagedStaticPollReport>() == 8 * 4);
 const _: () = assert!(std::mem::size_of::<VylManagedStaticTrailerReport>() == 8 * 5);
 
-
-
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VylManagedStaticToken {
@@ -305,14 +350,6 @@ pub struct VylManagedStaticToken {
     pub worker_generation: u64,
     pub generation: u64,
 }
-
-
-
-
-
-
-
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -326,7 +363,6 @@ pub struct VylManagedStaticEvent {
     pub path_offset: usize,
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VylManagedStaticPollReport {
@@ -335,7 +371,6 @@ pub struct VylManagedStaticPollReport {
     pub method_required: usize,
     pub path_required: usize,
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

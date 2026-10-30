@@ -99,6 +99,7 @@ pub const VYL_H2_NO_FIELD: usize = usize::MAX;
 pub const VYL_H2_MAX_ACTIONS: usize = veylor_client::h2::MAX_ACTIONS;
 pub const VYL_H2_MAX_FIELDS: usize = veylor_client::h2::MAX_FIELDS;
 pub const VYL_H2_MAX_SETTINGS: usize = veylor_client::h2::MAX_SETTINGS;
+pub const VYL_H2_MAX_HEADER_LIST_SIZE: u32 = veylor_client::h2::MAX_HEADER_LIST_SIZE;
 
 pub type VylSpan = Span;
 pub type VylHeader = Header;

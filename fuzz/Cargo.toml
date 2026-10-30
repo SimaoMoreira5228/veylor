@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 veylor-http1 = { path = "../crates/veylor-http1" }
 veylor-http2 = { path = "../crates/veylor-http2" }
+veylor-websocket = { path = "../crates/veylor-websocket" }
 
 [[bin]]
 name = "fuzz_request_head"
@@ -53,5 +54,11 @@ doc = false
 [[bin]]
 name = "fuzz_h2_frame"
 path = "fuzz_targets/fuzz_h2_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_websocket_frame"
+path = "fuzz_targets/fuzz_websocket_frame.rs"
 test = false
 doc = false

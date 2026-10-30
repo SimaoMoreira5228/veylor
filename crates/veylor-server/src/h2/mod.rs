@@ -43,6 +43,7 @@ pub const MAX_H2_CONNS: usize = 8;
 // deliberate split (65-100 headers: served on H1, refused on H2).
 pub const HEADER_SLOTS: usize = 64;
 pub const HEADER_BLOCK_CAP: usize = 16_384;
+pub const H2C_MAX_HEADER_LIST_SIZE: u32 = 16_384;
 pub const DECODE_ENTRIES: usize = 64;
 pub const DECODE_BYTES: usize = 16_384;
 pub const ENCODE_ENTRIES: usize = 64;
@@ -168,7 +169,13 @@ impl<'a> H2Conn<'a> {
         ack_limits: &'a mut [u32],
         headers: &'a mut [HpackHeader],
     ) -> Self {
-        let phase = match H2cServerHandshake::new(streams, decoder, encoder, ack_limits) {
+        let phase = match H2cServerHandshake::new(
+            streams,
+            decoder,
+            encoder,
+            ack_limits,
+            H2C_MAX_HEADER_LIST_SIZE,
+        ) {
             Ok(handshake) => Phase::Handshake(handshake),
             Err(_) => Phase::Dead,
         };
@@ -675,9 +682,18 @@ fn pump_controls(
                 stage(StreamEvent::Data(stream_id, start, data.len(), end_stream));
             }
             H2FrameAction::StreamReset { .. } => stage(StreamEvent::PeerReset),
-            H2FrameAction::GoAway { .. } | H2FrameAction::ConnectionError { .. } => {
-                stage(StreamEvent::PeerGoAway)
+            H2FrameAction::ConnectionError { error_code } => {
+                let mut writer = ControlFrameWriter::new(&mut output[*used..], max);
+                if writer
+                    .queue_action(H2FrameAction::ConnectionError { error_code }, 0)
+                    .is_err()
+                {
+                    return false;
+                }
+                *used += writer.pending_bytes().len();
+                stage(StreamEvent::PeerGoAway);
             }
+            H2FrameAction::GoAway { .. } => stage(StreamEvent::PeerGoAway),
         }
     }
     true

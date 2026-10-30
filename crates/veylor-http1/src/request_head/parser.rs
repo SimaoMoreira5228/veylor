@@ -95,6 +95,10 @@ impl Parser {
         self.header_count + usize::from(self.header_value_start.is_some())
     }
 
+    pub fn protocol_version(&self, input: &[u8]) -> Option<super::RequestVersion> {
+        super::RequestVersion::from_bytes(slice_at(input, self.version)?)
+    }
+
     pub fn parse(
         &mut self,
         input: &[u8],

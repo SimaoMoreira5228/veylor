@@ -42,6 +42,12 @@ pub(crate) struct ParkedEntry {
     pub(crate) request: Option<RequestSnapshot>,
     pub(crate) trailers: Option<Vec<crate::connection::trailers::StagedTrailer>>,
     pub(crate) trailer_allow: Vec<Vec<u8>>,
+    pub(crate) tunnel_in: Vec<u8>,
+    pub(crate) tunnel_in_start: usize,
+    pub(crate) tunnel_out: Vec<u8>,
+    pub(crate) tunnel_out_start: usize,
+    pub(crate) tunnel_eof: bool,
+    pub(crate) tunnel_close: bool,
 }
 
 pub struct StagedWork {
@@ -375,7 +381,11 @@ impl HostShared {
                 return (CancelOutcome::Stale, None);
             }
             if let Some(entry) = inner.parked[worker][slot].as_mut() {
-                entry.staged = Some(StagedAction::Cancel);
+                if entry.stream.as_ref().is_some_and(|stream| stream.upgraded) {
+                    entry.tunnel_close = true;
+                } else {
+                    entry.staged = Some(StagedAction::Cancel);
+                }
             }
             if let Some(epoch) = inner.staged_epoch.get_mut(worker) {
                 *epoch += 1;

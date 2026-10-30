@@ -1,6 +1,6 @@
 use veylor_http2::{
     ClientResponsePhase, H2FrameAction, HpackFieldToEncode, HpackHeader, HpackRepresentation,
-    ResponseSectionKind,
+    ResponseSectionKind, SETTINGS_ENABLE_PUSH, SETTINGS_MAX_HEADER_LIST_SIZE, SettingsParameter,
 };
 
 use super::{
@@ -151,6 +151,12 @@ fn handshake(conn: &mut H2ClientConnection<'_, '_>) {
         .send_settings(&[], &mut output)
         .expect("settings")
         .written;
+    assert_eq!(
+        &output[..written],
+        &[
+            0, 0, 12, 0x04, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 6, 0, 0, 8, 64,
+        ]
+    );
     assert_eq!(conn.acknowledge(written).expect("ack"), 0);
     let mut scratch = FeedScratch::new();
     let empty = peer_header(0, 0x04, 0, 0);
@@ -171,6 +177,70 @@ fn handshake(conn: &mut H2ClientConnection<'_, '_>) {
     let batch = poll(conn, &ack, &mut scratch);
     assert_eq!(batch.status, BatchStatus::NeedMore);
     assert_eq!(batch.consumed, ack.len());
+}
+
+#[test]
+fn settings_keep_push_disabled_and_header_storage_bounded() {
+    fixture!(tables, conn);
+    let _ = tables;
+    let mut output = [0; 128];
+    let push_enabled = [SettingsParameter {
+        id: SETTINGS_ENABLE_PUSH,
+        value: 1,
+    }];
+    assert_eq!(
+        conn.send_settings(&push_enabled, &mut output),
+        Err(H2ClientError::InvalidArgument)
+    );
+
+    let excessive_header_limit = [SettingsParameter {
+        id: SETTINGS_MAX_HEADER_LIST_SIZE,
+        value: super::MAX_HEADER_LIST_SIZE + 1,
+    }];
+    assert_eq!(
+        conn.send_settings(&excessive_header_limit, &mut output),
+        Err(H2ClientError::InvalidArgument)
+    );
+
+    let bounded = [
+        SettingsParameter {
+            id: SETTINGS_ENABLE_PUSH,
+            value: 0,
+        },
+        SettingsParameter {
+            id: SETTINGS_MAX_HEADER_LIST_SIZE,
+            value: 1_024,
+        },
+    ];
+    let written = conn
+        .send_settings(&bounded, &mut output)
+        .expect("bounded settings")
+        .written;
+    assert_eq!(written, 21);
+    assert_eq!(conn.acknowledge(written), Ok(0));
+    assert_eq!(
+        conn.driver.driver().streams().local_settings().enable_push,
+        0
+    );
+    assert_eq!(
+        conn.driver
+            .driver()
+            .streams()
+            .local_settings()
+            .max_header_list_size,
+        1_024
+    );
+
+    let full = [SettingsParameter {
+        id: veylor_http2::SETTINGS_HEADER_TABLE_SIZE,
+        value: 4_096,
+    }; super::MAX_SETTINGS];
+    let written = conn
+        .send_settings(&full, &mut output)
+        .expect("full caller settings plus defaults")
+        .written;
+    assert_eq!(written, 69);
+    assert_eq!(conn.acknowledge(written), Ok(0));
 }
 
 fn start_get(conn: &mut H2ClientConnection<'_, '_>) -> u32 {

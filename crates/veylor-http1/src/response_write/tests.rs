@@ -6,7 +6,7 @@ use super::{
     encode_response_final_chunk, encode_response_final_chunk_with_required_length,
     encode_response_head, join_allow_value, response_permits_reuse,
 };
-use crate::request_head::{Header, Limits, Parser};
+use crate::request_head::{Header, Limits, Parser, RequestVersion};
 use crate::request_write::Field;
 
 fn parse_request(input: &[u8]) -> crate::request_head::RequestHead {
@@ -26,6 +26,7 @@ fn encodes_fixed_response_head_into_caller_storage() {
     }];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",
@@ -45,10 +46,52 @@ fn encodes_fixed_response_head_into_caller_storage() {
 }
 
 #[test]
+fn keeps_http_10_response_framing_and_connection_policy() {
+    let mut output = [0; 128];
+    let keep_alive = ResponseToWrite {
+        request_method: b"GET",
+        request_version: RequestVersion::Http10,
+        requested_upgrade: b"",
+        status: 200,
+        reason: b"OK",
+        fields: &[],
+        framing: ResponseFraming::FixedLength,
+        content_length: 0,
+        connection: ConnectionHeader::KeepAlive,
+    };
+    let encoded = encode_response_head(&keep_alive, &mut output).unwrap();
+    assert_eq!(
+        &output[..encoded.length],
+        b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+    );
+
+    let close = ResponseToWrite {
+        connection: ConnectionHeader::Close,
+        ..keep_alive
+    };
+    let encoded = encode_response_head(&close, &mut output).unwrap();
+    assert_eq!(
+        &output[..encoded.length],
+        b"HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+
+    let chunked = ResponseToWrite {
+        framing: ResponseFraming::Chunked,
+        connection: ConnectionHeader::Close,
+        ..keep_alive
+    };
+    assert_eq!(
+        encode_response_head(&chunked, &mut output),
+        Err(ResponseEncodeError::Invalid)
+    );
+}
+
+#[test]
 fn applies_head_status_and_connect_body_rules() {
     let mut output = [0; 128];
     let head = ResponseToWrite {
         request_method: b"HEAD",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",
@@ -75,6 +118,7 @@ fn applies_head_status_and_connect_body_rules() {
 
     let tunnel = ResponseToWrite {
         request_method: b"CONNECT",
+        request_version: RequestVersion::Http11,
         status: 200,
         reason: b"Connection Established",
         content_length: 0,
@@ -89,6 +133,7 @@ fn applies_head_status_and_connect_body_rules() {
 
     let not_modified = ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         status: 304,
         framing: ResponseFraming::Chunked,
         content_length: 0,
@@ -107,6 +152,7 @@ fn rejects_invalid_framing_and_leaves_short_buffers_untouched() {
     let mut output = [0xa5; 128];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 204,
         reason: b"No Content",
@@ -172,6 +218,7 @@ fn rejects_invalid_framing_and_leaves_short_buffers_untouched() {
 fn close_delimited_responses_require_close_and_no_body_statuses_omit_framing() {
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",
@@ -230,6 +277,7 @@ fn encodes_protocol_upgrade_response_without_http_body_framing() {
     }];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"websocket",
         status: 101,
         reason: b"Switching Protocols",
@@ -269,6 +317,7 @@ fn encodes_protocol_upgrade_response_without_http_body_framing() {
 fn resumes_encoded_head_and_chunk_frames_after_short_writes() {
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",

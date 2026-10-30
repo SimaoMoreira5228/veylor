@@ -188,6 +188,9 @@ impl<'a> ServerConnection<'a> {
         };
         let response = ResponseToWrite {
             request_method: method,
+            request_version: request
+                .protocol_version(input)
+                .ok_or(ServerError::ProtocolError)?,
             requested_upgrade,
             status: params.status,
             reason: params.reason,

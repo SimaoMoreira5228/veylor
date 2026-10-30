@@ -2124,7 +2124,7 @@ unsafe extern "C" fn native_fixed(
     if request.is_null() || response.is_null() {
         return 1;
     }
-    
+
     let view = unsafe { &*request };
     let out = unsafe { &mut *response };
     if view.method_len == 0 || view.path_len == 0 {
@@ -2147,7 +2147,7 @@ unsafe extern "C" fn native_stray_304(
     if response.is_null() {
         return 1;
     }
-    
+
     let out = unsafe { &mut *response };
     out.status = 304;
     out.reason = b"Not Modified".as_ptr();
@@ -2186,7 +2186,7 @@ unsafe extern "C" fn native_reenter(
     if response.is_null() {
         return 1;
     }
-    
+
     let out = unsafe { &mut *response };
     out.status = 200;
     out.reason = b"OK".as_ptr();
@@ -2216,13 +2216,12 @@ unsafe extern "C" fn native_echo(
     if request.is_null() || response.is_null() {
         return 1;
     }
-    
+
     let view = unsafe { &*request };
     let out = unsafe { &mut *response };
     let mut staged = NATIVE_ECHO_BODY.lock().expect("echo lock");
     staged.clear();
     if !view.body.is_null() && view.body_len > 0 {
-        
         let bytes = unsafe { std::slice::from_raw_parts(view.body, view.body_len as usize) };
         staged.extend_from_slice(bytes);
     }
@@ -2243,7 +2242,7 @@ unsafe extern "C" fn native_record(
     if request.is_null() || response.is_null() {
         return 1;
     }
-    
+
     let view = unsafe { &*request };
     let out = unsafe { &mut *response };
     NATIVE_RECORD_BODY_NULL.store(view.body.is_null(), Ordering::SeqCst);
@@ -2265,7 +2264,7 @@ unsafe extern "C" fn native_large(
     if response.is_null() {
         return 1;
     }
-    
+
     let out = unsafe { &mut *response };
     out.status = 200;
     out.reason = b"OK".as_ptr();
@@ -2522,7 +2521,7 @@ unsafe extern "C" fn native_ctx(
     if user_data as usize != NATIVE_CTX_SENTINEL || request.is_null() || response.is_null() {
         return 1;
     }
-    
+
     let out = unsafe { &mut *response };
     out.status = 200;
     out.reason = b"OK".as_ptr();
@@ -2629,11 +2628,6 @@ fn h1_date_present_and_shaped_across_static_paths() {
     let _ = native.join().expect("join server");
 }
 
-
-
-
-
-
 #[test]
 fn hot_keep_alive_connection_does_not_starve_probe() {
     const HOT_EXCHANGES: u64 = 3000;
@@ -2649,7 +2643,6 @@ fn hot_keep_alive_connection_does_not_starve_probe() {
         let hot_done = Arc::clone(&hot_done);
         thread::spawn(move || {
             let mut stream = connect_addr(addr);
-            
 
             let request =
                 "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
@@ -2668,7 +2661,6 @@ fn hot_keep_alive_connection_does_not_starve_probe() {
     let mut probe = connect(&server);
     let mut worst = Duration::ZERO;
     for _ in 0..PROBES {
-        
         thread::sleep(PROBE_INTERVAL);
         let start = Instant::now();
         get(&mut probe, "/hello");

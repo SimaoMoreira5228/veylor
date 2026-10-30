@@ -19,14 +19,6 @@ struct ClientRequestHeadArguments {
     out_required: *mut usize,
 }
 
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_encode_request_head(
     connection: *mut VylClientConnection,
@@ -163,11 +155,6 @@ unsafe fn encode_request_head(
     }
 }
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_advance_request_write(
     connection: *mut VylClientConnection,
@@ -199,13 +186,6 @@ unsafe fn advance_request_write(
         Err(_) => VylResult::BadState,
     }
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_encode_request_body(
@@ -280,13 +260,6 @@ unsafe fn encode_request_body(
         Err(_) => VylResult::InvalidArgument,
     }
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_finish_request_body(
@@ -389,11 +362,6 @@ unsafe fn finish_request_body(
         Err(_) => VylResult::InvalidArgument,
     }
 }
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_cancel(

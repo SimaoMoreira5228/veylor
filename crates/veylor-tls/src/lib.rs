@@ -2,7 +2,7 @@ mod pem;
 mod pump;
 
 pub use pem::{load_cert_chain, load_private_key};
-pub use pump::{drain_plaintext, feed_ciphertext};
+pub use pump::{drain_plaintext, feed_ciphertext, queue_close_notify};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use std::io;

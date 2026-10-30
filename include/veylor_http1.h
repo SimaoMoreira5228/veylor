@@ -184,7 +184,7 @@ vyl_http1_result vyl_http1_server_connection_parse_head(
     vyl_http1_request_head* out_head,
     size_t* out_headers_required
 );
- 
+
 vyl_http1_result vyl_http1_server_connection_encode_response_head(
     vyl_server_connection* connection,
     const uint8_t* request_input,
@@ -274,7 +274,7 @@ vyl_http1_result vyl_http1_client_connection_new(
     size_t requested_upgrade_length,
     vyl_client_connection** out_connection
 );
- 
+
 vyl_http1_result vyl_http1_client_connection_encode_request_head(
     vyl_client_connection* connection,
     vyl_http1_bytes method,
@@ -288,13 +288,13 @@ vyl_http1_result vyl_http1_client_connection_encode_request_head(
     size_t* out_written,
     size_t* out_required
 );
- 
+
 vyl_http1_result vyl_http1_client_connection_advance_request_write(
     vyl_client_connection* connection,
     size_t transferred_bytes,
     size_t* out_pending
 );
- 
+
 vyl_http1_result vyl_http1_client_connection_encode_request_body(
     vyl_client_connection* connection,
     vyl_http1_bytes input,
@@ -303,7 +303,7 @@ vyl_http1_result vyl_http1_client_connection_encode_request_body(
     size_t* out_written,
     size_t* out_required
 );
- 
+
 vyl_http1_result vyl_http1_client_connection_finish_request_body(
     vyl_client_connection* connection,
     const vyl_http1_field* trailers,
@@ -313,7 +313,7 @@ vyl_http1_result vyl_http1_client_connection_finish_request_body(
     size_t* out_written,
     size_t* out_required
 );
- 
+
 vyl_http1_result vyl_http1_client_connection_cancel(vyl_client_connection* connection);
 /* NOTE: Keep requested_upgrade alive and unchanged until handle destruction.
    During an incomplete response head, retain the input base and bytes. Use
@@ -336,12 +336,12 @@ vyl_http1_result vyl_http1_client_connection_read_response(
 vyl_http1_result vyl_http1_client_connection_reset(vyl_client_connection* connection);
 vyl_http1_result vyl_http1_client_connection_destroy(vyl_client_connection* connection);
 
-/* NOTE: these three sizes must stay identical to the veylor-client native
-   constants (MAX_ACTIONS, MAX_FIELDS, MAX_SETTINGS): the cdylib side takes them
-   from the same source since `155767e`, so update both together or not at all. */
+/* NOTE: these H2 bounds must stay identical to their veylor-client native
+   constants; the cdylib side takes them from the same source. */
 #define VYL_H2_MAX_ACTIONS 16u
 #define VYL_H2_MAX_FIELDS 64u
 #define VYL_H2_MAX_SETTINGS 8u
+#define VYL_H2_MAX_HEADER_LIST_SIZE 2112u
 #define VYL_H2_END_STREAM 1u
 #define VYL_H2_NO_FIELD ((size_t)-1)
 
@@ -448,8 +448,10 @@ vyl_http1_result vyl_h2_client_connection_preface(
     size_t* out_written,
     size_t* out_required
 );
-/* NOTE: SETTINGS parameters are copied before return; the local settings take
-    effect only after the encoded bytes are fully acknowledged. */
+/* NOTE: SETTINGS parameters are copied before return. A value of 1 for
+    ENABLE_PUSH or a MAX_HEADER_LIST_SIZE above VYL_H2_MAX_HEADER_LIST_SIZE
+    rejects. Missing values default to ENABLE_PUSH=0 and the field-list cap.
+    Local settings take effect after the encoded bytes are acknowledged. */
 vyl_http1_result vyl_h2_client_send_settings(
     vyl_h2_client* handle,
     const vyl_h2_setting* parameters,
@@ -461,11 +463,8 @@ vyl_http1_result vyl_h2_client_send_settings(
 );
 /* NOTE: Acknowledge every accepted byte count before the next send call; keep
     each output buffer unchanged until fully acknowledged. */
-vyl_http1_result vyl_h2_client_acknowledge(
-    vyl_h2_client* handle,
-    size_t transferred_bytes,
-    size_t* out_pending
-);
+vyl_http1_result
+vyl_h2_client_acknowledge(vyl_h2_client* handle, size_t transferred_bytes, size_t* out_pending);
 vyl_http1_result vyl_h2_client_send_settings_ack(
     vyl_h2_client* handle,
     uint8_t* output,
@@ -588,8 +587,10 @@ vyl_http1_result vyl_h2_server_destroy(vyl_h2_server* handle);
 /* NOTE: Stop transport IO and close the connection after cancel; the handle
  * cannot be reused. */
 vyl_http1_result vyl_h2_server_cancel(vyl_h2_server* handle);
-/* NOTE: SETTINGS parameters are copied before return; the local settings take
-    effect only after the encoded bytes are fully acknowledged. */
+/* NOTE: SETTINGS parameters are copied before return. Missing
+    MAX_HEADER_LIST_SIZE defaults to VYL_H2_MAX_HEADER_LIST_SIZE. Larger values
+    reject because the server field table is fixed. Local settings take effect
+    after the encoded bytes are acknowledged. */
 vyl_http1_result vyl_h2_server_send_settings(
     vyl_h2_server* handle,
     const vyl_h2_setting* parameters,
@@ -601,11 +602,8 @@ vyl_http1_result vyl_h2_server_send_settings(
 );
 /* NOTE: Acknowledge every accepted byte count before the next send call; keep
     each output buffer unchanged until fully acknowledged. */
-vyl_http1_result vyl_h2_server_acknowledge(
-    vyl_h2_server* handle,
-    size_t transferred_bytes,
-    size_t* out_pending
-);
+vyl_http1_result
+vyl_h2_server_acknowledge(vyl_h2_server* handle, size_t transferred_bytes, size_t* out_pending);
 vyl_http1_result vyl_h2_server_send_settings_ack(
     vyl_h2_server* handle,
     uint8_t* output,
@@ -715,7 +713,7 @@ vyl_http1_result vyl_h2_server_goaway_drain(
     size_t* out_required
 );
 
-#define VYL_MANAGED_STATIC_ABI_VERSION 1u
+#define VYL_MANAGED_STATIC_ABI_VERSION 2u
 
 typedef struct vyl_managed_static_server vyl_managed_static_server;
 
@@ -734,6 +732,9 @@ typedef struct {
     int32_t poll_wait_ms;
     uint16_t port;
     uint32_t reserved;
+    vyl_http1_bytes address;
+    uint64_t max_connections;
+    uint64_t worker_count;
 } vyl_managed_static_config;
 
 typedef struct {
@@ -747,9 +748,9 @@ typedef struct {
     uint64_t shutdown;
 } vyl_managed_static_close_counts;
 
-/* NOTE: Static-only v1: loopback listener, frozen static routes, no host dispatch or events.
-   Register routes before start; start freezes them and spawns the worker. Destroy is valid
-   only before start or after join; a running handle must stop and join first. */
+/* NOTE: address is a numeric IPv4/IPv6 string; an empty value binds 127.0.0.1.
+   max_connections and worker_count use 0 for the configured default. Register routes
+   before start; start freezes them. Destroy is valid only before start or after join. */
 vyl_http1_result vyl_managed_static_new(
     const vyl_managed_static_config* config,
     vyl_managed_static_server** out_server
@@ -823,10 +824,7 @@ vyl_http1_result vyl_managed_static_register_managed_route_with_trailers(
 /* NOTE: Stages the cleartext HTTP/2 listener port for start; the port binds at start beside
    the H1 listener. Zero binds an ephemeral loopback port, any other port binds fixed; the
    last call wins. Valid only before start; post-start reports BAD_STATE. */
-vyl_http1_result vyl_managed_static_enable_h2c(
-    vyl_managed_static_server* server,
-    uint16_t port
-);
+vyl_http1_result vyl_managed_static_enable_h2c(vyl_managed_static_server* server, uint16_t port);
 /* NOTE: Stages DER certificate/key bytes plus the per-worker handshake budget for
    start; bytes are copied at call time. Zero budget or empty inputs reject; the
    dedicated port binds loopback TLS at start beside the H1 listener. Valid only
@@ -853,10 +851,8 @@ vyl_http1_result vyl_managed_static_rotate_tls(
    counts past 16 report INVALID_ARGUMENT. One keeps the single-worker path; more workers
    bind reuse-port listeners at start. The last call wins. Valid only before start;
    post-start reports BAD_STATE. */
-vyl_http1_result vyl_managed_static_set_worker_count(
-    vyl_managed_static_server* server,
-    size_t count
-);
+vyl_http1_result
+vyl_managed_static_set_worker_count(vyl_managed_static_server* server, size_t count);
 vyl_http1_result vyl_managed_static_start(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_accepting(vyl_managed_static_server* server);
 vyl_http1_result vyl_managed_static_stop_force(vyl_managed_static_server* server);
@@ -865,24 +861,21 @@ vyl_http1_result vyl_managed_static_join(
     vyl_managed_static_server* server,
     vyl_managed_static_close_counts* out_counts
 );
-vyl_http1_result vyl_managed_static_local_addr(
-    vyl_managed_static_server* server,
-    uint16_t* out_port
-);
+vyl_http1_result
+vyl_managed_static_local_addr(vyl_managed_static_server* server, uint16_t* out_port);
 /* NOTE: Reports the bound cleartext HTTP/2 loopback port; valid only while running with H2C
    enabled. Pre-start (the listener binds at start), H2C-disabled, and joined handles report
    BAD_STATE; null handles or outputs report INVALID_ARGUMENT. Ephemeral staging reports the
    bound port, multi-worker reuse-port the shared port. */
-vyl_http1_result vyl_managed_static_h2c_addr(
-    vyl_managed_static_server* server,
-    uint16_t* out_port
-);
+vyl_http1_result vyl_managed_static_h2c_addr(vyl_managed_static_server* server, uint16_t* out_port);
 
 enum {
     VYL_MANAGED_STATIC_EVENT_REQUEST = 0u,
     VYL_MANAGED_STATIC_EVENT_SHUTDOWN = 1u,
     VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE = 2u,
-    VYL_MANAGED_STATIC_EVENT_WRITABLE = 3u
+    VYL_MANAGED_STATIC_EVENT_WRITABLE = 3u,
+    VYL_MANAGED_STATIC_EVENT_TUNNEL_DATA = 4u,
+    VYL_MANAGED_STATIC_EVENT_TUNNEL_CLOSED = 5u
 };
 
 typedef struct {
@@ -949,10 +942,8 @@ vyl_http1_result vyl_managed_static_host_respond_with_headers(
 );
 /* NOTE: Cancels a parked request; the owner worker closes the connection. A repeat or an
    unknown token reports STALE_TOKEN. Valid only while running. */
-vyl_http1_result vyl_managed_static_host_cancel(
-    vyl_managed_static_server* server,
-    vyl_managed_static_token token
-);
+vyl_http1_result
+vyl_managed_static_host_cancel(vyl_managed_static_server* server, vyl_managed_static_token token);
 /* NOTE: Partial body copies are normal; out_pulled counts this call, out_end flags the last
    byte. A zero-capacity call queries completion without consuming. Valid only while running. */
 vyl_http1_result vyl_managed_static_host_pull_body(
@@ -1045,6 +1036,39 @@ vyl_http1_result vyl_managed_static_host_is_writable(
     vyl_managed_static_server* server,
     vyl_managed_static_token token,
     uint32_t* out_writable
+);
+vyl_http1_result vyl_managed_static_host_upgrade_websocket(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token
+);
+/* NOTE: Selects one subprotocol the client offered in Sec-WebSocket-Protocol; an unoffered,
+   empty, or over-long token reports INVALID_ARGUMENT and changes nothing. */
+vyl_http1_result vyl_managed_static_host_upgrade_websocket_with_protocol(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    vyl_http1_bytes protocol
+);
+/* NOTE: Tunnel data is opaque: reads copy staged bytes in order and report WOULD_BLOCK when
+   none are ready, GONE once the connection closed. TUNNEL_DATA is an edge hint (coalesced per
+   token), so drain with repeated reads until WOULD_BLOCK instead of one read per event. Writes
+   stage up to the per-tunnel cap and report WOULD_BLOCK when it is full; the staged bytes flush
+   before a close requested by host_tunnel_close. Valid only while running. */
+vyl_http1_result vyl_managed_static_host_tunnel_read(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    uint8_t* destination,
+    size_t capacity,
+    size_t* out_read
+);
+vyl_http1_result vyl_managed_static_host_tunnel_write(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    vyl_http1_bytes bytes,
+    size_t* out_accepted
+);
+vyl_http1_result vyl_managed_static_host_tunnel_close(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token
 );
 
 /* NOTE: Native (worker-executed) routes. The handler runs on the connection owner worker and

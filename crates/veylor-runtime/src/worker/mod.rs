@@ -331,7 +331,13 @@ impl<'a> Worker<'a> {
         if bytes == 0 {
             return Ok(false);
         }
-        cancel_phase_deadline(&mut self.table, &mut self.timers, token)?;
+        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+            Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if self.table.phase(token)? == ConnectionPhase::Tunnel {
+            return Ok(true);
+        }
         schedule_phase_deadline(
             &mut self.table,
             &mut self.timers,
@@ -359,7 +365,7 @@ impl<'a> Worker<'a> {
             let _ = self.table.transition(token, ConnectionPhase::Closing);
             return Err(error.into());
         }
-        if next == ConnectionPhase::Closing {
+        if next.deadline_kind().is_none() {
             return Ok(());
         }
         if let Err(error) = schedule_phase_deadline(

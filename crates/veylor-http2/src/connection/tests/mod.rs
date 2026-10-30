@@ -1,4 +1,5 @@
 mod control;
+mod header_block;
 mod settings;
 
 use super::*;
@@ -440,7 +441,7 @@ fn stream_flow_error_still_charges_connection_credit_without_partial_stream_cred
 }
 
 #[test]
-fn deprecated_headers_priority_self_dependency_does_not_reject_headers() {
+fn headers_priority_self_dependency_resets_stream() {
     let mut slots = [StreamSlot::EMPTY; 1];
     let mut header_block = [0; 32];
     let mut streams = StreamTable::new(&mut slots, H2Role::Server, &mut header_block, 32);
@@ -471,10 +472,13 @@ fn deprecated_headers_priority_self_dependency_does_not_reject_headers() {
     let mut headers = [HpackHeader::EMPTY; 1];
     let result = driver.feed(&input[..length], &mut actions, &mut headers);
     assert_eq!(result.status, FeedStatus::NeedMoreInput);
-    assert!(matches!(
+    assert_eq!(
         actions[0],
-        Some(H2FrameAction::Headers { stream_id: 1, .. })
-    ));
+        Some(H2FrameAction::SendReset {
+            stream_id: 1,
+            error_code: ErrorCode::ProtocolError,
+        })
+    );
 }
 
 #[test]

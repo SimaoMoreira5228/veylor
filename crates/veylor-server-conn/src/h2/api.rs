@@ -1,9 +1,12 @@
 use veylor_http2::{
-    ControlFrameWriter, FrameWriteError, H2FrameAction, MAX_WINDOW_INCREMENT, SettingsParameter,
-    settings_parameter_valid,
+    ControlFrameWriter, FrameWriteError, H2FrameAction, MAX_WINDOW_INCREMENT,
+    SETTINGS_MAX_HEADER_LIST_SIZE, SettingsParameter, settings_parameter_valid,
 };
 
-use super::{H2ServerConnection, H2ServerError, MAX_SETTINGS, PendingWrite, PendingWriteKind};
+use super::{
+    H2ServerConnection, H2ServerError, MAX_HEADER_LIST_SIZE, MAX_PENDING_SETTINGS, MAX_SETTINGS,
+    PendingWrite, PendingWriteKind,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteOut {
@@ -45,6 +48,11 @@ impl<'c, 'b> H2ServerConnection<'c, 'b> {
             return Err(H2ServerError::Capacity);
         }
         self.ensure_writable()?;
+
+        let mut staged = [SettingsParameter { id: 0, value: 0 }; MAX_PENDING_SETTINGS];
+        let mut setting_count = 0;
+        let mut max_header_list_size_seen = false;
+
         for parameter in parameters {
             // NOTE: the `SettingsParameter` type bounds ids to `u16`; only the unset id is
             // reachable here, and hosts must stage wider raw ids to zero before calling.
@@ -54,21 +62,39 @@ impl<'c, 'b> H2ServerConnection<'c, 'b> {
             if !settings_parameter_valid(parameter.id, parameter.value) {
                 return Err(H2ServerError::InvalidArgument);
             }
+            if parameter.id == SETTINGS_MAX_HEADER_LIST_SIZE {
+                if parameter.value > MAX_HEADER_LIST_SIZE {
+                    return Err(H2ServerError::InvalidArgument);
+                }
+                max_header_list_size_seen = true;
+            }
+            staged[setting_count] = *parameter;
+            setting_count += 1;
         }
+
+        if !max_header_list_size_seen {
+            staged[setting_count] = SettingsParameter {
+                id: SETTINGS_MAX_HEADER_LIST_SIZE,
+                value: MAX_HEADER_LIST_SIZE,
+            };
+            setting_count += 1;
+        }
+
         let max_frame_size = self.control_max_frame();
         let mut writer = ControlFrameWriter::new(output, max_frame_size);
         let mut required = 0;
         let written = writer
-            .queue_settings(parameters)
+            .queue_settings(&staged[..setting_count])
             .map_err(|error| map_control_error(error, &mut required))?;
-        let mut stored = [(0, 0); MAX_SETTINGS];
-        for (destination, parameter) in stored.iter_mut().zip(parameters.iter()) {
+
+        let mut stored = [(0, 0); MAX_PENDING_SETTINGS];
+        for (destination, parameter) in stored.iter_mut().zip(staged[..setting_count].iter()) {
             *destination = (parameter.id, parameter.value);
         }
         self.pending = PendingWrite {
             kind: PendingWriteKind::Settings,
             remaining: written,
-            setting_count: parameters.len(),
+            setting_count,
             settings: stored,
         };
         Ok(WriteOut {
@@ -90,7 +116,7 @@ impl<'c, 'b> H2ServerConnection<'c, 'b> {
             return Ok(self.pending.remaining);
         }
         if self.pending.kind == PendingWriteKind::Settings {
-            let mut parameters = [SettingsParameter { id: 0, value: 0 }; MAX_SETTINGS];
+            let mut parameters = [SettingsParameter { id: 0, value: 0 }; MAX_PENDING_SETTINGS];
             for (destination, stored) in parameters
                 .iter_mut()
                 .zip(self.pending.settings.iter())

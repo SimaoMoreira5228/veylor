@@ -610,13 +610,13 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     H2DataOutcome::OverDeclared => {
                         let slot = ctx.base.slot + ((stream >> 1) as usize % STREAM_SLOTS) as u32;
                         ctx.host.unpark_closed(ctx.base.worker_id, slot);
-                        self.deny(stream, ErrorCode::FlowControlError, false);
+                        self.deny(stream, ErrorCode::ProtocolError, false);
                     }
                     H2DataOutcome::Gone => self.deny(stream, ErrorCode::RefusedStream, false),
                 }
             }
             StreamEvent::PeerReset => {}
-            StreamEvent::PeerGoAway => self.outcome.closed = true,
+            StreamEvent::PeerGoAway => {}
         }
     }
 

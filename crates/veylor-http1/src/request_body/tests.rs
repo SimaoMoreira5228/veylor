@@ -502,7 +502,6 @@ fn admission_verdicts_match_shared_continue_policy() {
     assert!(!admission_needs_interim(verdict));
     assert!(admission_rejects_body(verdict));
 
-    
     let chunked =
         b"POST /upload HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
     let (head, headers) = parse_request(chunked);
@@ -517,10 +516,6 @@ fn admission_verdicts_match_shared_continue_policy() {
     let verdict = decoder.admit_body(true).unwrap();
     assert_eq!(verdict, RequestBodyAdmission::SendContinue);
     assert!(admission_needs_interim(verdict));
-
-    
-
-
 
     let plain = b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n";
     let (head, headers) = parse_request(plain);

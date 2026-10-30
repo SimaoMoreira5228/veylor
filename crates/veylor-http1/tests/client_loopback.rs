@@ -7,8 +7,8 @@ use veylor_http1::{
     BodyDriver, BodyEvent, BodyFraming as RequestBodyFraming, BodyLimits, BodyResult,
     ClientReadResult, ClientRequestDriver, ClientResponseDriver, ClientResponseEvent,
     ConnectionHeader, Field, HeadDriver, HeadResult, Header, IoCompletion, IoOperation, IoResult,
-    Limits, Request, RequestBodyAdmission, ResponseFraming, ResponseRequestMethod, ResponseToWrite,
-    ResponseWriteDriver, WriteState,
+    Limits, Request, RequestBodyAdmission, RequestVersion, ResponseFraming, ResponseRequestMethod,
+    ResponseToWrite, ResponseWriteDriver, WriteState,
 };
 
 #[test]
@@ -30,6 +30,7 @@ fn sends_two_requests_and_reads_two_responses_on_one_connection() {
         {
             let response = ResponseToWrite {
                 request_method: b"POST",
+                request_version: RequestVersion::Http11,
                 requested_upgrade: b"",
                 status: 200,
                 reason: b"OK",
@@ -48,6 +49,7 @@ fn sends_two_requests_and_reads_two_responses_on_one_connection() {
         read_request(&mut stream, 2, &mut operation_id, b"GET", b"/two", b"");
         let response = ResponseToWrite {
             request_method: b"GET",
+            request_version: RequestVersion::Http11,
             requested_upgrade: b"",
             status: 204,
             reason: b"No Content",

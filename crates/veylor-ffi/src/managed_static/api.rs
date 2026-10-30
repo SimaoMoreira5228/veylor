@@ -1,5 +1,4 @@
 use std::boxed::Box;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::slice;
 
@@ -9,12 +8,6 @@ use super::VYL_MANAGED_STATIC_ABI_VERSION;
 use super::{ManagedStaticState, ReadyServer, VylManagedStaticCloseCounts, VylManagedStaticConfig};
 use super::{VylManagedStaticServer, server_error_to_result};
 use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_new(
@@ -50,11 +43,11 @@ unsafe fn create_server(
         }
         unsafe { *config }
     };
-    let (server_config, port) = match owned.to_server_config() {
+    let (server_config, addr) = match owned.to_server_config() {
         Ok(config) => config,
         Err(error) => return error,
     };
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let worker_count = server_config.worker_count;
     let server = match Server::bind(addr, server_config.clone()) {
         Ok(server) => server,
         Err(error) => return server_error_to_result(error),
@@ -65,7 +58,7 @@ unsafe fn create_server(
             config: server_config,
             addr,
             h2c_port: None,
-            worker_count: 1,
+            worker_count,
             tls: None,
             ops: Vec::new(),
         })),
@@ -75,11 +68,6 @@ unsafe fn create_server(
     }
     VylResult::Ok
 }
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_destroy(
@@ -102,13 +90,6 @@ unsafe fn destroy_server(server: *mut VylManagedStaticServer) -> VylResult {
     VylResult::Ok
 }
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_enable_h2c(
     server: *mut VylManagedStaticServer,
@@ -130,12 +111,6 @@ unsafe fn enable_h2c(server: *mut VylManagedStaticServer, port: u16) -> VylResul
 }
 
 #[unsafe(no_mangle)]
-
-
-
-
-
-
 pub unsafe extern "C" fn vyl_managed_static_enable_tls(
     server: *mut VylManagedStaticServer,
     cert_ptr: *const u8,
@@ -182,12 +157,6 @@ unsafe fn enable_tls(
     VylResult::Ok
 }
 
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_rotate_tls(
     server: *mut VylManagedStaticServer,
@@ -230,13 +199,6 @@ unsafe fn rotate_tls(
     }
 }
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_set_worker_count(
     server: *mut VylManagedStaticServer,
@@ -259,10 +221,6 @@ unsafe fn set_worker_count(server: *mut VylManagedStaticServer, count: usize) ->
     ready.worker_count = count;
     VylResult::Ok
 }
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_start(
@@ -329,20 +287,12 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
     }
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_stop_accepting(
     server: *mut VylManagedStaticServer,
 ) -> VylResult {
     catch_ffi(|| unsafe { stop_server(server, false) })
 }
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_stop_force(
@@ -366,13 +316,6 @@ unsafe fn stop_server(server: *mut VylManagedStaticServer, force: bool) -> VylRe
     }
     VylResult::Ok
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_join(
@@ -412,11 +355,6 @@ unsafe fn join_server(
     }
 }
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_local_addr(
     server: *mut VylManagedStaticServer,
@@ -446,14 +384,6 @@ unsafe fn local_addr(server: *mut VylManagedStaticServer, out_port: *mut u16) ->
     }
     VylResult::Ok
 }
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_h2c_addr(

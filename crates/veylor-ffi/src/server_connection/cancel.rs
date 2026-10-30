@@ -2,11 +2,6 @@ use crate::abi::{VylResult, catch_ffi};
 
 use super::api::VylServerConnection;
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_cancel(
     connection: *mut VylServerConnection,

@@ -42,6 +42,22 @@ pub struct RequestHead {
     pub connection: ConnectionOptions,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestVersion {
+    Http10,
+    Http11,
+}
+
+impl RequestVersion {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            b"HTTP/1.0" => Some(Self::Http10),
+            b"HTTP/1.1" => Some(Self::Http11),
+            _ => None,
+        }
+    }
+}
+
 impl RequestHead {
     pub fn method(self, input: &[u8]) -> Option<&[u8]> {
         slice_at(input, self.method)
@@ -53,6 +69,10 @@ impl RequestHead {
 
     pub fn version(self, input: &[u8]) -> Option<&[u8]> {
         slice_at(input, self.version)
+    }
+
+    pub fn protocol_version(self, input: &[u8]) -> Option<RequestVersion> {
+        RequestVersion::from_bytes(self.version(input)?)
     }
 }
 

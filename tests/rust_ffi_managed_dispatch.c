@@ -15,7 +15,10 @@
 _Static_assert(sizeof(vyl_managed_static_token) == 32, "token layout must match Rust");
 _Static_assert(sizeof(vyl_managed_static_event) == 80, "event layout must match Rust");
 _Static_assert(sizeof(vyl_managed_static_poll_report) == 32, "report layout must match Rust");
-_Static_assert(sizeof(vyl_managed_static_trailer_report) == 40, "trailer report layout must match Rust");
+_Static_assert(
+    sizeof(vyl_managed_static_trailer_report) == 40,
+    "trailer report layout must match Rust"
+);
 _Static_assert(VYL_HTTP1_WOULD_BLOCK == 7, "would-block code must match Rust");
 _Static_assert(VYL_HTTP1_STALE_TOKEN == 12, "stale code must match Rust");
 _Static_assert(VYL_HTTP1_DUPLICATE == 13, "duplicate code must match Rust");
@@ -48,7 +51,8 @@ static size_t read_to_end(int fd, char* out, size_t capacity) {
     return total;
 }
 
-static void wait_stream_writable(vyl_managed_static_server* server, vyl_managed_static_token token) {
+static void
+wait_stream_writable(vyl_managed_static_server* server, vyl_managed_static_token token) {
     const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
     for (int i = 0; i < 500; i++) {
         uint32_t writable = 0;
@@ -101,9 +105,9 @@ static void assert_h1_date_shape(const char* response) {
     for (;;) {
         const char* next = strstr(line, "\r\n");
         size_t len = next != NULL ? (size_t)(next - line) : strlen(line);
-        if (len >= 5 && (line[0] == 'D' || line[0] == 'd') &&
-            (line[1] == 'A' || line[1] == 'a') && (line[2] == 'T' || line[2] == 't') &&
-            (line[3] == 'E' || line[3] == 'e') && line[4] == ':') {
+        if (len >= 5 && (line[0] == 'D' || line[0] == 'd') && (line[1] == 'A' || line[1] == 'a') &&
+            (line[2] == 'T' || line[2] == 't') && (line[3] == 'E' || line[3] == 'e') &&
+            line[4] == ':') {
             count++;
         }
         if (next == NULL || next >= head_end) {
@@ -114,7 +118,6 @@ static void assert_h1_date_shape(const char* response) {
     assert(count == 1);
 }
 
- 
 static vyl_h2_field_to_encode h2_text_field(const char* name, const char* value) {
     vyl_h2_field_to_encode field = {0};
     field.name.data = (const uint8_t*)name;
@@ -156,7 +159,7 @@ static size_t h2_read_frame(
     *out_flags = frame[4];
     *out_stream = (((uint32_t)frame[5] << 24) | ((uint32_t)frame[6] << 16) |
                    ((uint32_t)frame[7] << 8) | (uint32_t)frame[8]) &
-                  0x7FFFFFFFu;
+        0x7FFFFFFFu;
     if (length > 0) {
         recv_exact(fd, frame + 9, length);
     }
@@ -179,8 +182,22 @@ static int h2_feed_client(
     size_t data_required = 0;
     uint32_t connection_error = 0;
     int rc = vyl_h2_client_poll_feed(
-        client, frame, frame_length, &consumed, actions, 16, fields, 64, data, 4096, out_actions,
-        out_fields, &actions_required, &fields_required, &data_required, &connection_error
+        client,
+        frame,
+        frame_length,
+        &consumed,
+        actions,
+        16,
+        fields,
+        64,
+        data,
+        4096,
+        out_actions,
+        out_fields,
+        &actions_required,
+        &fields_required,
+        &data_required,
+        &connection_error
     );
     assert(consumed == frame_length);
     assert(rc == VYL_HTTP1_OK || rc == VYL_HTTP1_NEED_MORE);
@@ -223,7 +240,8 @@ int main(void) {
     static const uint8_t first_chunk[] = "hi";
     static const uint8_t second_chunk[] = "yo";
     static const char request[] = "GET /m HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
-    static const char stream_request[] = "GET /s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    static const char stream_request[] =
+        "GET /s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
     static const char cancel_request[] = "GET /c HTTP/1.1\r\nHost: test\r\n\r\n";
     vyl_managed_static_config config = {0};
     vyl_managed_static_server* server = NULL;
@@ -341,7 +359,15 @@ int main(void) {
     assert(send(fd, request, sizeof(request) - 1, 0) == (ssize_t)(sizeof(request) - 1));
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -388,17 +414,25 @@ int main(void) {
     };
     assert(
         vyl_managed_static_host_respond_with_headers(
-            NULL, token, 200,
+            NULL,
+            token,
+            200,
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-            hdr_names, hdr_values, 2,
+            hdr_names,
+            hdr_values,
+            2,
             (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
         ) == VYL_HTTP1_INVALID_ARGUMENT
     );
     assert(
         vyl_managed_static_host_respond_with_headers(
-            server, token, 200,
+            server,
+            token,
+            200,
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-            NULL, hdr_values, 2,
+            NULL,
+            hdr_values,
+            2,
             (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
         ) == VYL_HTTP1_INVALID_ARGUMENT
     );
@@ -411,32 +445,48 @@ int main(void) {
         }
         assert(
             vyl_managed_static_host_respond_with_headers(
-                server, token, 200,
+                server,
+                token,
+                200,
                 (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-                nine_names, nine_values, 9,
+                nine_names,
+                nine_values,
+                9,
                 (vyl_http1_bytes){.data = reply, .length = sizeof(reply) - 1}
             ) == VYL_HTTP1_INVALID_ARGUMENT
         );
     }
     assert(
         vyl_managed_static_host_begin_stream_with_headers(
-            NULL, token, 200,
+            NULL,
+            token,
+            200,
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-            hdr_names, hdr_values, 2
+            hdr_names,
+            hdr_values,
+            2
         ) == VYL_HTTP1_INVALID_ARGUMENT
     );
     assert(
         vyl_managed_static_host_begin_stream_with_headers(
-            server, token, 200,
+            server,
+            token,
+            200,
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-            NULL, hdr_values, 2
+            NULL,
+            hdr_values,
+            2
         ) == VYL_HTTP1_INVALID_ARGUMENT
     );
     assert(
         vyl_managed_static_host_begin_stream_with_headers(
-            server, token, 200,
+            server,
+            token,
+            200,
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-            hdr_names, NULL, 2
+            hdr_names,
+            NULL,
+            2
         ) == VYL_HTTP1_INVALID_ARGUMENT
     );
     {
@@ -444,13 +494,18 @@ int main(void) {
         static vyl_http1_bytes begin_nine_values[9];
         for (size_t i = 0; i < 9; i++) {
             begin_nine_names[i] = (vyl_http1_bytes){.data = x_name, .length = sizeof(x_name) - 1};
-            begin_nine_values[i] = (vyl_http1_bytes){.data = x_value, .length = sizeof(x_value) - 1};
+            begin_nine_values[i] =
+                (vyl_http1_bytes){.data = x_value, .length = sizeof(x_value) - 1};
         }
         assert(
             vyl_managed_static_host_begin_stream_with_headers(
-                server, token, 200,
+                server,
+                token,
+                200,
                 (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-                begin_nine_names, begin_nine_values, 9
+                begin_nine_names,
+                begin_nine_values,
+                9
             ) == VYL_HTTP1_INVALID_ARGUMENT
         );
     }
@@ -458,7 +513,15 @@ int main(void) {
     assert(send(fd, request, sizeof(request) - 1, 0) == (ssize_t)(sizeof(request) - 1));
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -484,11 +547,20 @@ int main(void) {
 
     fd = connect_loopback(port);
     assert(
-        send(fd, cancel_request, sizeof(cancel_request) - 1, 0) == (ssize_t)(sizeof(cancel_request) - 1)
+        send(fd, cancel_request, sizeof(cancel_request) - 1, 0) ==
+        (ssize_t)(sizeof(cancel_request) - 1)
     );
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -510,7 +582,14 @@ int main(void) {
     for (int i = 0; i < 500 && (!have_request || body_ready != sizeof(hello_body) - 1); i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -561,7 +640,12 @@ int main(void) {
     vyl_managed_static_trailer_report trailer_report = {0};
     assert(
         vyl_managed_static_host_pull_trailers(
-            server, token, short_names, sizeof(short_names), short_values, sizeof(short_values),
+            server,
+            token,
+            short_names,
+            sizeof(short_names),
+            short_values,
+            sizeof(short_values),
             &trailer_report
         ) == VYL_HTTP1_OK
     );
@@ -572,7 +656,13 @@ int main(void) {
     uint8_t values[2] = {0};
     assert(
         vyl_managed_static_host_pull_trailers(
-            server, token, names, sizeof(names), values, sizeof(values), &trailer_report
+            server,
+            token,
+            names,
+            sizeof(names),
+            values,
+            sizeof(values),
+            &trailer_report
         ) == VYL_HTTP1_OK
     );
     assert(trailer_report.fields == 1);
@@ -601,7 +691,15 @@ int main(void) {
     );
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -660,7 +758,15 @@ int main(void) {
     );
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -700,7 +806,14 @@ int main(void) {
     for (int i = 0; i < 500 && !have_writable; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -744,7 +857,15 @@ int main(void) {
     );
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -778,7 +899,10 @@ int main(void) {
     };
     assert(
         vyl_managed_static_host_end_stream_with_trailers(
-            server, token, resp_trailers, sizeof(resp_trailers) / sizeof(resp_trailers[0])
+            server,
+            token,
+            resp_trailers,
+            sizeof(resp_trailers) / sizeof(resp_trailers[0])
         ) == VYL_HTTP1_OK
     );
     read_to_end(fd, response, sizeof(response));
@@ -789,7 +913,10 @@ int main(void) {
     assert(strstr(response, "0\r\nx-checksum: abc\r\nx-tag: v1\r\n\r\n") != NULL);
     assert(
         vyl_managed_static_host_end_stream_with_trailers(
-            server, token, resp_trailers, sizeof(resp_trailers) / sizeof(resp_trailers[0])
+            server,
+            token,
+            resp_trailers,
+            sizeof(resp_trailers) / sizeof(resp_trailers[0])
         ) == VYL_HTTP1_GONE
     );
 
@@ -798,7 +925,10 @@ int main(void) {
             "GET /u HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n";
         int mfd = connect_loopback(port);
         const struct timeval mismatch_timeout = {.tv_sec = 5, .tv_usec = 0};
-        assert(setsockopt(mfd, SOL_SOCKET, SO_RCVTIMEO, &mismatch_timeout, sizeof(mismatch_timeout)) == 0);
+        assert(
+            setsockopt(mfd, SOL_SOCKET, SO_RCVTIMEO, &mismatch_timeout, sizeof(mismatch_timeout)) ==
+            0
+        );
         h2_send_all(mfd, (const uint8_t*)mismatch_request, sizeof(mismatch_request) - 1);
         read_to_end(mfd, response, sizeof(response));
         assert(close(mfd) == 0);
@@ -829,7 +959,15 @@ int main(void) {
         }
         assert(
             vyl_managed_static_poll_events(
-                server, 0, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+                server,
+                0,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
+                &report
             ) == VYL_HTTP1_OK
         );
         assert(report.copied == 0);
@@ -839,13 +977,21 @@ int main(void) {
         static char oversized[5120] = {0};
         int ofd = connect_loopback(port);
         const struct timeval oversized_timeout = {.tv_sec = 5, .tv_usec = 0};
-        assert(setsockopt(ofd, SOL_SOCKET, SO_RCVTIMEO, &oversized_timeout, sizeof(oversized_timeout)) == 0);
-        size_t used = (size_t)snprintf(oversized, sizeof(oversized), "GET /hello HTTP/1.1\r\nHost: test\r\n");
+        assert(
+            setsockopt(
+                ofd,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &oversized_timeout,
+                sizeof(oversized_timeout)
+            ) == 0
+        );
+        size_t used =
+            (size_t)snprintf(oversized, sizeof(oversized), "GET /hello HTTP/1.1\r\nHost: test\r\n");
         assert(used > 0 && used < sizeof(oversized));
         for (int i = 0; i < 120; i++) {
-            int n = snprintf(
-                oversized + used, sizeof(oversized) - used, "X-Pad-%03d: abcdefgh\r\n", i
-            );
+            int n =
+                snprintf(oversized + used, sizeof(oversized) - used, "X-Pad-%03d: abcdefgh\r\n", i);
             assert(n > 0 && used + (size_t)n < sizeof(oversized));
             used += (size_t)n;
         }
@@ -912,7 +1058,11 @@ int main(void) {
             if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_SETTINGS_ACK_REQUIRED) {
                 assert(
                     vyl_h2_client_send_settings_ack(
-                        h2, h2wire, sizeof(h2wire), &h2written, &h2required
+                        h2,
+                        h2wire,
+                        sizeof(h2wire),
+                        &h2written,
+                        &h2required
                     ) == VYL_HTTP1_OK
                 );
                 h2_send_all(h2fd, h2wire, h2written);
@@ -926,9 +1076,8 @@ int main(void) {
     for (int i = 0; i < 8 && !h2_settings_ack; i++) {
         size_t frame_length =
             h2_read_frame(h2fd, h2frame, sizeof(h2frame), &h2type, &h2flags, &h2stream);
-        int rc = h2_feed_client(
-            h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen
-        );
+        int rc =
+            h2_feed_client(h2, h2frame, frame_length, h2actions, h2fields, h2data, &h2got, &h2seen);
         if (h2type == 4 && (h2flags & 1u) != 0) {
             assert(rc == VYL_HTTP1_NEED_MORE);
             h2_settings_ack = 1;
@@ -946,8 +1095,15 @@ int main(void) {
     uint32_t h2stream_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2req, sizeof(h2req) / sizeof(h2req[0]), 0, h2wire, sizeof(h2wire), &h2written,
-            &h2stream_id, &h2required
+            h2,
+            h2req,
+            sizeof(h2req) / sizeof(h2req[0]),
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2stream_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2stream_id == 1);
@@ -955,7 +1111,15 @@ int main(void) {
     h2_ack_client(h2, h2written);
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -970,9 +1134,15 @@ int main(void) {
     uint32_t h2end = 0;
     assert(
         vyl_h2_client_send_data(
-            h2, 1,
+            h2,
+            1,
             (vyl_http1_bytes){.data = h2_post_body, .length = sizeof(h2_post_body) - 1},
-            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2consumed, &h2written, &h2end,
+            (uint32_t)VYL_H2_END_STREAM,
+            h2wire,
+            sizeof(h2wire),
+            &h2consumed,
+            &h2written,
+            &h2end,
             &h2required
         ) == VYL_HTTP1_OK
     );
@@ -984,7 +1154,14 @@ int main(void) {
     for (int i = 0; i < 500 && !h2_have_body; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1048,8 +1225,12 @@ int main(void) {
                 vyl_h2_response_class class = {0};
                 assert(
                     vyl_h2_client_classify_headers(
-                        h2, 1, h2actions[k].field_start, h2actions[k].field_count,
-                        h2actions[k].flags, &class
+                        h2,
+                        1,
+                        h2actions[k].field_start,
+                        h2actions[k].field_count,
+                        h2actions[k].flags,
+                        &class
                     ) == VYL_HTTP1_OK
                 );
                 assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
@@ -1060,14 +1241,19 @@ int main(void) {
                 assert(h2resp_len + h2actions[k].data_length <= sizeof(h2resp));
                 assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
                 memcpy(
-                    h2resp + h2resp_len, h2data + h2actions[k].data_offset,
+                    h2resp + h2resp_len,
+                    h2data + h2actions[k].data_offset,
                     h2actions[k].data_length
                 );
                 h2resp_len += h2actions[k].data_length;
                 uint32_t phase = 0;
                 assert(
                     vyl_h2_client_account_data(
-                        h2, 1, h2actions[k].data_length, h2actions[k].flags, &phase
+                        h2,
+                        1,
+                        h2actions[k].data_length,
+                        h2actions[k].flags,
+                        &phase
                     ) == VYL_HTTP1_OK
                 );
                 if ((h2actions[k].flags & 1u) != 0) {
@@ -1091,8 +1277,15 @@ int main(void) {
     uint32_t h2multi_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2req, sizeof(h2req) / sizeof(h2req[0]), 0, h2wire, sizeof(h2wire), &h2written,
-            &h2multi_id, &h2required
+            h2,
+            h2req,
+            sizeof(h2req) / sizeof(h2req[0]),
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2multi_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2multi_id == 3);
@@ -1100,7 +1293,15 @@ int main(void) {
     h2_ack_client(h2, h2written);
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     int h2multi_request = 0;
@@ -1108,7 +1309,9 @@ int main(void) {
         if (events[k].kind == (uint32_t)VYL_MANAGED_STATIC_EVENT_REQUEST &&
             events[k].token.stream_id == 3) {
             assert(events[k].method_len == sizeof(post_method) - 1);
-            assert(memcmp(methods + events[k].method_offset, post_method, events[k].method_len) == 0);
+            assert(
+                memcmp(methods + events[k].method_offset, post_method, events[k].method_len) == 0
+            );
             assert(events[k].path_len == sizeof(u_path) - 1);
             assert(memcmp(paths + events[k].path_offset, u_path, events[k].path_len) == 0);
             token = events[k].token;
@@ -1118,9 +1321,16 @@ int main(void) {
     assert(h2multi_request == 1);
     assert(
         vyl_h2_client_send_data(
-            h2, 3,
-            (vyl_http1_bytes){.data = h2_first, .length = sizeof(h2_first) - 1}, 0, h2wire,
-            sizeof(h2wire), &h2consumed, &h2written, &h2end, &h2required
+            h2,
+            3,
+            (vyl_http1_bytes){.data = h2_first, .length = sizeof(h2_first) - 1},
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2consumed,
+            &h2written,
+            &h2end,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2consumed == sizeof(h2_first) - 1);
@@ -1131,7 +1341,14 @@ int main(void) {
     for (int i = 0; i < 500 && !h2_have_first; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1151,9 +1368,15 @@ int main(void) {
     assert(h2_have_first == 1);
     assert(
         vyl_h2_client_send_data(
-            h2, 3,
+            h2,
+            3,
             (vyl_http1_bytes){.data = h2_second, .length = sizeof(h2_second) - 1},
-            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2consumed, &h2written, &h2end,
+            (uint32_t)VYL_H2_END_STREAM,
+            h2wire,
+            sizeof(h2wire),
+            &h2consumed,
+            &h2written,
+            &h2end,
             &h2required
         ) == VYL_HTTP1_OK
     );
@@ -1165,7 +1388,14 @@ int main(void) {
     for (int i = 0; i < 500 && !h2_have_rest; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1227,8 +1457,12 @@ int main(void) {
                 vyl_h2_response_class class = {0};
                 assert(
                     vyl_h2_client_classify_headers(
-                        h2, 3, h2actions[k].field_start, h2actions[k].field_count,
-                        h2actions[k].flags, &class
+                        h2,
+                        3,
+                        h2actions[k].field_start,
+                        h2actions[k].field_count,
+                        h2actions[k].flags,
+                        &class
                     ) == VYL_HTTP1_OK
                 );
                 assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
@@ -1239,14 +1473,19 @@ int main(void) {
                 assert(h2resp_len + h2actions[k].data_length <= sizeof(h2resp));
                 assert(h2actions[k].data_offset + h2actions[k].data_length <= sizeof(h2data));
                 memcpy(
-                    h2resp + h2resp_len, h2data + h2actions[k].data_offset,
+                    h2resp + h2resp_len,
+                    h2data + h2actions[k].data_offset,
                     h2actions[k].data_length
                 );
                 h2resp_len += h2actions[k].data_length;
                 uint32_t phase = 0;
                 assert(
                     vyl_h2_client_account_data(
-                        h2, 3, h2actions[k].data_length, h2actions[k].flags, &phase
+                        h2,
+                        3,
+                        h2actions[k].data_length,
+                        h2actions[k].flags,
+                        &phase
                     ) == VYL_HTTP1_OK
                 );
                 if ((h2actions[k].flags & 1u) != 0) {
@@ -1275,8 +1514,15 @@ int main(void) {
     uint32_t h2s_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2get_s, sizeof(h2get_s) / sizeof(h2get_s[0]), (uint32_t)VYL_H2_END_STREAM,
-            h2wire, sizeof(h2wire), &h2written, &h2s_id, &h2required
+            h2,
+            h2get_s,
+            sizeof(h2get_s) / sizeof(h2get_s[0]),
+            (uint32_t)VYL_H2_END_STREAM,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2s_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2s_id == 5);
@@ -1284,7 +1530,15 @@ int main(void) {
     h2_ack_client(h2, h2written);
     assert(
         vyl_managed_static_poll_events(
-            server, 5000000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths), &report
+            server,
+            5000000000u,
+            events,
+            8,
+            methods,
+            sizeof(methods),
+            paths,
+            sizeof(paths),
+            &report
         ) == VYL_HTTP1_OK
     );
     assert(report.copied == 1);
@@ -1317,7 +1571,10 @@ int main(void) {
     };
     assert(
         vyl_managed_static_host_end_stream_with_trailers(
-            server, token, h2_resp_trailers, sizeof(h2_resp_trailers) / sizeof(h2_resp_trailers[0])
+            server,
+            token,
+            h2_resp_trailers,
+            sizeof(h2_resp_trailers) / sizeof(h2_resp_trailers[0])
         ) == VYL_HTTP1_OK
     );
     size_t h2s_len = 0;
@@ -1335,8 +1592,12 @@ int main(void) {
                 vyl_h2_response_class class = {0};
                 assert(
                     vyl_h2_client_classify_headers(
-                        h2, 5, h2actions[k].field_start, h2actions[k].field_count,
-                        h2actions[k].flags, &class
+                        h2,
+                        5,
+                        h2actions[k].field_start,
+                        h2actions[k].field_count,
+                        h2actions[k].flags,
+                        &class
                     ) == VYL_HTTP1_OK
                 );
                 if (class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL) {
@@ -1354,14 +1615,16 @@ int main(void) {
                     assert(first.name_length == sizeof(checksum_name) - 1);
                     assert(
                         memcmp(
-                            h2data + first.name_offset, checksum_name,
+                            h2data + first.name_offset,
+                            checksum_name,
                             sizeof(checksum_name) - 1
                         ) == 0
                     );
                     assert(first.value_length == sizeof(checksum_value) - 1);
                     assert(
                         memcmp(
-                            h2data + first.value_offset, checksum_value,
+                            h2data + first.value_offset,
+                            checksum_value,
                             sizeof(checksum_value) - 1
                         ) == 0
                     );
@@ -1375,10 +1638,8 @@ int main(void) {
                     );
                     h2s_trailers = 1;
                 }
-            } else if (
-                h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
-                h2actions[k].stream_id == 5
-            ) {
+            } else if (h2actions[k].kind == (uint32_t)VYL_H2_ACTION_DATA &&
+                       h2actions[k].stream_id == 5) {
                 assert(0 && "zero-body trailer stream must send no DATA");
             }
         }
@@ -1390,7 +1651,10 @@ int main(void) {
     assert(h2s_len == 0);
     assert(
         vyl_managed_static_host_end_stream_with_trailers(
-            server, token, h2_resp_trailers, sizeof(h2_resp_trailers) / sizeof(h2_resp_trailers[0])
+            server,
+            token,
+            h2_resp_trailers,
+            sizeof(h2_resp_trailers) / sizeof(h2_resp_trailers[0])
         ) == VYL_HTTP1_GONE
     );
 
@@ -1402,10 +1666,27 @@ int main(void) {
     static const uint8_t h2_allow_body[] = "data";
     static const uint8_t h2_allow_done[] = "done";
     static const uint8_t h2_evil_block[] = {
-        0x00, 0x06, 'x', '-', 'e', 'v', 'i', 'l', 0x01, '0',
+        0x00,
+        0x06,
+        'x',
+        '-',
+        'e',
+        'v',
+        'i',
+        'l',
+        0x01,
+        '0',
     };
     static const uint8_t h2_tag1_block[] = {
-        0x00, 0x05, 'x', '-', 't', 'a', 'g', 0x01, '1',
+        0x00,
+        0x05,
+        'x',
+        '-',
+        't',
+        'a',
+        'g',
+        0x01,
+        '1',
     };
     const vyl_h2_field_to_encode h2allow[] = {
         h2_text_field(":method", "POST"),
@@ -1417,8 +1698,15 @@ int main(void) {
     uint32_t h2a_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2allow, sizeof(h2allow) / sizeof(h2allow[0]), 0, h2wire, sizeof(h2wire),
-            &h2written, &h2a_id, &h2required
+            h2,
+            h2allow,
+            sizeof(h2allow) / sizeof(h2allow[0]),
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2a_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2a_id == 7);
@@ -1428,7 +1716,14 @@ int main(void) {
     for (int i = 0; i < 50 && !h2a_park; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1450,9 +1745,15 @@ int main(void) {
     assert(h2a_park == 1);
     assert(
         vyl_h2_client_send_data(
-            h2, 7,
+            h2,
+            7,
             (vyl_http1_bytes){.data = h2_allow_body, .length = sizeof(h2_allow_body) - 1},
-            (uint32_t)VYL_H2_END_STREAM, h2wire, sizeof(h2wire), &h2consumed, &h2written, &h2end,
+            (uint32_t)VYL_H2_END_STREAM,
+            h2wire,
+            sizeof(h2wire),
+            &h2consumed,
+            &h2written,
+            &h2end,
             &h2required
         ) == VYL_HTTP1_OK
     );
@@ -1463,7 +1764,14 @@ int main(void) {
     for (int i = 0; i < 500 && !h2a_body; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1523,8 +1831,12 @@ int main(void) {
                 vyl_h2_response_class class = {0};
                 assert(
                     vyl_h2_client_classify_headers(
-                        h2, 7, h2actions[k].field_start, h2actions[k].field_count,
-                        h2actions[k].flags, &class
+                        h2,
+                        7,
+                        h2actions[k].field_start,
+                        h2actions[k].field_count,
+                        h2actions[k].flags,
+                        &class
                     ) == VYL_HTTP1_OK
                 );
                 assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
@@ -1534,14 +1846,19 @@ int main(void) {
                        h2actions[k].stream_id == 7) {
                 assert(h2resp_len + h2actions[k].data_length <= sizeof(h2resp));
                 memcpy(
-                    h2resp + h2resp_len, h2data + h2actions[k].data_offset,
+                    h2resp + h2resp_len,
+                    h2data + h2actions[k].data_offset,
                     h2actions[k].data_length
                 );
                 h2resp_len += h2actions[k].data_length;
                 uint32_t phase = 0;
                 assert(
                     vyl_h2_client_account_data(
-                        h2, 7, h2actions[k].data_length, h2actions[k].flags, &phase
+                        h2,
+                        7,
+                        h2actions[k].data_length,
+                        h2actions[k].flags,
+                        &phase
                     ) == VYL_HTTP1_OK
                 );
                 if ((h2actions[k].flags & 1u) != 0) {
@@ -1560,8 +1877,15 @@ int main(void) {
     uint32_t h2evil_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2allow, sizeof(h2allow) / sizeof(h2allow[0]), 0, h2wire, sizeof(h2wire),
-            &h2written, &h2evil_id, &h2required
+            h2,
+            h2allow,
+            sizeof(h2allow) / sizeof(h2allow[0]),
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2evil_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2evil_id == 9);
@@ -1571,7 +1895,14 @@ int main(void) {
     for (int i = 0; i < 50 && !h2evil_park; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1585,9 +1916,16 @@ int main(void) {
     assert(h2evil_park == 1);
     assert(
         vyl_h2_client_send_data(
-            h2, 9,
-            (vyl_http1_bytes){.data = h2_allow_body, .length = sizeof(h2_allow_body) - 1}, 0,
-            h2wire, sizeof(h2wire), &h2consumed, &h2written, &h2end, &h2required
+            h2,
+            9,
+            (vyl_http1_bytes){.data = h2_allow_body, .length = sizeof(h2_allow_body) - 1},
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2consumed,
+            &h2written,
+            &h2end,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2consumed == sizeof(h2_allow_body) - 1);
@@ -1613,8 +1951,15 @@ int main(void) {
     uint32_t h2tag_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2allow, sizeof(h2allow) / sizeof(h2allow[0]), 0, h2wire, sizeof(h2wire),
-            &h2written, &h2tag_id, &h2required
+            h2,
+            h2allow,
+            sizeof(h2allow) / sizeof(h2allow[0]),
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2tag_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2tag_id == 11);
@@ -1624,7 +1969,14 @@ int main(void) {
     for (int i = 0; i < 50 && !h2tag_park; i++) {
         assert(
             vyl_managed_static_poll_events(
-                server, 100000000u, events, 8, methods, sizeof(methods), paths, sizeof(paths),
+                server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
                 &report
             ) == VYL_HTTP1_OK
         );
@@ -1639,9 +1991,16 @@ int main(void) {
     assert(h2tag_park == 1);
     assert(
         vyl_h2_client_send_data(
-            h2, 11,
-            (vyl_http1_bytes){.data = h2_allow_body, .length = sizeof(h2_allow_body) - 1}, 0,
-            h2wire, sizeof(h2wire), &h2consumed, &h2written, &h2end, &h2required
+            h2,
+            11,
+            (vyl_http1_bytes){.data = h2_allow_body, .length = sizeof(h2_allow_body) - 1},
+            0,
+            h2wire,
+            sizeof(h2wire),
+            &h2consumed,
+            &h2written,
+            &h2end,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2consumed == sizeof(h2_allow_body) - 1);
@@ -1676,7 +2035,13 @@ int main(void) {
         uint8_t names[1] = {0};
         uint8_t values[1] = {0};
         int rc = vyl_managed_static_host_pull_trailers(
-            server, token, names, sizeof(names), values, sizeof(values), &h2tag_report
+            server,
+            token,
+            names,
+            sizeof(names),
+            values,
+            sizeof(values),
+            &h2tag_report
         );
         if (rc == VYL_HTTP1_OK) {
             assert(h2tag_report.fields == 1);
@@ -1693,7 +2058,12 @@ int main(void) {
     uint8_t h2tag_values[1] = {0};
     assert(
         vyl_managed_static_host_pull_trailers(
-            server, token, h2tag_names, sizeof(h2tag_names), h2tag_values, sizeof(h2tag_values),
+            server,
+            token,
+            h2tag_names,
+            sizeof(h2tag_names),
+            h2tag_values,
+            sizeof(h2tag_values),
             &h2tag_report
         ) == VYL_HTTP1_OK
     );
@@ -1726,8 +2096,12 @@ int main(void) {
                 vyl_h2_response_class class = {0};
                 assert(
                     vyl_h2_client_classify_headers(
-                        h2, 11, h2actions[k].field_start, h2actions[k].field_count,
-                        h2actions[k].flags, &class
+                        h2,
+                        11,
+                        h2actions[k].field_start,
+                        h2actions[k].field_count,
+                        h2actions[k].flags,
+                        &class
                     ) == VYL_HTTP1_OK
                 );
                 assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
@@ -1737,14 +2111,19 @@ int main(void) {
                        h2actions[k].stream_id == 11) {
                 assert(h2resp_len + h2actions[k].data_length <= sizeof(h2resp));
                 memcpy(
-                    h2resp + h2resp_len, h2data + h2actions[k].data_offset,
+                    h2resp + h2resp_len,
+                    h2data + h2actions[k].data_offset,
                     h2actions[k].data_length
                 );
                 h2resp_len += h2actions[k].data_length;
                 uint32_t phase = 0;
                 assert(
                     vyl_h2_client_account_data(
-                        h2, 11, h2actions[k].data_length, h2actions[k].flags, &phase
+                        h2,
+                        11,
+                        h2actions[k].data_length,
+                        h2actions[k].flags,
+                        &phase
                     ) == VYL_HTTP1_OK
                 );
                 if ((h2actions[k].flags & 1u) != 0) {
@@ -1769,8 +2148,15 @@ int main(void) {
     uint32_t h2hello_id = 0;
     assert(
         vyl_h2_client_start_request(
-            h2, h2hello, sizeof(h2hello) / sizeof(h2hello[0]), (uint32_t)VYL_H2_END_STREAM,
-            h2wire, sizeof(h2wire), &h2written, &h2hello_id, &h2required
+            h2,
+            h2hello,
+            sizeof(h2hello) / sizeof(h2hello[0]),
+            (uint32_t)VYL_H2_END_STREAM,
+            h2wire,
+            sizeof(h2wire),
+            &h2written,
+            &h2hello_id,
+            &h2required
         ) == VYL_HTTP1_OK
     );
     assert(h2hello_id == 13);
@@ -1791,8 +2177,12 @@ int main(void) {
                 vyl_h2_response_class class = {0};
                 assert(
                     vyl_h2_client_classify_headers(
-                        h2, 13, h2actions[k].field_start, h2actions[k].field_count,
-                        h2actions[k].flags, &class
+                        h2,
+                        13,
+                        h2actions[k].field_start,
+                        h2actions[k].field_count,
+                        h2actions[k].flags,
+                        &class
                     ) == VYL_HTTP1_OK
                 );
                 assert(class.kind == (uint32_t)VYL_H2_RESPONSE_FINAL);
@@ -1802,14 +2192,19 @@ int main(void) {
                        h2actions[k].stream_id == 13) {
                 assert(h2resp_len + h2actions[k].data_length <= sizeof(h2resp));
                 memcpy(
-                    h2resp + h2resp_len, h2data + h2actions[k].data_offset,
+                    h2resp + h2resp_len,
+                    h2data + h2actions[k].data_offset,
                     h2actions[k].data_length
                 );
                 h2resp_len += h2actions[k].data_length;
                 uint32_t phase = 0;
                 assert(
                     vyl_h2_client_account_data(
-                        h2, 13, h2actions[k].data_length, h2actions[k].flags, &phase
+                        h2,
+                        13,
+                        h2actions[k].data_length,
+                        h2actions[k].flags,
+                        &phase
                     ) == VYL_HTTP1_OK
                 );
                 if ((h2actions[k].flags & 1u) != 0) {
@@ -1835,13 +2230,18 @@ int main(void) {
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == 9
+            counts.shutdown ==
+        9
     );
     assert(
         vyl_managed_static_host_begin_stream_with_headers(
-            server, token, 200,
+            server,
+            token,
+            200,
             (vyl_http1_bytes){.data = reason, .length = sizeof(reason) - 1},
-            NULL, NULL, 0
+            NULL,
+            NULL,
+            0
         ) == VYL_HTTP1_BAD_STATE
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);

@@ -47,13 +47,6 @@ struct BodyReadArguments {
     out_trailers_required: *mut usize,
 }
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_admit_body(
     connection: *mut VylServerConnection,
@@ -190,10 +183,6 @@ unsafe fn admit_body(
     }
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_continue_sent(
     connection: *mut VylServerConnection,
@@ -212,13 +201,6 @@ unsafe fn mark_continue_sent(connection: *mut VylServerConnection) -> VylResult 
         Err(error) => map_error(error),
     }
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_read_body(

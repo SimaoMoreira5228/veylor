@@ -81,6 +81,7 @@ pub(crate) fn open_slot(
 pub(crate) fn abort_slot(meta: &mut H2Meta, stream_poller: &mut Poller, counts: &mut CloseCounts) {
     if let Some(mut stream) = meta.stream.take() {
         let _ = stream_poller.deregister(&mut stream);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     meta.occupied = false;
     meta.readable = false;
@@ -158,6 +159,7 @@ fn shut_slot(meta: &mut H2Meta, poller: &mut Poller, reason: ConnClose, turn: &m
     unpark_conn(turn.host, turn.worker_id, meta);
     if let Some(mut stream) = meta.stream.take() {
         let _ = poller.deregister(&mut stream);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     if meta.tls.take().is_some() {
         if let Some(acceptor) = turn.tls_acceptor.as_mut() {

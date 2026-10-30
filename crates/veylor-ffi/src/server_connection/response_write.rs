@@ -25,11 +25,6 @@ struct FinishBodyArguments {
     out_required: *mut usize,
 }
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_advance_response_write(
     connection: *mut VylServerConnection,
@@ -64,12 +59,6 @@ unsafe fn advance_response_write(
         Err(error) => map_error(error),
     }
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_encode_response_body(
@@ -149,12 +138,6 @@ unsafe fn encode_response_body(
         Err(error) => map_error(error),
     }
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_server_connection_finish_response_body(

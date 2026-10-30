@@ -18,8 +18,7 @@ pub enum HpackRepresentation {
     Incremental,
     WithoutIndexing,
     NeverIndexed,
-    
-    
+
     Default,
 }
 
@@ -46,20 +45,20 @@ impl HpackHeader {
 // secrets never enter the table in either direction.
 // Policy lives beside the representation enum it maps onto: one match site, one precedence rule.
 const NEVER_INDEXED_NAMES: [&[u8]; 4] = [
-    b"authorization",       
-    b"proxy-authorization", 
-    b"cookie", 
-    b"set-cookie", 
+    b"authorization",
+    b"proxy-authorization",
+    b"cookie",
+    b"set-cookie",
 ];
 const INCREMENTAL_NAMES: [&[u8]; 8] = [
-    b":method",          
-    b":scheme",          
-    b":authority",       
-    b":status",          
-    b"content-type",     
-    b"content-encoding", 
-    b"cache-control",    
-    b"server",           
+    b":method",
+    b":scheme",
+    b":authority",
+    b":status",
+    b"content-type",
+    b"content-encoding",
+    b"cache-control",
+    b"server",
 ];
 
 fn is_sensitive_name(name: &[u8]) -> bool {
@@ -73,10 +72,6 @@ fn is_stable_name(name: &[u8]) -> bool {
         .iter()
         .any(|known| name.eq_ignore_ascii_case(known))
 }
-
-
-
-
 
 pub fn default_literal_representation(name: &[u8]) -> HpackRepresentation {
     if is_sensitive_name(name) {
@@ -162,16 +157,19 @@ pub fn decode_header_block(
             continue;
         }
 
-        if header_count == headers_output.len() {
-            return Err(HpackError::HeaderCapacity {
-                required: header_count + 1,
-            });
-        }
         let (header, consumed) = decode_header_field(&input[offset..], table)?;
-        headers_output[header_count] = header;
+        if header_count < headers_output.len() {
+            headers_output[header_count] = header;
+        }
         header_count += 1;
         offset += consumed;
         saw_field = true;
+    }
+
+    if header_count > headers_output.len() {
+        return Err(HpackError::HeaderCapacity {
+            required: header_count,
+        });
     }
 
     Ok((header_count, offset))

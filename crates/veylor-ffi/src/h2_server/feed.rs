@@ -27,17 +27,6 @@ struct PollArguments {
     out_connection_error: *mut u32,
 }
 
-
-
-
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_poll_feed(
     handle: *mut VylH2Server,

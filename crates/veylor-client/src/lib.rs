@@ -32,49 +32,6 @@ pub enum ClientError {
     Cancelled,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 pub struct ClientConnection<'a> {
     method: RequestMethod,
     requested_upgrade: &'a [u8],

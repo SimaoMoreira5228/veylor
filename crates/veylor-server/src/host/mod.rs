@@ -12,6 +12,7 @@ use veylor_tls::{CertificateDer, PrivateKeyDer, TlsAcceptor, TlsError};
 mod request;
 mod signals;
 mod staged;
+mod tunnel;
 
 // NOTE: advisory signal staging (BodyAvailable/Writable stage, admission rollback, signal
 // retire) lives in signals.rs; re-exported here so existing crate::host:: paths resolve.
@@ -25,6 +26,7 @@ pub(crate) use signals::stage_body_available;
 // crate::host:: paths resolve.
 pub use staged::StagedWork;
 pub(crate) use staged::{ParkedEntry, StagedAction};
+pub(crate) use tunnel::HOST_TUNNEL_CAP;
 
 // NOTE: bounded per-worker event queues with whole-event dequeue and required-capacity
 // reporting, level-triggered wakeups, one Shutdown event per worker. Fixed-length bodies
@@ -93,6 +95,8 @@ pub enum HostEventKind {
     // connection/streams.rs plus the H2 re-arm loop in h2/serve.rs). Each event admits exactly
     // one write_stream continuation; the is_writable query stays authoritative on a full queue.
     Writable,
+    TunnelData,
+    TunnelClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -573,7 +577,13 @@ fn drain_pending(
         // NOTE: signal events carry advisory counts in the reused length fields and no bytes:
         // BodyAvailable reports staged-ready bytes with the end flag, Writable carries the
         // token alone. Both always fit; only Request/Shutdown touch the caller buffers.
-        let signal = matches!(kind, HostEventKind::BodyAvailable | HostEventKind::Writable);
+        let signal = matches!(
+            kind,
+            HostEventKind::BodyAvailable
+                | HostEventKind::Writable
+                | HostEventKind::TunnelData
+                | HostEventKind::TunnelClosed
+        );
         let (method_len, path_len) = if signal {
             (event.body_ready, usize::from(event.body_complete))
         } else {

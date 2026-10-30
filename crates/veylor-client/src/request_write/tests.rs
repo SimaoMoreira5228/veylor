@@ -223,7 +223,7 @@ fn fixed_body_completes_and_allows_reset_for_reuse() {
     // terminal bytes (unlike chunked's zero-chunk), so reset() can park the next exchange.
     let finished = conn.finish_request_body(&[], &mut output).unwrap();
     assert_eq!(finished.written, 0);
-    
+
     let mut headers = [crate::Header::default(); 8];
     let mut trailers = [crate::Header::default(); 8];
     let input = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";

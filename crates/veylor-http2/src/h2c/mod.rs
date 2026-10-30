@@ -64,6 +64,7 @@ pub struct H2cFeedResult {
 
 pub struct H2cServerHandshake<'borrow, 'streams, 'decoder, 'encoder> {
     server: H2ServerDriver<'borrow, 'streams, 'decoder, 'encoder>,
+    max_header_list_size: u32,
 }
 
 impl<'borrow, 'streams, 'decoder, 'encoder>
@@ -74,6 +75,7 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
         decoder: &'borrow mut HpackTable<'decoder>,
         encoder: &'borrow mut HpackTable<'encoder>,
         settings_ack_limits: &'borrow mut [u32],
+        max_header_list_size: u32,
     ) -> Result<Self, H2cError> {
         if streams.role() != H2Role::Server {
             return Err(H2cError::WrongRole);
@@ -83,7 +85,10 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
         }
         let server = H2ServerDriver::new(streams, decoder, encoder, settings_ack_limits)
             .map_err(|_| H2cError::WrongRole)?;
-        Ok(Self { server })
+        Ok(Self {
+            server,
+            max_header_list_size,
+        })
     }
 
     pub fn server_settings<'output>(
@@ -111,9 +116,8 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
         // NOTE: advertise the table-sized ceiling, never the configured default alone: the slot
         // slice is the single source (STREAM_SLOTS at the live server), so a peer-legitimate open
         // under RFC 9113 §5.1.2 always fits and excess fails per stream with REFUSED_STREAM.
-        // The header-list cap rides the same single source: the assembler only ever holds
-        // header_block_limit bytes, so an oversize block is the sender's violation and the
-        // server refuses its stream instead of tearing down the connection.
+        // NOTE: an oversized compressed block exceeds the assembly limit and closes the
+        // connection because its HPACK state cannot be kept synchronized without decoding it.
         let local = [
             SettingsParameter {
                 id: SETTINGS_HEADER_TABLE_SIZE,
@@ -129,7 +133,7 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
             },
             SettingsParameter {
                 id: SETTINGS_MAX_HEADER_LIST_SIZE,
-                value: self.server.driver().streams().header_block_limit(),
+                value: self.max_header_list_size,
             },
         ];
         writer.queue_settings(&local)?;

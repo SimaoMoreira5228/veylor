@@ -146,13 +146,6 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         })
     }
 
-    
-    
-    
-    
-    
-    
-    
     pub const fn flood_counters(&self) -> (u32, u32) {
         (self.inbound_resets, self.inbound_settings)
     }

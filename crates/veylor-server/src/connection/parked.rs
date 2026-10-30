@@ -1,6 +1,6 @@
 use veylor_http1::{
-    BodyDecoder, BodyLimits, ConnectionHeader, Field, Header, ResponseBody, ResponseFraming,
-    ResponseToWrite, connection_header_for_response, encode_response_head,
+    BodyDecoder, BodyLimits, ConnectionHeader, Field, RequestVersion, ResponseBody,
+    ResponseFraming, ResponseToWrite, connection_header_for_response, encode_response_head,
     response_body_allowed_for, response_permits_reuse,
 };
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
@@ -44,6 +44,7 @@ impl ConnState {
         let ConnPhase::Parked {
             method_len,
             method,
+            request_version,
             connection,
             body_total,
             body_received,
@@ -85,6 +86,7 @@ impl ConnState {
         }
         let response = ResponseToWrite {
             request_method,
+            request_version,
             requested_upgrade: b"",
             status,
             reason,
@@ -382,6 +384,9 @@ pub(crate) fn park_request(
         return ExchangeOutcome::Close(ConnClose::TransportError);
     };
     let method_len = head.method(input).map(|method| method.len()).unwrap_or(0);
+    let Some(request_version) = head.protocol_version(input) else {
+        return ExchangeOutcome::Close(ConnClose::TransportError);
+    };
     let target_len = head.target(input).map(|target| target.len()).unwrap_or(0);
     if method_len > HOST_MAX_METHOD_BYTES || method_len == 0 || target_len == 0 {
         return ExchangeOutcome::Close(ConnClose::TransportError);
@@ -410,9 +415,9 @@ pub(crate) fn park_request(
     let connection: ConnectionHeader =
         connection_header_for_response(head, input, 200, ResponseFraming::FixedLength, true, false);
     // NOTE: shared keep-alive verdict (see respond.rs keep_open NOTE): the park stores this
-    // provisional response-half verdict whole — not a bool — so complete_parked and the
-    // streaming Begin arm emit the same Connection header the static path would (including
-    // the HTTP/1.0 keep-alive echo). The body half rides body_total/body_received (or
+    // provisional response-half verdict whole — not a bool — so fixed responses match the
+    // static path. HTTP/1.1 streaming uses it too; HTTP/1.0 streaming must close because it
+    // uses close-delimited framing. The body half rides body_total/body_received (or
     // chunked_done) through the DrainingBody phase instead of the shared booleans.
     // NOTE: status-driven closes stay path-owned and deliberately split: a static 404/405/416
     // closes (response_close=true at the encode sites) while a managed host answering the
@@ -453,7 +458,7 @@ pub(crate) fn park_request(
             // Date and close exactly like the static path instead of closing silent;
             // other snapshot overflows (method) keep the silent transport close.
             if target_len > crate::host::HOST_MAX_PATH_BYTES {
-                super::exchange::send_uri_too_long(conn);
+                super::exchange::send_uri_too_long(conn, request_version);
                 return ExchangeOutcome::Responded;
             }
             return ExchangeOutcome::Close(ConnClose::TransportError);
@@ -496,7 +501,7 @@ pub(crate) fn park_request(
         return ExchangeOutcome::Close(ConnClose::TransportError);
     };
     conn.trailer_conn = connection_value(&headers[..], head, input).to_vec();
-    conn.trailer_slots = [Header::default(); TRAILER_SLOTS];
+    conn.trailer_slots = None;
     conn.trailer_staged = 0;
     let buffered = (conn.len - conn.head_len) as u64;
     let take = if chunked {
@@ -538,6 +543,7 @@ pub(crate) fn park_request(
         route_id,
         method_len: method_len as u8,
         method: snapshot,
+        request_version,
         connection,
         body_total,
         body_received,
@@ -554,9 +560,12 @@ fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) ->
         return ExchangeOutcome::Close(ConnClose::TransportError);
     };
     let method = head.method(&input[..len]).unwrap_or_default();
+    let request_version = head
+        .protocol_version(&input[..len])
+        .unwrap_or(RequestVersion::Http11);
     ConnState::materialize_output(&mut conn.output);
     let length = match conn.output.as_mut() {
-        Some(output) => respond_payload_too_large(&mut output[..], method).ok(),
+        Some(output) => respond_payload_too_large(&mut output[..], method, request_version).ok(),
         None => None,
     };
     match length {
@@ -598,6 +607,12 @@ impl ParkedEntry {
             request: None,
             trailers: None,
             trailer_allow: trailer_allow.to_vec(),
+            tunnel_in: Vec::new(),
+            tunnel_in_start: 0,
+            tunnel_out: Vec::new(),
+            tunnel_out_start: 0,
+            tunnel_eof: false,
+            tunnel_close: false,
         }
     }
 }

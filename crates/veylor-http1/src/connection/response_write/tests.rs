@@ -1,4 +1,5 @@
 use super::ResponseWriteDriver;
+use crate::RequestVersion;
 use crate::connection::{IoCompletion, IoOperation, IoResult, WriteResult, WriteState};
 use crate::request_write::Field;
 use crate::response_write::{
@@ -22,6 +23,7 @@ fn response(
 ) -> ResponseToWrite<'static> {
     ResponseToWrite {
         request_method,
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",

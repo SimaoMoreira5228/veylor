@@ -1,9 +1,9 @@
 // NOTE: response-assembly half of the static_routes seam: registry owns route storage and
 // validation (super), this module owns response encoding over already-matched routes.
 use veylor_http1::{
-    ALLOW_BYTES, ALLOW_METHODS, ConnectionHeader, Field, Header, RequestHead, ResponseFraming,
-    ResponseToWrite, TargetForm, connection_header_for_response, encode_response_head,
-    join_allow_value, response_permits_reuse,
+    ALLOW_BYTES, ALLOW_METHODS, ConnectionHeader, Field, Header, RequestHead, RequestVersion,
+    ResponseFraming, ResponseToWrite, TargetForm, connection_header_for_response,
+    encode_response_head, join_allow_value, response_permits_reuse,
 };
 use veylor_router::{RouteCapture, RouteError, RouteKind, RouteTable};
 
@@ -116,14 +116,19 @@ pub fn respond_to_head(
         Err(error) => return Err(RouteBuildError::from(error)),
     };
     let method = head.method(input).unwrap_or_default();
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     // NOTE: static routes cannot use trailers, so any chunked request rejects without reading;
     // oversized declarations reject the same way with no interim, both against the matched
     // route's cap (zero admits no body byte at all; u64::MAX is input-buffer bounded).
     if head.is_chunked {
-        return reject_payload(output, method);
+        return reject_payload(output, method, request_version);
     }
     let drain_total = match head.content_length {
-        Some(length) if length > cap => return reject_payload(output, method),
+        Some(length) if length > cap => {
+            return reject_payload(output, method, request_version);
+        }
         Some(length) => length,
         None => 0,
     };
@@ -186,6 +191,7 @@ pub fn respond_to_head(
     };
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status,
         reason,
@@ -246,11 +252,16 @@ fn respond_method_not_allowed(
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
     let method = head.method(input).unwrap_or_default();
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     if head.is_chunked {
-        return reject_payload(output, method);
+        return reject_payload(output, method, request_version);
     }
     let drain_total = match head.content_length {
-        Some(length) if length > MAX_STATIC_BODY_BYTES => return reject_payload(output, method),
+        Some(length) if length > MAX_STATIC_BODY_BYTES => {
+            return reject_payload(output, method, request_version);
+        }
         Some(length) => length,
         None => 0,
     };
@@ -286,6 +297,9 @@ pub(crate) fn encode_method_not_allowed(
     interim_len: usize,
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let request_version = head
+        .protocol_version(input)
+        .ok_or(RouteBuildError::Invalid)?;
     let connection =
         connection_header_for_response(head, input, 405, ResponseFraming::FixedLength, true, true);
     let mut now = [0u8; HTTP_DATE_BYTES];
@@ -302,6 +316,7 @@ pub(crate) fn encode_method_not_allowed(
     ];
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status: 405,
         reason: b"Method Not Allowed",
@@ -363,6 +378,9 @@ fn respond_server_options(
     ];
     let response = ResponseToWrite {
         request_method: method,
+        request_version: head
+            .protocol_version(input)
+            .ok_or(RouteBuildError::Invalid)?,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",
@@ -389,8 +407,9 @@ fn respond_server_options(
 pub(crate) fn reject_payload(
     output: &mut [u8],
     method: &[u8],
+    request_version: RequestVersion,
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
-    let length = respond_payload_too_large(output, method)?;
+    let length = respond_payload_too_large(output, method, request_version)?;
     Ok(EncodedStaticResponse {
         length,
         keep_open: false,
@@ -412,6 +431,7 @@ pub(crate) fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildErro
 pub fn respond_payload_too_large(
     output: &mut [u8],
     method: &[u8],
+    request_version: RequestVersion,
 ) -> Result<usize, RouteBuildError> {
     let mut now = [0u8; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now);
@@ -421,6 +441,7 @@ pub fn respond_payload_too_large(
     }];
     let response = ResponseToWrite {
         request_method: method,
+        request_version,
         requested_upgrade: b"",
         status: 413,
         reason: b"Payload Too Large",
@@ -442,7 +463,10 @@ pub fn respond_payload_too_large(
     Ok(length)
 }
 
-pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+pub fn respond_expectation_failed(
+    output: &mut [u8],
+    request_version: RequestVersion,
+) -> Result<usize, RouteBuildError> {
     let mut now = [0u8; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now);
     let date = [Field {
@@ -451,6 +475,7 @@ pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuild
     }];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version,
         requested_upgrade: b"",
         status: 417,
         reason: b"Expectation Failed",
@@ -472,7 +497,10 @@ pub fn respond_expectation_failed(output: &mut [u8]) -> Result<usize, RouteBuild
     Ok(length)
 }
 
-pub fn respond_bad_request(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+pub fn respond_bad_request(
+    output: &mut [u8],
+    request_version: RequestVersion,
+) -> Result<usize, RouteBuildError> {
     let mut now = [0u8; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now);
     let date = [Field {
@@ -481,6 +509,7 @@ pub fn respond_bad_request(output: &mut [u8]) -> Result<usize, RouteBuildError> 
     }];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version,
         requested_upgrade: b"",
         status: 400,
         reason: b"Bad Request",
@@ -500,6 +529,7 @@ pub fn respond_bad_request(output: &mut [u8]) -> Result<usize, RouteBuildError> 
 
 pub fn respond_request_header_fields_too_large(
     output: &mut [u8],
+    request_version: RequestVersion,
 ) -> Result<usize, RouteBuildError> {
     let mut now = [0u8; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now);
@@ -509,6 +539,7 @@ pub fn respond_request_header_fields_too_large(
     }];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version,
         requested_upgrade: b"",
         status: 431,
         reason: b"Request Header Fields Too Large",
@@ -529,7 +560,10 @@ pub fn respond_request_header_fields_too_large(
 // NOTE: RFC 9110 15.5.15 scopes 414 to a long target URI specifically; Date-first with close
 // mirrors the 431 sibling exactly (same error family, no keep-alive), method/version overflows
 // stay on the 400 responder above.
-pub fn respond_uri_too_long(output: &mut [u8]) -> Result<usize, RouteBuildError> {
+pub fn respond_uri_too_long(
+    output: &mut [u8],
+    request_version: RequestVersion,
+) -> Result<usize, RouteBuildError> {
     let mut now = [0u8; HTTP_DATE_BYTES];
     let now_len = now_http_date(&mut now);
     let date = [Field {
@@ -538,6 +572,7 @@ pub fn respond_uri_too_long(output: &mut [u8]) -> Result<usize, RouteBuildError>
     }];
     let response = ResponseToWrite {
         request_method: b"GET",
+        request_version,
         requested_upgrade: b"",
         status: 414,
         reason: b"URI Too Long",
@@ -556,110 +591,5 @@ pub fn respond_uri_too_long(output: &mut [u8]) -> Result<usize, RouteBuildError>
 }
 
 #[cfg(test)]
-mod tests {
-    // NOTE: drift alarm for the converged 100-continue policy: the managed pump stages this
-    // exact shape ahead of the final response while the host-driven conn crate encodes the
-    // same shared shape for its continue handshake, so any shape edit upstream fails here
-    // until the pump follows.
-    use super::encode_continue;
-    use veylor_http1::{
-        ALLOW_BYTES, ALLOW_METHODS, CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES, continue_interim,
-        encode_response_head,
-    };
-
-    #[test]
-    fn interim_stages_shared_continue_shape_ahead_of_final() {
-        let mut staged = [0u8; 64];
-        let len = encode_continue(&mut staged).expect("interim fits");
-        let mut expected = [0u8; 64];
-        let encoded = encode_response_head(&continue_interim(), &mut expected)
-            .expect("shared interim encodes");
-        assert_eq!(&staged[..len], &expected[..encoded.length]);
-        assert_eq!(&staged[..len], b"HTTP/1.1 100 Continue\r\n\r\n");
-    }
-
-    #[test]
-    fn keep_open_verdict_matches_shared_reuse_policy() {
-        // NOTE: drift alarm for the converged keep-alive policy: every static keep_open below
-        // must equal veylor_http1::response_permits_reuse on the same verdict, so a local
-        // verdict edit fails here until the shared predicate follows. The upgrade input stays
-        // false (this path never upgrades) and drain rides drain_total, not the booleans.
-        use super::respond_to_head;
-        use crate::static_routes::StaticRoutes;
-        use veylor_http1::{
-            Header, Limits, Parser, RequestHead, ResponseFraming, connection_header_for_response,
-            response_permits_reuse,
-        };
-        use veylor_router::RouteSlot;
-
-        fn drive(routes: &StaticRoutes, input: &[u8]) -> (RequestHead, bool) {
-            let mut slots = [RouteSlot::EMPTY; 8];
-            let table = routes.build_table(&mut slots).expect("table builds");
-            let mut headers = [Header::default(); 16];
-            let mut parser = Parser::new();
-            let head = parser
-                .parse(input, &mut headers, Limits::default())
-                .expect("head parses")
-                .expect("head complete");
-            let mut output = [0u8; 2048];
-            let encoded = respond_to_head(routes, &table, head, &headers, input, &mut output)
-                .expect("static encodes");
-            (head, encoded.keep_open)
-        }
-
-        let mut routes = StaticRoutes::new();
-        routes
-            .register(b"GET", b"/hello", 200, b"OK", b"hi", 1024)
-            .expect("register static");
-
-        let plain = b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n";
-        let (head, keep_open) = drive(&routes, plain);
-        let verdict = connection_header_for_response(
-            head,
-            plain,
-            200,
-            ResponseFraming::FixedLength,
-            true,
-            false,
-        );
-        assert!(keep_open);
-        assert_eq!(keep_open, response_permits_reuse(false, verdict));
-
-        let close = b"GET /hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
-        let (head, keep_open) = drive(&routes, close);
-        let verdict = connection_header_for_response(
-            head,
-            close,
-            200,
-            ResponseFraming::FixedLength,
-            true,
-            false,
-        );
-        assert!(!keep_open);
-        assert_eq!(keep_open, response_permits_reuse(false, verdict));
-
-        let missing = b"GET /nope HTTP/1.1\r\nHost: test\r\n\r\n";
-        let (head, keep_open) = drive(&routes, missing);
-        let verdict = connection_header_for_response(
-            head,
-            missing,
-            404,
-            ResponseFraming::FixedLength,
-            true,
-            true,
-        );
-        assert!(!keep_open);
-        assert_eq!(keep_open, response_permits_reuse(false, verdict));
-    }
-
-    #[test]
-    fn allow_scratch_sizes_match_shared_bounds() {
-        // NOTE: drift alarm for the converged Allow scratch policy: this engine sizes
-        // every Allow, Content-Range, and multipart buffer from the shared veylor_http1
-        // bounds, so a shared-bound edit fails here until this consumer follows.
-        assert_eq!(ALLOW_METHODS, 16);
-        assert_eq!(ALLOW_BYTES, 320);
-        assert_eq!(CONTENT_RANGE_BYTES, 80);
-        assert_eq!(MULTIPART_CTYPE_BYTES, 128);
-    }
-}
+#[path = "respond/tests.rs"]
+mod tests;

@@ -1,4 +1,4 @@
-use veylor_http1::{BodyEvent, Limits};
+use veylor_http1::{BodyEvent, Header, Limits};
 use veylor_runtime::ConnectionToken;
 
 use crate::host::HostShared;
@@ -103,7 +103,7 @@ fn stage_new_trailers(
 ) -> bool {
     while conn.trailer_staged < TRAILER_SLOTS {
         let staged = conn.trailer_staged;
-        let header = conn.trailer_slots[staged];
+        let header = conn.trailer_slots()[staged];
         if header.name.length == 0 {
             break;
         }
@@ -149,6 +149,9 @@ pub(crate) fn decode_chunked(
         done: false,
         failed: false,
     };
+    if conn.trailer_slots.is_none() {
+        conn.trailer_slots = Some(Box::new([Header::default(); TRAILER_SLOTS]));
+    }
     loop {
         let Some(decoder) = conn.chunked_decoder.as_mut() else {
             feed.failed = true;
@@ -160,10 +163,14 @@ pub(crate) fn decode_chunked(
             feed.failed = true;
             break;
         };
+        let Some(trailer_slots) = conn.trailer_slots.as_mut() else {
+            feed.failed = true;
+            break;
+        };
         let next = match decoder.next(
             &input[base..end],
             false,
-            &mut conn.trailer_slots,
+            &mut **trailer_slots,
             Limits::default(),
         ) {
             Ok(next) => next,

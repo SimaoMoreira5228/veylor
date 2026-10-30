@@ -30,6 +30,20 @@ pub fn feed_ciphertext(
     Ok(input.len() - cursor.len())
 }
 
+pub fn queue_close_notify(conn: &mut TlsConn, out: &mut Vec<u8>) -> Result<(), TlsError> {
+    conn.inner.send_close_notify();
+
+    while conn.inner.wants_write() {
+        let wrote = conn.inner.write_tls(out)?;
+
+        if wrote == 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn drain_plaintext(
     conn: &mut TlsConn,
     plain: &[u8],

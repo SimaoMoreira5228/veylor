@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use veylor_http1::{
     BodyEvent, BodyLimits, ConnectionHeader, FixedResponseBodyWriter, Header, Limits, Parser,
-    RequestBodyAdmission, RequestBodyDecoder, RequestHead, ResponseFraming, ResponseToWrite,
-    encode_response_head,
+    RequestBodyAdmission, RequestBodyDecoder, RequestHead, RequestVersion, ResponseFraming,
+    ResponseToWrite, encode_response_head,
 };
 
 struct CountAlloc;
@@ -53,6 +53,7 @@ const ITERATIONS: usize = 64;
 fn response_to_write() -> ResponseToWrite<'static> {
     ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 200,
         reason: b"OK",

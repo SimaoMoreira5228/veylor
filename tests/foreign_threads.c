@@ -198,12 +198,18 @@ static void ft_wait_writable(vyl_managed_static_server* server, vyl_managed_stat
     assert(0 && "stream never armed writable");
 }
 
-static void ft_write_ok(vyl_managed_static_server* server, vyl_managed_static_token token,
-                         const uint8_t* chunk, size_t chunk_len) {
+static void ft_write_ok(
+    vyl_managed_static_server* server,
+    vyl_managed_static_token token,
+    const uint8_t* chunk,
+    size_t chunk_len
+) {
     const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
     for (int i = 0; i < 5000; i++) {
         int rc = vyl_managed_static_host_write_stream(
-            server, token, (vyl_http1_bytes){.data = chunk, .length = chunk_len}
+            server,
+            token,
+            (vyl_http1_bytes){.data = chunk, .length = chunk_len}
         );
         ft_sane(rc);
         if (rc == VYL_HTTP1_OK) {
@@ -245,8 +251,15 @@ static void* ft_poller_main(void* raw) {
         vyl_managed_static_poll_report report = {0};
         assert(
             vyl_managed_static_poll_events(
-                arg->server, 100000000u, events, 8, methods, sizeof(methods), paths,
-                sizeof(paths), &report
+                arg->server,
+                100000000u,
+                events,
+                8,
+                methods,
+                sizeof(methods),
+                paths,
+                sizeof(paths),
+                &report
             ) == VYL_HTTP1_OK
         );
         for (size_t k = 0; k < report.copied; k++) {
@@ -400,9 +413,8 @@ int main(void) {
     pthread_barrier_t start = {0};
     assert(pthread_barrier_init(&start, NULL, FT_POLLERS + 3) == 0);
     ft_poller_arg poller_arg = {.server = server, .start = &start, .incoming = &incoming};
-    ft_worker_arg worker_arg = {
-        .server = server, .start = &start, .incoming = &incoming, .streams = &streams
-    };
+    ft_worker_arg worker_arg =
+        {.server = server, .start = &start, .incoming = &incoming, .streams = &streams};
     pthread_t pollers[FT_POLLERS] = {0};
     pthread_t responder = 0;
     pthread_t writer = 0;
@@ -454,7 +466,8 @@ int main(void) {
     assert(
         counts.completed + counts.peer_closed + counts.reset + counts.timeout +
             counts.protocol_error + counts.response_overflow + counts.transport_error +
-            counts.shutdown == FT_EXCHANGES
+            counts.shutdown ==
+        FT_EXCHANGES
     );
     assert(vyl_managed_static_destroy(server) == VYL_HTTP1_OK);
     assert(pthread_barrier_destroy(&start) == 0);

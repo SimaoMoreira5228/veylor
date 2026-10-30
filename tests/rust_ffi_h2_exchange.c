@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 
-
 /* NOTE: cross-boundary layout pins (all declared targets are 64-bit, so
    size_t is 8 bytes): the C declarations must stay byte-identical to the Rust
    #[repr(C)] originals. Any field addition, removal, or reorder breaks these. */
@@ -12,19 +11,13 @@ _Static_assert(
     sizeof(vyl_h2_field_to_encode) == 48,
     "H2 field layout must match Rust HpackFieldToEncode"
 );
-_Static_assert(
-    sizeof(vyl_h2_field) == 32,
-    "H2 decoded field layout must match Rust HpackHeader"
-);
-_Static_assert(
-    sizeof(vyl_h2_action) == 56,
-    "H2 action layout must match Rust H2FrameAction"
-);
+_Static_assert(sizeof(vyl_h2_field) == 32, "H2 decoded field layout must match Rust HpackHeader");
+_Static_assert(sizeof(vyl_h2_action) == 56, "H2 action layout must match Rust H2FrameAction");
 _Static_assert(
     sizeof(vyl_h2_response_class) == 24,
     "H2 response class layout must match Rust ResponseClass"
 );
- 
+
 #define WIRE_CAP 4096u
 #define POLL_ACTIONS 16u
 #define POLL_FIELDS 64u
@@ -33,7 +26,7 @@ _Static_assert(
 #define CHECK(step, cond)                                                                          \
     do {                                                                                           \
         if (!(cond)) {                                                                             \
-            fprintf(stderr, "h2_exchange: %s failed at line %d\n", step, __LINE__);                 \
+            fprintf(stderr, "h2_exchange: %s failed at line %d\n", step, __LINE__);                \
             return 1;                                                                              \
         }                                                                                          \
     } while (0)
@@ -156,15 +149,11 @@ static int feed_server(
     return 0;
 }
 
-static int field_equals(
-    const uint8_t* data,
-    vyl_h2_field field,
-    const char* name,
-    const char* value
-) {
+static int
+field_equals(const uint8_t* data, vyl_h2_field field, const char* name, const char* value) {
     return field.name_length == strlen(name) && field.value_length == strlen(value) &&
-           memcmp(data + field.name_offset, name, field.name_length) == 0 &&
-           memcmp(data + field.value_offset, value, field.value_length) == 0;
+        memcmp(data + field.name_offset, name, field.name_length) == 0 &&
+        memcmp(data + field.value_offset, value, field.value_length) == 0;
 }
 
 static int test_h2_exchange(void) {
@@ -256,13 +245,14 @@ static int test_h2_exchange(void) {
     CHECK(
         "server settings ack",
         vyl_h2_server_send_settings_ack(
-            server, server_ack, sizeof(server_ack), &server_ack_length, &required
+            server,
+            server_ack,
+            sizeof(server_ack),
+            &server_ack_length,
+            &required
         ) == VYL_HTTP1_OK
     );
-    CHECK(
-        "server settings ack",
-        ack_server(server, "server settings ack", server_ack_length) == 0
-    );
+    CHECK("server settings ack", ack_server(server, "server settings ack", server_ack_length) == 0);
 
     CHECK(
         "server settings",
@@ -297,7 +287,11 @@ static int test_h2_exchange(void) {
     CHECK(
         "client settings ack",
         vyl_h2_client_send_settings_ack(
-            client, client_ack, sizeof(client_ack), &client_ack_length, &required
+            client,
+            client_ack,
+            sizeof(client_ack),
+            &client_ack_length,
+            &required
         ) == VYL_HTTP1_OK
     );
     CHECK("client settings ack", ack_client(client, "client settings ack", client_ack_length) == 0);
@@ -404,7 +398,11 @@ static int test_h2_exchange(void) {
         CHECK(
             "server accept request",
             vyl_h2_server_accept_request(
-                server, 1, actions[0].field_start, actions[0].field_count, &validated
+                server,
+                1,
+                actions[0].field_start,
+                actions[0].field_count,
+                &validated
             ) == VYL_HTTP1_OK
         );
         CHECK(
@@ -425,7 +423,15 @@ static int test_h2_exchange(void) {
         CHECK(
             "server send response",
             vyl_h2_server_send_response(
-                server, 1, response_fields, 2, 0, wire, sizeof(wire), &written, &required
+                server,
+                1,
+                response_fields,
+                2,
+                0,
+                wire,
+                sizeof(wire),
+                &written,
+                &required
             ) == VYL_HTTP1_OK
         );
     }
@@ -485,7 +491,12 @@ static int test_h2_exchange(void) {
         CHECK(
             "client classify headers",
             vyl_h2_client_classify_headers(
-                client, 1, actions[0].field_start, actions[0].field_count, actions[0].flags, &class
+                client,
+                1,
+                actions[0].field_start,
+                actions[0].field_count,
+                actions[0].flags,
+                &class
             ) == VYL_HTTP1_OK
         );
         CHECK("client classify headers", class.kind == VYL_H2_RESPONSE_FINAL);
@@ -550,7 +561,11 @@ static int test_h2_exchange(void) {
         CHECK(
             "client account data head",
             vyl_h2_client_account_data(
-                client, 1, actions[0].data_length, actions[0].flags, &phase
+                client,
+                1,
+                actions[0].data_length,
+                actions[0].flags,
+                &phase
             ) == VYL_HTTP1_OK
         );
         CHECK("client account data head", phase == VYL_H2_PHASE_CONTENT);
@@ -605,7 +620,11 @@ static int test_h2_exchange(void) {
         CHECK(
             "client account data tail",
             vyl_h2_client_account_data(
-                client, 1, actions[0].data_length, actions[0].flags, &phase
+                client,
+                1,
+                actions[0].data_length,
+                actions[0].flags,
+                &phase
             ) == VYL_HTTP1_OK
         );
         CHECK("client account data tail", phase == VYL_H2_PHASE_COMPLETE);
@@ -623,7 +642,15 @@ static int test_h2_exchange(void) {
         CHECK(
             "client start second request",
             vyl_h2_client_start_request(
-                client, second_fields, 4, 0, wire, sizeof(wire), &written, &stream_id, &required
+                client,
+                second_fields,
+                4,
+                0,
+                wire,
+                sizeof(wire),
+                &written,
+                &stream_id,
+                &required
             ) == VYL_HTTP1_OK
         );
         CHECK("client start second request", stream_id == 3);
@@ -731,7 +758,14 @@ static int test_h2_exchange(void) {
         CHECK(
             "client post-goaway request",
             vyl_h2_client_start_request(
-                client, late_fields, 4, VYL_H2_END_STREAM, wire, sizeof(wire), &written, &stream_id,
+                client,
+                late_fields,
+                4,
+                VYL_H2_END_STREAM,
+                wire,
+                sizeof(wire),
+                &written,
+                &stream_id,
                 &required
             ) == VYL_HTTP1_BAD_STATE
         );

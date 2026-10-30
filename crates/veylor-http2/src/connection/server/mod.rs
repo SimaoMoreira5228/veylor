@@ -179,8 +179,6 @@ impl<'borrow, 'streams, 'decoder, 'encoder> H2ServerDriver<'borrow, 'streams, 'd
         Ok(validate_server_request_fields(&self.driver, fields)?)
     }
 
-    
-    
     pub fn send_response<'output>(
         &mut self,
         stream_id: u32,

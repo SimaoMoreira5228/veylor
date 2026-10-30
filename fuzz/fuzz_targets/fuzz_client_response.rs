@@ -1,22 +1,4 @@
 #![no_main]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 use libfuzzer_sys::fuzz_target;
 use veylor_http1::{ClientResponse, Header, Limits, ResponseRequestMethod};
 

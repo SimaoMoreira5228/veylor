@@ -8,11 +8,6 @@ use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
 const MAX_TRAILER_NAMES: usize = 32;
 const MAX_TRAILER_NAME_BYTES: usize = 128;
 
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_static_route(
     server: *mut VylManagedStaticServer,
@@ -35,13 +30,6 @@ pub unsafe extern "C" fn vyl_managed_static_register_static_route(
     })
 }
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_body_cap(
     server: *mut VylManagedStaticServer,
@@ -56,9 +44,6 @@ pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_body_cap(
         register_static_route(server, method, path, status, reason, body, max_body_bytes)
     })
 }
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_gzip(
@@ -81,14 +66,6 @@ pub unsafe extern "C" fn vyl_managed_static_register_static_route_with_gzip(
         )
     })
 }
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_managed_route(
@@ -236,14 +213,6 @@ unsafe fn register_managed_route(
     }
 }
 
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_managed_route_with_trailers(
     server: *mut VylManagedStaticServer,
@@ -324,14 +293,6 @@ unsafe fn register_managed_with_trailers(
         Err(error) => server_error_to_result(error),
     }
 }
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_register_file_mount(

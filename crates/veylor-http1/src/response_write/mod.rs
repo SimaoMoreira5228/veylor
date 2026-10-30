@@ -1,5 +1,5 @@
 use crate::fields::{is_token, upgrade_protocols_offered, valid_upgrade_field};
-use crate::request_head::RequestHead;
+use crate::request_head::{RequestHead, RequestVersion};
 use crate::request_write::Field;
 
 pub fn encode_response_chunk(
@@ -204,6 +204,7 @@ pub fn join_allow_value(methods: &[&[u8]], out: &mut [u8]) -> Option<usize> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResponseToWrite<'a> {
     pub request_method: &'a [u8],
+    pub request_version: RequestVersion,
     pub requested_upgrade: &'a [u8],
     pub status: u16,
     pub reason: &'a [u8],
@@ -227,6 +228,7 @@ pub struct EncodedResponseHead {
 pub fn continue_interim() -> ResponseToWrite<'static> {
     ResponseToWrite {
         request_method: b"GET",
+        request_version: RequestVersion::Http11,
         requested_upgrade: b"",
         status: 100,
         reason: b"Continue",
@@ -335,7 +337,10 @@ pub fn encode_response_head_with_required_length(
     }
 
     let mut writer = Writer::new(output);
-    writer.write(b"HTTP/1.1 ")?;
+    writer.write(match response.request_version {
+        RequestVersion::Http10 => b"HTTP/1.0 ",
+        RequestVersion::Http11 => b"HTTP/1.1 ",
+    })?;
     writer.write_decimal_status(response.status)?;
     writer.write(b" ")?;
     writer.write(response.reason)?;
@@ -424,7 +429,9 @@ fn validate_response(response: &ResponseToWrite<'_>) -> Result<(), ResponseEncod
         return Err(ResponseEncodeError::Invalid);
     }
     if response.framing == ResponseFraming::Chunked
-        && (!chunked_allowed(response) || response.content_length != 0)
+        && (response.request_version == RequestVersion::Http10
+            || !chunked_allowed(response)
+            || response.content_length != 0)
     {
         return Err(ResponseEncodeError::Invalid);
     }

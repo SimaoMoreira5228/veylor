@@ -127,11 +127,15 @@ pub fn stream_state_on_frame(
             };
             transition(StreamAction::ACCEPT, next)
         }
-        StreamState::Closed => match direction {
-            FrameDirection::Received => {
+        StreamState::Closed => match (direction, frame_type) {
+            (FrameDirection::Received, FrameType::Headers | FrameType::Continuation) => transition(
+                StreamAction::connection_error(ErrorCode::StreamClosed),
+                state,
+            ),
+            (FrameDirection::Received, _) => {
                 transition(StreamAction::send_rst(ErrorCode::StreamClosed), state)
             }
-            FrameDirection::Sent => transition(StreamAction::REJECT, state),
+            (FrameDirection::Sent, _) => transition(StreamAction::REJECT, state),
         },
     }
 }

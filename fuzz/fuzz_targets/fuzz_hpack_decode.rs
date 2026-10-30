@@ -1,17 +1,4 @@
 #![no_main]
-
-
-
-
-
-
-
-
-
-
-
-
-
 use libfuzzer_sys::fuzz_target;
 use veylor_http2::{
     HpackEntrySlot, HpackHeader, HpackTable, decode_header_block, decode_header_field,

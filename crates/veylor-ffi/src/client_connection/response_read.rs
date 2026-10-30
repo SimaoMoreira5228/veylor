@@ -23,16 +23,6 @@ struct ClientResponseReadArguments {
     out_trailers_required: *mut usize,
 }
 
-
-
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_read_response(
     connection: *mut VylClientConnection,

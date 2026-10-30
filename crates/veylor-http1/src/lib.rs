@@ -21,7 +21,7 @@ pub use fields::{ConnectionOptions, is_token};
 pub use request_body::{
     RequestBodyAdmission, RequestBodyDecoder, admission_needs_interim, admission_rejects_body,
 };
-pub use request_head::{Header, Limits, ParseError, Parser, RequestHead, Span};
+pub use request_head::{Header, Limits, ParseError, Parser, RequestHead, RequestVersion, Span};
 pub use request_target::TargetForm;
 pub use request_write::{
     BodyFraming, ClientRequestWriter, Field, Request, RequestEncodeError, encode_chunk,

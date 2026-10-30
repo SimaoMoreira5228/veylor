@@ -362,6 +362,39 @@ fn rejects_invalid_arguments_and_reports_state() {
         },
         VylResult::InvalidArgument
     );
+    let push_enabled = [VylH2Setting { id: 2, value: 1 }];
+    assert_eq!(
+        unsafe {
+            vyl_h2_client_send_settings(
+                client,
+                push_enabled.as_ptr(),
+                push_enabled.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+                &mut required,
+            )
+        },
+        VylResult::InvalidArgument
+    );
+    let oversized_header_list = [VylH2Setting {
+        id: 6,
+        value: crate::abi::VYL_H2_MAX_HEADER_LIST_SIZE + 1,
+    }];
+    assert_eq!(
+        unsafe {
+            vyl_h2_client_send_settings(
+                client,
+                oversized_header_list.as_ptr(),
+                oversized_header_list.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut written,
+                &mut required,
+            )
+        },
+        VylResult::InvalidArgument
+    );
     let fields = [encode_field(b":method", b"GET")];
     let mut stream_id: u32 = 0;
     assert_eq!(
@@ -725,7 +758,12 @@ fn peer_answer_settings(handle: *mut VylH2Client, bytes: &[u8]) {
 
 fn scripted_handshake(handle: *mut VylH2Client) {
     let settings = client_settings(handle);
-    assert!(!settings.is_empty());
+    assert_eq!(
+        settings,
+        [
+            0, 0, 12, 0x04, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 6, 0, 0, 8, 64,
+        ]
+    );
     let empty = peer_header(0, 0x04, 0, 0);
     peer_answer_settings(handle, &empty);
     let ack = peer_settings_ack();
@@ -1375,7 +1413,7 @@ fn scripted_continuation_within_limit_succeeds() {
     scripted_handshake(client);
     let stream = scripted_get(client);
     assert_eq!(stream, 1);
-    let block = peer_padded_block(b"200", 1_100);
+    let block = peer_padded_block(b"200", 500);
     assert!(block.len() < 4_096);
     let wire = peer_fragmented_headers(1, &block, 1_000);
     let out = poll_peer(client, &wire);
@@ -1390,7 +1428,7 @@ fn scripted_continuation_within_limit_succeeds() {
 }
 
 #[test]
-fn scripted_continuation_over_limit_resets_stream_and_spares_connection() {
+fn scripted_continuation_over_limit_fails_connection_before_reuse() {
     let client = new_client();
     scripted_handshake(client);
     let stream = scripted_get(client);
@@ -1399,13 +1437,14 @@ fn scripted_continuation_over_limit_resets_stream_and_spares_connection() {
     assert!(block.len() > 4_096);
     let wire = peer_fragmented_headers(1, &block, 1_000);
     let out = poll_peer(client, &wire);
-    assert_eq!(out.result, VylResult::Ok);
+    assert_eq!(out.result, VylResult::ProtocolError);
     assert_eq!(out.consumed, wire.len());
     assert_eq!(out.actions.len(), 1);
-    assert_eq!(out.actions[0].kind, VylH2ActionKind::SendReset);
-    assert_eq!(out.actions[0].stream_id, 1);
-    assert_eq!(out.actions[0].error_code, 7);
-    let stream = scripted_request(client, b"GET", b"/again", 1);
-    assert_eq!(stream, 3);
+    assert_eq!(out.actions[0].kind, VylH2ActionKind::ConnectionError);
+    assert_eq!(out.actions[0].error_code, 9);
+    assert_eq!(out.connection_error, 9);
+    let closed = poll_peer(client, &[]);
+    assert_eq!(closed.result, VylResult::ProtocolError);
+    assert_eq!(closed.connection_error, 9);
     destroy_client(client);
 }

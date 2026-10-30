@@ -5,6 +5,7 @@ pub(crate) mod parked;
 pub(crate) mod streams;
 pub(crate) mod tls;
 pub(crate) mod trailers;
+mod tunnel;
 
 pub(crate) use exchange::{ExchangeOutcome, parse_exchange};
 #[cfg(target_os = "linux")]
@@ -17,7 +18,7 @@ pub use trailers::{TrailerOutcome, TrailerReport};
 
 use tls::{TLS_PENDING_MIN_BYTES, tls_alpn_is_h2, tls_encrypt_output, tls_turn_active};
 
-use veylor_http1::{BodyDecoder, ConnectionHeader, Header, Parser};
+use veylor_http1::{BodyDecoder, ConnectionHeader, Header, Parser, RequestVersion};
 use veylor_router::RouteTable;
 use veylor_runtime::{
     CloseReason, ConnectionToken, IoBatch, ReadStatus, TcpStream, WriteStatus, dispatch,
@@ -46,14 +47,13 @@ pub(crate) enum ConnPhase {
     // NOTE: in-flight file body after its head flushed; offsets ride conn.file and every
     // body byte stages through the output buffer, so this variant stays fieldless + Copy.
     SendingFile,
-    // NOTE: the owner-side parked snapshot: method copy for HEAD semantics at respond time,
-    // shared connection verdict from the request line alone, fixed-length body admission with
-    // the event token so worker turns can stage wire bytes for host pulls; unread bytes drain
-    // within the cap.
+    // NOTE: the owner-side parked snapshot keeps method and version for response framing,
+    // plus the connection verdict, body admission, and event token for staged host dispatch.
     Parked {
         route_id: u64,
         method_len: u8,
         method: [u8; HOST_MAX_METHOD_BYTES],
+        request_version: RequestVersion,
         connection: ConnectionHeader,
         body_total: u64,
         body_received: u64,
@@ -61,6 +61,7 @@ pub(crate) enum ConnPhase {
         chunked: bool,
         chunked_done: bool,
     },
+    Tunnel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,7 +89,7 @@ pub struct ConnState {
     pub(crate) chunked_decoder: Option<BodyDecoder>,
     pub(crate) trailer_allow: Vec<Vec<u8>>,
     pub(crate) trailer_conn: Vec<u8>,
-    pub(crate) trailer_slots: [Header; crate::connection::parked::TRAILER_SLOTS],
+    pub(crate) trailer_slots: Option<Box<[Header; crate::connection::parked::TRAILER_SLOTS]>>,
     pub(crate) trailer_staged: usize,
     pub(crate) len: usize,
     pub(crate) head_len: usize,
@@ -102,10 +103,14 @@ pub struct ConnState {
     pub(crate) file_cache: FdCache,
     pub(crate) read_ready: bool,
     pub(crate) write_blocked: bool,
+    pub(crate) write_interest: bool,
     pub(crate) closing: bool,
     pub(crate) close_reason: ConnClose,
     pub(crate) error_hint: bool,
-    pub(crate) tls: Option<TlsConn>,
+    pub(crate) tls: Option<Box<TlsConn>>,
+    pub(crate) tunnel_token: ConnectionToken,
+    pub(crate) tunnel_eof: bool,
+    pub(crate) tunnel_notified: bool,
     pub(crate) tls_pending: Vec<u8>,
     pub(crate) tls_pending_sent: usize,
     pub(crate) tls_plain: Vec<u8>,
@@ -122,7 +127,7 @@ impl ConnState {
             chunked_decoder: None,
             trailer_allow: Vec::new(),
             trailer_conn: Vec::new(),
-            trailer_slots: [Header::default(); crate::connection::parked::TRAILER_SLOTS],
+            trailer_slots: None,
             trailer_staged: 0,
             len: 0,
             head_len: 0,
@@ -136,18 +141,28 @@ impl ConnState {
             file_cache: FdCache::default(),
             read_ready: true,
             write_blocked: false,
+            write_interest: false,
             closing: false,
             close_reason: ConnClose::Completed,
             error_hint: false,
             tls: None,
+            tunnel_token: ConnectionToken::default(),
+            tunnel_eof: false,
+            tunnel_notified: false,
             tls_pending: Vec::new(),
             tls_pending_sent: 0,
             tls_plain: Vec::new(),
         }
     }
 
+    pub(crate) fn trailer_slots(&self) -> &[Header; crate::connection::parked::TRAILER_SLOTS] {
+        self.trailer_slots
+            .as_deref()
+            .expect("trailer slots are materialized before use")
+    }
+
     pub(crate) fn attach_tls(&mut self, tls: TlsConn) {
-        self.tls = Some(tls);
+        self.tls = Some(Box::new(tls));
 
         if self.tls_pending.capacity() < TLS_PENDING_MIN_BYTES {
             self.tls_pending
@@ -249,6 +264,8 @@ pub struct PumpProgress {
     pub entered_response: bool,
     pub entered_park: bool,
     pub response_flushed: bool,
+    pub tunnel_upgraded: bool,
+    pub tunnel_draining: bool,
 }
 
 pub fn pump_connection(
@@ -262,6 +279,9 @@ pub fn pump_connection(
 ) -> PumpOutcome {
     if conn.error_hint {
         return PumpOutcome::Close(ConnClose::TransportError);
+    }
+    if conn.phase == ConnPhase::Tunnel {
+        return tunnel::pump_tunnel(conn, host, byte_budget);
     }
     if conn.is_parked() {
         return parked::pump_parked(conn, host);
@@ -731,5 +751,15 @@ mod tests {
             assert_eq!(conn.headers.as_ref().map(|slab| slab.as_ptr()), headers_ptr);
             assert_eq!(conn.output.as_ref().map(|slab| slab.as_ptr()), output_ptr);
         }
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_idle_record_stays_within_budget() {
+        assert!(std::mem::size_of::<ConnState>() <= 1024);
     }
 }

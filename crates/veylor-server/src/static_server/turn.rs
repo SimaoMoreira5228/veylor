@@ -1,4 +1,5 @@
 use std::io;
+use std::io::Write as _;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,9 @@ use veylor_runtime::{
 };
 
 use crate::connection::tls::tls_alpn_is_h2;
-use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
+use crate::connection::{
+    ConnClose, ConnPhase, ConnState, PumpOutcome, PumpProgress, pump_connection,
+};
 use crate::h2::H2Conn;
 use crate::h2::slots as h2_slots;
 use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps, move_h2_tls_slot};
@@ -740,6 +743,23 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut result.counts,
                     &mut tls_acceptor,
                 );
+                continue;
+            }
+            if let Some(conn) = conns[index].as_mut() {
+                let want = conn.write_blocked;
+                if want != conn.write_interest {
+                    conn.write_interest = want;
+                    let interest = if want {
+                        PollInterest::ReadWrite
+                    } else {
+                        PollInterest::Readable
+                    };
+                    let _ = stream_poller.reregister(
+                        &mut conn.stream,
+                        conn_poll_token(index),
+                        interest,
+                    );
+                }
             }
         }
         if !skip_pump {
@@ -1093,6 +1113,18 @@ fn apply_pump_hooks(
             return Some(ConnClose::TransportError);
         }
     }
+    if progress.tunnel_upgraded {
+        let entered = worker.transition_phase(token, ConnectionPhase::Tunnel, now_ns);
+        if entered.is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
+    if progress.tunnel_draining {
+        let entered = worker.transition_phase(token, ConnectionPhase::TunnelDraining, now_ns);
+        if entered.is_err() {
+            return Some(ConnClose::TransportError);
+        }
+    }
     if progress.entered_response {
         let entered = worker.transition_phase(token, ConnectionPhase::WritingResponse, now_ns);
         if entered.is_err() {
@@ -1130,12 +1162,31 @@ fn close_conn(
     counts: &mut CloseCounts,
     tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
 ) {
-    let Some(conn) = conns[index].take() else {
+    let Some(mut conn) = conns[index].take() else {
         return;
     };
     let token = conn.token();
     let parked = conn.is_parked();
+    let tunnel = conn.phase == ConnPhase::Tunnel;
+    let tunnel_token = conn.tunnel_token;
+    let tunnel_notified = conn.tunnel_notified;
     let had_tls = conn.has_tls();
+    if had_tls {
+        if let Some(tls) = conn.tls.as_mut() {
+            let mut flight = Vec::with_capacity(64);
+            if veylor_tls::queue_close_notify(tls, &mut flight).is_ok() {
+                let mut sent = 0;
+                while sent < flight.len() {
+                    match conn.stream.write(&flight[sent..]) {
+                        Ok(0) => break,
+                        Ok(wrote) => sent += wrote,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
     let mut stream = conn.into_stream();
     let _ = stream_poller.deregister(&mut stream);
     let _ = worker.close(token);
@@ -1147,7 +1198,12 @@ fn close_conn(
     // NOTE: every parked close unparks exactly once (take_staged already removed staged
     // entries, so this is a no-op for applied responds/cancels): the host tomb records
     // Gone and a later respond can never report success for a dead connection.
-    if parked {
+    if tunnel {
+        if !tunnel_notified {
+            let _ = host.stage_tunnel_closed(tunnel_token);
+        }
+        host.unpark_closed(tunnel_token.worker_id, tunnel_token.slot);
+    } else if parked {
         host.unpark_closed(token.worker_id, token.slot);
     }
     counts.add(reason);

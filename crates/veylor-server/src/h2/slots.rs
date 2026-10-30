@@ -51,7 +51,7 @@ impl Default for H2Buffers {
 #[derive(Default)]
 pub(crate) struct H2Meta {
     pub(crate) stream: Option<TcpStream>,
-    pub(crate) tls: Option<TlsConn>,
+    pub(crate) tls: Option<Box<TlsConn>>,
     pub(crate) tls_pending: Vec<u8>,
     pub(crate) tls_pending_sent: usize,
     pub(crate) tls_plain: Vec<u8>,

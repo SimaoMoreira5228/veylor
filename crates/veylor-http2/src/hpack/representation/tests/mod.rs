@@ -2,9 +2,9 @@ mod encode_block;
 mod policy;
 
 use super::{
-    HpackError, HpackHeader, HpackRepresentation, decode_header_block, decode_header_field,
-    encode_indexed_header, encode_literal_header, encode_pending_table_size_updates,
-    encode_table_size_update,
+    HpackError, HpackFieldToEncode, HpackHeader, HpackRepresentation, decode_header_block,
+    decode_header_field, encode_header_block, encode_indexed_header, encode_literal_header,
+    encode_pending_table_size_updates, encode_table_size_update,
 };
 use crate::hpack::{HpackEntrySlot, HpackTable, HpackTableError, TableInsert};
 
@@ -443,6 +443,44 @@ fn fails_closed_on_truncated_literal_and_caller_capacity_limits() {
         decode_header_block(RFC_C24, &mut table, &mut []),
         Err(HpackError::HeaderCapacity { required: 1 })
     );
+}
+
+#[test]
+fn caller_capacity_overflow_still_decodes_the_entire_block() {
+    let fields = [
+        HpackFieldToEncode {
+            name: b"x-state",
+            value: b"preserved",
+            representation: HpackRepresentation::Incremental,
+            huffman_name: false,
+            huffman_value: false,
+        },
+        HpackFieldToEncode {
+            name: b"x-tail",
+            value: b"decoded",
+            representation: HpackRepresentation::WithoutIndexing,
+            huffman_name: false,
+            huffman_value: false,
+        },
+    ];
+    let mut encoder_entries = [HpackEntrySlot::EMPTY; 4];
+    let mut encoder_storage = [0; 128];
+    let mut encoder = HpackTable::new(&mut encoder_entries, &mut encoder_storage, 4_096);
+    let mut block = [0; 256];
+    let block_length = encode_header_block(&fields, &mut encoder, &mut block).unwrap();
+
+    let mut decoder_entries = [HpackEntrySlot::EMPTY; 4];
+    let mut decoder_storage = [0; 128];
+    let mut decoder = HpackTable::new(&mut decoder_entries, &mut decoder_storage, 4_096);
+    let mut headers = [HpackHeader::EMPTY; 1];
+    assert_eq!(
+        decode_header_block(&block[..block_length], &mut decoder, &mut headers),
+        Err(HpackError::HeaderCapacity { required: 2 })
+    );
+
+    let inserted = decoder.get(62).unwrap();
+    assert_eq!(decoder.resolve(inserted.name), Some(&b"x-state"[..]));
+    assert_eq!(decoder.resolve(inserted.value), Some(&b"preserved"[..]));
 }
 
 #[test]

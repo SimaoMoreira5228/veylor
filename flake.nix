@@ -14,13 +14,27 @@
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              odin
-              ols
+              rustc
+              cargo
+              rustfmt
+              clippy
+              rust-analyzer
               clang
               clang-tools
               lldb
+              cmake
+              perl
               just
               pkg-config
+              openssl
+              sqlite
+              zig
+              go
+              h2spec
+              nghttp2
+              curlHTTP3
+              jq
+              valgrind
             ];
           };
         });

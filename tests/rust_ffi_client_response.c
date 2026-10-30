@@ -3,7 +3,6 @@
 #include <assert.h>
 #include <string.h>
 
-
 /* NOTE: cross-boundary layout pins (all declared targets are 64-bit, so
    size_t is 8 bytes): the C declarations must stay byte-identical to the Rust
    #[repr(C)] originals. Any field addition, removal, or reorder breaks these. */

@@ -138,10 +138,6 @@ pub fn encode_pending_table_size_updates(
     Ok(total_length)
 }
 
-
-
-
-
 pub fn encode_header_block(
     fields: &[HpackFieldToEncode<'_>],
     table: &mut HpackTable<'_>,

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "examples/conformance",
     "examples/ledger",
     "crates/veylor-client",
     "crates/veylor-ffi",
@@ -11,6 +12,7 @@ members = [
     "crates/veylor-server",
     "crates/veylor-server-conn",
     "crates/veylor-tls",
+    "crates/veylor-websocket",
 ]
 default-members = [
     "crates/veylor-client",
@@ -22,6 +24,7 @@ default-members = [
     "crates/veylor-server",
     "crates/veylor-server-conn",
     "crates/veylor-tls",
+    "crates/veylor-websocket",
 ]
 exclude = ["fuzz"]
 

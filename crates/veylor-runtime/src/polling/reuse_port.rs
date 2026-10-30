@@ -3,14 +3,6 @@ use std::net::SocketAddr;
 
 use super::TcpListener;
 
-
-
-
-
-
-
-
-
 #[cfg(unix)]
 pub fn bind_reuse_port(addr: SocketAddr) -> io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -23,7 +15,6 @@ pub fn bind_reuse_port(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(1024)?;
     Ok(TcpListener::from_std(socket.into()))
 }
-
 
 #[cfg(not(unix))]
 pub fn bind_reuse_port(_addr: SocketAddr) -> io::Result<TcpListener> {

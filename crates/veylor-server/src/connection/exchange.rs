@@ -1,4 +1,4 @@
-use veylor_http1::{Limits, ParseError};
+use veylor_http1::{Limits, ParseError, RequestVersion};
 use veylor_router::{RouteKind, RouteTable};
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
@@ -54,11 +54,12 @@ pub(crate) fn parse_exchange(
             // itself stays managed-side (status-shape territory, not this policy); the
             // host-driven conn crate maps the failed head to ProtocolError and fails every
             // follow-up closed instead.
-            send_expectation_failed(conn);
+            let version = response_version(conn);
+            send_expectation_failed(conn, version);
             ExchangeOutcome::Responded
         }
         Err(ParseError::HeaderSectionTooLarge) => {
-            send_request_header_fields_too_large(conn);
+            send_request_header_fields_too_large(conn, response_version(conn));
             ExchangeOutcome::Responded
         }
         // NOTE: RFC 9110 15.5.15 scopes 414 to a long target URI specifically, so an over-long
@@ -68,15 +69,17 @@ pub(crate) fn parse_exchange(
         // ParseError matches outside this slice), and a full input buffer surfaces as NeedMore, so
         // this arm attributes the buffered line itself; the hot scan is unaffected (error path only).
         Ok(None) | Err(ParseError::RequestLineTooLarge) => {
+            let version = response_version(conn);
             if request_target_too_long(conn) {
-                send_uri_too_long(conn);
+                send_uri_too_long(conn, version);
             } else {
-                send_bad_request(conn);
+                send_bad_request(conn, version);
             }
             ExchangeOutcome::Responded
         }
         Err(_) => {
-            send_bad_request(conn);
+            let version = response_version(conn);
+            send_bad_request(conn, version);
             ExchangeOutcome::Responded
         }
     }
@@ -196,19 +199,47 @@ fn encode_static(
     }
 }
 
-fn send_bad_request(conn: &mut ConnState) {
+fn response_version(conn: &ConnState) -> RequestVersion {
+    let Some(input) = conn.input.as_ref() else {
+        return RequestVersion::Http11;
+    };
+    let input = &input[..conn.len];
+    if let Some(version) = conn.parser.protocol_version(input) {
+        return version;
+    }
+
+    let line_end = input
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(input.len());
+    let line = input[..line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&input[..line_end]);
+    let Some(version_start) = line
+        .iter()
+        .rposition(|byte| *byte == b' ')
+        .map(|index| index + 1)
+    else {
+        return RequestVersion::Http11;
+    };
+    RequestVersion::from_bytes(&line[version_start..]).unwrap_or(RequestVersion::Http11)
+}
+
+fn send_bad_request(conn: &mut ConnState, request_version: RequestVersion) {
     ConnState::materialize_output(&mut conn.output);
     let staged = match conn.output.as_mut() {
-        Some(output) => respond_bad_request(&mut output[..]).ok(),
+        Some(output) => respond_bad_request(&mut output[..], request_version).ok(),
         None => None,
     };
     finish_simple(conn, ConnClose::ProtocolError, staged);
 }
 
-fn send_request_header_fields_too_large(conn: &mut ConnState) {
+fn send_request_header_fields_too_large(conn: &mut ConnState, request_version: RequestVersion) {
     ConnState::materialize_output(&mut conn.output);
     let staged = match conn.output.as_mut() {
-        Some(output) => respond_request_header_fields_too_large(&mut output[..]).ok(),
+        Some(output) => {
+            respond_request_header_fields_too_large(&mut output[..], request_version).ok()
+        }
         None => None,
     };
     finish_simple(conn, ConnClose::ProtocolError, staged);
@@ -244,19 +275,19 @@ fn request_target_too_long(conn: &ConnState) -> bool {
     target_len + MIN_REQUEST_LINE_FRAME > Limits::default().request_line_bytes
 }
 
-pub(crate) fn send_uri_too_long(conn: &mut ConnState) {
+pub(crate) fn send_uri_too_long(conn: &mut ConnState, request_version: RequestVersion) {
     ConnState::materialize_output(&mut conn.output);
     let staged = match conn.output.as_mut() {
-        Some(output) => respond_uri_too_long(&mut output[..]).ok(),
+        Some(output) => respond_uri_too_long(&mut output[..], request_version).ok(),
         None => None,
     };
     finish_simple(conn, ConnClose::ProtocolError, staged);
 }
 
-fn send_expectation_failed(conn: &mut ConnState) {
+fn send_expectation_failed(conn: &mut ConnState, request_version: RequestVersion) {
     ConnState::materialize_output(&mut conn.output);
     let staged = match conn.output.as_mut() {
-        Some(output) => respond_expectation_failed(&mut output[..]).ok(),
+        Some(output) => respond_expectation_failed(&mut output[..], request_version).ok(),
         None => None,
     };
     finish_simple(conn, ConnClose::Completed, staged);

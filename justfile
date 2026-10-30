@@ -70,6 +70,12 @@ integration-rust-ffi-linux:
     clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_managed_native.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
         -o build/test-rust-ffi-managed-native
+    clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_managed_bind.c \
+        -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
+        -o build/test-rust-ffi-managed-bind
+    clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_managed_tunnel.c \
+        -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
+        -o build/test-rust-ffi-managed-tunnel
     clang {{ ABI_CFLAGS }} -pthread -Iinclude tests/foreign_threads.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug -pthread \
         -o build/test-foreign-threads
@@ -82,4 +88,9 @@ integration-rust-ffi-linux:
     build/test-rust-ffi-managed-static
     build/test-rust-ffi-managed-dispatch
     build/test-rust-ffi-managed-native
+    build/test-rust-ffi-managed-bind
+    build/test-rust-ffi-managed-tunnel
     build/test-foreign-threads
+
+conformance:
+    bash scripts/conformance.sh

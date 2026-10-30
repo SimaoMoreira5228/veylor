@@ -83,6 +83,16 @@ impl RequestSnapshot {
         })
     }
 
+    pub(crate) fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.headers.iter().filter_map(|header| {
+            let name_end = header.name.offset.checked_add(header.name.length)?;
+            let value_end = header.value.offset.checked_add(header.value.length)?;
+            let name = self.bytes.get(header.name.offset..name_end)?;
+            let value = self.bytes.get(header.value.offset..value_end)?;
+            Some((name, value))
+        })
+    }
+
     pub(crate) fn copy(
         &self,
         headers: &mut [Header],

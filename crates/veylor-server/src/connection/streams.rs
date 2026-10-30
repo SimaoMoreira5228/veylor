@@ -1,7 +1,8 @@
 use veylor_http1::{
-    Field, ResponseFraming, ResponseToWrite, encode_response_chunk,
-    encode_response_chunk_with_required_length, encode_response_final_chunk_with_required_length,
-    encode_response_head, prohibited_request_trailer, response_permits_reuse,
+    ConnectionHeader, Field, RequestVersion, ResponseFraming, ResponseToWrite,
+    encode_response_chunk, encode_response_chunk_with_required_length,
+    encode_response_final_chunk_with_required_length, encode_response_head,
+    prohibited_request_trailer, response_permits_reuse,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -78,6 +79,7 @@ pub(crate) struct StreamState {
     pub(crate) head_sent: bool,
     pub(crate) writable: bool,
     pub(crate) ending: bool,
+    pub(crate) upgraded: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +97,9 @@ pub(crate) enum StreamCmd {
         trailers: Vec<StagedTrailer>,
     },
     Cancel,
+    Upgrade {
+        response: Vec<u8>,
+    },
 }
 
 fn stream_entry(inner: &mut HostInner, token: ConnectionToken) -> Option<&mut ParkedEntry> {
@@ -109,7 +114,7 @@ fn stream_entry(inner: &mut HostInner, token: ConnectionToken) -> Option<&mut Pa
 pub(crate) fn take_stream_cmd(inner: &mut HostInner, token: ConnectionToken) -> Option<StreamCmd> {
     let entry = stream_entry(inner, token)?;
     if let Some(cmd) = entry.stream_cmd.take() {
-        if matches!(cmd, StreamCmd::Begin { .. }) {
+        if matches!(cmd, StreamCmd::Begin { .. } | StreamCmd::Upgrade { .. }) {
             if let Some(stream) = entry.stream.as_mut() {
                 stream.head_sent = true;
                 stream.writable = true;
@@ -140,7 +145,10 @@ impl HostShared {
             let Some(entry) = stream_entry(inner, token) else {
                 return (false, None);
             };
-            let open = entry.stream.as_ref().is_some_and(|stream| stream.head_sent);
+            let open = entry
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.head_sent && !stream.upgraded);
             if !open || entry.stream_cmd.is_some() || entry.staged.is_some() {
                 return (false, None);
             }
@@ -292,12 +300,21 @@ impl HostShared {
                 .and_then(|table| table.get(token.slot as usize))
                 .and_then(|entry| entry.as_ref())
                 .is_some_and(|entry| {
-                    entry.token == token
-                        && entry.staged.is_none()
+                    let Some(stream) = entry.stream.as_ref() else {
+                        return false;
+                    };
+                    if entry.token != token || entry.staged.is_some() {
+                        return false;
+                    }
+                    if stream.upgraded {
+                        return !entry.tunnel_close
+                            && entry.tunnel_out.len() - entry.tunnel_out_start
+                                < crate::host::HOST_TUNNEL_CAP;
+                    }
+                    stream.head_sent
+                        && stream.writable
+                        && !stream.ending
                         && entry.stream_cmd.is_none()
-                        && entry.stream.as_ref().is_some_and(|stream| stream.head_sent)
-                        && entry.stream.as_ref().is_some_and(|stream| stream.writable)
-                        && entry.stream.as_ref().is_some_and(|stream| !stream.ending)
                 });
             (live, None)
         });
@@ -347,7 +364,10 @@ impl HostShared {
                     entry.stream = Some(StreamState::default());
                 }
                 StreamCmd::Write { .. } => {
-                    let open = entry.stream.as_ref().is_some_and(|stream| stream.head_sent);
+                    let open = entry
+                        .stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.head_sent && !stream.upgraded);
                     if !open {
                         return (RespondOutcome::NotWritable, None);
                     }
@@ -365,7 +385,10 @@ impl HostShared {
                     }
                 }
                 StreamCmd::End | StreamCmd::EndWithTrailers { .. } => {
-                    let open = entry.stream.as_ref().is_some_and(|stream| stream.head_sent);
+                    let open = entry
+                        .stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.head_sent && !stream.upgraded);
                     if !open {
                         return (RespondOutcome::Invalid, None);
                     }
@@ -380,6 +403,17 @@ impl HostShared {
                     if let Some(stream) = entry.stream.as_mut() {
                         stream.ending = true;
                     }
+                }
+                StreamCmd::Upgrade { .. } => {
+                    if entry.stream.is_some() || entry.staged.is_some() {
+                        inner.counters.responds_duplicate += 1;
+                        return (RespondOutcome::Duplicate, None);
+                    }
+                    entry.stream = Some(StreamState {
+                        upgraded: true,
+                        ..StreamState::default()
+                    });
+                    entry.stream_cmd = Some(cmd);
                 }
                 StreamCmd::Cancel => {
                     return (RespondOutcome::Invalid, None);
@@ -413,7 +447,12 @@ pub(crate) fn apply_stream_cmd(
     cmd: StreamCmd,
     mut progress: PumpProgress,
 ) -> PumpOutcome {
-    let ConnPhase::Parked { connection, .. } = conn.phase else {
+    let ConnPhase::Parked {
+        connection,
+        request_version,
+        ..
+    } = conn.phase
+    else {
         return PumpOutcome::Close(ConnClose::TransportError);
     };
     ConnState::materialize_output(&mut conn.output);
@@ -435,9 +474,8 @@ pub(crate) fn apply_stream_cmd(
                 host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             }
-            // NOTE: the head emits the shared park-time verdict whole (see park_request NOTE):
-            // bool-erasing it to Omit here dropped the HTTP/1.0 keep-alive echo while the
-            // pump still reused, disagreeing with the static path and the conn crate.
+            // NOTE: HTTP/1.0 streams use close-delimited framing; HTTP/1.1 keeps the parked
+            // connection verdict and uses chunked framing.
             let mut now = [0u8; HTTP_DATE_BYTES];
             let now_len = now_http_date(&mut now);
             let mut fields = [Field {
@@ -458,13 +496,20 @@ pub(crate) fn apply_stream_cmd(
             }
             let response = ResponseToWrite {
                 request_method: &method[..usize::from(method_len)],
+                request_version,
                 requested_upgrade: b"",
                 status,
                 reason: &reason,
                 fields: &fields[..field_count],
-                framing: ResponseFraming::Chunked,
+                framing: match request_version {
+                    RequestVersion::Http10 => ResponseFraming::CloseDelimited,
+                    RequestVersion::Http11 => ResponseFraming::Chunked,
+                },
                 content_length: 0,
-                connection,
+                connection: match request_version {
+                    RequestVersion::Http10 => ConnectionHeader::Close,
+                    RequestVersion::Http11 => connection,
+                },
             };
             let Some(output) = conn.output.as_mut() else {
                 host.unpark_closed(token.worker_id, token.slot);
@@ -484,13 +529,37 @@ pub(crate) fn apply_stream_cmd(
                 host.unpark_closed(token.worker_id, token.slot);
                 return PumpOutcome::Close(ConnClose::TransportError);
             };
-            let Ok(length) = encode_response_chunk(&chunk, &mut output[..]) else {
-                host.unpark_closed(token.worker_id, token.slot);
-                return PumpOutcome::Close(ConnClose::TransportError);
-            };
-            length
+            match request_version {
+                RequestVersion::Http10 if chunk.len() <= output.len() => {
+                    output[..chunk.len()].copy_from_slice(&chunk);
+                    chunk.len()
+                }
+                RequestVersion::Http10 => {
+                    host.unpark_closed(token.worker_id, token.slot);
+                    return PumpOutcome::Close(ConnClose::ResponseOverflow);
+                }
+                RequestVersion::Http11 => match encode_response_chunk(&chunk, &mut output[..]) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        host.unpark_closed(token.worker_id, token.slot);
+                        return PumpOutcome::Close(ConnClose::TransportError);
+                    }
+                },
+            }
         }
         StreamCmd::End | StreamCmd::EndWithTrailers { .. } => {
+            if request_version == RequestVersion::Http10 {
+                if matches!(cmd, StreamCmd::EndWithTrailers { .. }) {
+                    host.unpark_closed(token.worker_id, token.slot);
+                    return PumpOutcome::Close(ConnClose::ProtocolError);
+                }
+                conn.pending_len = 0;
+                conn.closing = true;
+                conn.close_reason = ConnClose::Completed;
+                conn.phase = ConnPhase::SendingResponse;
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Keep(progress);
+            }
             // NOTE: stage validation plus the staged caps prove the trailer block fits, so the
             // required-length probe here is the no-truncation guarantee, never a fit check: any
             // encode failure is permanent and fails the connection closed like the chunk path.
@@ -523,6 +592,46 @@ pub(crate) fn apply_stream_cmd(
             conn.phase = ConnPhase::SendingResponse;
             host.unpark_closed(token.worker_id, token.slot);
             length
+        }
+        StreamCmd::Upgrade { response } => {
+            let ConnPhase::Parked {
+                request_version,
+                body_total,
+                body_received,
+                chunked,
+                chunked_done,
+                ..
+            } = conn.phase
+            else {
+                return PumpOutcome::Close(ConnClose::TransportError);
+            };
+            if request_version != RequestVersion::Http11 {
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Close(ConnClose::ProtocolError);
+            }
+            let body_complete = if chunked {
+                chunked_done
+            } else {
+                body_total == body_received
+            };
+            if !body_complete || response.len() > OUTPUT_CAP {
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Close(ConnClose::ProtocolError);
+            }
+            let Some(output) = conn.output.as_mut() else {
+                host.unpark_closed(token.worker_id, token.slot);
+                return PumpOutcome::Close(ConnClose::TransportError);
+            };
+            output[..response.len()].copy_from_slice(&response);
+            conn.out_len = response.len();
+            conn.out_sent = 0;
+            conn.write_blocked = false;
+            conn.closing = false;
+            conn.tunnel_token = token;
+            conn.tunnel_eof = false;
+            conn.phase = ConnPhase::Tunnel;
+            progress.tunnel_upgraded = true;
+            return PumpOutcome::Keep(progress);
         }
         StreamCmd::Cancel => return PumpOutcome::Close(ConnClose::Cancelled),
     };

@@ -6,13 +6,6 @@ use super::dispatch::{
 };
 use super::{ManagedStaticState, VylManagedStaticServer, VylManagedStaticToken};
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_begin_stream(
     server: *mut VylManagedStaticServer,
@@ -46,12 +39,6 @@ unsafe fn host_begin_stream(
             .begin_stream(token_to_server(token), status, reason),
     )
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_begin_stream_with_headers(
@@ -128,14 +115,6 @@ unsafe fn host_begin_stream_with_headers(
     ))
 }
 
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_write_stream(
     server: *mut VylManagedStaticServer,
@@ -164,12 +143,6 @@ unsafe fn host_write_stream(
     respond_outcome_to_result(running.host().write_stream(token_to_server(token), chunk))
 }
 
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_end_stream(
     server: *mut VylManagedStaticServer,
@@ -191,17 +164,6 @@ unsafe fn host_end_stream(
     };
     respond_outcome_to_result(running.host().end_stream(token_to_server(token)))
 }
-
-
-
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_end_stream_with_trailers(
@@ -261,11 +223,6 @@ unsafe fn host_end_stream_with_trailers(
 // NOTE: the Rust query returns a bare bool with no invalid signal, so the shape check lives here:
 // a zero-generation token reports bad-state, while an unknown-but-well-formed token answers Ok
 // with false — absence of a live writable stream is a negative answer, never an error.
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_managed_static_host_is_writable(

@@ -18,6 +18,8 @@ pub enum ConnectionPhase {
     AwaitingHandler,
     WritingResponse,
     KeepAliveIdle,
+    Tunnel,
+    TunnelDraining,
     Closing,
 }
 
@@ -29,7 +31,8 @@ impl ConnectionPhase {
             Self::AwaitingHandler => Some(ConnectionDeadlineKind::AwaitingHandler),
             Self::WritingResponse => Some(ConnectionDeadlineKind::ResponseWrite),
             Self::KeepAliveIdle => Some(ConnectionDeadlineKind::KeepAliveIdle),
-            Self::Closing => None,
+            Self::Tunnel | Self::Closing => None,
+            Self::TunnelDraining => Some(ConnectionDeadlineKind::AwaitingHandler),
         }
     }
 }
@@ -369,9 +372,16 @@ fn phase_transition_allowed(current: ConnectionPhase, next: ConnectionPhase) -> 
             next,
             ConnectionPhase::AwaitingHandler | ConnectionPhase::WritingResponse
         ),
-        ConnectionPhase::AwaitingHandler => next == ConnectionPhase::WritingResponse,
+        ConnectionPhase::AwaitingHandler => {
+            matches!(
+                next,
+                ConnectionPhase::WritingResponse | ConnectionPhase::Tunnel
+            )
+        }
         ConnectionPhase::WritingResponse => next == ConnectionPhase::KeepAliveIdle,
         ConnectionPhase::KeepAliveIdle => next == ConnectionPhase::ReadingRequestHead,
+        ConnectionPhase::Tunnel => next == ConnectionPhase::TunnelDraining,
+        ConnectionPhase::TunnelDraining => false,
         ConnectionPhase::Closing => false,
     }
 }

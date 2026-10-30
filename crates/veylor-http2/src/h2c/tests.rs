@@ -31,6 +31,7 @@ fn with_handshake(run: impl FnOnce(H2cServerHandshake<'_, '_, '_, '_>)) {
         &mut decoder,
         &mut encoder,
         &mut settings_ack_limits,
+        256,
     )
     .unwrap();
     run(handshake);
@@ -129,9 +130,8 @@ fn exact_magic_plus_empty_settings_completes() {
                     id: crate::frame::SETTINGS_MAX_CONCURRENT_STREAMS,
                     value: H2C_MAX_CONCURRENT_STREAMS.min(4)
                 },
-                // NOTE: the handshake advertises the table's effective assembly cap
-                // (this harness wires 256-byte storage with a 256 limit), not a fixed
-                // const, so the wire promise always matches what fits.
+                // NOTE: this field-section budget is independent of the compressed assembly
+                // storage above; callers provide it from their decoded-header capacity.
                 SettingsParameter {
                     id: crate::frame::SETTINGS_MAX_HEADER_LIST_SIZE,
                     value: 256,
@@ -386,7 +386,8 @@ fn handshake_rejects_client_role_and_double_settings() {
             &mut streams,
             &mut decoder,
             &mut encoder,
-            &mut settings_ack_limits
+            &mut settings_ack_limits,
+            256,
         ),
         Err(H2cError::WrongRole)
     ));
@@ -416,7 +417,8 @@ fn handshake_rejects_client_role_and_double_settings() {
             &mut server_streams,
             &mut server_decoder,
             &mut server_encoder,
-            &mut empty_limits
+            &mut empty_limits,
+            256,
         ),
         Err(H2cError::EmptySettingsAckStorage)
     ));

@@ -12,6 +12,7 @@ veylor-router = { version = "0.1.0", path = "../veylor-router" }
 veylor-http1 = { version = "0.1.0", path = "../veylor-http1" }
 veylor-http2 = { version = "0.1.0", path = "../veylor-http2" }
 veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
+veylor-websocket = { version = "0.1.0", path = "../veylor-websocket" }
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }

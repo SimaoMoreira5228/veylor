@@ -13,12 +13,6 @@ pub const VYL_HTTP1_RESPONSE_CONNECTION_KEEP_ALIVE: u32 = 4;
 pub const VYL_HTTP1_RESPONSE_CONNECTION_UPGRADE: u32 = 8;
 pub const VYL_HTTP1_MAX_REQUEST_FIELDS: usize = Limits::DEFAULT_HEADER_COUNT;
 
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_new(
     request_method: u32,
@@ -78,10 +72,6 @@ unsafe fn create_connection(
     VylResult::Ok
 }
 
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_reset(
     connection: *mut VylClientConnection,
@@ -101,11 +91,6 @@ unsafe fn reset_connection(connection: *mut VylClientConnection) -> VylResult {
         Err(_) => VylResult::BadState,
     }
 }
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_http1_client_connection_destroy(

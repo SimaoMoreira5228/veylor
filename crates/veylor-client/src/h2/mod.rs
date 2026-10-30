@@ -25,6 +25,9 @@ pub const MAX_RESPONSES: usize = 32;
 pub const MAX_ACTIONS: usize = 16;
 pub const MAX_FIELDS: usize = 64;
 pub const MAX_SETTINGS: usize = 8;
+pub const MAX_HEADER_LIST_SIZE: u32 =
+    (MAX_FIELDS as u32) * (veylor_http2::MIN_HEADER_FIELD_SIZE as u32);
+pub(crate) const MAX_PENDING_SETTINGS: usize = MAX_SETTINGS + 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum H2ClientError {
@@ -38,110 +41,6 @@ pub enum H2ClientError {
     WriteOverrun,
     Cancelled,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub struct H2ClientTables<'a> {
     streams: StreamTable<'a>,
@@ -218,7 +117,7 @@ pub(crate) struct PendingWrite {
     pub(crate) kind: PendingWriteKind,
     pub(crate) remaining: usize,
     pub(crate) setting_count: usize,
-    pub(crate) settings: [(u16, u32); MAX_SETTINGS],
+    pub(crate) settings: [(u16, u32); MAX_PENDING_SETTINGS],
 }
 
 impl Default for PendingWrite {
@@ -227,7 +126,7 @@ impl Default for PendingWrite {
             kind: PendingWriteKind::None,
             remaining: 0,
             setting_count: 0,
-            settings: [(0, 0); MAX_SETTINGS],
+            settings: [(0, 0); MAX_PENDING_SETTINGS],
         }
     }
 }

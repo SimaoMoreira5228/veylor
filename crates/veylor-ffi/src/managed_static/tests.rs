@@ -21,6 +21,12 @@ fn test_config(port: u16) -> VylManagedStaticConfig {
         poll_wait_ms: 10,
         port,
         reserved: 0,
+        address: VylBytes {
+            data: std::ptr::null(),
+            length: 0,
+        },
+        max_connections: 0,
+        worker_count: 0,
     }
 }
 
@@ -5643,4 +5649,51 @@ fn managed_stream_begin_with_headers_streams_them() {
     let counts = unsafe { stop_join(server) };
     assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
     assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn config_binds_address_and_applies_limits() {
+    let mut config = test_config(0);
+    let address = b"0.0.0.0";
+    config.address = bytes(address);
+    config.max_connections = 1;
+    config.worker_count = 2;
+
+    let server = unsafe { create(&config) };
+    unsafe { register(server, b"GET", b"/hello", b"hello") };
+    assert_eq!(unsafe { vyl_managed_static_start(server) }, VylResult::Ok);
+    let port = unsafe { local_port(server) };
+    let response = get(port, "/hello");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    let counts = unsafe { stop_join(server) };
+    assert_eq!(counts_total(counts), 1);
+    assert_eq!(unsafe { vyl_managed_static_destroy(server) }, VylResult::Ok);
+}
+
+#[test]
+fn config_rejects_invalid_address_and_limits() {
+    let mut config = test_config(0);
+    let bad_address = b"not-an-ip";
+    config.address = bytes(bad_address);
+    let mut server = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { vyl_managed_static_new(&config, &mut server) },
+        VylResult::InvalidArgument
+    );
+
+    let mut config = test_config(0);
+    config.max_connections = 1025;
+    let mut server = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { vyl_managed_static_new(&config, &mut server) },
+        VylResult::InvalidArgument
+    );
+
+    let mut config = test_config(0);
+    config.worker_count = 17;
+    let mut server = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { vyl_managed_static_new(&config, &mut server) },
+        VylResult::InvalidArgument
+    );
 }

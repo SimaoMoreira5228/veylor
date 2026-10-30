@@ -44,7 +44,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             FrameType::RstStream => self.process_rst_stream(header, payload, actions, result),
             FrameType::GoAway => self.process_goaway(header, payload, actions, result),
             FrameType::Ping => self.process_ping(header, payload, actions, result),
-            FrameType::Priority => self.process_priority(header, payload),
+            FrameType::Priority => self.process_priority(header, payload, actions, result),
             FrameType::PushPromise => {
                 let action = self
                     .streams
@@ -150,7 +150,14 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         if action.kind == StreamActionKind::ConnectionError {
             return Err(action.code);
         }
-        let disposition = header_disposition(action);
+        let disposition = if decoded
+            .priority
+            .is_some_and(|priority| priority.dependency == header.stream_id)
+        {
+            HeaderDisposition::Reset(ErrorCode::ProtocolError)
+        } else {
+            header_disposition(action)
+        };
         let end_stream = header.flags & HEADERS_FLAG_END_STREAM != 0;
         if header.flags & HEADERS_FLAG_END_HEADERS == 0 {
             self.pending_headers = Some(PendingHeaders {
@@ -260,8 +267,17 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             .headers
             .get_mut(start..)
             .ok_or(ErrorCode::InternalError)?;
-        let (count, consumed) =
-            decode_header_block(block, hpack, header_output).map_err(hpack_error_code)?;
+        let (count, consumed) = match decode_header_block(block, hpack, header_output) {
+            Ok(decoded) => decoded,
+            Err(HpackError::HeaderCapacity { .. }) => {
+                return match disposition {
+                    HeaderDisposition::Deliver => Ok(Some(ErrorCode::RefusedStream)),
+                    HeaderDisposition::Reset(error_code) => Ok(Some(error_code)),
+                    HeaderDisposition::Ignore => Ok(None),
+                };
+            }
+            Err(error) => return Err(hpack_error_code(error)),
+        };
         if consumed != block.len() {
             return Err(ErrorCode::CompressionError);
         }
@@ -280,7 +296,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
                         .ok()
                         .and_then(|value_length| name_length.checked_add(value_length))
                 })
-                .and_then(|size| size.checked_add(32))
+                .and_then(|size| size.checked_add(crate::HEADER_FIELD_SIZE_OVERHEAD))
                 .ok_or(ErrorCode::EnhanceYourCalm)?;
             header_list_size = header_list_size
                 .checked_add(field_size)
@@ -469,12 +485,21 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         Ok(())
     }
 
-    fn process_priority(&mut self, header: FrameHeader, payload: &[u8]) -> Result<(), ErrorCode> {
+    fn process_priority<'input>(
+        &mut self,
+        header: FrameHeader,
+        payload: &[u8],
+        actions: &mut [Option<H2FrameAction<'input>>],
+        result: &mut FeedResult,
+    ) -> Result<(), ErrorCode> {
         let action = self.streams.on_frame(header, FrameDirection::Received, &[]);
         if action.kind == StreamActionKind::ConnectionError {
             return Err(action.code);
         }
-        let _priority = decode_priority_payload(header, payload).map_err(payload_error_code)?;
+        let priority = decode_priority_payload(header, payload).map_err(payload_error_code)?;
+        if priority.dependency == header.stream_id {
+            self.queue_reset(header.stream_id, ErrorCode::ProtocolError, actions, result);
+        }
         Ok(())
     }
 
@@ -525,9 +550,6 @@ fn payload_error_code(error: crate::frame::FramePayloadError) -> ErrorCode {
     }
 }
 
-fn hpack_error_code(error: HpackError) -> ErrorCode {
-    match error {
-        HpackError::HeaderCapacity { .. } => ErrorCode::InternalError,
-        _ => ErrorCode::CompressionError,
-    }
+fn hpack_error_code(_: HpackError) -> ErrorCode {
+    ErrorCode::CompressionError
 }

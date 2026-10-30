@@ -16,13 +16,6 @@ unsafe fn read_bytes(bytes: VylBytes) -> Result<&'static [u8], VylResult> {
     Ok(unsafe { slice::from_raw_parts(bytes.data, bytes.length) })
 }
 
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_accept_request(
     handle: *mut VylH2Server,
@@ -94,13 +87,6 @@ unsafe fn accept_request(
     }
     VylResult::Ok
 }
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_response(
@@ -264,14 +250,6 @@ unsafe fn send_response(
     }
 }
 
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_data(
     handle: *mut VylH2Server,
@@ -381,12 +359,6 @@ unsafe fn send_data(
     }
 }
 
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_refuse(
     handle: *mut VylH2Server,
@@ -408,12 +380,6 @@ pub unsafe extern "C" fn vyl_h2_server_refuse(
         )
     })
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_send_reset(
@@ -498,12 +464,6 @@ unsafe fn reset_stream(
         }
     }
 }
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vyl_h2_server_goaway_drain(
