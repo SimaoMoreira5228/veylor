@@ -1,8 +1,7 @@
 use std::slice;
 
-use veylor_server_conn::h2::{
-    BatchStatus, FeedBatch, FeedScratch, H2ServerConnection, error_code_value,
-};
+use veylor_http2::ErrorCode;
+use veylor_server_conn::h2::{BatchStatus, FeedBatch, FeedScratch, H2ServerConnection};
 
 use super::{VylH2Server, split_error};
 use crate::abi::{
@@ -155,7 +154,7 @@ unsafe fn poll_feed(handle: *mut VylH2Server, arguments: PollArguments) -> VylRe
             if batch.connection_failed {
                 unsafe {
                     out_connection_error
-                        .write(batch.connection_error.map(error_code_value).unwrap_or(1));
+                        .write(batch.connection_error.map(ErrorCode::value).unwrap_or(1));
                 }
                 return VylResult::ProtocolError;
             }
@@ -346,7 +345,7 @@ unsafe fn translate_pending(
             } => VylH2Action {
                 kind: VylH2ActionKind::StreamReset,
                 stream_id: *stream_id,
-                error_code: error_code_value(*error_code),
+                error_code: error_code.value(),
                 ..VylH2Action::default()
             },
             veylor_http2::H2FrameAction::GoAway {
@@ -360,7 +359,7 @@ unsafe fn translate_pending(
                 VylH2Action {
                     kind: VylH2ActionKind::GoAway,
                     stream_id: *last_stream_id,
-                    error_code: error_code_value(*error_code),
+                    error_code: error_code.value(),
                     data_offset,
                     data_length: debug_data.len(),
                     ..VylH2Action::default()
@@ -381,12 +380,12 @@ unsafe fn translate_pending(
             } => VylH2Action {
                 kind: VylH2ActionKind::SendReset,
                 stream_id: *stream_id,
-                error_code: error_code_value(*error_code),
+                error_code: error_code.value(),
                 ..VylH2Action::default()
             },
             veylor_http2::H2FrameAction::ConnectionError { error_code } => VylH2Action {
                 kind: VylH2ActionKind::ConnectionError,
-                error_code: error_code_value(*error_code),
+                error_code: error_code.value(),
                 ..VylH2Action::default()
             },
         };
@@ -398,7 +397,7 @@ unsafe fn translate_pending(
         outputs.out_fields.write(field_next);
         outputs
             .out_connection_error
-            .write(batch.connection_error.map(error_code_value).unwrap_or(0));
+            .write(batch.connection_error.map(ErrorCode::value).unwrap_or(0));
     }
     connection.finish_batch();
     if batch.connection_failed {

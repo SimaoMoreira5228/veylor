@@ -6,7 +6,7 @@ mod response;
 mod tests;
 
 pub use api::WriteOut;
-pub use feed::{BatchStatus, FeedBatch, FeedScratch, error_code_value};
+pub use feed::{BatchStatus, FeedBatch, FeedScratch};
 pub use request::{DataOut, RequestOut};
 pub use response::{AccountPhase, ResponseClass};
 pub use veylor_http2::{

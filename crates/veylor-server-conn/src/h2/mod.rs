@@ -12,7 +12,7 @@ mod tests;
 // gap here would duplicate the shaping layer instead of sharing it.
 
 pub use api::WriteOut;
-pub use feed::{BatchStatus, FeedBatch, FeedScratch, error_code_value};
+pub use feed::{BatchStatus, FeedBatch, FeedScratch};
 pub use request::{DataOut, ValidatedRequest};
 pub use veylor_http2::{
     ErrorCode, H2FrameAction, HpackEntrySlot, HpackFieldToEncode, HpackHeader, HpackRepresentation,

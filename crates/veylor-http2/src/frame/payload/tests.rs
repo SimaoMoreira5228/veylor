@@ -170,6 +170,33 @@ fn rst_stream_preserves_known_and_unknown_error_codes() {
 }
 
 #[test]
+fn error_code_value_passes_every_code_through() {
+    let named = [
+        (ErrorCode::NoError, 0),
+        (ErrorCode::ProtocolError, 1),
+        (ErrorCode::InternalError, 2),
+        (ErrorCode::FlowControlError, 3),
+        (ErrorCode::SettingsTimeout, 4),
+        (ErrorCode::StreamClosed, 5),
+        (ErrorCode::FrameSizeError, 6),
+        (ErrorCode::RefusedStream, 7),
+        (ErrorCode::Cancel, 8),
+        (ErrorCode::CompressionError, 9),
+        (ErrorCode::ConnectError, 10),
+        (ErrorCode::EnhanceYourCalm, 11),
+        (ErrorCode::InadequateSecurity, 12),
+        (ErrorCode::Http11Required, 13),
+        (ErrorCode::Unknown(14), 14),
+        (ErrorCode::Unknown(5), 5),
+        (ErrorCode::Unknown(u32::MAX), u32::MAX),
+    ];
+
+    for (code, expected) in named {
+        assert_eq!(code.value(), expected);
+    }
+}
+
+#[test]
 fn rejects_unknown_error_code_values_that_are_registered() {
     let mut output = [0xa5; RST_STREAM_PAYLOAD_LEN];
     assert_eq!(

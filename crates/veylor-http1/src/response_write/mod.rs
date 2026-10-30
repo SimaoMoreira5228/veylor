@@ -19,7 +19,7 @@ pub fn encode_response_chunk_with_required_length(
     if bytes.is_empty() {
         return Err(ResponseEncodeError::Invalid);
     }
-    let required = chunk_hex_length(bytes.len())
+    let required = crate::request_write::chunk_hex_length(bytes.len())
         .checked_add(4)
         .and_then(|length| length.checked_add(bytes.len()))
         .ok_or(ResponseEncodeError::BufferTooSmall)?;
@@ -120,15 +120,6 @@ fn prohibited_response_trailer(name: &[u8]) -> bool {
     ]
     .iter()
     .any(|prohibited| name.eq_ignore_ascii_case(prohibited))
-}
-
-fn chunk_hex_length(mut value: usize) -> usize {
-    let mut length = 1;
-    while value >= 16 {
-        value >>= 4;
-        length += 1;
-    }
-    length
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

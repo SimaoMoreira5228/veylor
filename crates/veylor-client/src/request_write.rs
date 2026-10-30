@@ -1,5 +1,5 @@
 use veylor_http1::{
-    BodyFraming, Field, Request, RequestEncodeError, encode_chunk,
+    BodyFraming, Field, Request, RequestEncodeError, encode_chunk_with_required_length,
     encode_head_with_required_length, finish_chunks_with_required_length,
 };
 
@@ -152,16 +152,14 @@ impl<'a> ClientConnection<'a> {
                 if input.is_empty() {
                     return Err(ClientError::InvalidArgument);
                 }
-                let Some(required) = chunk_length(input.len()) else {
-                    return Err(ClientError::BodyTooLong);
-                };
-                if output.len() < required {
-                    return Err(ClientError::BufferTooSmall { required });
+                let mut required = 0;
+                match encode_chunk_with_required_length(input, output, &mut required) {
+                    Ok(written) => (written, RequestBodyState::Chunked),
+                    Err(RequestEncodeError::BufferTooSmall) => {
+                        return Err(ClientError::BufferTooSmall { required });
+                    }
+                    Err(_) => return Err(ClientError::InvalidArgument),
                 }
-                if encode_chunk(input, output).is_err() {
-                    return Err(ClientError::InvalidArgument);
-                }
-                (required, RequestBodyState::Chunked)
             }
             RequestBodyState::Finished => return Err(ClientError::BadState),
         };
@@ -228,16 +226,6 @@ fn body_state(framing: BodyFraming) -> RequestBodyState {
         BodyFraming::Fixed(length) => RequestBodyState::Fixed(length),
         BodyFraming::Chunked => RequestBodyState::Chunked,
     }
-}
-
-fn chunk_length(length: usize) -> Option<usize> {
-    let mut digits = 1;
-    let mut remaining = length;
-    while remaining >= 16 {
-        digits += 1;
-        remaining >>= 4;
-    }
-    length.checked_add(digits)?.checked_add(4)
 }
 
 fn matches_request_method(request_method: RequestMethod, method: &[u8]) -> bool {

@@ -79,6 +79,26 @@ impl From<u32> for ErrorCode {
 }
 
 impl ErrorCode {
+    pub fn value(self) -> u32 {
+        match self {
+            Self::NoError => 0,
+            Self::ProtocolError => 1,
+            Self::InternalError => 2,
+            Self::FlowControlError => 3,
+            Self::SettingsTimeout => 4,
+            Self::StreamClosed => 5,
+            Self::FrameSizeError => 6,
+            Self::RefusedStream => 7,
+            Self::Cancel => 8,
+            Self::CompressionError => 9,
+            Self::ConnectError => 10,
+            Self::EnhanceYourCalm => 11,
+            Self::InadequateSecurity => 12,
+            Self::Http11Required => 13,
+            Self::Unknown(value) => value,
+        }
+    }
+
     fn wire_value(self) -> Result<u32, FramePayloadError> {
         let value = match self {
             Self::NoError => 0,

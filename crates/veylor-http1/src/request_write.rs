@@ -296,8 +296,26 @@ fn decimal_length(mut value: u64) -> usize {
 }
 
 pub fn encode_chunk(chunk: &[u8], output: &mut [u8]) -> Result<usize, RequestEncodeError> {
+    let mut required_length = 0;
+    encode_chunk_with_required_length(chunk, output, &mut required_length)
+}
+
+pub fn encode_chunk_with_required_length(
+    chunk: &[u8],
+    output: &mut [u8],
+    required_length: &mut usize,
+) -> Result<usize, RequestEncodeError> {
+    *required_length = 0;
     if chunk.is_empty() {
         return Err(RequestEncodeError::Invalid);
+    }
+    let required = chunk_hex_length(chunk.len())
+        .checked_add(4)
+        .and_then(|length| length.checked_add(chunk.len()))
+        .ok_or(RequestEncodeError::BufferTooSmall)?;
+    *required_length = required;
+    if required > output.len() {
+        return Err(RequestEncodeError::BufferTooSmall);
     }
     let mut writer = Writer::new(output);
     writer.write_hex(chunk.len())?;
@@ -305,6 +323,15 @@ pub fn encode_chunk(chunk: &[u8], output: &mut [u8]) -> Result<usize, RequestEnc
     writer.write(chunk)?;
     writer.write(b"\r\n")?;
     Ok(writer.length)
+}
+
+pub(crate) fn chunk_hex_length(mut value: usize) -> usize {
+    let mut length = 1;
+    while value >= 16 {
+        value >>= 4;
+        length += 1;
+    }
+    length
 }
 
 pub fn finish_chunks(fields: &[Field<'_>], output: &mut [u8]) -> Result<usize, RequestEncodeError> {
@@ -500,6 +527,37 @@ mod tests {
         );
         assert_eq!(required_length, b"0\r\nDigest: sha-256=abc\r\n\r\n".len());
         assert_eq!(output, [0xaa; 4]);
+    }
+
+    #[test]
+    fn reports_required_chunk_capacity_without_partial_output() {
+        let mut output = [0; 8];
+        let mut required_length = 0;
+
+        assert_eq!(
+            encode_chunk_with_required_length(b"abc", &mut output, &mut required_length),
+            Ok(8)
+        );
+        assert_eq!(required_length, 8);
+        assert_eq!(&output, b"3\r\nabc\r\n");
+
+        let mut output = [0xaa; 7];
+        let mut required_length = 0;
+
+        assert_eq!(
+            encode_chunk_with_required_length(b"abc", &mut output, &mut required_length),
+            Err(RequestEncodeError::BufferTooSmall)
+        );
+        assert_eq!(required_length, 8);
+        assert_eq!(output, [0xaa; 7]);
+
+        let mut required_length = 0;
+
+        assert_eq!(
+            encode_chunk_with_required_length(b"", &mut [0; 8], &mut required_length),
+            Err(RequestEncodeError::Invalid)
+        );
+        assert_eq!(required_length, 0);
     }
 
     #[test]

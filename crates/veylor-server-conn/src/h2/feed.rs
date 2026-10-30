@@ -43,26 +43,6 @@ pub struct FeedBatch<'s, 'i> {
     pub connection_error: Option<ErrorCode>,
 }
 
-pub fn error_code_value(code: ErrorCode) -> u32 {
-    match code {
-        ErrorCode::NoError => 0,
-        ErrorCode::ProtocolError => 1,
-        ErrorCode::InternalError => 2,
-        ErrorCode::FlowControlError => 3,
-        ErrorCode::SettingsTimeout => 4,
-        ErrorCode::StreamClosed => 5,
-        ErrorCode::FrameSizeError => 6,
-        ErrorCode::RefusedStream => 7,
-        ErrorCode::Cancel => 8,
-        ErrorCode::CompressionError => 9,
-        ErrorCode::ConnectError => 10,
-        ErrorCode::EnhanceYourCalm => 11,
-        ErrorCode::InadequateSecurity => 12,
-        ErrorCode::Http11Required => 13,
-        ErrorCode::Unknown(value) => value,
-    }
-}
-
 impl<'c, 'b> H2ServerConnection<'c, 'b> {
     fn batch_from<'s, 'i>(&self, scratch: &'s FeedScratch<'i>) -> FeedBatch<'s, 'i> {
         FeedBatch {

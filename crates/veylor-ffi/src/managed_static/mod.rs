@@ -6,6 +6,8 @@ mod dispatch;
 mod native;
 #[allow(unsafe_code)]
 mod register;
+#[allow(unsafe_code)]
+mod stream;
 
 #[cfg(test)]
 #[allow(unsafe_code)]
@@ -18,12 +20,9 @@ pub use api::{
     vyl_managed_static_start, vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
-    vyl_managed_static_host_begin_stream, vyl_managed_static_host_begin_stream_with_headers,
-    vyl_managed_static_host_cancel, vyl_managed_static_host_end_stream,
-    vyl_managed_static_host_end_stream_with_trailers, vyl_managed_static_host_is_writable,
-    vyl_managed_static_host_pull_body, vyl_managed_static_host_pull_trailers,
-    vyl_managed_static_host_respond, vyl_managed_static_host_respond_with_headers,
-    vyl_managed_static_host_write_stream, vyl_managed_static_poll_events,
+    vyl_managed_static_host_cancel, vyl_managed_static_host_pull_body,
+    vyl_managed_static_host_pull_trailers, vyl_managed_static_host_respond,
+    vyl_managed_static_host_respond_with_headers, vyl_managed_static_poll_events,
 };
 pub use native::{
     VylManagedStaticNativeHandler, VylManagedStaticNativeHandlerFn, VylManagedStaticNativeRequest,
@@ -36,6 +35,11 @@ pub use register::{
     vyl_managed_static_register_static_route,
     vyl_managed_static_register_static_route_with_body_cap,
     vyl_managed_static_register_static_route_with_gzip,
+};
+pub use stream::{
+    vyl_managed_static_host_begin_stream, vyl_managed_static_host_begin_stream_with_headers,
+    vyl_managed_static_host_end_stream, vyl_managed_static_host_end_stream_with_trailers,
+    vyl_managed_static_host_is_writable, vyl_managed_static_host_write_stream,
 };
 use veylor_server::{CloseCounts, NativeHandler, RunningServer, Server, ServerConfig};
 
