@@ -15,6 +15,7 @@ use crate::host::{HostShared, StagedWork};
 use crate::static_routes::MAX_RESPONSE_BODY;
 use crate::static_server::turn::apply_h2_staged;
 use crate::static_server::{CloseCounts, H2StaticRoute, MAX_CONNECTIONS};
+use veylor_http2::ErrorCode;
 
 // NOTE: spanning driver borrows persist across turns: only same-site overwrites end
 // old regions, so workers pre-allocate buffer sets and borrow FIELDS at one inline
@@ -22,6 +23,13 @@ use crate::static_server::{CloseCounts, H2StaticRoute, MAX_CONNECTIONS};
 pub(crate) const H2C_LISTENER_TOKEN: usize = usize::MAX - 1;
 pub(crate) const H2_FLUSH_THRESHOLD: usize = 1024;
 pub(crate) const MAX_H2_STEPS_PER_TURN: usize = 4;
+// NOTE: inbound flood trip-wire: per-connection sliding window over the engine's
+// monotonic control-frame counters. Resets are cheap for honest peers (one per
+// cancelled stream) and SETTINGS are near-free, so 64/16 per second only trips on
+// abuse; the trip fails the connection open with GOAWAY(ENHANCE_YOUR_CALM).
+pub(crate) const FLOOD_WINDOW_NS: u64 = 1_000_000_000;
+pub(crate) const FLOOD_MAX_RESETS: u32 = 64;
+pub(crate) const FLOOD_MAX_SETTINGS: u32 = 16;
 
 pub(crate) struct H2Turn<'a> {
     pub(crate) routes: &'a FrozenRoutesView<'a>,
@@ -162,16 +170,36 @@ fn shut_slot(meta: &mut H2Meta, poller: &mut Poller, reason: ConnClose, turn: &m
     turn.counts.add(reason);
 }
 
+// NOTE: sliding-window flood check over the engine's monotonic counters: the first
+// sample arms the window, later samples trip when either delta exceeds its ceiling
+// inside the window. Window rollover re-arms instead of tripping, so a slow trickle
+// never accumulates into a false positive.
+fn flood_tripped(meta: &mut H2Meta, conn: Option<&H2Conn<'_>>, now_ns: u64) -> bool {
+    let Some(live) = conn else {
+        return false;
+    };
+    let (resets, settings) = live.flood_counters();
+    if now_ns.saturating_sub(meta.flood_window_start_ns) >= FLOOD_WINDOW_NS {
+        meta.flood_window_start_ns = now_ns;
+        meta.flood_rst_base = resets;
+        meta.flood_settings_base = settings;
+        return false;
+    }
+    resets.saturating_sub(meta.flood_rst_base) > FLOOD_MAX_RESETS
+        || settings.saturating_sub(meta.flood_settings_base) > FLOOD_MAX_SETTINGS
+}
+
 // NOTE: polite close (timeouts, drain-idle): stage GOAWAY, flush once, then close.
 fn goaway_close(
     meta: &mut H2Meta,
     conn: &mut Option<H2Conn<'_>>,
     stream_poller: &mut Poller,
     reason: ConnClose,
+    code: ErrorCode,
     turn: &mut H2Turn<'_>,
 ) -> Option<ConnClose> {
     if let Some(active) = conn.as_mut().filter(|active| !active.is_closed()) {
-        let staged = active.drain(pending_spare(meta));
+        let staged = active.drain_with_code(pending_spare(meta), code);
         meta.pending_len += staged.written;
     }
     let fatal = match flush_h2(meta, stream_poller, &mut turn.budget) {
@@ -201,14 +229,38 @@ pub(crate) fn pump_slot(
         return Some(ConnClose::Shutdown);
     }
     if meta.timed_out {
-        return goaway_close(meta, conn, stream_poller, ConnClose::Timeout, turn);
+        return goaway_close(
+            meta,
+            conn,
+            stream_poller,
+            ConnClose::Timeout,
+            ErrorCode::NoError,
+            turn,
+        );
     }
     if turn.draining && turn.linger_due && idle_for_drain(meta, conn.as_ref()) {
-        return goaway_close(meta, conn, stream_poller, ConnClose::Shutdown, turn);
+        return goaway_close(
+            meta,
+            conn,
+            stream_poller,
+            ConnClose::Shutdown,
+            ErrorCode::NoError,
+            turn,
+        );
     }
     if meta.error {
         shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
         return Some(ConnClose::TransportError);
+    }
+    if flood_tripped(meta, conn.as_ref(), turn.now_ns) {
+        return goaway_close(
+            meta,
+            conn,
+            stream_poller,
+            ConnClose::Abused,
+            ErrorCode::EnhanceYourCalm,
+            turn,
+        );
     }
     let mut close_reason: Option<ConnClose> = None;
     let mut eof = false;

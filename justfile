@@ -37,16 +37,8 @@ build:
 
 integration-linux: test-linux integration-rust-ffi-linux
 
-# Full sanitizer screen (mirrors local/sanitizers/REPORT.md): sanitized cdylib,
-# both C build flavors, all binaries under ASan+UBSan(+LSan), log verdicts.
 sanitize:
-    CARGO_TARGET_DIR=$PWD/local/sanitizers/target RUSTFLAGS="-Zsanitizer=address" cargo +nightly-x86_64-unknown-linux-gnu build -Zbuild-std --target x86_64-unknown-linux-gnu -p veylor-ffi
-    ./local/sanitizers/build.sh
-    ./local/sanitizers/build-int.sh
-    mkdir -p local/sanitizers/logs local/sanitizers/logs-int
-    for b in local/sanitizers/build/test-rust-ffi-* local/sanitizers/build/test-foreign-threads; do n=$(basename $b); ASAN_OPTIONS="detect_leaks=1:print_stacktrace=1:abort_on_error=0:halt_on_error=0" UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0" timeout 90 ./$b > local/sanitizers/logs/$n.log 2>&1 || echo "EXIT $? (see log): $n"; done
-    for b in local/sanitizers/build-int/*; do n=$(basename $b); ASAN_OPTIONS="detect_leaks=1:print_stacktrace=1:abort_on_error=0:halt_on_error=0" UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0" timeout 90 ./$b > local/sanitizers/logs-int/$n.log 2>&1 || echo "EXIT $? (see log): $n"; done
-    grep -rIlE "ERROR|runtime error|WARNING|leaked|Sanitizer" local/sanitizers/logs local/sanitizers/logs-int && (echo "SANITIZER FINDINGS ABOVE"; exit 1) || echo "sanitize: all logs clean"
+    bash tests/sanitize.sh
 
 integration-rust-ffi-linux:
     mkdir -p build

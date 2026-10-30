@@ -49,6 +49,7 @@ pub struct CloseCounts {
     pub response_overflow: u64,
     pub transport_error: u64,
     pub shutdown: u64,
+    pub abused: u64,
     pub h2_served: u64,
     pub h2_refused: u64,
 }
@@ -71,6 +72,7 @@ impl CloseCounts {
             ConnClose::ResponseOverflow => &mut self.response_overflow,
             ConnClose::TransportError => &mut self.transport_error,
             ConnClose::Shutdown => &mut self.shutdown,
+            ConnClose::Abused => &mut self.abused,
         };
         *count += 1;
     }

@@ -77,6 +77,14 @@ pub fn accept_ready(
         attempts += 1;
         match listener.accept() {
             Ok((stream, peer)) => {
+                if let Err(error) = stream.set_nodelay(true) {
+                    return Ok(AcceptBatch {
+                        accepted,
+                        attempts,
+                        outcome: AcceptBatchOutcome::Error(error),
+                    });
+                }
+
                 storage[accepted] = Some(AcceptedConnection { stream, peer });
                 accepted += 1;
             }

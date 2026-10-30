@@ -318,6 +318,12 @@ impl<'borrow, 'streams, 'decoder, 'encoder> H2ServerDriver<'borrow, 'streams, 'd
         &mut self.driver
     }
 
+    // NOTE: abuse-detection projection: the managed pump snapshots these per window; the
+    // engine itself never trips, so host-driven users keep an unfiltered feed.
+    pub const fn flood_counters(&self) -> (u32, u32) {
+        self.driver.flood_counters()
+    }
+
     fn reset_with<'output>(
         &mut self,
         stream_id: u32,

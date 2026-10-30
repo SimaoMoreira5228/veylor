@@ -138,6 +138,7 @@ fn accepts_until_would_block_and_keeps_peer_addresses() {
         AcceptBatchOutcome::Stopped(AcceptStop::Drained)
     ));
     assert!(storage[0].as_ref().unwrap().peer.is_ipv4());
+    assert!(storage[0].as_ref().unwrap().stream.nodelay().unwrap());
     assert!(storage[1].is_none());
 }
 

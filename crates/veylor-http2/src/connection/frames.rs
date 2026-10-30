@@ -318,6 +318,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         actions: &mut [Option<H2FrameAction<'input>>],
         result: &mut FeedResult,
     ) -> Result<(), ErrorCode> {
+        self.inbound_settings = self.inbound_settings.saturating_add(1);
         let settings_ack = header.flags & SETTINGS_ACK != 0;
         if settings_ack
             && header.stream_id == 0
@@ -402,6 +403,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         actions: &mut [Option<H2FrameAction<'input>>],
         result: &mut FeedResult,
     ) -> Result<(), ErrorCode> {
+        self.inbound_resets = self.inbound_resets.saturating_add(1);
         let action = self.streams.on_frame(header, FrameDirection::Received, &[]);
         if action.kind == StreamActionKind::ConnectionError {
             return Err(action.code);

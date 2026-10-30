@@ -9,6 +9,8 @@ allow = [
     "ISC",
     "BSD-3-Clause",
     "MIT-0",
+    "Zlib",
+    "Unicode-3.0",
 ]
 
 [bans]

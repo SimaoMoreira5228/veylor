@@ -114,6 +114,8 @@ pub struct H2FrameDriver<'stream, 'streams, 'decoder, 'encoder> {
     connection_send_window: FlowWindow,
     pending_headers: Option<PendingHeaders>,
     failed: Option<ErrorCode>,
+    inbound_resets: u32,
+    inbound_settings: u32,
 }
 
 impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'decoder, 'encoder> {
@@ -139,7 +141,20 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             connection_send_window,
             pending_headers: None,
             failed: None,
+            inbound_resets: 0,
+            inbound_settings: 0,
         })
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    pub const fn flood_counters(&self) -> (u32, u32) {
+        (self.inbound_resets, self.inbound_settings)
     }
 
     pub const fn connection_receive_window(&self) -> FlowWindow {

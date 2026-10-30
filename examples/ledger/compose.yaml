@@ -1,0 +1,87 @@
+name: veylor-ledger
+
+x-ledger: &ledger
+  build:
+    context: ../..
+    dockerfile: examples/ledger/Dockerfile
+  image: veylor-ledger:local
+  command:
+    - --address
+    - 0.0.0.0:9999
+    - --database
+    - /data/accounts.sqlite3
+    - --workers
+    - "1"
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  volumes:
+    - accounts:/data
+  stop_signal: SIGTERM
+  stop_grace_period: 15s
+  healthcheck:
+    test:
+      - CMD
+      - curl
+      - --fail
+      - --silent
+      - --max-time
+      - "2"
+      - http://127.0.0.1:9999/ready
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+  cpus: 0.45
+  mem_limit: 128m
+
+services:
+  ledger-1:
+    <<: *ledger
+
+  ledger-2:
+    <<: *ledger
+    depends_on:
+      ledger-1:
+        condition: service_healthy
+
+  proxy:
+    build:
+      context: ./deploy
+    image: veylor-ledger-proxy:local
+    ports:
+      - "127.0.0.1:9999:8080"
+    depends_on:
+      ledger-1:
+        condition: service_healthy
+      ledger-2:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    stop_grace_period: 15s
+    cpus: 0.1
+    mem_limit: 32m
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8080/ready
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  accounts:

@@ -561,13 +561,14 @@ fn managed_parked_timeout_releases_slot() {
         other => panic!("expected EOF after parked timeout, got {other:?}"),
     }
     assert!(spin_until(|| host.parked_count() == 0), "park expires");
-    let mut again = connect(&server);
-    get(&mut again, "/work");
     let (stale, _, _) = poll_request(&host);
     assert_eq!(
         host.respond(stale.token, 200, b"OK", b"late"),
         RespondOutcome::Gone
     );
+
+    let mut again = connect(&server);
+    get(&mut again, "/work");
     let (event, _, _) = poll_request(&host);
     assert_eq!(
         host.respond(event.token, 200, b"OK", b"reused"),

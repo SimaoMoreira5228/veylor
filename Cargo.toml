@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "examples/ledger",
     "crates/veylor-client",
     "crates/veylor-ffi",
     "crates/veylor-http1",

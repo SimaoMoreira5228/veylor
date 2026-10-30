@@ -76,6 +76,7 @@ pub enum ConnClose {
     TransportError,
     Shutdown,
     Completed,
+    Abused,
 }
 
 pub struct ConnState {

@@ -2556,6 +2556,75 @@ fn h2_progressing_conn_after_h1_drain_stays_bound_by_grace() {
 }
 
 #[test]
+fn h2_reset_flood_goes_away_with_enhance_your_calm() {
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/hello", true);
+    let hello = read_response(&mut stream, 1);
+    assert_eq!(hello.status, 200);
+    for _ in 0..300 {
+        write_frame(&mut stream, FrameType::RstStream, 0, 1, &[0, 0, 0, 8]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() > deadline {
+            panic!("no GOAWAY for reset flood");
+        }
+        match try_read_frame(&mut stream) {
+            Some((header, payload)) if header.frame_type == FrameType::GoAway => {
+                let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
+                assert_eq!(goaway.error_code, ErrorCode::EnhanceYourCalm);
+                return;
+            }
+            Some(_) | None => {}
+        }
+    }
+}
+
+#[test]
+fn h2_settings_flood_goes_away_with_enhance_your_calm() {
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/hello", true);
+    let hello = read_response(&mut stream, 1);
+    assert_eq!(hello.status, 200);
+    for _ in 0..60 {
+        write_frame(&mut stream, FrameType::Settings, 0, 0, &[]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() > deadline {
+            panic!("no GOAWAY for settings flood");
+        }
+        match try_read_frame(&mut stream) {
+            Some((header, payload)) if header.frame_type == FrameType::GoAway => {
+                let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
+                assert_eq!(goaway.error_code, ErrorCode::EnhanceYourCalm);
+                return;
+            }
+            Some(_) | None => {}
+        }
+    }
+}
+
+#[test]
+fn h2_occasional_resets_do_not_trip_flood_guard() {
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    send_headers(&mut stream, 1, b"GET", b"/hello", false);
+    write_frame(&mut stream, FrameType::RstStream, 0, 1, &[0, 0, 0, 8]);
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
 fn h2_managed_short_body_reset_stream_survives() {
     let server = managed_h2_body_server();
     let mut stream = h2_connect(&server);

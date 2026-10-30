@@ -1929,7 +1929,17 @@ fn dispatch_pull_body_partial_copies_and_completion_query() {
     stream
         .write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 11\r\n\r\nhello world")
         .expect("write request");
-    let token = unsafe { poll_one(server) };
+    let (token, mut signals) = unsafe { poll_request_with_signals(server) };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+    while !signals.iter().any(|event| event.path_len == 1) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal body signal did not arrive"
+        );
+        unsafe { gather_signals(server, &mut signals) };
+    }
+
     let mut staged = Vec::new();
     let mut chunk = [0u8; 4];
     let (first, pulled, end) = unsafe { pull_into(server, token, &mut chunk) };

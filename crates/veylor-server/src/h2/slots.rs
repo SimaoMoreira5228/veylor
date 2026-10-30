@@ -69,6 +69,9 @@ pub(crate) struct H2Meta {
     pub(crate) pending_sent: usize,
     pub(crate) deadline_ns: u64,
     pub(crate) last_progress_ns: u64,
+    pub(crate) flood_window_start_ns: u64,
+    pub(crate) flood_rst_base: u32,
+    pub(crate) flood_settings_base: u32,
 }
 
 impl H2Meta {

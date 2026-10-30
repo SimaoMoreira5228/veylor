@@ -207,6 +207,14 @@ impl<'a> H2Conn<'a> {
         self.staged
     }
 
+    pub fn flood_counters(&self) -> (u32, u32) {
+        match &self.phase {
+            Phase::Serving(server) => server.flood_counters(),
+            Phase::Handshake(handshake) => handshake.server().flood_counters(),
+            Phase::Dead => (0, 0),
+        }
+    }
+
     pub fn spare_mut(&mut self) -> &mut [u8] {
         &mut self.staging[self.staged..]
     }
@@ -219,6 +227,10 @@ impl<'a> H2Conn<'a> {
     }
 
     pub fn drain(&mut self, output: &mut [u8]) -> StepOutcome {
+        self.drain_with_code(output, ErrorCode::NoError)
+    }
+
+    pub fn drain_with_code(&mut self, output: &mut [u8], code: ErrorCode) -> StepOutcome {
         let mut outcome = StepOutcome::default();
         if self.terminal {
             outcome.closed = true;
@@ -234,7 +246,7 @@ impl<'a> H2Conn<'a> {
             return outcome;
         }
         let mut used = 0;
-        self.fail(ErrorCode::NoError, output, &mut used, &mut outcome);
+        self.fail(code, output, &mut used, &mut outcome);
         outcome
     }
 
