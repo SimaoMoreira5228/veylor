@@ -304,6 +304,17 @@ impl<'a> H2Conn<'a> {
                 outcome.served += 1;
                 outcome.written = used;
             }
+            Err(ErrorCode::RefusedStream) => {
+                match server.rst_stream(stream, ErrorCode::RefusedStream, &mut output[used..]) {
+                    Ok(writer) => {
+                        used += writer.pending_bytes().len();
+                        outcome.refused += 1;
+                        outcome.written = used;
+                    }
+                    Err(ServerError::StreamClosed) | Err(ServerError::UnknownStream) => {}
+                    Err(_) => self.fail(ErrorCode::InternalError, output, &mut used, &mut outcome),
+                }
+            }
             Err(code) => self.fail(code, output, &mut used, &mut outcome),
         }
         outcome

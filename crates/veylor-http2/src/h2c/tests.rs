@@ -106,14 +106,14 @@ fn exact_magic_plus_empty_settings_completes() {
         let header = decode_frame_header(&settings_bytes, DEFAULT_MAX_FRAME_SIZE).unwrap();
         assert_eq!(header.frame_type, FrameType::Settings);
         assert_eq!(header.stream_id, 0);
-        let mut parameters = [SettingsParameter { id: 0, value: 0 }; 3];
+        let mut parameters = [SettingsParameter { id: 0, value: 0 }; 4];
         let count = decode_settings_payload(
             header,
             &settings_bytes[FRAME_HEADER_LEN..H2C_SERVER_SETTINGS_LEN],
             &mut parameters,
         )
         .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         assert_eq!(
             parameters,
             [
@@ -128,6 +128,13 @@ fn exact_magic_plus_empty_settings_completes() {
                 SettingsParameter {
                     id: crate::frame::SETTINGS_MAX_CONCURRENT_STREAMS,
                     value: H2C_MAX_CONCURRENT_STREAMS.min(4)
+                },
+                // NOTE: the handshake advertises the table's effective assembly cap
+                // (this harness wires 256-byte storage with a 256 limit), not a fixed
+                // const, so the wire promise always matches what fits.
+                SettingsParameter {
+                    id: crate::frame::SETTINGS_MAX_HEADER_LIST_SIZE,
+                    value: 256,
                 },
             ]
         );

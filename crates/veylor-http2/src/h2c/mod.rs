@@ -7,7 +7,8 @@ use super::connection::{
 use super::flow_control::FlowWindowError;
 use super::frame::{
     ErrorCode, FRAME_HEADER_LEN, GOAWAY_FIXED_LEN, SETTINGS_ENTRY_LEN, SETTINGS_HEADER_TABLE_SIZE,
-    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SettingsParameter,
+    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
+    SettingsParameter,
 };
 use super::hpack::{HpackHeader, HpackTable};
 use super::stream::{H2Role, SettingsError, StreamTable};
@@ -19,7 +20,7 @@ pub const H2C_MAX_FRAME_SIZE: u32 = 16_384;
 // effective ceiling is 32 today (pinned by the managed 33rd-stream refusal test).
 // This constant only binds if a larger table ever exists; keep it if the table grows.
 pub const H2C_MAX_CONCURRENT_STREAMS: u32 = 100;
-pub const H2C_SERVER_SETTINGS_LEN: usize = FRAME_HEADER_LEN + 3 * SETTINGS_ENTRY_LEN;
+pub const H2C_SERVER_SETTINGS_LEN: usize = FRAME_HEADER_LEN + 4 * SETTINGS_ENTRY_LEN;
 pub const H2C_GOAWAY_LEN: usize = FRAME_HEADER_LEN + GOAWAY_FIXED_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +111,9 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
         // NOTE: advertise the table-sized ceiling, never the configured default alone: the slot
         // slice is the single source (STREAM_SLOTS at the live server), so a peer-legitimate open
         // under RFC 9113 §5.1.2 always fits and excess fails per stream with REFUSED_STREAM.
+        // The header-list cap rides the same single source: the assembler only ever holds
+        // header_block_limit bytes, so an oversize block is the sender's violation and the
+        // server refuses its stream instead of tearing down the connection.
         let local = [
             SettingsParameter {
                 id: SETTINGS_HEADER_TABLE_SIZE,
@@ -122,6 +126,10 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
             SettingsParameter {
                 id: SETTINGS_MAX_CONCURRENT_STREAMS,
                 value: max_concurrent,
+            },
+            SettingsParameter {
+                id: SETTINGS_MAX_HEADER_LIST_SIZE,
+                value: self.server.driver().streams().header_block_limit(),
             },
         ];
         writer.queue_settings(&local)?;

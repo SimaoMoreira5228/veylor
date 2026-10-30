@@ -196,6 +196,20 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         if action.kind == StreamActionKind::ConnectionError {
             return Err(action.code);
         }
+        if action.kind == StreamActionKind::SendRst {
+            // NOTE: an aborted block leaves a stale pending entry that would poison the
+            // next header block's stream-id check, so it is dropped only when it names
+            // this stream; other streams' in-progress blocks are untouched.
+            if self
+                .pending_headers
+                .as_ref()
+                .is_some_and(|pending| pending.stream_id == header.stream_id)
+            {
+                self.pending_headers = None;
+            }
+            self.queue_reset(header.stream_id, action.code, actions, result);
+            return Ok(());
+        }
         if self.streams.is_assembling_headers() {
             return Ok(());
         }
@@ -272,7 +286,11 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
                 .checked_add(field_size)
                 .ok_or(ErrorCode::EnhanceYourCalm)?;
             if header_list_size > u64::from(streams.local_settings().max_header_list_size) {
-                return Err(ErrorCode::EnhanceYourCalm);
+                // NOTE: same blast-radius rule as the wire cap: the block decoded fully
+                // and HPACK state stays consistent, so an oversize list refuses its
+                // stream instead of tearing down the connection. The checked_add arms
+                // above stay connection errors: arithmetic overflow is not a peer signal.
+                return Ok(Some(ErrorCode::RefusedStream));
             }
         }
         output.result.headers += count;

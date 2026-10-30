@@ -221,6 +221,18 @@ pub(crate) fn send_full(
     } else {
         (body, end_stream)
     };
+    // NOTE: pre-flight the whole body against both send windows before staging anything:
+    // a peer that shrank (or never opened) its windows gets a per-stream refusal it may
+    // retry, never a torn-down connection or a truncated response. Zero output has been
+    // staged at this point, so refusing is side-effect free; the DATA loop below can no
+    // longer hit NoSendCredit because only our own exact debits move the windows.
+    if !end_stream
+        && send_body
+        && !body.is_empty()
+        && !response_fits_window(server, stream, body.len())
+    {
+        return Err(ErrorCode::RefusedStream);
+    }
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, u64::from(status));
     let mut length_buf = [0; DECIMAL_CAP];
@@ -304,6 +316,12 @@ pub(crate) fn send_method_not_allowed(
     output: &mut [u8],
     used: &mut usize,
 ) -> Result<(), ErrorCode> {
+    if !end_stream
+        && send_body
+        && !response_fits_window(server, stream, METHOD_NOT_ALLOWED_BODY.len())
+    {
+        return Err(ErrorCode::RefusedStream);
+    }
     let mut status_buf = [0; DECIMAL_CAP];
     let status_len = push_decimal(&mut status_buf, 405);
     let mut length_buf = [0; DECIMAL_CAP];
@@ -387,6 +405,24 @@ pub(crate) fn send_options(
         .map_err(|_| ErrorCode::InternalError)?;
     *used += sent.writer.pending_bytes().len();
     Ok(())
+}
+
+// NOTE: single pre-flight gate for the H2 response senders below: the whole body must
+// fit both send windows before anything is staged, so a stalled peer gets a per-stream
+// refusal instead of a torn-down connection. Unknown streams read as zero credit, which
+// the callers map to a silent drop through their usual closed/unknown handling.
+fn response_fits_window(
+    server: &H2ServerDriver<'_, '_, '_, '_>,
+    stream: u32,
+    body_len: usize,
+) -> bool {
+    let need = body_len as u64;
+    let connection_open =
+        u64::try_from(server.driver().connection_send_window().value()).unwrap_or(0);
+    let stream_open = server.driver().streams().find(stream).map_or(0, |found| {
+        u64::try_from(found.send_window.value()).unwrap_or(0)
+    });
+    connection_open >= need && stream_open >= need
 }
 
 pub(crate) fn field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {

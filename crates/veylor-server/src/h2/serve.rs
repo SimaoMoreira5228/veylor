@@ -163,6 +163,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             self.used,
         ) {
             Ok(()) => self.outcome.served += 1,
+            Err(ErrorCode::RefusedStream) => {
+                self.deny(stream, ErrorCode::RefusedStream, false);
+            }
             Err(code) => self.fail(code),
         }
     }
@@ -213,6 +216,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             self.used,
         ) {
             Ok(()) => self.outcome.served += 1,
+            Err(ErrorCode::RefusedStream) => {
+                self.deny(stream, ErrorCode::RefusedStream, false);
+            }
             Err(code) => self.fail(code),
         }
     }
@@ -379,6 +385,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         self.used,
                     ) {
                         Ok(()) => self.outcome.served += 1,
+                        Err(ErrorCode::RefusedStream) => {
+                            self.deny(stream, ErrorCode::RefusedStream, false);
+                        }
                         Err(code) => self.fail(code),
                     }
                     return;
@@ -474,6 +483,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                                 self.used,
                             ) {
                                 Ok(()) => self.outcome.served += 1,
+                                Err(ErrorCode::RefusedStream) => {
+                                    self.deny(stream, ErrorCode::RefusedStream, false);
+                                }
                                 Err(code) => self.fail(code),
                             }
                             return;
@@ -527,6 +539,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     self.used,
                 ) {
                     Ok(()) => self.outcome.served += 1,
+                    Err(ErrorCode::RefusedStream) => {
+                        self.deny(stream, ErrorCode::RefusedStream, false);
+                    }
                     Err(code) => self.fail(code),
                 }
             }

@@ -405,6 +405,19 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     host.push_shutdown(worker_id);
                     break;
                 }
+                // NOTE: H1 reaching zero mid-shutdown cancels the grace timer, so an
+                // H2 connection that keeps progressing would otherwise never see a
+                // force bound; arm it here exactly once, with the same grace the
+                // stop path grants when H1 is already gone.
+                if outcome.shutdown_complete && h2_force_ns == 0 && h2_slots::occupied(&h2_meta) > 0
+                {
+                    h2_turn::restart_h2_drain(
+                        &mut drain_start_ns,
+                        &mut h2_force_ns,
+                        now_ns,
+                        config.shutdown_grace_ns,
+                    );
+                }
             }
             Err(WorkerError::SlotCapacity) => {}
             Err(error) => {
@@ -1036,6 +1049,7 @@ pub(crate) fn apply_h2_staged(
         let outcome = live.apply_staged(h2_slots::pending_spare(meta), &work);
         meta.pending_len += outcome.written;
         turn.counts.h2_served += u64::from(outcome.served);
+        turn.counts.h2_refused += u64::from(outcome.refused);
         if work.cancel {
             turn.counts.h2_refused += 1;
         }

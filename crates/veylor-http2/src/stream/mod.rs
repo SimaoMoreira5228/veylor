@@ -261,6 +261,11 @@ impl<'a> StreamTable<'a> {
         self.active_streams
     }
 
+    pub fn header_block_limit(&self) -> u32 {
+        let cap = self.assembler.limit.min(self.assembler.buffer.len());
+        u32::try_from(cap).unwrap_or(u32::MAX)
+    }
+
     pub fn find(&self, id: u32) -> Option<&Stream> {
         self.slots[..self.used]
             .iter()
@@ -332,11 +337,23 @@ impl<'a> StreamTable<'a> {
                     fragment,
                     header.flags & crate::frame::CONTINUATION_FLAG_END_HEADERS != 0,
                 ) {
-                    return StreamAction::connection_error(ErrorCode::CompressionError);
+                    // NOTE: wire-cap overflow is a per-stream refusal, not a connection
+                    // kill: the block never decodes, so HPACK state stays clean and the
+                    // stream RSTs while multiplexed siblings survive.
+                    return StreamAction::send_rst(ErrorCode::RefusedStream);
                 }
                 return StreamAction::ACCEPT;
             }
             if kind == FrameType::Continuation {
+                // NOTE: a CONTINUATION for a closed stream is likely in flight past our
+                // RST, so it RSTs again instead of tearing down the connection; anything
+                // else never opened a block and stays a connection error per §6.10.
+                let closed = self
+                    .find(header.stream_id)
+                    .is_some_and(|stream| stream.state == StreamState::Closed);
+                if closed {
+                    return StreamAction::send_rst(ErrorCode::StreamClosed);
+                }
                 return StreamAction::connection_error(ErrorCode::ProtocolError);
             }
             if kind == FrameType::Headers {
@@ -389,7 +406,7 @@ impl<'a> StreamTable<'a> {
                 && header.flags & HEADERS_FLAG_END_HEADERS == 0
                 && !self.assembler.begin(header.stream_id, fragment)
             {
-                return StreamAction::connection_error(ErrorCode::CompressionError);
+                return StreamAction::send_rst(ErrorCode::RefusedStream);
             }
             return StreamAction::IGNORE;
         }
@@ -420,7 +437,7 @@ impl<'a> StreamTable<'a> {
             && header.flags & HEADERS_FLAG_END_HEADERS == 0
             && !self.assembler.begin(header.stream_id, fragment)
         {
-            return StreamAction::connection_error(ErrorCode::CompressionError);
+            return StreamAction::send_rst(ErrorCode::RefusedStream);
         }
         action
     }

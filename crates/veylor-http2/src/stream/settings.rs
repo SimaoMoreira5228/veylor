@@ -27,9 +27,10 @@ pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = u32::MAX;
 
 impl EndpointSettings {
     pub const fn for_role(role: H2Role) -> Self {
-        // NOTE: max_header_list_size stays at the RFC 9113 default (unlimited): the real
-        // bound is the caller-supplied HPACK table (entries/scratch report Capacity past
-        // their fixed sizes), so no protocol-level setting is needed to stay fail-closed.
+        // NOTE: max_header_list_size stays at the RFC 9113 default (unlimited) until we
+        // advertise our own cap: the assembler enforces the caller's storage bound per
+        // stream and oversize blocks RST with REFUSED_STREAM, so the connection survives
+        // peers that never read the advertisement.
         Self {
             header_table_size: DEFAULT_HEADER_TABLE_SIZE,
             enable_push: match role {

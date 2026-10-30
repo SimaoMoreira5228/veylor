@@ -673,7 +673,7 @@ fn continuation_gate_rejects_strays_wrong_streams_and_interleaving() {
 }
 
 #[test]
-fn continuation_assembly_resets_on_storage_or_header_limit_overflow() {
+fn continuation_assembly_resets_stream_on_storage_or_header_limit_overflow() {
     let mut slots = [StreamSlot::EMPTY; 2];
     let mut storage = [0; 4];
     let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut storage, 8);
@@ -684,7 +684,7 @@ fn continuation_assembly_resets_on_storage_or_header_limit_overflow() {
             FrameDirection::Received,
             &[1, 2, 3, 4, 5]
         ),
-        StreamAction::connection_error(ErrorCode::CompressionError)
+        StreamAction::send_rst(ErrorCode::RefusedStream)
     );
     assert!(!table.is_assembling_headers());
     assert_eq!(table.assembled_header_block(), None);
@@ -712,8 +712,48 @@ fn continuation_assembly_resets_on_storage_or_header_limit_overflow() {
             FrameDirection::Received,
             &[4, 5],
         ),
-        StreamAction::connection_error(ErrorCode::CompressionError)
+        StreamAction::send_rst(ErrorCode::RefusedStream)
     );
     assert!(!limited.is_assembling_headers());
     assert_eq!(limited.assembled_header_block(), None);
+}
+
+#[test]
+fn stray_continuation_on_closed_stream_resets_instead_of_failing_the_connection() {
+    let mut slots = [StreamSlot::EMPTY; 2];
+    let mut storage = [0; 64];
+    let mut table = StreamTable::new(&mut slots, H2Role::Server, &mut storage, 64);
+    establish(&mut table);
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::Headers, crate::HEADERS_FLAG_END_HEADERS, 1, 0),
+            FrameDirection::Received,
+            &[]
+        ),
+        StreamAction::ACCEPT
+    );
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::RstStream, 0, 1, 4),
+            FrameDirection::Received,
+            &[0, 0, 0, 0]
+        ),
+        StreamAction::ACCEPT
+    );
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::Continuation, 0, 1, 1),
+            FrameDirection::Received,
+            &[0]
+        ),
+        StreamAction::send_rst(ErrorCode::StreamClosed)
+    );
+    assert_eq!(
+        table.on_frame(
+            header(FrameType::Continuation, 0, 99, 1),
+            FrameDirection::Received,
+            &[0]
+        ),
+        StreamAction::connection_error(ErrorCode::ProtocolError)
+    );
 }

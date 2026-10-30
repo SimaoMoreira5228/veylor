@@ -13,7 +13,7 @@ use veylor_http2::{
     decode_goaway_payload, decode_header_block, decode_rst_stream_payload, encode_frame_header,
     encode_header_block,
 };
-use veylor_runtime::ConnectionToken;
+use veylor_runtime::{ConnectionTimeouts, ConnectionToken};
 
 type TrailerFields = Vec<(Vec<u8>, Vec<u8>)>;
 use veylor_server::{
@@ -2065,6 +2065,28 @@ fn send_open_trailers(stream: &mut TcpStream, id: u32, fields: &[(&'static [u8],
     );
 }
 
+fn send_fragmented_headers(stream: &mut TcpStream, id: u32, fields: &[(&[u8], &[u8])]) {
+    let encoded: Vec<HpackFieldToEncode<'_>> = fields
+        .iter()
+        .map(|(name, value)| field(name, value))
+        .collect();
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut block = [0; 24_576];
+    let len = encode_header_block(&encoded, &mut encoder, &mut block).expect("encode block");
+    assert!(
+        len > 16_384,
+        "block must exceed the assembly cap, got {len}"
+    );
+    let mut chunks = block[..len].chunks(8_000);
+    let first = chunks.next().expect("block");
+    write_frame(stream, FrameType::Headers, 0, id, first);
+    for chunk in chunks {
+        write_frame(stream, FrameType::Continuation, 0, id, chunk);
+    }
+}
+
 fn pull_all(host: &HostHandle, token: ConnectionToken) -> Vec<u8> {
     let deadline = Instant::now() + DEADLINE;
     let mut body = Vec::new();
@@ -2345,6 +2367,195 @@ fn h2_managed_nonfinal_trailer_headers_reset_protocol_error() {
 }
 
 #[test]
+fn h2_oversize_request_header_block_resets_stream_and_spares_connection() {
+    // NOTE: a header block past the advertised 16,384-octet cap is a per-stream
+    // refusal, not a connection kill: the overflow RSTs only its stream while a
+    // sibling exchange on the same connection still serves.
+    let server = managed_h2_body_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for index in 0..400usize {
+        names.push(format!("x-pad-{index:04}"));
+        values.push("v".repeat(40));
+    }
+    let mut fields: Vec<(&[u8], &[u8])> = vec![
+        (&b":method"[..], &b"POST"[..]),
+        (b":scheme", b"http"),
+        (b":path", b"/upload"),
+        (b":authority", b"localhost"),
+    ];
+    for (name, value) in names.iter().zip(values.iter()) {
+        fields.push((name.as_bytes(), value.as_bytes()));
+    }
+    send_fragmented_headers(&mut stream, 1, &fields);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::RefusedStream);
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_zero_window_static_body_refuses_stream_and_spares_connection() {
+    // NOTE: a peer that never opens its send window (INITIAL_WINDOW_SIZE 0 is
+    // explicit flow control, not misbehavior) must get a per-stream refusal it
+    // may retry, never a connection teardown with a truncated response.
+    let server = h2_server();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(&mut stream, FrameType::Settings, 0, 0, &[0, 4, 0, 0, 0, 0]);
+    let (header, _) = read_frame(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_ne!(header.flags & SETTINGS_ACK, 0);
+    send_headers(&mut stream, 1, b"GET", b"/hello", true);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::RefusedStream);
+    send_headers(&mut stream, 3, b"GET", b"/empty", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 1, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_zero_window_staged_body_refuses_stream_and_spares_connection() {
+    // NOTE: same pre-flight rule on the managed staged path: the host already
+    // answered, so tearing down the connection would drop a good response and
+    // seven innocent siblings; the stream RSTs and a later POST still serves.
+    let server = managed_h2_body_server();
+    let host = server.host();
+    let mut stream = h2_connect(&server);
+    handshake(&mut stream);
+    write_frame(&mut stream, FrameType::Settings, 0, 0, &[0, 4, 0, 0, 0, 0]);
+    let (header, _) = read_frame(&mut stream);
+    assert_eq!(header.frame_type, FrameType::Settings);
+    assert_ne!(header.flags & SETTINGS_ACK, 0);
+    send_headers_len(&mut stream, 1, b"POST", b"/upload", Some(4), false);
+    write_frame(
+        &mut stream,
+        FrameType::Data,
+        DATA_FLAG_END_STREAM,
+        1,
+        b"data",
+    );
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"late"),
+        RespondOutcome::Ok
+    );
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::RefusedStream);
+    send_headers_len(&mut stream, 3, b"POST", b"/upload", Some(4), false);
+    write_frame(
+        &mut stream,
+        FrameType::Data,
+        DATA_FLAG_END_STREAM,
+        3,
+        b"data",
+    );
+    let (event, _, _) = poll_h2_request(&host);
+    assert_eq!(
+        host.respond(event.token, 200, b"OK", b"late"),
+        RespondOutcome::Ok
+    );
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 3);
+    assert_eq!(code, ErrorCode::RefusedStream);
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 0, "counts: {counts:?}");
+    assert_eq!(counts.h2_refused, 2, "counts: {counts:?}");
+}
+
+#[test]
+fn h2_progressing_conn_after_h1_drain_stays_bound_by_grace() {
+    // NOTE: once the last H1 connection closes mid-shutdown, the cancelled
+    // grace timer must not leave a progressing H2 connection unforced:
+    // per-second GETs defeat body-progress timeouts and the disabled linger
+    // defeats idle closes, so only the grace bound can release the worker.
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = ServerConfig {
+        h2c_port: Some(0),
+        drain_idle_linger_ns: u64::MAX,
+        timeouts: ConnectionTimeouts {
+            body_progress_ns: 2_000_000_000,
+            ..ConnectionTimeouts::production()
+        },
+        ..ServerConfig::default()
+    };
+    let mut server = Server::bind(addr, config).expect("bind loopback");
+    server
+        .register_route(
+            b"GET",
+            b"/hello",
+            200,
+            b"OK",
+            b"hello",
+            MAX_STATIC_BODY_BYTES,
+        )
+        .expect("register hello");
+    let server = server.start().expect("start server");
+    let mut h1 = h1_connect(&server);
+    h1.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+        .expect("write h1 request");
+    let (status, _) = read_h1_body(&mut h1);
+    assert_eq!(status, 200);
+    let mut h2 = h2_connect(&server);
+    handshake(&mut h2);
+    send_headers(&mut h2, 1, b"GET", b"/hello", true);
+    let hello = read_response(&mut h2, 1);
+    assert_eq!(hello.status, 200);
+    server.stop_accepting();
+    // NOTE: let the worker observe stop (Draining + grace armed) before
+    // dropping H1, and keep GETs flowing until the verdict: stopping GETs
+    // would let the trailing body-progress timeout release the worker and
+    // mask a hang. A failed GET is only acceptable if join already completed.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(h1);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(stop_join(server));
+    });
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut id = 3u32;
+    loop {
+        if let Ok(counts) = done_rx.try_recv() {
+            assert!(counts.h2_served >= 2, "counts: {counts:?}");
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("join hung past grace");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let alive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send_headers(&mut h2, id, b"GET", b"/hello", true);
+            let sibling = read_response(&mut h2, id);
+            assert_eq!(sibling.status, 200);
+        }));
+        if alive.is_err() {
+            break;
+        }
+        id += 2;
+    }
+    let counts = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("h2 died without join completing");
+    assert!(counts.h2_served >= 2, "counts: {counts:?}");
+}
+
+#[test]
 fn h2_managed_short_body_reset_stream_survives() {
     let server = managed_h2_body_server();
     let mut stream = h2_connect(&server);
@@ -2516,12 +2727,12 @@ fn h2_adversarial_window_update_closed_ignored() {
     assert_eq!(counts.shutdown, 1);
 }
 
-// NOTE: RFC 9113 section 4.3 (a field block the endpoint does not decompress is a
-// COMPRESSION_ERROR connection error): 12000 plus 5000 fragment octets breach the 16384
-// assembler cap before completion, so the connection dies with nothing served (last 1 names
-// the fragment-opened stream, which never reaches serving).
+// NOTE: RFC 9113 section 4.3 (a field block the endpoint does not decompress is refused
+// per stream, not per connection): 12000 plus 5000 fragment octets breach the 16384
+// assembler cap before completion, so only stream 1 RSTs with REFUSED_STREAM while the
+// sibling exchange on a fresh stream still serves.
 #[test]
-fn h2_adversarial_oversized_header_block_goes_away() {
+fn h2_adversarial_oversized_header_block_resets_stream() {
     let server = h2_server();
     let mut stream = h2_connect(&server);
     handshake(&mut stream);
@@ -2535,10 +2746,13 @@ fn h2_adversarial_oversized_header_block_goes_away() {
         1,
         &second,
     );
-    let (last, code) = read_goaway(&mut stream);
-    assert_eq!(code, ErrorCode::CompressionError);
-    assert_eq!(last, 1);
-    read_eof(&mut stream);
+    let (id, code) = read_rst(&mut stream);
+    assert_eq!(id, 1);
+    assert_eq!(code, ErrorCode::RefusedStream);
+    send_headers(&mut stream, 3, b"GET", b"/hello", true);
+    let sibling = read_response(&mut stream, 3);
+    assert_eq!(sibling.status, 200);
+    assert_eq!(sibling.body, b"hello");
     stop_join(server);
 }
 

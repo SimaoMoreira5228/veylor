@@ -1390,7 +1390,7 @@ fn scripted_continuation_within_limit_succeeds() {
 }
 
 #[test]
-fn scripted_continuation_over_limit_fails_closed() {
+fn scripted_continuation_over_limit_resets_stream_and_spares_connection() {
     let client = new_client();
     scripted_handshake(client);
     let stream = scripted_get(client);
@@ -1399,36 +1399,13 @@ fn scripted_continuation_over_limit_fails_closed() {
     assert!(block.len() > 4_096);
     let wire = peer_fragmented_headers(1, &block, 1_000);
     let out = poll_peer(client, &wire);
-    assert_eq!(out.result, VylResult::ProtocolError);
-    assert_eq!(out.connection_error, 9);
-    let out = poll_peer(client, &[]);
-    assert_eq!(out.result, VylResult::ProtocolError);
-    assert_eq!(out.connection_error, 9);
-    let fields = [
-        encode_field(b":method", b"GET"),
-        encode_field(b":scheme", b"https"),
-        encode_field(b":path", b"/"),
-        encode_field(b":authority", b"example.com"),
-    ];
-    let mut request = [0; 1_024];
-    let mut written = 0;
-    let mut stream_id = 0;
-    let mut required = 0;
-    assert_eq!(
-        unsafe {
-            vyl_h2_client_start_request(
-                client,
-                fields.as_ptr(),
-                fields.len(),
-                1,
-                request.as_mut_ptr(),
-                request.len(),
-                &mut written,
-                &mut stream_id,
-                &mut required,
-            )
-        },
-        VylResult::BadState
-    );
+    assert_eq!(out.result, VylResult::Ok);
+    assert_eq!(out.consumed, wire.len());
+    assert_eq!(out.actions.len(), 1);
+    assert_eq!(out.actions[0].kind, VylH2ActionKind::SendReset);
+    assert_eq!(out.actions[0].stream_id, 1);
+    assert_eq!(out.actions[0].error_code, 7);
+    let stream = scripted_request(client, b"GET", b"/again", 1);
+    assert_eq!(stream, 3);
     destroy_client(client);
 }
