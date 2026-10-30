@@ -18,9 +18,11 @@ pub(crate) mod turn;
 // writes), step owns the staged step draining one queued host command, and file owns
 // file-mount assembly (range planning, HEADERS emit, DATA pump).
 mod file;
+mod flush;
 mod routes;
 mod send;
 mod serve;
+pub(crate) mod slots;
 mod step;
 
 pub(crate) use file::H2FileTransfer;

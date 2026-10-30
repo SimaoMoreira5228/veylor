@@ -1,21 +1,16 @@
-use std::io::{self, Read, Write};
-
-use veylor_http2::{HpackEntrySlot, HpackHeader, StreamSlot};
 use veylor_runtime::{
-    AcceptedConnection, ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness,
-    TcpListener, TcpStream,
+    ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness, TcpListener, TcpStream,
 };
-use veylor_tls::{TlsAcceptor, TlsConn};
+use veylor_tls::TlsAcceptor;
 
-use super::{
-    ACK_SLOTS, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES, FrozenNativeRoute,
-    FrozenRoute, FrozenRoutesView, H2Conn, HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP,
-    MAX_H2_CONNS, STREAM_SLOTS,
+use super::flush::{H2Flush, H2Read, flush_h2, read_once};
+use super::slots::{
+    H2_PENDING_CAP, H2_STREAM_TOKEN_BASE, H2Meta, H2MetaSlots, idle_for_drain, meta_at,
+    pending_spare,
 };
+use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView, H2Conn, MAX_H2_CONNS, STREAM_SLOTS};
 use crate::connection::ConnClose;
-use crate::connection::tls::{
-    TlsWriteOutcome, tls_encrypt_bytes, tls_read_decrypted, tls_write_once,
-};
+use crate::connection::tls::tls_read_decrypted;
 use crate::host::{HostShared, StagedWork};
 use crate::static_routes::MAX_RESPONSE_BODY;
 use crate::static_server::turn::apply_h2_staged;
@@ -25,115 +20,8 @@ use crate::static_server::{CloseCounts, H2StaticRoute, MAX_CONNECTIONS};
 // old regions, so workers pre-allocate buffer sets and borrow FIELDS at one inline
 // build site per slot; closes visibly clear the conn. 8x32 streams out-multiplex H1.
 pub(crate) const H2C_LISTENER_TOKEN: usize = usize::MAX - 1;
-pub(crate) const H2_STREAM_TOKEN_BASE: usize = 1024;
-pub(crate) const H2_ACCEPT_STAGING: usize = 8;
-pub(crate) const H2_PENDING_CAP: usize = 16_384 + 512;
 pub(crate) const H2_FLUSH_THRESHOLD: usize = 1024;
 pub(crate) const MAX_H2_STEPS_PER_TURN: usize = 4;
-
-// NOTE: per-conn backing stores, boxed so idle slots cost two words (~57 KiB live per
-// active conn; 17 KiB pending rides the meta). Sizes mirror the step-driver harness.
-pub(crate) struct H2Buffers {
-    pub(crate) staging: Box<[u8; INPUT_STAGING_CAP]>,
-    pub(crate) slots: Box<[StreamSlot; STREAM_SLOTS]>,
-    pub(crate) block: Box<[u8; HEADER_BLOCK_CAP]>,
-    pub(crate) dec_entries: Box<[HpackEntrySlot; DECODE_ENTRIES]>,
-    pub(crate) dec_scratch: Box<[u8; DECODE_BYTES]>,
-    pub(crate) enc_entries: Box<[HpackEntrySlot; ENCODE_ENTRIES]>,
-    pub(crate) enc_scratch: Box<[u8; ENCODE_BYTES]>,
-    pub(crate) ack: Box<[u32; ACK_SLOTS]>,
-    pub(crate) headers: Box<[HpackHeader; HEADER_SLOTS]>,
-}
-
-impl H2Buffers {
-    pub(crate) fn new() -> Self {
-        Self {
-            staging: Box::new([0; INPUT_STAGING_CAP]),
-            slots: Box::new([StreamSlot::EMPTY; STREAM_SLOTS]),
-            block: Box::new([0; HEADER_BLOCK_CAP]),
-            dec_entries: Box::new([HpackEntrySlot::EMPTY; DECODE_ENTRIES]),
-            dec_scratch: Box::new([0; DECODE_BYTES]),
-            enc_entries: Box::new([HpackEntrySlot::EMPTY; ENCODE_ENTRIES]),
-            enc_scratch: Box::new([0; ENCODE_BYTES]),
-            ack: Box::new([0; ACK_SLOTS]),
-            headers: Box::new([HpackHeader::EMPTY; HEADER_SLOTS]),
-        }
-    }
-}
-
-impl Default for H2Buffers {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// NOTE: scalar half of a slot: borrow-free, mutates freely beside driver borrows.
-#[derive(Default)]
-pub(crate) struct H2Meta {
-    stream: Option<TcpStream>,
-    pub(crate) tls: Option<TlsConn>,
-    tls_pending: Vec<u8>,
-    tls_pending_sent: usize,
-    tls_plain: Vec<u8>,
-    pub(crate) occupied: bool,
-    readable: bool,
-    write_blocked: bool,
-    watching_write: bool,
-    error: bool,
-    staged: bool,
-    serving: bool,
-    timed_out: bool,
-    pub(crate) token: usize,
-    pending: Option<Box<[u8; H2_PENDING_CAP]>>,
-    pub(crate) pending_len: usize,
-    pending_sent: usize,
-    deadline_ns: u64,
-    last_progress_ns: u64,
-}
-
-impl H2Meta {
-    fn pending_unflushed(&self) -> bool {
-        self.pending_len > self.pending_sent
-    }
-
-    fn tls_unflushed(&self) -> bool {
-        self.tls_pending.len() > self.tls_pending_sent
-    }
-
-    fn wants_pump(&self) -> bool {
-        self.readable
-            || self.staged
-            || ((self.pending_unflushed() || self.tls_unflushed()) && !self.write_blocked)
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct H2BufSlots {
-    pub(crate) b0: H2Buffers,
-    pub(crate) b1: H2Buffers,
-    pub(crate) b2: H2Buffers,
-    pub(crate) b3: H2Buffers,
-    pub(crate) b4: H2Buffers,
-    pub(crate) b5: H2Buffers,
-    pub(crate) b6: H2Buffers,
-    pub(crate) b7: H2Buffers,
-}
-
-#[derive(Default)]
-pub(crate) struct H2MetaSlots {
-    pub(crate) m0: H2Meta,
-    pub(crate) m1: H2Meta,
-    pub(crate) m2: H2Meta,
-    pub(crate) m3: H2Meta,
-    pub(crate) m4: H2Meta,
-    pub(crate) m5: H2Meta,
-    pub(crate) m6: H2Meta,
-    pub(crate) m7: H2Meta,
-}
-
-pub(crate) fn accept_staging() -> [Option<AcceptedConnection>; H2_ACCEPT_STAGING] {
-    std::array::from_fn(|_| None)
-}
 
 pub(crate) struct H2Turn<'a> {
     pub(crate) routes: &'a FrozenRoutesView<'a>,
@@ -148,315 +36,6 @@ pub(crate) struct H2Turn<'a> {
     pub(crate) forcing: bool,
     pub(crate) counts: &'a mut CloseCounts,
     pub(crate) tls_acceptor: Option<&'a mut TlsAcceptor>,
-}
-
-pub(crate) fn occupied(metas: &H2MetaSlots) -> usize {
-    (0..MAX_H2_CONNS)
-        .filter(|&index| meta_ref(metas, index).occupied)
-        .count()
-}
-
-pub(crate) fn free_slot(metas: &H2MetaSlots) -> Option<usize> {
-    (0..MAX_H2_CONNS).find(|&index| !meta_ref(metas, index).occupied)
-}
-
-pub(crate) fn wants_pump(metas: &H2MetaSlots) -> bool {
-    (0..MAX_H2_CONNS)
-        .any(|index| meta_ref(metas, index).occupied && meta_ref(metas, index).wants_pump())
-}
-
-pub(crate) fn meta_ref(metas: &H2MetaSlots, index: usize) -> &H2Meta {
-    match index {
-        0 => &metas.m0,
-        1 => &metas.m1,
-        2 => &metas.m2,
-        3 => &metas.m3,
-        4 => &metas.m4,
-        5 => &metas.m5,
-        6 => &metas.m6,
-        _ => &metas.m7,
-    }
-}
-
-pub(crate) fn meta_at(metas: &mut H2MetaSlots, index: usize) -> &mut H2Meta {
-    match index {
-        0 => &mut metas.m0,
-        1 => &mut metas.m1,
-        2 => &mut metas.m2,
-        3 => &mut metas.m3,
-        4 => &mut metas.m4,
-        5 => &mut metas.m5,
-        6 => &mut metas.m6,
-        _ => &mut metas.m7,
-    }
-}
-
-// NOTE: h2c tracks timeouts in slot scalars (no table tokens): head budget covers the
-// handshake, then last-progress drives body-progress activity and the idle bound.
-pub(crate) fn sweep_deadlines(metas: &mut H2MetaSlots, now_ns: u64, timeouts: ConnectionTimeouts) {
-    for index in 0..MAX_H2_CONNS {
-        let meta = meta_at(metas, index);
-        if !meta.occupied || meta.timed_out {
-            continue;
-        }
-        if !meta.serving {
-            if now_ns > meta.deadline_ns {
-                meta.timed_out = true;
-            }
-        } else if now_ns.saturating_sub(meta.last_progress_ns) > timeouts.body_progress_ns
-            || now_ns > meta.deadline_ns
-        {
-            meta.timed_out = true;
-        }
-    }
-}
-
-fn idle_for_drain(meta: &H2Meta, conn: Option<&H2Conn<'_>>) -> bool {
-    conn.is_some_and(|active| active.handshake_complete() && active.staged_len() == 0)
-        && !meta.pending_unflushed()
-        && !meta.tls_unflushed()
-}
-
-pub(crate) fn pending_spare(meta: &mut H2Meta) -> &mut [u8] {
-    let len = meta.pending_len.min(H2_PENDING_CAP);
-    match meta.pending.as_deref_mut() {
-        Some(staged) => &mut staged[len..],
-        None => &mut [],
-    }
-}
-
-enum H2Flush {
-    Done,
-    Blocked,
-    Retry,
-    Closed(ConnClose),
-}
-
-enum H2Write {
-    Accepted(usize),
-    Blocked,
-    Interrupted,
-    Closed(ConnClose),
-}
-
-enum H2Read {
-    Progress(usize),
-    Blocked,
-    Eof,
-    Closed(ConnClose),
-}
-
-// NOTE: runtime-dispatch contract minus tokens (EINTR once, WouldBlock backpressures,
-// RST/EPIPE map like H1); double-INTR reports Interrupted so the turn retries promptly.
-fn write_once(stream: &mut TcpStream, bytes: &[u8]) -> H2Write {
-    if bytes.is_empty() {
-        return H2Write::Accepted(0);
-    }
-    for _ in 0..2 {
-        match stream.write(bytes) {
-            Ok(accepted) => return H2Write::Accepted(accepted),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return H2Write::Blocked,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
-                return H2Write::Closed(ConnClose::Reset);
-            }
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                return H2Write::Closed(ConnClose::PeerClosed);
-            }
-            Err(_) => return H2Write::Closed(ConnClose::TransportError),
-        }
-    }
-    H2Write::Interrupted
-}
-
-fn read_once(stream: &mut TcpStream, spare: &mut [u8]) -> H2Read {
-    if spare.is_empty() {
-        return H2Read::Blocked;
-    }
-    for _ in 0..2 {
-        match stream.read(spare) {
-            Ok(0) => return H2Read::Eof,
-            Ok(read) => return H2Read::Progress(read),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return H2Read::Blocked,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
-                return H2Read::Closed(ConnClose::Reset);
-            }
-            Err(_) => return H2Read::Closed(ConnClose::TransportError),
-        }
-    }
-    H2Read::Blocked
-}
-
-// NOTE: h2c upgrades to ReadWrite while blocked so writability wakes the flush, then
-// downgrades. No turn ever waits inside h2c: every path ends Done/Blocked/Retry/Closed.
-fn flush_pending(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64) -> H2Flush {
-    if !meta.pending_unflushed() {
-        return H2Flush::Done;
-    }
-    let Some(stream) = meta.stream.as_mut() else {
-        return H2Flush::Closed(ConnClose::TransportError);
-    };
-    let Some(staged) = meta.pending.as_deref() else {
-        return H2Flush::Closed(ConnClose::TransportError);
-    };
-    let mut sent = meta.pending_sent;
-    let mut allowance = *budget;
-    let mut outcome = H2Flush::Done;
-    while sent < meta.pending_len {
-        if allowance == 0 {
-            outcome = H2Flush::Blocked;
-            break;
-        }
-        let end = (meta.pending_len - sent).min(allowance as usize) + sent;
-        match write_once(stream, &staged[sent..end]) {
-            H2Write::Accepted(accepted) => {
-                sent += accepted;
-                allowance -= accepted as u64;
-                if accepted == 0 {
-                    outcome = H2Flush::Blocked;
-                    break;
-                }
-            }
-            H2Write::Blocked => {
-                outcome = H2Flush::Blocked;
-                break;
-            }
-            H2Write::Interrupted => {
-                outcome = H2Flush::Retry;
-                break;
-            }
-            H2Write::Closed(reason) => {
-                outcome = H2Flush::Closed(reason);
-                break;
-            }
-        }
-    }
-    *budget = allowance;
-    meta.pending_sent = sent;
-    match outcome {
-        H2Flush::Done => {
-            meta.pending_len = 0;
-            meta.pending_sent = 0;
-            meta.write_blocked = false;
-            if meta.watching_write {
-                meta.watching_write = false;
-                if meta.token != 0 {
-                    let _ = stream_poller.reregister(stream, meta.token, PollInterest::Readable);
-                }
-            }
-            H2Flush::Done
-        }
-        H2Flush::Blocked => {
-            meta.write_blocked = true;
-            if !meta.watching_write {
-                meta.watching_write = true;
-                if meta.token != 0 {
-                    let _ = stream_poller.reregister(stream, meta.token, PollInterest::ReadWrite);
-                }
-            }
-            H2Flush::Blocked
-        }
-        H2Flush::Retry | H2Flush::Closed(_) => outcome,
-    }
-}
-
-fn flush_h2(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64) -> H2Flush {
-    if meta.tls.is_some() {
-        tls_flush_h2(meta, stream_poller, budget)
-    } else {
-        flush_pending(meta, stream_poller, budget)
-    }
-}
-
-fn tls_flush_h2(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64) -> H2Flush {
-    if meta.tls_pending.len() <= meta.tls_pending_sent && meta.pending_len > meta.pending_sent {
-        let Some(staged) = meta.pending.as_deref() else {
-            return H2Flush::Closed(ConnClose::TransportError);
-        };
-        let plain_end = meta.pending_len.min(staged.len());
-        let plain_start = meta.pending_sent.min(plain_end);
-        meta.tls_pending.clear();
-        meta.tls_pending_sent = 0;
-        let Some(tls) = meta.tls.as_mut() else {
-            return H2Flush::Closed(ConnClose::TransportError);
-        };
-        if tls_encrypt_bytes(tls, &staged[plain_start..plain_end], &mut meta.tls_pending).is_err() {
-            return H2Flush::Closed(ConnClose::TransportError);
-        }
-        meta.pending_sent = meta.pending_len;
-    }
-    let Some(stream) = meta.stream.as_mut() else {
-        return H2Flush::Closed(ConnClose::TransportError);
-    };
-    let staged_end = meta.tls_pending.len();
-    let mut sent = meta.tls_pending_sent;
-    let mut allowance = *budget;
-    let mut outcome = H2Flush::Done;
-    let mut attempts = 0;
-    while sent < staged_end {
-        if allowance == 0 {
-            outcome = H2Flush::Blocked;
-            break;
-        }
-        let end = (staged_end - sent).min(allowance as usize) + sent;
-        let width = end - sent;
-        match tls_write_once(stream, &meta.tls_pending[sent..end]) {
-            TlsWriteOutcome::Accepted(accepted) => {
-                sent += accepted;
-                allowance -= accepted as u64;
-                if accepted == 0 {
-                    outcome = H2Flush::Blocked;
-                    break;
-                }
-                if accepted < width {
-                    outcome = H2Flush::Blocked;
-                    break;
-                }
-            }
-            TlsWriteOutcome::Blocked => {
-                outcome = H2Flush::Blocked;
-                break;
-            }
-            TlsWriteOutcome::Interrupted => {
-                attempts += 1;
-                if attempts >= 2 {
-                    break;
-                }
-            }
-            TlsWriteOutcome::Closed(reason) => {
-                outcome = H2Flush::Closed(reason);
-                break;
-            }
-        }
-    }
-    *budget = allowance;
-    meta.tls_pending_sent = sent;
-    match outcome {
-        H2Flush::Done => {
-            meta.tls_pending.clear();
-            meta.tls_pending_sent = 0;
-            meta.write_blocked = false;
-            if meta.watching_write {
-                meta.watching_write = false;
-                if meta.token != 0 {
-                    let _ = stream_poller.reregister(stream, meta.token, PollInterest::Readable);
-                }
-            }
-            H2Flush::Done
-        }
-        H2Flush::Blocked => {
-            meta.write_blocked = true;
-            if !meta.watching_write {
-                meta.watching_write = true;
-                if meta.token != 0 {
-                    let _ = stream_poller.reregister(stream, meta.token, PollInterest::ReadWrite);
-                }
-            }
-            H2Flush::Blocked
-        }
-        H2Flush::Retry | H2Flush::Closed(_) => outcome,
-    }
 }
 
 pub(crate) fn open_slot(
@@ -913,7 +492,7 @@ macro_rules! move_h2_tls_slot {
             &mut $result.counts,
         ) {
             if $crate::h2::turn::build_h2_conn!($bufs, $buf, $ts, $dec, $enc, $conn) {
-                $crate::h2::turn::meta_at(&mut $metas, $slot).tls = Some($tls);
+                $crate::h2::slots::meta_at(&mut $metas, $slot).tls = Some($tls);
                 moved = $conn
                     .as_mut()
                     .is_some_and(|live| live.push_input(&$prefix).is_ok());
@@ -952,7 +531,7 @@ macro_rules! drive_h2_accepts {
                         let Some(accepted) = entry.take() else {
                             continue;
                         };
-                        match $crate::h2::turn::free_slot(&$metas) {
+                        match $crate::h2::slots::free_slot(&$metas) {
                             Some(0) => $crate::h2::turn::accept_h2_slot!(
                                 0, $metas, m0, $bufs, b0, $ts0, $dec0, $enc0, $c0, accepted, $now,
                                 $config, $poller, $result
@@ -1020,7 +599,7 @@ pub(crate) use pump_h2_one;
 macro_rules! drive_h2_pumps {
     ($enabled:ident, $view:ident, $draining:ident, $budget:ident, $now:ident, $metas:ident, $poller:ident, $config:ident, $result:ident, $worker:ident, $force:ident, $h2force:ident, $drainstart:ident, $ts0:ident, $ts1:ident, $ts2:ident, $ts3:ident, $ts4:ident, $ts5:ident, $ts6:ident, $ts7:ident, $dec0:ident, $dec1:ident, $dec2:ident, $dec3:ident, $dec4:ident, $dec5:ident, $dec6:ident, $dec7:ident, $enc0:ident, $enc1:ident, $enc2:ident, $enc3:ident, $enc4:ident, $enc5:ident, $enc6:ident, $enc7:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $host:ident, $wid:ident, $h2staged:ident, $tlsacc:ident) => {
         if $enabled {
-            $crate::h2::turn::sweep_deadlines(&mut $metas, $now, $config.timeouts);
+            $crate::h2::slots::sweep_deadlines(&mut $metas, $now, $config.timeouts);
             if let Some(view) = $view.as_ref() {
                 let mut turn = $crate::h2::turn::H2Turn {
                     routes: view,

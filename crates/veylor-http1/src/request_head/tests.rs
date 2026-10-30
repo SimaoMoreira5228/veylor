@@ -205,7 +205,7 @@ fn colon_less_line_past_caller_capacity_fails_instead_of_livelocking_resume() {
 fn head_error_precedence_pins_shared_decoder_ordering() {
     // NOTE: drift alarm for H1-6 (error precedence): the which-error-wins ordering lives in the
     // shared head-parser scan (request_head/parser.rs), not in either engine's mapper — the
-    // managed pump arms (connection/mod.rs parse_exchange) and the conn-crate map_parse_error
+    // managed pump arms (connection/exchange.rs parse_exchange) and the conn-crate map_parse_error
     // (server-conn request_read.rs) are disjoint patterns over a single error value, so a
     // canonical rank function would only relabel ParseError with zero call-site deletion. This
     // corpus pins the decoder verdict each evil input must yield; the per-engine renderings

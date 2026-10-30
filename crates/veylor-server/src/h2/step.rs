@@ -10,8 +10,8 @@ use crate::host::HostShared;
 use super::routes::project_extra_headers;
 use super::send::{field, send_begin};
 use super::serve::valid_trailer_field;
-use super::turn;
 use super::{H2Conn, Phase, STREAM_SLOTS};
+use super::{slots, turn};
 
 #[derive(Clone, Copy)]
 enum StreamStep {
@@ -55,17 +55,17 @@ fn is_head_park(host: &HostShared, token: ConnectionToken) -> bool {
 }
 
 pub(crate) fn apply_h2_streams(
-    meta: &mut turn::H2Meta,
+    meta: &mut slots::H2Meta,
     conn: &mut Option<H2Conn<'_>>,
     turn: &mut turn::H2Turn<'_>,
 ) -> bool {
-    if turn::pending_spare(meta).len() < 2048 {
+    if slots::pending_spare(meta).len() < 2048 {
         return false;
     }
     let Some(live) = conn.as_mut().filter(|active| !active.is_closed()) else {
         return false;
     };
-    let index = meta.token.saturating_sub(turn::H2_STREAM_TOKEN_BASE);
+    let index = meta.token.saturating_sub(slots::H2_STREAM_TOKEN_BASE);
     let base = (crate::static_server::MAX_CONNECTIONS + index * STREAM_SLOTS) as u32;
     let host = turn.host;
     let fail = ErrorCode::InternalError;
@@ -127,7 +127,7 @@ pub(crate) fn apply_h2_streams(
         host.unpark_closed(token.worker_id, token.slot);
         return true;
     };
-    let spare = turn::pending_spare(meta).len();
+    let spare = slots::pending_spare(meta).len();
     let found = server.driver().streams().find(stream);
     let credit = found
         .filter(|found| found.state != StreamState::Closed)
@@ -140,7 +140,7 @@ pub(crate) fn apply_h2_streams(
             return false;
         }
     }
-    let spare = turn::pending_spare(meta);
+    let spare = slots::pending_spare(meta);
     let step = match cmd {
         StreamCmd::Begin {
             status, headers, ..
@@ -166,7 +166,7 @@ pub(crate) fn apply_h2_streams(
                         served: false,
                         refused: false,
                     },
-                    Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+                    Err(_) => abort_stream(server, host, token, fail, slots::pending_spare(meta)),
                 }
             }
         }
@@ -192,7 +192,7 @@ pub(crate) fn apply_h2_streams(
                     refused: false,
                 }
             } else {
-                abort_stream(server, host, token, fail, turn::pending_spare(meta))
+                abort_stream(server, host, token, fail, slots::pending_spare(meta))
             }
         }
         StreamCmd::End => match server.send_data(stream, b"", true, spare) {
@@ -205,7 +205,7 @@ pub(crate) fn apply_h2_streams(
                     refused: false,
                 }
             }
-            Err(_) => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+            Err(_) => abort_stream(server, host, token, fail, slots::pending_spare(meta)),
         },
         StreamCmd::EndWithTrailers { trailers } => {
             // NOTE: terminal HEADERS stay per stream: the token-gated take plus the slot-derived
@@ -247,20 +247,20 @@ pub(crate) fn apply_h2_streams(
                                 }
                             }
                             Err(_) => {
-                                abort_stream(server, host, token, fail, turn::pending_spare(meta))
+                                abort_stream(server, host, token, fail, slots::pending_spare(meta))
                             }
                         }
                     }
-                    _ => abort_stream(server, host, token, fail, turn::pending_spare(meta)),
+                    _ => abort_stream(server, host, token, fail, slots::pending_spare(meta)),
                 }
             }
         }
         StreamCmd::Cancel => {
-            let used = match server.rst_stream(stream, ErrorCode::Cancel, turn::pending_spare(meta))
-            {
-                Ok(writer) => writer.pending_bytes().len(),
-                Err(_) => 0,
-            };
+            let used =
+                match server.rst_stream(stream, ErrorCode::Cancel, slots::pending_spare(meta)) {
+                    Ok(writer) => writer.pending_bytes().len(),
+                    Err(_) => 0,
+                };
             host.unpark_closed(token.worker_id, token.slot);
             StreamStep::Done {
                 used,

@@ -363,7 +363,7 @@ fn cancel_wins_over_pending_work() {
 fn head_error_corpus_matches_managed_status_table() {
     // NOTE: drift alarm for H1-6 (error precedence), conn-crate half: parse_head collapses every
     // terminal head error to ProtocolError (the host renders the final status) while the managed
-    // pump renders per-variant statuses (connection/mod.rs parse_exchange). The pinned agreement
+    // pump renders per-variant statuses (connection/exchange.rs parse_exchange). The pinned agreement
     // is per-row — same input bytes => managed status X <=> this outcome:
     // bad Expect => 417 (server_tests unsupported_expectation_rejected_with_417_then_close),
     // oversized section => 431 (server_tests oversized_header_section_closes_with_431),

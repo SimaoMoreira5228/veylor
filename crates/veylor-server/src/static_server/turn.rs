@@ -14,6 +14,7 @@ use veylor_runtime::{
 use crate::connection::tls::tls_alpn_is_h2;
 use crate::connection::{ConnClose, ConnState, PumpOutcome, PumpProgress, pump_connection};
 use crate::h2::H2Conn;
+use crate::h2::slots as h2_slots;
 use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps, move_h2_tls_slot};
 use crate::host::{HostShared, StagedWork};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
@@ -152,9 +153,9 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         .collect();
     let mut admitted: Vec<Option<AdmittedConnection>> = (0..staging_cap).map(|_| None).collect();
     let mut ready: Vec<Readiness> = Vec::new();
-    let mut h2_meta = h2_turn::H2MetaSlots::default();
-    let mut h2_bufs = h2_turn::H2BufSlots::default();
-    let mut h2_staging = h2_turn::accept_staging();
+    let mut h2_meta = h2_slots::H2MetaSlots::default();
+    let mut h2_bufs = h2_slots::H2BufSlots::default();
+    let mut h2_staging = h2_slots::accept_staging();
     // NOTE: pre-allocated before any borrow exists and never moved: Option-
     // wrapped buffers would force as_mut bindings that the borrow checker
     // rejects for spanning borrows. ~57 KiB per slot, ~456 KiB per worker.
@@ -219,7 +220,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     worker.begin_shutdown(now_ns, config.shutdown_grace_ns, SHUTDOWN_TIMER_ID);
                 if result == veylor_runtime::ShutdownResult::Draining {
                     drain_start_ns = now_ns;
-                } else if h2_turn::occupied(&h2_meta) > 0 {
+                } else if h2_slots::occupied(&h2_meta) > 0 {
                     h2_turn::restart_h2_drain(
                         &mut drain_start_ns,
                         &mut h2_force_ns,
@@ -237,8 +238,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // worker poller carries the wait as before (no spin either way). Stop/force wake
         // only worker-poller wakers, so a stop sleeping in the stream poll is observed at
         // loop top within one stream cadence; new accepts likewise wait out one cadence.
-        let live_streams = worker.live_count() + h2_turn::occupied(&h2_meta);
-        let h2_want = h2_turn::wants_pump(&h2_meta);
+        let live_streams = worker.live_count() + h2_slots::occupied(&h2_meta);
+        let h2_want = h2_slots::wants_pump(&h2_meta);
         let pending = if h1_quiet {
             h2_want
         } else {
@@ -384,7 +385,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 // NOTE: the shutdown state only tracks H1 slots, so it can
                 // report complete while h2c conns are still draining; hold the
                 // worker until they finish (force still bounds the wait).
-                if outcome.shutdown_complete && h2_turn::occupied(&h2_meta) == 0 {
+                if outcome.shutdown_complete && h2_slots::occupied(&h2_meta) == 0 {
                     cleanup_all(
                         &host,
                         &mut conns,
@@ -476,7 +477,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
 
         // NOTE: the per-conn byte budget divides across H1+H2 conns together:
         // one turn's bytes split fairly instead of each family taking a full share.
-        let live_count = (worker.live_count() + h2_turn::occupied(&h2_meta)).max(1) as u64;
+        let live_count = (worker.live_count() + h2_slots::occupied(&h2_meta)).max(1) as u64;
         let per_conn_budget = config.turn.byte_budget_per_turn.div_ceil(live_count).max(1);
         // NOTE: idle-turn skip: with no arrivals, admits, expiries, staged host work, H1
         // backlog, parks, or shutdown signal the sweep would repeat last turn's no-ops, so
@@ -527,7 +528,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         };
                         let mut stream = h1.into_stream();
                         let _ = stream_poller.deregister(&mut stream);
-                        let slot = h2_turn::free_slot(&h2_meta);
+                        let slot = h2_slots::free_slot(&h2_meta);
                         match (slot, tls) {
                             (Some(0), Some(tls)) => {
                                 move_h2_tls_slot!(
@@ -996,14 +997,14 @@ fn drain_host_staged(
 // NOTE: H2 staged hook: validate-then-complete per stream-keyed work item, fail closed
 // silently on divergence (entries arrive tombed and the host already has its outcome).
 pub(crate) fn apply_h2_staged(
-    meta: &mut h2_turn::H2Meta,
+    meta: &mut h2_slots::H2Meta,
     conn: &mut Option<H2Conn<'_>>,
     turn: &mut h2_turn::H2Turn<'_>,
 ) -> bool {
     if !meta.occupied {
         return false;
     }
-    let index = meta.token.saturating_sub(h2_turn::H2_STREAM_TOKEN_BASE);
+    let index = meta.token.saturating_sub(h2_slots::H2_STREAM_TOKEN_BASE);
     // NOTE: H2 base mirrors the h2/host slice arithmetic, which keys H2 slots from the
     // const ceiling; max_conns never moves this line, so H1/H2 slot ids cannot collide.
     let base = MAX_CONNECTIONS + index * crate::h2::STREAM_SLOTS;
@@ -1032,7 +1033,7 @@ pub(crate) fn apply_h2_staged(
         let Some(live) = conn.as_mut().filter(|active| !active.is_closed()) else {
             continue;
         };
-        let outcome = live.apply_staged(h2_turn::pending_spare(meta), &work);
+        let outcome = live.apply_staged(h2_slots::pending_spare(meta), &work);
         meta.pending_len += outcome.written;
         turn.counts.h2_served += u64::from(outcome.served);
         if work.cancel {
