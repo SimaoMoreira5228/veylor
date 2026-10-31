@@ -722,12 +722,11 @@ fn park_stream(
         total,
         trailers,
         Some(body_limit),
+        tunnel,
         request_headers,
     ) {
         Ok(event_token) => {
-            if tunnel {
-                ctx.host.mark_h2_tunnel(event_token);
-            }
+            let _ = event_token;
             outcome.parked += 1;
             true
         }

@@ -50,6 +50,7 @@ static void expect_get(vyl_h3_client* client, const char* url) {
     assert(response != NULL);
     assert(vyl_h3_response_status(response) == 200);
     assert(vyl_h3_response_header_count(response) > 0);
+    assert(vyl_h3_response_trailer_count(response) == 0);
     vyl_http1_bytes body = { 0 };
     assert(vyl_h3_response_body(response, &body) == VYL_HTTP1_OK);
     assert(body.length == 6);

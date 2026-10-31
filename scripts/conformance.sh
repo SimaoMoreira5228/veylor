@@ -8,6 +8,7 @@ BIN="$TOOLS_DIR/bin"
 mkdir -p "$BIN" "$LOG_DIR"
 
 WORKERS="${WORKERS:-16}"
+IO_BACKEND="${IO_BACKEND:-mio}"
 H2LOAD_CONNS="${H2LOAD_CONNS:-8}"
 H2LOAD_STREAMS="${H2LOAD_STREAMS:-16}"
 failures=0
@@ -36,6 +37,7 @@ SERVER_LOG="$LOG_DIR/server.log"
     --h2c-port 0 \
     --h3-port 0 \
     --workers "$WORKERS" \
+    --io-backend "$IO_BACKEND" \
     --assets "$ASSETS" \
     --tls-cert "$CERT" \
     --tls-key "$KEY" \
@@ -63,7 +65,7 @@ H2C="$(printf '%s\n' "$READY" | sed -n 's/.* h2c=\([^ ]*\).*/\1/p')"
 H2C_PORT="${H2C##*:}"
 H3="$(printf '%s\n' "$READY" | sed -n 's/.* h3=\([^ ]*\).*/\1/p')"
 TLS_ENABLED="$(printf '%s\n' "$READY" | sed -n 's/.* tls=\([^ ]*\).*/\1/p')"
-printf 'server %s\n' "$READY"
+printf 'server %s io_backend=%s\n' "$READY" "$IO_BACKEND"
 
 if [ "$TLS_ENABLED" = "1" ]; then
     H1_URL="https://$H1/hello"

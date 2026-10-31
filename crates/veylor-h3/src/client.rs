@@ -80,6 +80,7 @@ impl From<std::io::Error> for ClientError {
 pub struct ClientResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Bytes,
 }
 
@@ -95,7 +96,22 @@ enum Command {
         body: Bytes,
         reply: SyncSender<Result<ClientResponse, ClientError>>,
     },
+    Connect {
+        request: Request<()>,
+        protocol: Vec<u8>,
+        reply: SyncSender<Result<ClientTunnel, ClientError>>,
+    },
     Shutdown,
+}
+
+enum TunnelOp {
+    Write(Vec<u8>, SyncSender<Result<(), ClientError>>),
+    Read(SyncSender<Result<Option<Vec<u8>>, ClientError>>),
+    Close,
+}
+
+pub struct ClientTunnel {
+    commands: UnboundedSender<TunnelOp>,
 }
 
 impl Client {
@@ -136,6 +152,53 @@ impl Client {
             })
             .map_err(|_| ClientError::Closed)?;
         receiver.recv().map_err(|_| ClientError::Closed)?
+    }
+
+    pub fn connect_tunnel(
+        &self,
+        request: Request<()>,
+        protocol: &[u8],
+    ) -> Result<ClientTunnel, ClientError> {
+        if request.method() != http::Method::CONNECT || protocol.is_empty() {
+            return Err(ClientError::Protocol("invalid connect request"));
+        }
+        let (reply, receiver) = sync_channel(1);
+        self.commands
+            .send(Command::Connect {
+                request,
+                protocol: protocol.to_vec(),
+                reply,
+            })
+            .map_err(|_| ClientError::Closed)?;
+        receiver.recv().map_err(|_| ClientError::Closed)?
+    }
+}
+
+impl ClientTunnel {
+    pub fn write(&self, data: &[u8]) -> Result<(), ClientError> {
+        let (reply, receiver) = sync_channel(1);
+        self.commands
+            .send(TunnelOp::Write(data.to_vec(), reply))
+            .map_err(|_| ClientError::Closed)?;
+        receiver.recv().map_err(|_| ClientError::Closed)?
+    }
+
+    pub fn read(&self) -> Result<Option<Vec<u8>>, ClientError> {
+        let (reply, receiver) = sync_channel(1);
+        self.commands
+            .send(TunnelOp::Read(reply))
+            .map_err(|_| ClientError::Closed)?;
+        receiver.recv().map_err(|_| ClientError::Closed)?
+    }
+
+    pub fn close(&self) {
+        let _ = self.commands.send(TunnelOp::Close);
+    }
+}
+
+impl Drop for ClientTunnel {
+    fn drop(&mut self) {
+        let _ = self.commands.send(TunnelOp::Close);
     }
 }
 
@@ -205,6 +268,17 @@ fn run(
                     let connection = connection.clone();
                     tokio::spawn(async move {
                         let result = request_once(&connection, request, body, limits).await;
+                        let _ = reply.send(result);
+                    });
+                }
+                Command::Connect {
+                    request,
+                    protocol,
+                    reply,
+                } => {
+                    let connection = connection.clone();
+                    tokio::spawn(async move {
+                        let result = connect_tunnel(&connection, request, &protocol, limits).await;
                         let _ = reply.send(result);
                     });
                 }
@@ -361,7 +435,7 @@ async fn request_once(
         .open_bi()
         .await
         .map_err(|_| ClientError::Closed)?;
-    let fields = request_fields(&request)?;
+    let fields = request_fields(&request, None)?;
     let block = qpack::encode(&fields);
     let mut encoded = Vec::with_capacity(block.len() + 16);
     frame::encode_frame(frame::HEADERS, &block, &mut encoded);
@@ -379,6 +453,7 @@ async fn request_once(
 
     let mut status = None;
     let mut headers = HeaderMap::new();
+    let mut trailers = Vec::new();
     let mut response_body = Vec::new();
     loop {
         let kind = read_varint(&mut recv)
@@ -406,6 +481,8 @@ async fn request_once(
                     .map_err(|_| ClientError::Protocol("qpack"))?;
                 if status.is_none() {
                     status = Some(response_fields(&fields, &mut headers)?);
+                } else {
+                    append_trailers(&mut trailers, fields)?;
                 }
             }
             frame::DATA => {
@@ -434,13 +511,109 @@ async fn request_once(
     Ok(ClientResponse {
         status,
         headers,
+        trailers,
         body: Bytes::from(response_body),
     })
 }
 
+async fn connect_tunnel(
+    connection: &quinn::Connection,
+    request: Request<()>,
+    protocol: &[u8],
+    limits: Limits,
+) -> Result<ClientTunnel, ClientError> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|_| ClientError::Closed)?;
+    let fields = request_fields(&request, Some(protocol))?;
+    let block = qpack::encode(&fields);
+    let mut encoded = Vec::with_capacity(block.len() + 16);
+    frame::encode_frame(frame::HEADERS, &block, &mut encoded);
+    send.write_all(&encoded)
+        .await
+        .map_err(|_| ClientError::Closed)?;
+
+    let Some((kind, payload)) =
+        crate::frame_io::read_frame(&mut recv, limits.max_field_section as usize)
+            .await
+            .map_err(|_| ClientError::Protocol("connect response"))?
+    else {
+        return Err(ClientError::Protocol("missing connect response"));
+    };
+    if kind != frame::HEADERS {
+        return Err(ClientError::Protocol("unexpected connect response"));
+    }
+    let fields = qpack::decode(&payload, limits.max_field_section as usize)
+        .map_err(|_| ClientError::Protocol("connect qpack"))?;
+    let mut headers = HeaderMap::new();
+    let status = response_fields(&fields, &mut headers)?;
+    if status != StatusCode::OK {
+        let _ = send.finish();
+        let _ = recv.stop(0u32.into());
+        return Err(ClientError::Protocol("connect rejected"));
+    }
+
+    let (commands, operations) = unbounded_channel();
+    tokio::spawn(tunnel_task(send, recv, operations));
+    Ok(ClientTunnel { commands })
+}
+
+async fn tunnel_task(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    mut operations: UnboundedReceiver<TunnelOp>,
+) {
+    while let Some(operation) = operations.recv().await {
+        match operation {
+            TunnelOp::Write(data, reply) => {
+                let result = write_tunnel_data(&mut send, &data).await;
+                let _ = reply.send(result);
+            }
+            TunnelOp::Read(reply) => {
+                let result = read_tunnel_data(&mut recv).await;
+                let _ = reply.send(result);
+            }
+            TunnelOp::Close => {
+                let _ = send.finish();
+                let _ = recv.stop(0u32.into());
+                break;
+            }
+        }
+    }
+}
+
+const TUNNEL_FRAME_BYTES: usize = 64 * 1024;
+
+async fn read_tunnel_data(recv: &mut quinn::RecvStream) -> Result<Option<Vec<u8>>, ClientError> {
+    loop {
+        match crate::frame_io::read_frame(recv, TUNNEL_FRAME_BYTES)
+            .await
+            .map_err(|_| ClientError::Protocol("tunnel frame"))?
+        {
+            Some((kind, payload)) if kind == frame::DATA => return Ok(Some(payload)),
+            Some((frame::HEADERS, _)) => {}
+            Some(_) => {}
+            None => return Ok(None),
+        }
+    }
+}
+
+async fn write_tunnel_data(send: &mut quinn::SendStream, data: &[u8]) -> Result<(), ClientError> {
+    let mut head = [0u8; 16];
+    let used = frame::encode_frame_header(frame::DATA, data.len() as u64, &mut head);
+    send.write_all(&head[..used])
+        .await
+        .map_err(|_| ClientError::Closed)?;
+    send.write_all(data).await.map_err(|_| ClientError::Closed)
+}
+
 type RequestFields<'a> = Vec<(&'a [u8], &'a [u8])>;
 
-fn request_fields(request: &Request<()>) -> Result<RequestFields<'_>, ClientError> {
+fn request_fields<'a>(
+    request: &'a Request<()>,
+    protocol: Option<&'a [u8]>,
+) -> Result<RequestFields<'a>, ClientError> {
     let uri = request.uri();
     let scheme = uri.scheme_str().unwrap_or("https");
     let authority = uri
@@ -457,6 +630,9 @@ fn request_fields(request: &Request<()>) -> Result<RequestFields<'_>, ClientErro
     fields.push((b":scheme".as_slice(), scheme.as_bytes()));
     fields.push((b":authority".as_slice(), authority.as_bytes()));
     fields.push((b":path".as_slice(), target.as_bytes()));
+    if let Some(protocol) = protocol {
+        fields.push((b":protocol".as_slice(), protocol));
+    }
     for (name, value) in request.headers() {
         if name == HOST || name == CONTENT_LENGTH || prohibited(name.as_str().as_bytes()) {
             continue;
@@ -495,6 +671,55 @@ fn response_fields(
         headers.append(name, value);
     }
     status.ok_or(ClientError::Protocol("missing status"))
+}
+
+fn append_trailers(
+    trailers: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    fields: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<(), ClientError> {
+    if trailers.len().saturating_add(fields.len()) > 8 {
+        return Err(ClientError::Protocol("too many trailers"));
+    }
+    let mut total: usize = trailers
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    for (name, value) in fields {
+        if name.first() == Some(&b':') || prohibited(&name) {
+            return Err(ClientError::Protocol("trailer name"));
+        }
+        let valid_name = !name.is_empty()
+            && name.iter().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            });
+        if !valid_name {
+            return Err(ClientError::Protocol("trailer name"));
+        }
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        if total > 1024 {
+            return Err(ClientError::Protocol("trailers too large"));
+        }
+        trailers.push((name, value));
+    }
+    Ok(())
 }
 
 fn prohibited(name: &[u8]) -> bool {

@@ -417,3 +417,83 @@ fn delivers_request_trailers() {
 
     running.join().expect("join h3 server");
 }
+
+struct TrailerHandler;
+
+impl veylor_h3::Handler for TrailerHandler {
+    fn handle(
+        &self,
+        _request: http::Request<()>,
+        _body: bytes::Bytes,
+    ) -> http::Response<veylor_h3::Body> {
+        text_response(http::StatusCode::OK, "fallback")
+    }
+
+    fn managed<'a>(
+        &'a self,
+        _request: http::Request<()>,
+        _body: bytes::Bytes,
+        writer: &'a mut veylor_h3::ResponseWriter<'_>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = veylor_h3::ManagedOutcome> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if writer
+                .send_headers(http::StatusCode::OK, &[])
+                .await
+                .is_err()
+            {
+                return veylor_h3::ManagedOutcome::Streamed;
+            }
+            if writer.write(b"trailer-body").await.is_err() {
+                writer.reset(0);
+                return veylor_h3::ManagedOutcome::Streamed;
+            }
+            let trailers = vec![(b"x-tail".to_vec(), b"tail-value".to_vec())];
+            if writer.write_trailers(&trailers).await.is_err() {
+                writer.reset(0);
+                return veylor_h3::ManagedOutcome::Streamed;
+            }
+            let _ = writer.finish().await;
+            veylor_h3::ManagedOutcome::Streamed
+        })
+    }
+}
+
+#[test]
+fn client_reads_response_trailers() {
+    let (cert, key) = identity();
+    let server = Server::bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Config {
+            tls: Tls::new(vec![cert.clone()], key),
+            limits: Limits::default(),
+        },
+    );
+    let running = server.start(TrailerHandler).expect("start h3 server");
+
+    let client = veylor_h3::Client::connect(veylor_h3::ClientConfig {
+        server: running.address(),
+        server_name: "localhost".to_owned(),
+        tls: veylor_h3::ClientTls::new(vec![cert]),
+        limits: Limits::default(),
+    })
+    .expect("connect h3 client");
+
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri("https://localhost/trailers")
+        .body(())
+        .expect("request");
+    let response = client
+        .request(request, bytes::Bytes::new())
+        .expect("response");
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert_eq!(response.body.as_ref(), b"trailer-body");
+    assert_eq!(
+        response.trailers,
+        vec![(b"x-tail".to_vec(), b"tail-value".to_vec())]
+    );
+
+    drop(client);
+    running.join().expect("join h3 server");
+}

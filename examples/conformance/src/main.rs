@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use veylor_runtime::ConnectionToken;
+use veylor_runtime::{ConnectionToken, PollBackend};
 use veylor_server::{
     EventSlot, HostEventKind, HostHandle, RespondOutcome, Server, ServerConfig, TlsConfig,
 };
@@ -16,6 +16,7 @@ struct Options {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     assets: Option<PathBuf>,
+    io_backend: PollBackend,
 }
 
 fn parse() -> Result<Options, String> {
@@ -27,6 +28,7 @@ fn parse() -> Result<Options, String> {
         tls_cert: None,
         tls_key: None,
         assets: None,
+        io_backend: PollBackend::Mio,
     };
     let mut args = std::env::args_os().skip(1);
     while let Some(flag) = args.next() {
@@ -64,6 +66,7 @@ fn parse() -> Result<Options, String> {
             "--tls-cert" => options.tls_cert = Some(PathBuf::from(value)),
             "--tls-key" => options.tls_key = Some(PathBuf::from(value)),
             "--assets" => options.assets = Some(PathBuf::from(value)),
+            "--io-backend" => options.io_backend = parse_backend(&value.to_string_lossy())?,
             _ => return Err(format!("unknown option: {flag}")),
         }
     }
@@ -74,6 +77,15 @@ fn parse() -> Result<Options, String> {
         return Err("HTTP/3 needs --tls-cert and --tls-key".to_owned());
     }
     Ok(options)
+}
+
+fn parse_backend(value: &str) -> Result<PollBackend, String> {
+    match value {
+        "mio" | "epoll" | "0" => Ok(PollBackend::Mio),
+        #[cfg(target_os = "linux")]
+        "uring" | "io_uring" | "1" => Ok(PollBackend::IoUring),
+        _ => Err(format!("unknown io backend: {value}")),
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -91,6 +103,7 @@ fn main() -> Result<(), String> {
         h2c_port: Some(options.h2c_port),
         h3_port: options.h3_port,
         tls,
+        io_backend: options.io_backend,
         ..ServerConfig::default()
     };
     let mut server =

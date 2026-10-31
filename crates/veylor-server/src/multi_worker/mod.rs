@@ -181,7 +181,8 @@ fn prepare_worker(
         stop,
         force,
     } = inputs;
-    let mut worker_poller = Poller::new(MAX_EVENTS_PER_TURN).map_err(ServerError::Poll)?;
+    let mut worker_poller = Poller::new_with_backend(MAX_EVENTS_PER_TURN, config.io_backend)
+        .map_err(ServerError::Poll)?;
     worker_poller
         .register(&mut listener, LISTENER_TOKEN, PollInterest::Readable)
         .map_err(ServerError::Poll)?;

@@ -20,7 +20,7 @@ fn test_config(port: u16) -> VylManagedStaticConfig {
         byte_budget_per_turn: 65_536,
         poll_wait_ms: 10,
         port,
-        reserved: 0,
+        io_backend: 0,
         address: VylBytes {
             data: std::ptr::null(),
             length: 0,

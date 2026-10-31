@@ -14,7 +14,7 @@ veylor-h3 = { version = "0.1.0", path = "../veylor-h3" }
 veylor-http2 = { version = "0.1.0", path = "../veylor-http2" }
 veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
 veylor-websocket = { version = "0.1.0", path = "../veylor-websocket" }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }

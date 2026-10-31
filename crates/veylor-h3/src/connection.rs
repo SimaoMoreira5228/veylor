@@ -10,12 +10,14 @@ use veylor_http3::{
     H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR, H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE,
     H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, PUSH_STREAM, QPACK_DECODER_STREAM,
     QPACK_DECODER_STREAM_ERROR, QPACK_DECOMPRESSION_FAILED, QPACK_ENCODER_STREAM,
-    QPACK_ENCODER_STREAM_ERROR, SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
-    SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
+    QPACK_ENCODER_STREAM_ERROR, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_MAX_FIELD_SECTION_SIZE,
+    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
 };
 
 use crate::frame_io::{close, read_byte, read_continuation, read_frame, read_varint};
-use crate::{Body, Handler, Limits, ManagedOutcome, RequestTrailers};
+use crate::{
+    Body, ConnectProtocol, Handler, Limits, ManagedOutcome, RequestStream, RequestTrailers,
+};
 
 const MAX_TRAILER_FIELDS: usize = 8;
 const MAX_TRAILER_BYTES: usize = 1024;
@@ -53,6 +55,7 @@ async fn setup_control(connection: &Connection, limits: Limits) -> Result<(), ()
         (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
         (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
         (SETTINGS_MAX_FIELD_SECTION_SIZE, limits.max_field_section),
+        (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
     ]);
     let mut encoded = Vec::with_capacity(settings.len() + 16);
     frame::encode_frame(frame::SETTINGS, &settings, &mut encoded);
@@ -317,6 +320,27 @@ async fn handle_request(
         return Ok(());
     };
 
+    if request.method() == Method::CONNECT {
+        let outcome = {
+            let mut writer = crate::ResponseWriter::new(&mut send);
+            handler
+                .connect(request, RequestStream::new(recv), &mut writer)
+                .await
+        };
+        match outcome {
+            ManagedOutcome::Handled(response) => write_response(&mut send, response, false).await,
+            ManagedOutcome::Pass(_, _) => {
+                write_response(
+                    &mut send,
+                    crate::text_response(StatusCode::NOT_IMPLEMENTED, "connect unsupported"),
+                    false,
+                )
+                .await;
+            }
+            ManagedOutcome::Streamed => {}
+        }
+        return Ok(());
+    }
     let mut body = Vec::new();
     let mut trailers = Vec::new();
     loop {
@@ -500,6 +524,7 @@ fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
     let mut scheme = None;
     let mut authority = None;
     let mut path = None;
+    let mut protocol = None;
     let mut regular = false;
     let mut headers = Vec::new();
 
@@ -513,6 +538,7 @@ fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
                 b":scheme" => set_once(&mut scheme, value)?,
                 b":authority" => set_once(&mut authority, value)?,
                 b":path" => set_once(&mut path, value)?,
+                b":protocol" => set_once(&mut protocol, value)?,
                 _ => return None,
             }
             continue;
@@ -538,10 +564,16 @@ fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
     let scheme = scheme?;
     let authority = authority?;
     let path = path?;
-    if method == b"CONNECT" || (scheme != b"https" && scheme != b"http") {
+    if scheme != b"https" && scheme != b"http" {
         return None;
     }
     if path != b"*" && path.first() != Some(&b'/') {
+        return None;
+    }
+    let connect = method == b"CONNECT";
+    if connect {
+        protocol?;
+    } else if protocol.is_some() {
         return None;
     }
 
@@ -554,6 +586,14 @@ fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
     let mut request = Request::new(());
     *request.method_mut() = Method::from_bytes(method).ok()?;
     *request.uri_mut() = Uri::try_from(uri).ok()?;
+    if let Some(protocol) = protocol {
+        if protocol.is_empty() {
+            return None;
+        }
+        request
+            .extensions_mut()
+            .insert(ConnectProtocol(protocol.to_vec()));
+    }
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name).ok()?;
         let value = HeaderValue::from_bytes(value).ok()?;

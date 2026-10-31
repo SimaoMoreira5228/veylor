@@ -36,6 +36,7 @@ pub struct VylH3Client {
 pub struct VylH3Response {
     status: u16,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
     body: Vec<u8>,
 }
 
@@ -178,6 +179,7 @@ unsafe fn request(
     let response = Box::new(VylH3Response {
         status: response.status.as_u16(),
         headers,
+        trailers: response.trailers,
         body: response.body.to_vec(),
     });
     unsafe {
@@ -225,6 +227,41 @@ pub unsafe extern "C" fn vyl_h3_response_header(
     }
     let response = unsafe { &*response };
     let Some((name, value)) = response.headers.get(index) else {
+        return VylResult::InvalidArgument;
+    };
+    unsafe {
+        out_name.write(VylBytes {
+            data: name.as_ptr(),
+            length: name.len(),
+        });
+        out_value.write(VylBytes {
+            data: value.as_ptr(),
+            length: value.len(),
+        });
+    }
+    VylResult::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_response_trailer_count(response: *const VylH3Response) -> usize {
+    if response.is_null() {
+        return 0;
+    }
+    unsafe { (*response).trailers.len() }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_response_trailer(
+    response: *const VylH3Response,
+    index: usize,
+    out_name: *mut VylBytes,
+    out_value: *mut VylBytes,
+) -> VylResult {
+    if response.is_null() || out_name.is_null() || out_value.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let response = unsafe { &*response };
+    let Some((name, value)) = response.trailers.get(index) else {
         return VylResult::InvalidArgument;
     };
     unsafe {

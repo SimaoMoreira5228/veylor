@@ -111,6 +111,47 @@ pub struct Config {
 #[derive(Clone, Debug, Default)]
 pub struct RequestTrailers(pub Vec<(Vec<u8>, Vec<u8>)>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectProtocol(pub Vec<u8>);
+
+pub struct RequestStream {
+    recv: quinn::RecvStream,
+}
+
+impl RequestStream {
+    pub(crate) fn new(recv: quinn::RecvStream) -> Self {
+        Self { recv }
+    }
+
+    pub async fn read(&mut self, max: usize) -> io::Result<Option<Bytes>> {
+        match self.recv.read_chunk(max, true).await {
+            Ok(Some(chunk)) => Ok(Some(chunk.bytes)),
+            Ok(None) => Ok(None),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+
+    pub async fn read_data(&mut self, max: usize) -> io::Result<Option<Bytes>> {
+        loop {
+            match crate::frame_io::read_frame(&mut self.recv, max).await {
+                Ok(Some((veylor_http3::frame::DATA, payload))) => {
+                    return Ok(Some(Bytes::from(payload)));
+                }
+                Ok(Some((veylor_http3::frame::HEADERS, _))) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(None),
+                Err(()) => return Err(io::Error::other("invalid tunnel frame")),
+            }
+        }
+    }
+
+    pub fn stop(&mut self, code: u64) {
+        if let Ok(code) = quinn::VarInt::from_u64(code) {
+            let _ = self.recv.stop(code);
+        }
+    }
+}
+
 pub enum ManagedOutcome {
     Handled(Response<Body>),
     Pass(Request<()>, Bytes),
@@ -191,6 +232,20 @@ pub trait Handler: Send + Sync + 'static {
         _writer: &'a mut ResponseWriter<'_>,
     ) -> Pin<Box<dyn Future<Output = ManagedOutcome> + Send + 'a>> {
         Box::pin(async move { ManagedOutcome::Pass(request, body) })
+    }
+
+    fn connect<'a>(
+        &'a self,
+        _request: Request<()>,
+        _stream: RequestStream,
+        _writer: &'a mut ResponseWriter<'_>,
+    ) -> Pin<Box<dyn Future<Output = ManagedOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            ManagedOutcome::Handled(text_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "connect unsupported",
+            ))
+        })
     }
 }
 

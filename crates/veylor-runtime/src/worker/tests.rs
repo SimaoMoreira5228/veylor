@@ -51,7 +51,7 @@ fn open_worker<const SLOTS: usize, const TIMERS: usize, const INDEX: usize>(
     harness: &mut Harness<SLOTS, TIMERS, INDEX>,
     config: TurnConfig,
 ) -> (Worker<'_>, TcpListener, SocketAddr) {
-    let poller = Poller::new(8).unwrap();
+    let mut poller = Poller::new(8).unwrap();
     let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut listener = TcpListener::bind(address).unwrap();
     let address = listener.local_addr().unwrap();

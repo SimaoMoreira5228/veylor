@@ -29,7 +29,10 @@ pub use polling::{
     AcceptBatch, AcceptBatchOutcome, AcceptStop, AcceptedConnection, WAKE_TOKEN, accept_ready,
 };
 #[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
-pub use polling::{PollInterest, Poller, Readiness, TcpListener, TcpStream, bind_reuse_port};
+pub use polling::{
+    PollBackend, PollInterest, PollSource, Poller, Readiness, TcpListener, TcpStream,
+    bind_reuse_port,
+};
 pub use shutdown::{
     ShutdownPhase, ShutdownResult, ShutdownState, close_connection, destroy, force_shutdown,
     process_deadline, register_connection, register_connections, request_shutdown,

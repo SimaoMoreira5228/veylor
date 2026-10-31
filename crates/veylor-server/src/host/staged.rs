@@ -89,6 +89,7 @@ impl HostShared {
             body_total,
             trailer_allow,
             None,
+            false,
             || Ok(None),
         )
     }
@@ -104,6 +105,7 @@ impl HostShared {
         body_total: u64,
         trailer_allow: &[Vec<u8>],
         body_limit: Option<u64>,
+        tunnel: bool,
         headers: impl Iterator<Item = Option<(&'a [u8], &'a [u8])>> + Clone,
     ) -> Result<ConnectionToken, ParkError> {
         if method.is_empty()
@@ -123,6 +125,7 @@ impl HostShared {
             body_total,
             trailer_allow,
             body_limit,
+            tunnel,
             || {
                 RequestSnapshot::new(path, headers)
                     .map(Some)
@@ -142,6 +145,7 @@ impl HostShared {
         body_total: u64,
         trailer_allow: &[Vec<u8>],
         body_limit: Option<u64>,
+        tunnel: bool,
         request_snapshot: impl FnOnce() -> Result<Option<RequestSnapshot>, ParkError>,
     ) -> Result<ConnectionToken, ParkError> {
         if method.is_empty()
@@ -197,6 +201,7 @@ impl HostShared {
             inner.events[worker].push_back(event);
             let mut parked = ParkedEntry::new(event_token, body_total, method, trailer_allow);
             parked.body_limit = body_limit;
+            parked.h2_tunnel = tunnel;
             parked.request = request;
             inner.parked[worker][slot] = Some(parked);
             inner.counters.parks += 1;
@@ -206,6 +211,11 @@ impl HostShared {
         let Some((result, waker)) = outcome else {
             return Err(ParkError::Full);
         };
+        if result.is_ok() && tunnel {
+            if let Some(count) = self.h2_tunnels.get(worker_id as usize) {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if result.is_ok() {
             if let Some(waker) = waker {
                 let _ = waker.wake();

@@ -38,4 +38,5 @@ pub use static_server::{
     TlsConfigError,
 };
 pub use static_server::{LISTENER_TOKEN, MAX_CONNECTIONS, SHUTDOWN_TIMER_ID};
+pub use veylor_runtime::PollBackend;
 pub use veylor_tls::{CertificateDer, PrivateKeyDer};

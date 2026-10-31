@@ -763,6 +763,13 @@ vyl_http1_result vyl_h3_response_header(
     vyl_http1_bytes* out_name,
     vyl_http1_bytes* out_value
 );
+size_t vyl_h3_response_trailer_count(const vyl_h3_response* response);
+vyl_http1_result vyl_h3_response_trailer(
+    const vyl_h3_response* response,
+    size_t index,
+    vyl_http1_bytes* out_name,
+    vyl_http1_bytes* out_value
+);
 vyl_http1_result vyl_h3_response_body(
     const vyl_h3_response* response,
     vyl_http1_bytes* out_body
@@ -787,7 +794,7 @@ typedef struct {
     uint64_t byte_budget_per_turn;
     int32_t poll_wait_ms;
     uint16_t port;
-    uint32_t reserved;
+    uint32_t io_backend; /* 0 = epoll/mio, 1 = io_uring (Linux) */
     vyl_http1_bytes address;
     uint64_t max_connections;
     uint64_t worker_count;

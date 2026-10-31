@@ -146,6 +146,7 @@ pub struct ServerConfig {
     pub h2c_port: Option<u16>,
     pub h3_port: Option<u16>,
     pub tls: Option<TlsConfig>,
+    pub io_backend: veylor_runtime::PollBackend,
 }
 
 impl Default for ServerConfig {
@@ -161,6 +162,7 @@ impl Default for ServerConfig {
             h2c_port: None,
             h3_port: None,
             tls: None,
+            io_backend: veylor_runtime::PollBackend::Mio,
         }
     }
 }
@@ -494,7 +496,8 @@ impl Server {
             h2_routes,
             host,
         } = self;
-        let mut worker_poller = Poller::new(MAX_EVENTS_PER_TURN).map_err(ServerError::Poll)?;
+        let mut worker_poller = Poller::new_with_backend(MAX_EVENTS_PER_TURN, config.io_backend)
+            .map_err(ServerError::Poll)?;
         worker_poller
             .register(&mut listener, LISTENER_TOKEN, PollInterest::Readable)
             .map_err(ServerError::Poll)?;

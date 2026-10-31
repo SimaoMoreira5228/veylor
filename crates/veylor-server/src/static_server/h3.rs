@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 use veylor_h3::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
 use veylor_h3::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use veylor_h3::{
-    Body, Bytes, ManagedOutcome, RequestTrailers, ResponseWriter, RunningServer, Server, Tls,
+    Body, Bytes, ConnectProtocol, ManagedOutcome, RequestStream, RequestTrailers, ResponseWriter,
+    RunningServer, Server, Tls,
 };
 use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, join_allow_value};
 use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route};
@@ -30,6 +31,7 @@ use crate::static_routes::{
 use super::{H2StaticRoute, ServerConfig, ServerError};
 
 mod file;
+mod tunnel;
 
 type WaiterKey = (u32, u32, u64);
 
@@ -227,6 +229,45 @@ impl veylor_h3::Handler for Handler {
         serve_route(&self.routes, request, body)
     }
 
+    fn connect<'a>(
+        &'a self,
+        request: Request<()>,
+        stream: RequestStream,
+        writer: &'a mut ResponseWriter<'_>,
+    ) -> Pin<Box<dyn Future<Output = ManagedOutcome> + Send + 'a>> {
+        let protocol = request
+            .extensions()
+            .get::<ConnectProtocol>()
+            .map(|protocol| protocol.0.clone())
+            .unwrap_or_default();
+        eprintln!(
+            "connect protocol: {protocol:?} path: {}",
+            request.uri().path()
+        );
+        if protocol != b"websocket" {
+            return Box::pin(async move {
+                ManagedOutcome::Handled(text(StatusCode::NOT_IMPLEMENTED, b"Not Implemented"))
+            });
+        }
+        let path = request.uri().path().as_bytes().to_vec();
+        let Some(found) = select(&self.routes, b"CONNECT", &path) else {
+            return Box::pin(async move {
+                ManagedOutcome::Handled(text(StatusCode::NOT_FOUND, b"Not Found"))
+            });
+        };
+        if !found.route.managed {
+            return Box::pin(async move {
+                ManagedOutcome::Handled(text(StatusCode::NOT_FOUND, b"Not Found"))
+            });
+        }
+        let route_id = found.index as u64;
+        let trailer_allow = found.route.trailers.clone();
+        Box::pin(async move {
+            self.tunnel(request, stream, writer, route_id, &path, &trailer_allow)
+                .await
+        })
+    }
+
     fn managed<'a>(
         &'a self,
         mut request: Request<()>,
@@ -326,6 +367,7 @@ impl Handler {
             body.len() as u64,
             trailer_allow,
             Some(body_limit),
+            false,
             headers,
         );
         let Ok(event_token) = parked else {

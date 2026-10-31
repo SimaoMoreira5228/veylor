@@ -225,3 +225,70 @@ fn cross_thread_wake_uses_the_reserved_token() {
     assert!(events.next().is_none());
     wake_thread.join().unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uring_backend_reports_listener_stream_and_wake() {
+    use super::PollBackend;
+
+    let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut listener = TcpListener::bind(address).unwrap();
+    let address = listener.local_addr().unwrap();
+    let Ok(mut poller) = Poller::new_with_backend(4, PollBackend::IoUring) else {
+        eprintln!("io_uring unavailable; skipping");
+        return;
+    };
+    poller
+        .register(&mut listener, 10, PollInterest::Readable)
+        .unwrap();
+
+    let mut client = StdTcpStream::connect(address).unwrap();
+    assert!(
+        poller
+            .poll(Some(Duration::from_secs(2)))
+            .unwrap()
+            .any(|event| event.token == 10 && event.readable)
+    );
+
+    let (mut stream, _) = listener.accept().unwrap();
+    poller
+        .register(&mut stream, 11, PollInterest::Readable)
+        .unwrap();
+    client.write_all(b"ping").unwrap();
+    assert!(
+        poller
+            .poll(Some(Duration::from_secs(2)))
+            .unwrap()
+            .any(|event| event.token == 11 && event.readable)
+    );
+
+    let mut input = [0; 4];
+    stream.read_exact(&mut input).unwrap();
+    assert_eq!(&input, b"ping");
+
+    poller
+        .reregister(&mut stream, 11, PollInterest::Writable)
+        .unwrap();
+    assert!(
+        poller
+            .poll(Some(Duration::from_secs(2)))
+            .unwrap()
+            .any(|event| event.token == 11 && event.writable)
+    );
+    poller.deregister(&mut stream).unwrap();
+
+    let waker = poller.create_waker().unwrap();
+    waker.wake().unwrap();
+    assert!(
+        poller
+            .poll(Some(Duration::from_secs(2)))
+            .unwrap()
+            .any(|event| event.token == WAKE_TOKEN)
+    );
+
+    let idle = poller
+        .poll(Some(Duration::from_millis(20)))
+        .unwrap()
+        .count();
+    assert_eq!(idle, 0);
+}

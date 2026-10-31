@@ -447,6 +447,7 @@ pub(crate) fn park_request(
         body_total,
         &[],
         None,
+        false,
         request_headers,
     ) {
         Ok(event_token) => event_token,

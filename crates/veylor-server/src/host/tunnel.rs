@@ -390,26 +390,6 @@ impl HostShared {
         .is_some_and(|(done, _)| done)
     }
 
-    pub(crate) fn mark_h2_tunnel(&self, token: ConnectionToken) {
-        let marked = self
-            .with_inner(|inner| {
-                let Some(entry) = tunnel_entry(inner, token) else {
-                    return (false, None);
-                };
-                if entry.h2_tunnel {
-                    return (false, None);
-                }
-                entry.h2_tunnel = true;
-                (true, None)
-            })
-            .is_some_and(|(marked, _)| marked);
-        if marked {
-            if let Some(count) = self.h2_tunnels.get(token.worker_id as usize) {
-                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
-
     pub(crate) fn h2_tunnel_active(&self, worker: u32) -> bool {
         self.h2_tunnels
             .get(worker as usize)

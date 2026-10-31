@@ -54,7 +54,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     // keeps riding MAX_CONNECTIONS (their slice owns that math) and stays sufficient
     // because validate_config pins max_connections <= MAX_CONNECTIONS.
     let max_conns = config.max_connections;
-    let mut stream_poller = match Poller::new(max_conns * 2) {
+    let mut stream_poller = match Poller::new_with_backend(max_conns * 2, config.io_backend) {
         Ok(poller) => poller,
         Err(error) => {
             result.error = Some(error.to_string());

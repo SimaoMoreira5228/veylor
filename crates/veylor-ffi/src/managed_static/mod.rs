@@ -84,7 +84,7 @@ pub struct VylManagedStaticConfig {
     pub byte_budget_per_turn: u64,
     pub poll_wait_ms: i32,
     pub port: u16,
-    pub reserved: u32,
+    pub io_backend: u32,
     pub address: crate::abi::VylBytes,
     pub max_connections: u64,
     pub worker_count: u64,
@@ -286,6 +286,12 @@ impl VylManagedStaticConfig {
             usize::try_from(self.max_events_per_turn).map_err(|_| VylResult::InvalidArgument)?;
         config.turn.byte_budget_per_turn = self.byte_budget_per_turn;
         config.poll_wait_ms = self.poll_wait_ms;
+        config.io_backend = match self.io_backend {
+            0 => veylor_runtime::PollBackend::Mio,
+            #[cfg(target_os = "linux")]
+            1 => veylor_runtime::PollBackend::IoUring,
+            _ => return Err(VylResult::InvalidArgument),
+        };
 
         let address = if self.address.length == 0 {
             IpAddr::from(std::net::Ipv4Addr::LOCALHOST)
