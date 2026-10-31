@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use veylor_http1::{ALLOW_BYTES, is_token, prohibited_request_trailer};
+use veylor_http1::ALLOW_BYTES;
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HeaderRange, HpackHeader, ServerError, ValidatedServerRequest,
 };
@@ -8,7 +8,7 @@ use veylor_runtime::ConnectionToken;
 
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::trailers::StagedTrailer;
-use crate::connection::trailers::trailer_allowed;
+use crate::connection::trailers::{trailer_allowed, valid_trailer_field};
 use crate::host::{HOST_MAX_REASON_BYTES, HOST_TUNNEL_CAP, HostEventKind, stage_tunnel_signal};
 use crate::static_files::FileReject;
 use crate::static_routes::{
@@ -740,30 +740,6 @@ enum H2Trailer {
     Staged,
     Stream(ErrorCode),
     Conn,
-}
-
-pub(crate) fn valid_trailer_field(name: &[u8], value: &[u8]) -> bool {
-    if name.is_empty() || name.first() == Some(&b':') || prohibited_request_trailer(name) {
-        return false;
-    }
-    if !name
-        .iter()
-        .copied()
-        .all(|byte| is_token(byte) && !byte.is_ascii_uppercase())
-    {
-        return false;
-    }
-    let ows = |byte: &u8| *byte == b' ' || *byte == b'\t';
-    if value.first().is_some_and(ows) || value.last().is_some_and(ows) {
-        return false;
-    }
-    !value.iter().any(|byte| {
-        *byte == 0
-            || *byte == b'\r'
-            || *byte == b'\n'
-            || *byte == 0x7f
-            || (*byte < 0x20 && *byte != b'\t')
-    })
 }
 
 // NOTE: the H2 request-trailer prohibited set is the same 15-name decoder policy as H1

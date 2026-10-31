@@ -10,9 +10,9 @@ use crate::host::HostShared;
 
 use super::routes::project_extra_headers;
 use super::send::{field, send_begin};
-use super::serve::valid_trailer_field;
 use super::{H2Conn, Phase, STREAM_SLOTS, TUNNEL_STEP};
 use super::{slots, turn};
+use crate::connection::trailers::valid_trailer_field;
 
 #[derive(Clone, Copy)]
 enum StreamStep {

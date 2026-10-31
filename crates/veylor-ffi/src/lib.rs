@@ -3,6 +3,8 @@ mod abi;
 mod client_connection;
 mod h2_client;
 mod h2_server;
+#[allow(unsafe_code)]
+mod h3_client;
 mod managed_static;
 mod server_connection;
 
@@ -36,6 +38,12 @@ pub use h2_server::{
     vyl_h2_server_refuse, vyl_h2_server_send_data, vyl_h2_server_send_ping_ack,
     vyl_h2_server_send_reset, vyl_h2_server_send_response, vyl_h2_server_send_settings,
     vyl_h2_server_send_settings_ack, vyl_h2_server_send_window_update,
+};
+pub use h3_client::{
+    VYL_H3_CLIENT_ABI_VERSION, VylH3Client, VylH3ClientConfig, VylH3Response,
+    vyl_h3_client_destroy, vyl_h3_client_new, vyl_h3_client_request, vyl_h3_response_body,
+    vyl_h3_response_destroy, vyl_h3_response_header, vyl_h3_response_header_count,
+    vyl_h3_response_status,
 };
 pub use managed_static::{
     VYL_MANAGED_STATIC_ABI_VERSION, VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE,

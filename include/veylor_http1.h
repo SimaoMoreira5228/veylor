@@ -713,6 +713,62 @@ vyl_http1_result vyl_h2_server_goaway_drain(
     size_t* out_required
 );
 
+#define VYL_H3_CLIENT_ABI_VERSION 1u
+
+typedef struct vyl_h3_client vyl_h3_client;
+typedef struct vyl_h3_response vyl_h3_response;
+
+/* NOTE: address is a numeric IPv4/IPv6 string and root_cert is a DER certificate
+   chain. Requests block until the response completes; every returned span points
+   into the owning response and stays valid until vyl_h3_response_destroy. */
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved0;
+    size_t struct_size;
+    vyl_http1_bytes address;
+    vyl_http1_bytes server_name;
+    vyl_http1_bytes root_cert;
+    uint16_t port;
+    uint16_t reserved1;
+    uint32_t reserved2;
+    uint64_t idle_timeout_ns;
+    uint64_t max_response_body;
+} vyl_h3_client_config;
+
+_Static_assert(sizeof(vyl_h3_client_config) == 88, "vyl_h3_client_config size");
+_Static_assert(offsetof(vyl_h3_client_config, struct_size) == 8, "vyl_h3_client_config struct_size");
+_Static_assert(offsetof(vyl_h3_client_config, address) == 16, "vyl_h3_client_config address");
+_Static_assert(offsetof(vyl_h3_client_config, port) == 64, "vyl_h3_client_config port");
+_Static_assert(offsetof(vyl_h3_client_config, idle_timeout_ns) == 72, "vyl_h3_client_config idle_timeout_ns");
+_Static_assert(offsetof(vyl_h3_client_config, max_response_body) == 80, "vyl_h3_client_config max_response_body");
+
+vyl_http1_result vyl_h3_client_new(
+    const vyl_h3_client_config* config,
+    vyl_h3_client** out_client
+);
+vyl_http1_result vyl_h3_client_request(
+    vyl_h3_client* client,
+    vyl_http1_bytes method,
+    vyl_http1_bytes url,
+    vyl_http1_bytes body,
+    vyl_h3_response** out_response
+);
+vyl_http1_result vyl_h3_client_destroy(vyl_h3_client* client);
+
+uint16_t vyl_h3_response_status(const vyl_h3_response* response);
+size_t vyl_h3_response_header_count(const vyl_h3_response* response);
+vyl_http1_result vyl_h3_response_header(
+    const vyl_h3_response* response,
+    size_t index,
+    vyl_http1_bytes* out_name,
+    vyl_http1_bytes* out_value
+);
+vyl_http1_result vyl_h3_response_body(
+    const vyl_h3_response* response,
+    vyl_http1_bytes* out_body
+);
+vyl_http1_result vyl_h3_response_destroy(vyl_h3_response* response);
+
 #define VYL_MANAGED_STATIC_ABI_VERSION 2u
 
 typedef struct vyl_managed_static_server vyl_managed_static_server;

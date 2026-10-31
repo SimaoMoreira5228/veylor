@@ -291,3 +291,129 @@ fn writes_h3_response_through_writer() {
 
     running.join().expect("join h3 server");
 }
+
+#[test]
+fn client_requests_reuse_the_connection() {
+    let (cert, key) = identity();
+    let server = Server::bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Config {
+            tls: Tls::new(vec![cert.clone()], key),
+            limits: Limits::default(),
+        },
+    );
+    let running = server
+        .start(|request: http::Request<()>, body: bytes::Bytes| {
+            let status = if request.method() == http::Method::POST {
+                http::StatusCode::CREATED
+            } else {
+                http::StatusCode::OK
+            };
+            let path = request.uri().path().as_bytes().to_vec();
+            text_response(status, [path, b":".to_vec(), body.to_vec()].concat())
+        })
+        .expect("start h3 server");
+
+    let client = veylor_h3::Client::connect(veylor_h3::ClientConfig {
+        server: running.address(),
+        server_name: "localhost".to_owned(),
+        tls: veylor_h3::ClientTls::new(vec![cert]),
+        limits: Limits::default(),
+    })
+    .expect("connect h3 client");
+
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri("https://localhost/first")
+        .body(())
+        .expect("request");
+    let response = client
+        .request(request, bytes::Bytes::new())
+        .expect("first response");
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert_eq!(response.body.as_ref(), b"/first:");
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://localhost/second")
+        .body(())
+        .expect("request");
+    let response = client
+        .request(request, bytes::Bytes::from_static(b"body"))
+        .expect("second response");
+    assert_eq!(response.status, http::StatusCode::CREATED);
+    assert_eq!(response.body.as_ref(), b"/second:body");
+
+    drop(client);
+    running.join().expect("join h3 server");
+}
+
+#[test]
+fn delivers_request_trailers() {
+    let (cert, key) = identity();
+    let server = Server::bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Config {
+            tls: Tls::new(vec![cert.clone()], key),
+            limits: Limits::default(),
+        },
+    );
+    let running = server
+        .start(|request: http::Request<()>, _body: bytes::Bytes| {
+            let value = request
+                .extensions()
+                .get::<veylor_h3::RequestTrailers>()
+                .and_then(|trailers| trailers.0.first())
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            text_response(http::StatusCode::OK, value)
+        })
+        .expect("start h3 server");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("client runtime");
+    runtime.block_on(async {
+        let (endpoint, config) = client_endpoint(cert);
+        let connection = endpoint
+            .connect_with(config, running.address(), "localhost")
+            .expect("connect")
+            .await
+            .expect("handshake");
+        let (mut driver, mut client) = h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .expect("h3 client");
+        let driver = tokio::spawn(async move { driver.wait_idle().await });
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/trailers")
+            .body(())
+            .expect("request");
+        let mut stream = client.send_request(request).await.expect("send");
+        stream
+            .send_data(bytes::Bytes::from_static(b"body"))
+            .await
+            .expect("body");
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert(
+            http::HeaderName::from_static("x-check"),
+            http::HeaderValue::from_static("yes"),
+        );
+        stream.send_trailers(trailers).await.expect("trailers");
+        stream.finish().await.expect("finish");
+        let response = stream.recv_response().await.expect("response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.recv_data().await.expect("data") {
+            body.extend_from_slice(chunk.chunk());
+        }
+        assert_eq!(body, b"yes");
+
+        endpoint.close(quinn::VarInt::from_u32(0), b"done");
+        let _ = driver.await;
+    });
+
+    running.join().expect("join h3 server");
+}

@@ -17,10 +17,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 pub use bytes;
 pub use bytes::Bytes;
+pub use client::{Client, ClientConfig, ClientError, ClientResponse, ClientTls};
 pub use http;
 pub use response_writer::ResponseWriter;
 
+mod client;
 mod connection;
+mod frame_io;
 mod response_writer;
 
 const MAX_UNI_STREAMS: u64 = 8;
@@ -104,6 +107,9 @@ pub struct Config {
     pub tls: Tls,
     pub limits: Limits,
 }
+
+#[derive(Clone, Debug, Default)]
+pub struct RequestTrailers(pub Vec<(Vec<u8>, Vec<u8>)>);
 
 pub enum ManagedOutcome {
     Handled(Response<Body>),

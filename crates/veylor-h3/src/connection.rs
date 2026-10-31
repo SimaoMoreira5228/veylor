@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri};
-use quinn::{Connection, ReadExactError, RecvStream, SendStream, VarInt};
+use quinn::{Connection, RecvStream, SendStream, VarInt};
 use veylor_http3::frame::SettingsError;
 use veylor_http3::{
     CONTROL_STREAM, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR,
@@ -14,7 +14,11 @@ use veylor_http3::{
     SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
 };
 
-use crate::{Body, Handler, Limits, ManagedOutcome};
+use crate::frame_io::{close, read_byte, read_continuation, read_frame, read_varint};
+use crate::{Body, Handler, Limits, ManagedOutcome, RequestTrailers};
+
+const MAX_TRAILER_FIELDS: usize = 8;
+const MAX_TRAILER_BYTES: usize = 1024;
 
 pub(crate) async fn serve(connection: Connection, handler: Arc<dyn Handler>, limits: Limits) {
     if setup_control(&connection, limits).await.is_err() {
@@ -308,12 +312,13 @@ async fn handle_request(
         );
         return Ok(());
     };
-    let Some(request) = request_from_fields(&fields) else {
+    let Some(mut request) = request_from_fields(&fields) else {
         close(&connection, H3_MESSAGE_ERROR, "malformed request");
         return Ok(());
     };
 
     let mut body = Vec::new();
+    let mut trailers = Vec::new();
     loop {
         match read_frame(&mut recv, limits.max_request_body.saturating_add(1)).await {
             Ok(Some((kind, payload))) => match kind {
@@ -324,7 +329,18 @@ async fn handle_request(
                     }
                     body.extend_from_slice(&payload);
                 }
-                frame::HEADERS => {}
+                frame::HEADERS => {
+                    if payload.len() > limits.max_field_section as usize
+                        || !append_trailers(
+                            &mut trailers,
+                            &payload,
+                            limits.max_field_section as usize,
+                        )
+                    {
+                        close(&connection, H3_MESSAGE_ERROR, "invalid request trailers");
+                        return Ok(());
+                    }
+                }
                 frame::SETTINGS
                 | frame::GOAWAY
                 | frame::MAX_PUSH_ID
@@ -343,6 +359,9 @@ async fn handle_request(
         }
     }
 
+    if !trailers.is_empty() {
+        request.extensions_mut().insert(RequestTrailers(trailers));
+    }
     let is_head = request.method() == Method::HEAD;
     let outcome = {
         let mut writer = crate::ResponseWriter::new(&mut send);
@@ -448,6 +467,32 @@ async fn write_response(send: &mut SendStream, response: Response<Body>, is_head
         }
     }
     let _ = send.finish();
+}
+
+fn append_trailers(
+    trailers: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    payload: &[u8],
+    field_limit: usize,
+) -> bool {
+    let Some(fields) = qpack::decode(payload, field_limit).ok() else {
+        return false;
+    };
+    if trailers.len().saturating_add(fields.len()) > MAX_TRAILER_FIELDS {
+        return false;
+    }
+    let mut total: usize = trailers.iter().map(|(name, _)| name.len()).sum();
+    total += trailers.iter().map(|(_, value)| value.len()).sum::<usize>();
+    for (name, value) in fields {
+        if name.first() == Some(&b':') || !valid_name(&name) || !valid_value(&value) {
+            return false;
+        }
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        if total > MAX_TRAILER_BYTES {
+            return false;
+        }
+        trailers.push((name, value));
+    }
+    true
 }
 
 fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
@@ -558,66 +603,4 @@ fn valid_value(value: &[u8]) -> bool {
             || *byte == 0x7f
             || (*byte < 0x20 && *byte != b'\t')
     })
-}
-
-async fn read_byte(recv: &mut RecvStream) -> Option<u8> {
-    let mut byte = [0u8; 1];
-    match recv.read_exact(&mut byte).await {
-        Ok(()) => Some(byte[0]),
-        Err(_) => None,
-    }
-}
-
-async fn read_continuation(recv: &mut RecvStream) -> Option<u64> {
-    let mut value = 0u64;
-    loop {
-        let byte = read_byte(recv).await?;
-        value = value.checked_shl(7)?.checked_add(u64::from(byte & 0x7f))?;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-    }
-}
-
-async fn read_varint(recv: &mut RecvStream) -> Result<Option<u64>, ()> {
-    let mut first = [0u8; 1];
-    match recv.read_exact(&mut first).await {
-        Ok(()) => {}
-        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
-        Err(_) => return Err(()),
-    }
-    let length = 1usize << (first[0] >> 6);
-    let mut bytes = [0u8; 8];
-    bytes[0] = first[0];
-    if length > 1 {
-        recv.read_exact(&mut bytes[1..length])
-            .await
-            .map_err(|_| ())?;
-    }
-    match frame::decode_varint(&bytes[..length]) {
-        Some((value, _)) => Ok(Some(value)),
-        None => Err(()),
-    }
-}
-
-async fn read_frame(recv: &mut RecvStream, limit: usize) -> Result<Option<(u64, Vec<u8>)>, ()> {
-    let Some(kind) = read_varint(recv).await? else {
-        return Ok(None);
-    };
-    let Some(length) = read_varint(recv).await? else {
-        return Ok(None);
-    };
-    let length = usize::try_from(length).map_err(|_| ())?;
-    if length > limit {
-        return Err(());
-    }
-    let mut payload = vec![0u8; length];
-    recv.read_exact(&mut payload).await.map_err(|_| ())?;
-    Ok(Some((kind, payload)))
-}
-
-fn close(connection: &Connection, code: u64, reason: &'static str) {
-    if let Ok(code) = VarInt::from_u64(code) {
-        connection.close(code, reason.as_bytes());
-    }
 }

@@ -1267,6 +1267,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "veylor-client",
+ "veylor-h3",
  "veylor-http1",
  "veylor-http2",
  "veylor-runtime",

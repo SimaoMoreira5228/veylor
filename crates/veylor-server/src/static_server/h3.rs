@@ -12,13 +12,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use veylor_h3::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
 use veylor_h3::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use veylor_h3::{Body, Bytes, ManagedOutcome, ResponseWriter, RunningServer, Server, Tls};
+use veylor_h3::{
+    Body, Bytes, ManagedOutcome, RequestTrailers, ResponseWriter, RunningServer, Server, Tls,
+};
 use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, join_allow_value};
 use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route};
 use veylor_runtime::ConnectionToken;
 
 use crate::connection::streams::StreamCmd;
-use crate::host::{H3_PARK_SLOTS, HOST_MAX_REASON_BYTES, HostShared, StagedWork};
+use crate::host::{H3_PARK_SLOTS, HOST_MAX_REASON_BYTES, HostShared, RespondOutcome, StagedWork};
 use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::now_http_date;
 use crate::static_routes::{
@@ -227,10 +229,15 @@ impl veylor_h3::Handler for Handler {
 
     fn managed<'a>(
         &'a self,
-        request: Request<()>,
+        mut request: Request<()>,
         body: Bytes,
         writer: &'a mut ResponseWriter<'_>,
     ) -> Pin<Box<dyn Future<Output = ManagedOutcome> + Send + 'a>> {
+        let trailers = request
+            .extensions_mut()
+            .remove::<RequestTrailers>()
+            .map(|trailers| trailers.0)
+            .unwrap_or_default();
         let method = request.method().as_str().as_bytes().to_vec();
         let path = request.uri().path().as_bytes().to_vec();
         let Some(found) = select(&self.routes, &method, &path) else {
@@ -246,9 +253,20 @@ impl veylor_h3::Handler for Handler {
         }
         let route_id = found.index as u64;
         let body_limit = found.route.max_body_bytes;
+        let trailer_allow = found.route.trailers.clone();
         Box::pin(async move {
-            self.park(request, body, route_id, &method, &path, body_limit, writer)
-                .await
+            self.park(
+                request,
+                body,
+                route_id,
+                &method,
+                &path,
+                body_limit,
+                trailers,
+                &trailer_allow,
+                writer,
+            )
+            .await
         })
     }
 }
@@ -263,6 +281,8 @@ impl Handler {
         method: &[u8],
         path: &[u8],
         body_limit: u64,
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
+        trailer_allow: &[Vec<u8>],
         writer: &mut ResponseWriter<'_>,
     ) -> ManagedOutcome {
         let Some((slot, generation)) = self.slots.lock().ok().and_then(|mut slots| slots.acquire())
@@ -304,7 +324,7 @@ impl Handler {
             method,
             path,
             body.len() as u64,
-            &[],
+            trailer_allow,
             Some(body_limit),
             headers,
         );
@@ -323,6 +343,16 @@ impl Handler {
             self.remove_waiter(key);
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
+        }
+        if !trailers.is_empty() {
+            let fields: Vec<(&[u8], &[u8])> = trailers
+                .iter()
+                .map(|(name, value)| (name.as_slice(), value.as_slice()))
+                .collect();
+            if self.host.push_request_trailers(event_token, &fields) != RespondOutcome::Ok {
+                self.retire(key, slot);
+                return ManagedOutcome::Handled(text(StatusCode::BAD_REQUEST, b"Bad Request"));
+            }
         }
 
         let mut streaming = false;

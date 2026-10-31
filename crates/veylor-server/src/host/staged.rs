@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use veylor_runtime::ConnectionToken;
 
-use crate::connection::parked::BodyPushOutcome;
+use crate::connection::parked::{BodyPushOutcome, MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
+use crate::connection::trailers::{StagedTrailer, trailer_allowed, valid_trailer_field};
 use crate::connection::{pull_staged_body, push_staged_body};
 use crate::static_routes::MAX_RESPONSE_BODY;
 
@@ -420,6 +421,69 @@ impl HostShared {
         result
     }
 
+    pub(crate) fn push_request_trailers(
+        &self,
+        token: ConnectionToken,
+        fields: &[(&[u8], &[u8])],
+    ) -> RespondOutcome {
+        if fields.len() > TRAILER_SLOTS {
+            return RespondOutcome::Invalid;
+        }
+        let outcome = self.with_inner(|inner| {
+            let worker = token.worker_id as usize;
+            let slot = token.slot as usize;
+            let entry = inner
+                .parked
+                .get_mut(worker)
+                .and_then(|table| table.get_mut(slot))
+                .and_then(|entry| entry.as_mut())
+                .filter(|entry| entry.token == token);
+            let Some(entry) = entry else {
+                let outcome = match find_tomb(inner, worker, token) {
+                    Some(TombCause::Responded) => RespondOutcome::Duplicate,
+                    Some(TombCause::Gone) => RespondOutcome::Gone,
+                    Some(TombCause::Cancelled) | None => RespondOutcome::Stale,
+                };
+                return (outcome, None);
+            };
+            if entry.staged.is_some() {
+                return (RespondOutcome::Duplicate, None);
+            }
+            let have = entry.trailers.as_ref().map_or(0, Vec::len);
+            if have.saturating_add(fields.len()) > TRAILER_SLOTS {
+                return (RespondOutcome::Invalid, None);
+            }
+            let mut total: usize = entry
+                .trailers
+                .iter()
+                .flatten()
+                .map(|field| field.name.len() + field.value.len())
+                .sum();
+            for (name, value) in fields {
+                if !valid_trailer_field(name, value)
+                    || !trailer_allowed(&entry.trailer_allow, b"", name)
+                {
+                    return (RespondOutcome::Invalid, None);
+                }
+                total = total.saturating_add(name.len()).saturating_add(value.len());
+                if total > MAX_STAGED_TRAILER_BYTES {
+                    return (RespondOutcome::Invalid, None);
+                }
+            }
+            let staged = entry.trailers.get_or_insert_with(Vec::new);
+            for (name, value) in fields {
+                staged.push(StagedTrailer {
+                    name: name.to_vec(),
+                    value: value.to_vec(),
+                });
+            }
+            (RespondOutcome::Ok, None)
+        });
+        outcome
+            .map(|(outcome, _)| outcome)
+            .unwrap_or(RespondOutcome::Stale)
+    }
+
     pub fn pull_body(&self, token: ConnectionToken, out: &mut [u8]) -> BodyPull {
         let done = self.with_inner(|inner| (pull_staged_body(inner, token, out), None));
         done.map(|(r, _)| r)
@@ -537,5 +601,59 @@ impl HostShared {
         taken
             .map(|((staged, epoch), _)| (staged, epoch))
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::connection::trailers::TrailerOutcome;
+
+    use super::*;
+
+    fn token() -> ConnectionToken {
+        ConnectionToken {
+            worker_id: 0,
+            slot: 0,
+            request_seq: 0,
+            stream_id: 0,
+            worker_generation: 1,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn staged_request_trailers_follow_allowlist_and_body_completion() {
+        let shared = Arc::new(HostShared::new(1));
+        let token = token();
+        let event = shared
+            .try_park(0, token, 0, b"POST", b"/upload", 3, &[b"x-check".to_vec()])
+            .expect("park");
+        let handle = crate::host::HostHandle::new(Arc::clone(&shared));
+
+        assert!(shared.push_body(event, b"abc"));
+        let mut body = [0u8; 3];
+        assert_eq!(
+            handle.pull_body(event, &mut body),
+            (RespondOutcome::Ok, 3, true)
+        );
+
+        assert_eq!(
+            shared.push_request_trailers(event, &[(&b"x-check"[..], &b"yes"[..])]),
+            RespondOutcome::Ok
+        );
+        assert_eq!(
+            shared.push_request_trailers(event, &[(&b"x-other"[..], &b"no"[..])]),
+            RespondOutcome::Invalid
+        );
+
+        let mut names = [0u8; 8];
+        let mut values = [0u8; 8];
+        let report = handle.pull_trailers(event, &mut names, &mut values);
+        assert_eq!(report.outcome, TrailerOutcome::Ok);
+        assert_eq!(report.fields, 1);
+        assert_eq!(&names[..report.names_copied], b"x-check");
+        assert_eq!(&values[..report.values_copied], b"yes");
     }
 }

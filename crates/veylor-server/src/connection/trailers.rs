@@ -1,4 +1,4 @@
-use veylor_http1::{Header, Span, is_token};
+use veylor_http1::{Header, Span, is_token, prohibited_request_trailer};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StagedTrailer {
@@ -30,6 +30,30 @@ pub struct TrailerReport {
 // proxy-connection; RFC 9110 forbids both in request trailers, so the allowlist gate rejects them
 // here alongside unlisted and Connection-nominated names. Decoder verdicts stay authoritative for
 // syntax and its own prohibited set; anything refused anywhere fails the connection closed.
+pub(crate) fn valid_trailer_field(name: &[u8], value: &[u8]) -> bool {
+    if name.is_empty() || name.first() == Some(&b':') || prohibited_request_trailer(name) {
+        return false;
+    }
+    if !name
+        .iter()
+        .copied()
+        .all(|byte| is_token(byte) && !byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let ows = |byte: &u8| *byte == b' ' || *byte == b'\t';
+    if value.first().is_some_and(ows) || value.last().is_some_and(ows) {
+        return false;
+    }
+    !value.iter().any(|byte| {
+        *byte == 0
+            || *byte == b'\r'
+            || *byte == b'\n'
+            || *byte == 0x7f
+            || (*byte < 0x20 && *byte != b'\t')
+    })
+}
+
 pub(crate) fn trailer_allowed(allow: &[Vec<u8>], connection: &[u8], name: &[u8]) -> bool {
     if name.eq_ignore_ascii_case(b"keep-alive") || name.eq_ignore_ascii_case(b"proxy-connection") {
         return false;

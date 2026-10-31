@@ -79,6 +79,9 @@ integration-rust-ffi-linux:
     clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_managed_h3.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
         -o build/test-rust-ffi-managed-h3
+    clang {{ ABI_CFLAGS }} -Iinclude tests/rust_ffi_h3_client.c \
+        -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug \
+        -o build/test-rust-ffi-h3-client
     clang {{ ABI_CFLAGS }} -pthread -Iinclude tests/foreign_threads.c \
         -Ltarget/debug -lveylor_ffi -Wl,-rpath,$PWD/target/debug -pthread \
         -o build/test-foreign-threads
@@ -94,6 +97,7 @@ integration-rust-ffi-linux:
     build/test-rust-ffi-managed-bind
     build/test-rust-ffi-managed-tunnel
     build/test-rust-ffi-managed-h3
+    build/test-rust-ffi-h3-client
     build/test-foreign-threads
 
 conformance:
