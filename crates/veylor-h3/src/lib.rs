@@ -1,6 +1,5 @@
-// NOTE: the h3 0.0.8 mapping layer leaves 13 h3spec error-path cases unhandled (QPACK control
-// streams, push-stream creation, duplicate/ordered pseudo-headers, SETTINGS framing). Normal
-// requests pass; patching or replacing the mapping layer is tracked in the whitepaper.
+// NOTE: the HTTP/3 connection layer is Veylor-owned and runs on the in-repo
+// veylor-http3 frame/QPACK codec. QPACK dynamic state is disabled (capacity 0).
 
 use std::fmt;
 use std::fs;
@@ -8,14 +7,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
-use http::header::{CONTENT_LENGTH, TE};
-use http::{Method, Request, Response, StatusCode};
+use http::header::CONTENT_LENGTH;
+use http::{Request, Response, StatusCode};
 use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 pub use bytes;
+pub use bytes::Bytes;
 pub use http;
+
+mod connection;
 
 const MAX_UNI_STREAMS: u64 = 8;
 
@@ -78,6 +79,7 @@ pub struct Limits {
     pub idle_timeout: Duration,
     pub max_field_section: u64,
     pub max_request_body: usize,
+    pub max_response_body: usize,
 }
 
 impl Default for Limits {
@@ -88,6 +90,7 @@ impl Default for Limits {
             idle_timeout: Duration::from_secs(30),
             max_field_section: 16 * 1024,
             max_request_body: 1024 * 1024,
+            max_response_body: 4 * 1024 * 1024,
         }
     }
 }
@@ -121,7 +124,11 @@ impl Server {
     }
 
     pub fn start<H: Handler>(self, handler: H) -> Result<RunningServer, Error> {
-        let server_config = server_config(&self.config)?;
+        let server_config = server_config(
+            self.config.tls.certs.clone(),
+            self.config.tls.key.clone_key(),
+            self.config.limits,
+        )?;
         let limits = self.config.limits;
         let handler: Arc<dyn Handler> = Arc::new(handler);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -141,6 +148,7 @@ impl Server {
         Ok(RunningServer {
             address,
             endpoint,
+            limits,
             thread: Some(thread),
         })
     }
@@ -149,12 +157,23 @@ impl Server {
 pub struct RunningServer {
     address: SocketAddr,
     endpoint: quinn::Endpoint,
+    limits: Limits,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RunningServer {
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn rotate_tls(
+        &self,
+        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> Result<(), Error> {
+        let config = server_config(certs, key, self.limits)?;
+        self.endpoint.set_server_config(Some(config));
+        Ok(())
     }
 
     pub fn stop(&self) {
@@ -176,9 +195,11 @@ impl Drop for RunningServer {
     }
 }
 
-fn server_config(config: &Config) -> Result<quinn::ServerConfig, Error> {
-    let certs = config.tls.certs.clone();
-    let key = config.tls.key.clone_key();
+fn server_config(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    limits: Limits,
+) -> Result<quinn::ServerConfig, Error> {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
@@ -195,15 +216,14 @@ fn server_config(config: &Config) -> Result<quinn::ServerConfig, Error> {
         .map_err(|_| Error::Config("no quic cipher suite"))?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport = quinn::TransportConfig::default();
-    let streams = VarInt::from_u64(config.limits.max_streams)
-        .map_err(|_| Error::Config("invalid stream limit"))?;
+    let streams =
+        VarInt::from_u64(limits.max_streams).map_err(|_| Error::Config("invalid stream limit"))?;
     let uni =
         VarInt::from_u64(MAX_UNI_STREAMS).map_err(|_| Error::Config("invalid stream limit"))?;
     transport.max_concurrent_bidi_streams(streams);
     transport.max_concurrent_uni_streams(uni);
     transport.max_idle_timeout(Some(
-        config
-            .limits
+        limits
             .idle_timeout
             .try_into()
             .map_err(|_| Error::Config("invalid idle timeout"))?,
@@ -223,106 +243,9 @@ async fn accept_loop(endpoint: quinn::Endpoint, handler: Arc<dyn Handler>, limit
             let Ok(connection) = incoming.await else {
                 return;
             };
-            serve_connection(
-                connection,
-                handler,
-                limits.max_field_section,
-                limits.max_request_body,
-            )
-            .await;
+            connection::serve(connection, handler, limits).await;
         });
     }
-}
-
-async fn serve_connection(
-    connection: quinn::Connection,
-    handler: Arc<dyn Handler>,
-    max_field_section: u64,
-    max_request_body: usize,
-) {
-    let mut builder = h3::server::builder();
-    builder.max_field_section_size(max_field_section);
-    let quic = connection.clone();
-    let connection = h3_quinn::Connection::new(connection);
-    let Ok(mut h3) = builder.build(connection).await else {
-        return;
-    };
-
-    loop {
-        match h3.accept().await {
-            Ok(Some(resolver)) => {
-                let handler = Arc::clone(&handler);
-                let connection = quic.clone();
-                tokio::spawn(async move {
-                    let _ = handle_request(resolver, handler, connection, max_request_body).await;
-                });
-            }
-            Ok(None) => return,
-            Err(_) => return,
-        }
-    }
-}
-
-fn malformed_request(request: &Request<()>) -> bool {
-    let headers = request.headers();
-    for name in headers.keys() {
-        if matches!(
-            name.as_str(),
-            "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
-        ) {
-            return true;
-        }
-    }
-    headers
-        .get(TE)
-        .is_some_and(|value| value.as_bytes() != b"trailers")
-}
-
-async fn handle_request(
-    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
-    handler: Arc<dyn Handler>,
-    connection: quinn::Connection,
-    max_request_body: usize,
-) -> Result<(), h3::error::StreamError> {
-    let (request, mut stream) = resolver.resolve_request().await?;
-    if malformed_request(&request) {
-        let code = VarInt::from_u64(h3::error::Code::H3_MESSAGE_ERROR.value())
-            .unwrap_or(VarInt::from_u32(0x10e));
-        connection.close(code, b"malformed request");
-        return Ok(());
-    }
-    let is_head = request.method() == Method::HEAD;
-
-    let mut body = Vec::new();
-    loop {
-        let Some(chunk) = stream.recv_data().await? else {
-            break;
-        };
-        let remaining = max_request_body.saturating_sub(body.len());
-        if chunk.remaining() > remaining {
-            let mut response = Response::new(());
-            *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
-            response.headers_mut().insert(CONTENT_LENGTH, 0.into());
-            stream.send_response(response).await?;
-            stream.finish().await?;
-            return Ok(());
-        }
-        body.extend_from_slice(chunk.chunk());
-    }
-
-    let response = handler.handle(request, Bytes::from(body));
-    let (parts, body) = response.into_parts();
-    let mut response = Response::from_parts(parts, ());
-    response
-        .headers_mut()
-        .entry(CONTENT_LENGTH)
-        .or_insert_with(|| body.len().into());
-    stream.send_response(response).await?;
-    if !is_head && !body.is_empty() {
-        stream.send_data(body).await?;
-    }
-    stream.finish().await?;
-    Ok(())
 }
 
 pub fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Bytes> {

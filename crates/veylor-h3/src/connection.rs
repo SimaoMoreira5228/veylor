@@ -1,0 +1,566 @@
+use std::sync::Arc;
+
+use bytes::Bytes;
+use http::header::{HeaderName, HeaderValue};
+use http::{Method, Request, Response, StatusCode, Uri};
+use quinn::{Connection, ReadExactError, RecvStream, SendStream, VarInt};
+use veylor_http3::frame::SettingsError;
+use veylor_http3::{
+    CONTROL_STREAM, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR,
+    H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR, H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE,
+    H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, PUSH_STREAM, QPACK_DECODER_STREAM,
+    QPACK_DECODER_STREAM_ERROR, QPACK_DECOMPRESSION_FAILED, QPACK_ENCODER_STREAM,
+    QPACK_ENCODER_STREAM_ERROR, SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
+    SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
+};
+
+use crate::{Handler, Limits};
+
+pub(crate) async fn serve(connection: Connection, handler: Arc<dyn Handler>, limits: Limits) {
+    if setup_control(&connection, limits).await.is_err() {
+        return;
+    }
+
+    let uni = connection.clone();
+    tokio::spawn(async move {
+        accept_uni(uni, limits).await;
+    });
+
+    loop {
+        let Ok((send, recv)) = connection.accept_bi().await else {
+            return;
+        };
+        let handler = Arc::clone(&handler);
+        let control = connection.clone();
+        tokio::spawn(async move {
+            let _ = handle_request(send, recv, handler, control, limits).await;
+        });
+    }
+}
+
+async fn setup_control(connection: &Connection, limits: Limits) -> Result<(), ()> {
+    let mut control = connection.open_uni().await.map_err(|_| ())?;
+    control
+        .write_all(&[CONTROL_STREAM as u8])
+        .await
+        .map_err(|_| ())?;
+
+    let settings = frame::encode_settings(&[
+        (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+        (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+        (SETTINGS_MAX_FIELD_SECTION_SIZE, limits.max_field_section),
+    ]);
+    let mut encoded = Vec::with_capacity(settings.len() + 16);
+    frame::encode_frame(frame::SETTINGS, &settings, &mut encoded);
+    control.write_all(&encoded).await.map_err(|_| ())?;
+
+    let mut encoder = connection.open_uni().await.map_err(|_| ())?;
+    encoder
+        .write_all(&[QPACK_ENCODER_STREAM as u8])
+        .await
+        .map_err(|_| ())?;
+    let mut decoder = connection.open_uni().await.map_err(|_| ())?;
+    decoder
+        .write_all(&[QPACK_DECODER_STREAM as u8])
+        .await
+        .map_err(|_| ())?;
+
+    let connection = connection.clone();
+    tokio::spawn(async move {
+        let _ = connection.closed().await;
+        drop((control, encoder, decoder));
+    });
+    Ok(())
+}
+
+async fn accept_uni(connection: Connection, limits: Limits) {
+    let mut control_seen = false;
+    let mut encoder_seen = false;
+    let mut decoder_seen = false;
+
+    loop {
+        let Ok(mut recv) = connection.accept_uni().await else {
+            return;
+        };
+        let Ok(Some(kind)) = read_varint(&mut recv).await else {
+            continue;
+        };
+        match kind {
+            CONTROL_STREAM => {
+                if control_seen {
+                    close(
+                        &connection,
+                        H3_STREAM_CREATION_ERROR,
+                        "second control stream",
+                    );
+                    return;
+                }
+                control_seen = true;
+                let control = connection.clone();
+                tokio::spawn(async move {
+                    read_control(control, recv, limits).await;
+                });
+            }
+            QPACK_ENCODER_STREAM => {
+                if encoder_seen {
+                    close(
+                        &connection,
+                        H3_STREAM_CREATION_ERROR,
+                        "second encoder stream",
+                    );
+                    return;
+                }
+                encoder_seen = true;
+                let control = connection.clone();
+                tokio::spawn(async move {
+                    read_qpack(control, recv, kind).await;
+                });
+            }
+            QPACK_DECODER_STREAM => {
+                if decoder_seen {
+                    close(
+                        &connection,
+                        H3_STREAM_CREATION_ERROR,
+                        "second decoder stream",
+                    );
+                    return;
+                }
+                decoder_seen = true;
+                let control = connection.clone();
+                tokio::spawn(async move {
+                    read_qpack(control, recv, kind).await;
+                });
+            }
+            PUSH_STREAM => {
+                close(&connection, H3_STREAM_CREATION_ERROR, "client push stream");
+                return;
+            }
+            _ => {
+                let _ = recv.stop(VarInt::from_u32(0));
+            }
+        }
+    }
+}
+
+async fn read_control(connection: Connection, mut recv: RecvStream, limits: Limits) {
+    let mut first = true;
+    let limit = (limits.max_field_section as usize)
+        .saturating_mul(2)
+        .max(1024);
+
+    loop {
+        match read_frame(&mut recv, limit).await {
+            Ok(Some((kind, payload))) => match kind {
+                frame::SETTINGS => {
+                    if !first {
+                        close(&connection, H3_FRAME_UNEXPECTED, "second settings");
+                        return;
+                    }
+                    match frame::decode_settings(&payload) {
+                        Ok(_) => {}
+                        Err(SettingsError::Truncated) => {
+                            close(&connection, H3_FRAME_ERROR, "settings truncated");
+                            return;
+                        }
+                        Err(_) => {
+                            close(&connection, H3_SETTINGS_ERROR, "invalid settings");
+                            return;
+                        }
+                    }
+                    first = false;
+                }
+                frame::DATA | frame::HEADERS => {
+                    close(&connection, H3_FRAME_UNEXPECTED, "request frame on control");
+                    return;
+                }
+                _ => {
+                    if first {
+                        close(&connection, H3_MISSING_SETTINGS, "settings must be first");
+                        return;
+                    }
+                }
+            },
+            Ok(None) => {
+                close(
+                    &connection,
+                    H3_CLOSED_CRITICAL_STREAM,
+                    "control stream closed",
+                );
+                return;
+            }
+            Err(()) => {
+                close(&connection, H3_EXCESSIVE_LOAD, "control frame too large");
+                return;
+            }
+        }
+    }
+}
+
+async fn read_qpack(connection: Connection, mut recv: RecvStream, kind: u64) {
+    if kind == QPACK_ENCODER_STREAM {
+        loop {
+            let Some(first) = read_byte(&mut recv).await else {
+                close(
+                    &connection,
+                    H3_CLOSED_CRITICAL_STREAM,
+                    "encoder stream closed",
+                );
+                return;
+            };
+            if first & 0xE0 != 0x20 {
+                close(
+                    &connection,
+                    QPACK_ENCODER_STREAM_ERROR,
+                    "dynamic qpack insert",
+                );
+                return;
+            }
+            let mut capacity = u64::from(first & 0x1f);
+            if capacity == 0x1f {
+                let Some(value) = read_continuation(&mut recv).await else {
+                    close(
+                        &connection,
+                        H3_CLOSED_CRITICAL_STREAM,
+                        "encoder stream truncated",
+                    );
+                    return;
+                };
+                capacity = value;
+            }
+            if capacity != 0 {
+                close(
+                    &connection,
+                    QPACK_ENCODER_STREAM_ERROR,
+                    "dynamic qpack capacity",
+                );
+                return;
+            }
+        }
+    }
+
+    loop {
+        let Some(first) = read_byte(&mut recv).await else {
+            close(
+                &connection,
+                H3_CLOSED_CRITICAL_STREAM,
+                "decoder stream closed",
+            );
+            return;
+        };
+        if first & 0x80 != 0 {
+            if first & 0x7f == 0x7f {
+                let Some(_) = read_continuation(&mut recv).await else {
+                    close(
+                        &connection,
+                        H3_CLOSED_CRITICAL_STREAM,
+                        "decoder stream truncated",
+                    );
+                    return;
+                };
+            }
+        } else if first & 0x40 != 0 {
+            if first & 0x3f == 0x3f {
+                let Some(_) = read_continuation(&mut recv).await else {
+                    close(
+                        &connection,
+                        H3_CLOSED_CRITICAL_STREAM,
+                        "decoder stream truncated",
+                    );
+                    return;
+                };
+            }
+        } else {
+            close(
+                &connection,
+                QPACK_DECODER_STREAM_ERROR,
+                "insert count increment",
+            );
+            return;
+        }
+    }
+}
+
+async fn handle_request(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    handler: Arc<dyn Handler>,
+    connection: Connection,
+    limits: Limits,
+) -> Result<(), ()> {
+    let limit = (limits.max_field_section as usize).saturating_mul(2);
+    let Some((kind, payload)) = read_frame(&mut recv, limit).await.map_err(|_| ())? else {
+        close(
+            &connection,
+            H3_REQUEST_INCOMPLETE,
+            "request finished before headers",
+        );
+        return Ok(());
+    };
+    if kind != frame::HEADERS {
+        close(&connection, H3_FRAME_UNEXPECTED, "expected headers");
+        return Ok(());
+    }
+    let Some(fields) = qpack::decode(&payload, limits.max_field_section as usize).ok() else {
+        close(
+            &connection,
+            QPACK_DECOMPRESSION_FAILED,
+            "header block decode failed",
+        );
+        return Ok(());
+    };
+    let Some(request) = request_from_fields(&fields) else {
+        close(&connection, H3_MESSAGE_ERROR, "malformed request");
+        return Ok(());
+    };
+
+    let mut body = Vec::new();
+    loop {
+        match read_frame(&mut recv, limits.max_request_body.saturating_add(1)).await {
+            Ok(Some((kind, payload))) => match kind {
+                frame::DATA => {
+                    if body.len().saturating_add(payload.len()) > limits.max_request_body {
+                        close(&connection, H3_EXCESSIVE_LOAD, "request body too large");
+                        return Ok(());
+                    }
+                    body.extend_from_slice(&payload);
+                }
+                frame::HEADERS => {}
+                frame::SETTINGS
+                | frame::GOAWAY
+                | frame::MAX_PUSH_ID
+                | frame::CANCEL_PUSH
+                | frame::PUSH_PROMISE => {
+                    close(&connection, H3_FRAME_UNEXPECTED, "unexpected request frame");
+                    return Ok(());
+                }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(()) => {
+                close(&connection, H3_FRAME_ERROR, "invalid request frame");
+                return Ok(());
+            }
+        }
+    }
+
+    let is_head = request.method() == Method::HEAD;
+    let response = handler.handle(request, Bytes::from(body));
+    let response = if response.body().len() > limits.max_response_body {
+        crate::text_response(StatusCode::INTERNAL_SERVER_ERROR, "response too large")
+    } else {
+        response
+    };
+    write_response(&mut send, response, is_head).await;
+    Ok(())
+}
+
+async fn write_response(send: &mut SendStream, response: Response<Bytes>, is_head: bool) {
+    let (parts, body) = response.into_parts();
+    let status = parts.status.as_u16().to_string();
+    let mut fields: Vec<(&[u8], &[u8])> = Vec::with_capacity(parts.headers.len() + 2);
+    fields.push((b":status", status.as_bytes()));
+    let length = body.len().to_string();
+    fields.push((b"content-length", length.as_bytes()));
+    for (name, value) in &parts.headers {
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "content-length"
+                | ":status"
+        ) {
+            continue;
+        }
+        fields.push((name.as_str().as_bytes(), value.as_bytes()));
+    }
+
+    let block = qpack::encode(&fields);
+    let mut encoded = Vec::with_capacity(block.len() + 16);
+    frame::encode_frame(frame::HEADERS, &block, &mut encoded);
+    if send.write_all(&encoded).await.is_err() {
+        return;
+    }
+    if !is_head && !body.is_empty() {
+        let mut data = Vec::with_capacity(body.len() + 16);
+        frame::encode_frame(frame::DATA, &body, &mut data);
+        if send.write_all(&data).await.is_err() {
+            return;
+        }
+    }
+    let _ = send.finish();
+}
+
+fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
+    let mut method = None;
+    let mut scheme = None;
+    let mut authority = None;
+    let mut path = None;
+    let mut regular = false;
+    let mut headers = Vec::new();
+
+    for (name, value) in fields {
+        if name.first() == Some(&b':') {
+            if regular {
+                return None;
+            }
+            match name.as_slice() {
+                b":method" => set_once(&mut method, value)?,
+                b":scheme" => set_once(&mut scheme, value)?,
+                b":authority" => set_once(&mut authority, value)?,
+                b":path" => set_once(&mut path, value)?,
+                _ => return None,
+            }
+            continue;
+        }
+
+        regular = true;
+        if !valid_name(name) || !valid_value(value) {
+            return None;
+        }
+        if matches!(
+            name.as_slice(),
+            b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding" | b"upgrade"
+        ) {
+            return None;
+        }
+        if name == b"te" && value != b"trailers" {
+            return None;
+        }
+        headers.push((name, value));
+    }
+
+    let method = method?;
+    let scheme = scheme?;
+    let authority = authority?;
+    let path = path?;
+    if method == b"CONNECT" || (scheme != b"https" && scheme != b"http") {
+        return None;
+    }
+    if path != b"*" && path.first() != Some(&b'/') {
+        return None;
+    }
+
+    let mut uri = Vec::with_capacity(scheme.len() + authority.len() + path.len() + 3);
+    uri.extend_from_slice(scheme);
+    uri.extend_from_slice(b"://");
+    uri.extend_from_slice(authority);
+    uri.extend_from_slice(path);
+
+    let mut request = Request::new(());
+    *request.method_mut() = Method::from_bytes(method).ok()?;
+    *request.uri_mut() = Uri::try_from(uri).ok()?;
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name).ok()?;
+        let value = HeaderValue::from_bytes(value).ok()?;
+        request.headers_mut().append(name, value);
+    }
+    Some(request)
+}
+
+fn set_once<'a>(slot: &mut Option<&'a [u8]>, value: &'a [u8]) -> Option<()> {
+    if slot.is_some() {
+        return None;
+    }
+    *slot = Some(value);
+    Some(())
+}
+
+fn valid_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().copied().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn valid_value(value: &[u8]) -> bool {
+    !value.iter().any(|byte| {
+        *byte == 0
+            || *byte == b'\r'
+            || *byte == b'\n'
+            || *byte == 0x7f
+            || (*byte < 0x20 && *byte != b'\t')
+    })
+}
+
+async fn read_byte(recv: &mut RecvStream) -> Option<u8> {
+    let mut byte = [0u8; 1];
+    match recv.read_exact(&mut byte).await {
+        Ok(()) => Some(byte[0]),
+        Err(_) => None,
+    }
+}
+
+async fn read_continuation(recv: &mut RecvStream) -> Option<u64> {
+    let mut value = 0u64;
+    loop {
+        let byte = read_byte(recv).await?;
+        value = value.checked_shl(7)?.checked_add(u64::from(byte & 0x7f))?;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+}
+
+async fn read_varint(recv: &mut RecvStream) -> Result<Option<u64>, ()> {
+    let mut first = [0u8; 1];
+    match recv.read_exact(&mut first).await {
+        Ok(()) => {}
+        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(_) => return Err(()),
+    }
+    let length = 1usize << (first[0] >> 6);
+    let mut bytes = [0u8; 8];
+    bytes[0] = first[0];
+    if length > 1 {
+        recv.read_exact(&mut bytes[1..length])
+            .await
+            .map_err(|_| ())?;
+    }
+    match frame::decode_varint(&bytes[..length]) {
+        Some((value, _)) => Ok(Some(value)),
+        None => Err(()),
+    }
+}
+
+async fn read_frame(recv: &mut RecvStream, limit: usize) -> Result<Option<(u64, Vec<u8>)>, ()> {
+    let Some(kind) = read_varint(recv).await? else {
+        return Ok(None);
+    };
+    let Some(length) = read_varint(recv).await? else {
+        return Ok(None);
+    };
+    let length = usize::try_from(length).map_err(|_| ())?;
+    if length > limit {
+        return Err(());
+    }
+    let mut payload = vec![0u8; length];
+    recv.read_exact(&mut payload).await.map_err(|_| ())?;
+    Ok(Some((kind, payload)))
+}
+
+fn close(connection: &Connection, code: u64, reason: &'static str) {
+    if let Ok(code) = VarInt::from_u64(code) {
+        connection.close(code, reason.as_bytes());
+    }
+}

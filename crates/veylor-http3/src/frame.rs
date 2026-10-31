@@ -1,7 +1,8 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsError {
-    Malformed,
+    Truncated,
     Duplicate,
+    Invalid,
 }
 
 pub const DATA: u64 = 0x0;
@@ -63,9 +64,12 @@ pub fn decode_settings(payload: &[u8]) -> Result<Vec<(u64, u64)>, SettingsError>
     let mut settings = Vec::new();
     let mut offset = 0;
     while offset < payload.len() {
-        let (id, used) = decode_varint(&payload[offset..]).ok_or(SettingsError::Malformed)?;
+        let (id, used) = decode_varint(&payload[offset..]).ok_or(SettingsError::Truncated)?;
         offset += used;
-        let (value, used) = decode_varint(&payload[offset..]).ok_or(SettingsError::Malformed)?;
+        if matches!(id, 0x2..=0x5) {
+            return Err(SettingsError::Invalid);
+        }
+        let (value, used) = decode_varint(&payload[offset..]).ok_or(SettingsError::Truncated)?;
         offset += used;
         if settings.iter().any(|(seen, _)| *seen == id) {
             return Err(SettingsError::Duplicate);
@@ -122,6 +126,7 @@ mod tests {
     fn settings_reject_duplicates_and_truncation() {
         let duplicate = encode_settings(&[(1, 1), (1, 2)]);
         assert_eq!(decode_settings(&duplicate), Err(SettingsError::Duplicate));
-        assert_eq!(decode_settings(&[1]), Err(SettingsError::Malformed));
+        assert_eq!(decode_settings(&[1]), Err(SettingsError::Truncated));
+        assert_eq!(decode_settings(&[2, 0]), Err(SettingsError::Invalid));
     }
 }

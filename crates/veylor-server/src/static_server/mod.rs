@@ -15,6 +15,7 @@ use crate::host::{HostHandle, HostShared};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::{MAX_ROUTES, NativeHandler, RouteBuildError, StaticRoutes};
 
+pub(crate) mod h3;
 pub(crate) mod turn;
 
 pub(crate) use turn::worker_main;
@@ -143,6 +144,7 @@ pub struct ServerConfig {
     // bind address IP. One extra port (not ALPN/upgrades) keeps the H1 path
     // untouched; each worker binds its own reuse-port h2c listener like H1.
     pub h2c_port: Option<u16>,
+    pub h3_port: Option<u16>,
     pub tls: Option<TlsConfig>,
 }
 
@@ -157,6 +159,7 @@ impl Default for ServerConfig {
             worker_count: 1,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             h2c_port: None,
+            h3_port: None,
             tls: None,
         }
     }
@@ -502,6 +505,8 @@ impl Server {
             .map(|bound| bound.local_addr().map_err(ServerError::Bind))
             .transpose()?;
         let tls = config.tls.is_some();
+        let h3 = h3::start(&config, addr.ip(), &h2_routes)?.map(Box::new);
+        let h3_addr = h3.as_ref().map(|server| server.address());
         let stop = Arc::new(AtomicBool::new(false));
         let force = Arc::new(AtomicBool::new(false));
         let ctx = ThreadCtx {
@@ -528,6 +533,8 @@ impl Server {
             force,
             addr,
             h2c_addr,
+            h3,
+            h3_addr,
             host: HostHandle::new(host),
             tls,
         })
@@ -541,6 +548,8 @@ pub struct RunningServer {
     pub(crate) force: Arc<AtomicBool>,
     pub(crate) addr: SocketAddr,
     pub(crate) h2c_addr: Option<SocketAddr>,
+    pub(crate) h3: Option<Box<veylor_h3::RunningServer>>,
+    pub(crate) h3_addr: Option<SocketAddr>,
     pub(crate) host: HostHandle,
     pub(crate) tls: bool,
 }
@@ -554,12 +563,19 @@ impl RunningServer {
         self.h2c_addr
     }
 
+    pub fn h3_addr(&self) -> Option<SocketAddr> {
+        self.h3_addr
+    }
+
     pub fn host(&self) -> HostHandle {
         self.host.clone()
     }
 
     pub fn stop_accepting(&self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(h3) = &self.h3 {
+            h3.stop();
+        }
         for waker in &self.wakers {
             let _ = waker.wake();
         }
@@ -573,6 +589,10 @@ impl RunningServer {
         let chain = veylor_tls::load_cert_chain(cert)?;
         let key = veylor_tls::load_private_key(key)?;
 
+        if let Some(h3) = &self.h3 {
+            h3.rotate_tls(chain.clone(), key.clone_key())
+                .map_err(|_| veylor_tls::TlsError::InvalidInput)?;
+        }
         self.host.shared.stage_tls_rotation(chain, key)?;
 
         for waker in &self.wakers {
@@ -585,6 +605,9 @@ impl RunningServer {
     pub fn stop_force(&self) {
         self.force.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
+        if let Some(h3) = &self.h3 {
+            h3.stop();
+        }
         for waker in &self.wakers {
             let _ = waker.wake();
         }
@@ -610,7 +633,11 @@ impl RunningServer {
         Ok(total)
     }
 
-    pub fn join_per_worker(self) -> Result<Vec<CloseCounts>, ServerError> {
+    pub fn join_per_worker(mut self) -> Result<Vec<CloseCounts>, ServerError> {
+        if let Some(h3) = self.h3.take() {
+            h3.join()
+                .map_err(|error| ServerError::Join(format!("h3: {error}")))?;
+        }
         let mut counts = Vec::with_capacity(self.handles.len());
         let mut first_error: Option<ServerError> = None;
         for handle in self.handles {
@@ -636,6 +663,9 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         .validate()
         .map_err(|_| ServerError::InvalidConfig)?;
     if config.worker_count == 0 || config.worker_count > MAX_WORKERS {
+        return Err(ServerError::InvalidConfig);
+    }
+    if config.h3_port.is_some() && config.tls.is_none() {
         return Err(ServerError::InvalidConfig);
     }
     if config.max_connections == 0 || config.max_connections > MAX_CONNECTIONS {

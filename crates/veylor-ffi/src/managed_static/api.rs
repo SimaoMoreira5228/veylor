@@ -58,6 +58,7 @@ unsafe fn create_server(
             config: server_config,
             addr,
             h2c_port: None,
+            h3_port: None,
             worker_count,
             tls: None,
             ops: Vec::new(),
@@ -107,6 +108,26 @@ unsafe fn enable_h2c(server: *mut VylManagedStaticServer, port: u16) -> VylResul
         return VylResult::BadState;
     };
     ready.h2c_port = Some(port);
+    VylResult::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_enable_h3(
+    server: *mut VylManagedStaticServer,
+    port: u16,
+) -> VylResult {
+    catch_ffi(|| unsafe { enable_h3(server, port) })
+}
+
+unsafe fn enable_h3(server: *mut VylManagedStaticServer, port: u16) -> VylResult {
+    if server.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &mut *server };
+    let ManagedStaticState::Ready(ready) = &mut handle.state else {
+        return VylResult::BadState;
+    };
+    ready.h3_port = Some(port);
     VylResult::Ok
 }
 
@@ -244,11 +265,12 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
         config,
         addr,
         h2c_port,
+        h3_port,
         worker_count,
         tls,
         ops,
     } = *ready;
-    if h2c_port.is_none() && worker_count == 1 && tls.is_none() {
+    if h2c_port.is_none() && h3_port.is_none() && worker_count == 1 && tls.is_none() {
         return match server.start() {
             Ok(running) => {
                 handle.state = ManagedStaticState::Running(running);
@@ -260,6 +282,7 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
     let mut staged = config;
     staged.worker_count = worker_count;
     staged.h2c_port = h2c_port;
+    staged.h3_port = h3_port;
     if let Some((cert_der, key_der, max_handshakes)) = tls {
         staged.tls = Some(veylor_server::TlsConfig {
             cert_chain: vec![veylor_server::CertificateDer::from(cert_der)],
@@ -421,4 +444,28 @@ pub(super) unsafe fn read_bytes<'a>(bytes: VylBytes) -> Result<&'a [u8], VylResu
         return Ok(&[]);
     }
     Ok(unsafe { slice::from_raw_parts(bytes.data, bytes.length) })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_managed_static_h3_addr(
+    server: *mut VylManagedStaticServer,
+    out_port: *mut u16,
+) -> VylResult {
+    catch_ffi(|| unsafe { h3_addr(server, out_port) })
+}
+
+unsafe fn h3_addr(server: *mut VylManagedStaticServer, out_port: *mut u16) -> VylResult {
+    if server.is_null() || out_port.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let handle = unsafe { &*server };
+    let ManagedStaticState::Running(running) = &handle.state else {
+        return VylResult::BadState;
+    };
+    let Some(address) = running.h3_addr() else {
+        return VylResult::BadState;
+    };
+    unsafe {
+        out_port.write(address.port());
+    }
+    VylResult::Ok
 }

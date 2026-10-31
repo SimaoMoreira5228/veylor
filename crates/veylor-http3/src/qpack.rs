@@ -215,7 +215,7 @@ fn decode_field(input: &[u8]) -> Result<(Field, usize), QpackError> {
             .checked_add(name_length as usize)
             .ok_or(QpackError::DecompressionFailed)?;
         let raw = input.get(used..end).ok_or(QpackError::InvalidString)?;
-        let name = if first & 0x10 != 0 {
+        let name = if first & 0x08 != 0 {
             decode_huffman_value(raw)?
         } else {
             raw.to_vec()

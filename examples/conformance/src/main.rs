@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::Bytes;
-use veylor_h3::http::{Method, Request, Response, StatusCode};
 use veylor_runtime::ConnectionToken;
 use veylor_server::{
     EventSlot, HostEventKind, HostHandle, RespondOutcome, Server, ServerConfig, TlsConfig,
@@ -88,6 +86,7 @@ fn main() -> Result<(), String> {
     let config = ServerConfig {
         worker_count: options.workers,
         h2c_port: Some(options.h2c_port),
+        h3_port: options.h3_port,
         tls,
         ..ServerConfig::default()
     };
@@ -118,36 +117,9 @@ fn main() -> Result<(), String> {
     let running = server
         .start()
         .map_err(|error| format!("start: {error:?}"))?;
-    let h3 = match options.h3_port {
-        None => None,
-        Some(port) => {
-            let cert = options
-                .tls_cert
-                .as_ref()
-                .ok_or_else(|| "HTTP/3 needs TLS".to_owned())?;
-            let key = options
-                .tls_key
-                .as_ref()
-                .ok_or_else(|| "HTTP/3 needs TLS".to_owned())?;
-            let tls = veylor_h3::Tls::from_files(cert, key)
-                .map_err(|error| format!("h3 TLS identity: {error}"))?;
-            let server = veylor_h3::Server::bind(
-                SocketAddr::new(options.address.ip(), port),
-                veylor_h3::Config {
-                    tls,
-                    limits: veylor_h3::Limits::default(),
-                },
-            );
-            Some(
-                server
-                    .start(h3_response)
-                    .map_err(|error| format!("h3 start: {error}"))?,
-            )
-        }
-    };
-    let h3_address = h3
-        .as_ref()
-        .map(|server| server.address().to_string())
+    let h3_address = running
+        .h3_addr()
+        .map(|address| address.to_string())
         .unwrap_or_else(|| "-".to_owned());
     let stop = Arc::new(AtomicBool::new(false));
     let host = running.host();
@@ -235,17 +207,5 @@ fn dispatch(host: HostHandle, stop: Arc<AtomicBool>) {
             let request = pending.swap_remove(index);
             host.respond(request.token, 200, b"OK", b"ok\n");
         }
-    }
-}
-
-fn h3_response(request: Request<()>, _body: Bytes) -> Response<Bytes> {
-    match (request.method(), request.uri().path()) {
-        (&Method::GET, "/hello") => veylor_h3::text_response(StatusCode::OK, "hello\n"),
-        (&Method::GET, "/empty") => veylor_h3::text_response(StatusCode::OK, ""),
-        (&Method::GET, "/fixed") => veylor_h3::text_response(StatusCode::OK, "fixed-body-1234"),
-        (&Method::GET, "/") | (&Method::POST, "/") => {
-            veylor_h3::text_response(StatusCode::OK, "ok\n")
-        }
-        _ => veylor_h3::text_response(StatusCode::NOT_FOUND, "not found\n"),
     }
 }

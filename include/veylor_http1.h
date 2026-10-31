@@ -829,6 +829,9 @@ vyl_http1_result vyl_managed_static_enable_h2c(vyl_managed_static_server* server
    start; bytes are copied at call time. Zero budget or empty inputs reject; the
    dedicated port binds loopback TLS at start beside the H1 listener. Valid only
    before start; post-start reports BAD_STATE. */
+/* NOTE: Stages the HTTP/3 listener port for start; requires TLS enabled in the same
+   config. Zero binds an ephemeral loopback port. Valid only before start. */
+vyl_http1_result vyl_managed_static_enable_h3(vyl_managed_static_server* server, uint16_t port);
 vyl_http1_result vyl_managed_static_enable_tls(
     vyl_managed_static_server* server,
     const uint8_t* cert,
@@ -868,6 +871,9 @@ vyl_managed_static_local_addr(vyl_managed_static_server* server, uint16_t* out_p
    BAD_STATE; null handles or outputs report INVALID_ARGUMENT. Ephemeral staging reports the
    bound port, multi-worker reuse-port the shared port. */
 vyl_http1_result vyl_managed_static_h2c_addr(vyl_managed_static_server* server, uint16_t* out_port);
+/* NOTE: Reports the bound HTTP/3 port; BAD_STATE before start, after join, or when H3 is
+   not enabled. */
+vyl_http1_result vyl_managed_static_h3_addr(vyl_managed_static_server* server, uint16_t* out_port);
 
 enum {
     VYL_MANAGED_STATIC_EVENT_REQUEST = 0u,

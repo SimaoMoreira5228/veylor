@@ -16,10 +16,11 @@ mod tunnel;
 mod tests;
 
 pub use api::{
-    vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_enable_tls,
-    vyl_managed_static_h2c_addr, vyl_managed_static_join, vyl_managed_static_local_addr,
-    vyl_managed_static_new, vyl_managed_static_rotate_tls, vyl_managed_static_set_worker_count,
-    vyl_managed_static_start, vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
+    vyl_managed_static_destroy, vyl_managed_static_enable_h2c, vyl_managed_static_enable_h3,
+    vyl_managed_static_enable_tls, vyl_managed_static_h2c_addr, vyl_managed_static_h3_addr,
+    vyl_managed_static_join, vyl_managed_static_local_addr, vyl_managed_static_new,
+    vyl_managed_static_rotate_tls, vyl_managed_static_set_worker_count, vyl_managed_static_start,
+    vyl_managed_static_stop_accepting, vyl_managed_static_stop_force,
 };
 pub use dispatch::{
     vyl_managed_static_host_cancel, vyl_managed_static_host_pull_body,
@@ -136,6 +137,7 @@ pub(super) struct ReadyServer {
     pub(super) config: ServerConfig,
     pub(super) addr: std::net::SocketAddr,
     pub(super) h2c_port: Option<u16>,
+    pub(super) h3_port: Option<u16>,
     pub(super) worker_count: usize,
     pub(super) tls: Option<(Vec<u8>, Vec<u8>, usize)>,
     pub(super) ops: Vec<ReadyRouteOp>,

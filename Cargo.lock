@@ -1257,8 +1257,6 @@ dependencies = [
 name = "veylor-conformance"
 version = "0.1.0"
 dependencies = [
- "bytes",
- "veylor-h3",
  "veylor-runtime",
  "veylor-server",
 ]
@@ -1288,6 +1286,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "tokio",
+ "veylor-http3",
  "veylor-tls",
 ]
 
@@ -1342,6 +1341,7 @@ dependencies = [
  "flate2",
  "rustix",
  "rustls",
+ "veylor-h3",
  "veylor-http1",
  "veylor-http2",
  "veylor-router",
