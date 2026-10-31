@@ -3,7 +3,10 @@
 
 use std::fmt;
 use std::fs;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,8 +18,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 pub use bytes;
 pub use bytes::Bytes;
 pub use http;
+pub use response_writer::ResponseWriter;
 
 mod connection;
+mod response_writer;
 
 const MAX_UNI_STREAMS: u64 = 8;
 
@@ -100,15 +105,94 @@ pub struct Config {
     pub limits: Limits,
 }
 
+pub enum ManagedOutcome {
+    Handled(Response<Body>),
+    Pass(Request<()>, Bytes),
+    Streamed,
+}
+
+pub trait BodySource: Send {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize>;
+}
+
+pub struct StreamBody {
+    content_length: Option<u64>,
+    source: Box<dyn BodySource>,
+}
+
+impl StreamBody {
+    pub fn new(content_length: Option<u64>, source: impl BodySource + 'static) -> Self {
+        Self {
+            content_length,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    pub fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.source.read(out)
+    }
+}
+
+pub enum Body {
+    Bytes(Bytes),
+    Stream(StreamBody),
+}
+
+impl Body {
+    pub fn content_length(&self) -> Option<u64> {
+        match self {
+            Self::Bytes(body) => Some(body.len() as u64),
+            Self::Stream(body) => body.content_length(),
+        }
+    }
+}
+
+impl From<Bytes> for Body {
+    fn from(body: Bytes) -> Self {
+        Self::Bytes(body)
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(body: Vec<u8>) -> Self {
+        Self::Bytes(Bytes::from(body))
+    }
+}
+
+impl From<&'static [u8]> for Body {
+    fn from(body: &'static [u8]) -> Self {
+        Self::Bytes(Bytes::from_static(body))
+    }
+}
+
+impl From<&'static str> for Body {
+    fn from(body: &'static str) -> Self {
+        Self::Bytes(Bytes::from_static(body.as_bytes()))
+    }
+}
+
 pub trait Handler: Send + Sync + 'static {
-    fn handle(&self, request: Request<()>, body: Bytes) -> Response<Bytes>;
+    fn handle(&self, request: Request<()>, body: Bytes) -> Response<Body>;
+
+    fn managed<'a>(
+        &'a self,
+        request: Request<()>,
+        body: Bytes,
+        _writer: &'a mut ResponseWriter<'_>,
+    ) -> Pin<Box<dyn Future<Output = ManagedOutcome> + Send + 'a>> {
+        Box::pin(async move { ManagedOutcome::Pass(request, body) })
+    }
 }
 
 impl<F> Handler for F
 where
-    F: Fn(Request<()>, Bytes) -> Response<Bytes> + Send + Sync + 'static,
+    F: Fn(Request<()>, Bytes) -> Response<Body> + Send + Sync + 'static,
 {
-    fn handle(&self, request: Request<()>, body: Bytes) -> Response<Bytes> {
+    fn handle(&self, request: Request<()>, body: Bytes) -> Response<Body> {
         self(request, body)
     }
 }
@@ -248,11 +332,11 @@ async fn accept_loop(endpoint: quinn::Endpoint, handler: Arc<dyn Handler>, limit
     }
 }
 
-pub fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Bytes> {
+pub fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Body> {
     let body = body.into();
     Response::builder()
         .status(status)
         .header(CONTENT_LENGTH, body.len())
-        .body(body)
+        .body(Body::Bytes(body))
         .expect("valid response")
 }

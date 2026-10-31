@@ -433,6 +433,7 @@ impl HostShared {
             return RespondOutcome::Stale;
         };
         if result == RespondOutcome::Ok {
+            self.wake.notify_all();
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }

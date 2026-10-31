@@ -40,6 +40,7 @@ pub const HOST_QUEUE_DEPTH: usize = 64;
 // indexed MAX_CONNECTIONS + conn * 32 + subslot; sized from the H2 turn constants.
 pub(crate) const H2_PARK_SLOTS: usize = crate::h2::MAX_H2_CONNS * crate::h2::STREAM_SLOTS;
 pub const HOST_MAX_METHOD_BYTES: usize = 16;
+pub(crate) const H3_PARK_SLOTS: usize = 64;
 pub const HOST_MAX_PATH_BYTES: usize = 2048;
 pub const HOST_MAX_REASON_BYTES: usize = 64;
 pub const MAX_STAGED_RESPONSE_HEADERS: usize = 8;
@@ -201,10 +202,11 @@ pub(crate) struct HostInner {
 
 pub struct HostShared {
     inner: Mutex<HostInner>,
-    wake: Condvar,
+    pub(crate) wake: Condvar,
     tls_rotation_epoch: AtomicU64,
     staged_epoch: Vec<AtomicU64>,
     h2_tunnels: Vec<AtomicU64>,
+    h3_worker: u32,
 }
 
 impl HostShared {
@@ -214,8 +216,8 @@ impl HostShared {
         let mut tombs = Vec::with_capacity(worker_count);
         let mut seqs = Vec::with_capacity(worker_count);
         let mut wakers = Vec::with_capacity(worker_count);
-        let mut staged_epoch = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
+        let mut staged_epoch = Vec::with_capacity(worker_count + 1);
+        for _ in 0..=worker_count {
             events.push(VecDeque::with_capacity(HOST_QUEUE_DEPTH));
             let park_cap = super::MAX_CONNECTIONS + H2_PARK_SLOTS;
             parked.push((0..park_cap).map(|_| None).collect());
@@ -235,12 +237,13 @@ impl HostShared {
                 counters: HostCounters::default(),
                 tls_rotation: None,
                 tls_rotation_epoch: 0,
-                staged_epoch: vec![0; worker_count],
+                staged_epoch: vec![0; worker_count + 1],
             }),
             wake: Condvar::new(),
             tls_rotation_epoch: AtomicU64::new(0),
-            staged_epoch,
+            staged_epoch: (0..=worker_count).map(|_| AtomicU64::new(0)).collect(),
             h2_tunnels: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
+            h3_worker: worker_count as u32,
         }
     }
 
@@ -249,6 +252,10 @@ impl HostShared {
             .lock()
             .map(|inner| inner.events.len())
             .unwrap_or(0)
+    }
+
+    pub fn h3_worker_id(&self) -> u32 {
+        self.h3_worker
     }
 
     pub fn register_waker(&self, worker_id: u32, waker: WakeHandle) {

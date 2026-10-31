@@ -20,19 +20,26 @@ pub struct FrameHeader {
 }
 
 pub fn encode_varint(value: u64, out: &mut Vec<u8>) {
-    debug_assert!(value < 1 << 62);
     let length = varint_length(value);
     let mut buffer = [0u8; 8];
-    for (index, byte) in buffer.iter_mut().take(length).enumerate() {
+    let used = encode_varint_into(value, &mut buffer);
+    out.extend_from_slice(&buffer[..used]);
+    debug_assert_eq!(used, length);
+}
+
+pub fn encode_varint_into(value: u64, out: &mut [u8]) -> usize {
+    debug_assert!(value < 1 << 62);
+    let length = varint_length(value);
+    for (index, byte) in out.iter_mut().take(length).enumerate() {
         *byte = (value >> (8 * (length - index - 1))) as u8;
     }
-    buffer[0] |= match length {
+    out[0] |= match length {
         1 => 0,
         2 => 0x40,
         4 => 0x80,
         _ => 0xc0,
     };
-    out.extend_from_slice(&buffer[..length]);
+    length
 }
 
 pub fn decode_varint(input: &[u8]) -> Option<(u64, usize)> {
@@ -58,6 +65,12 @@ pub fn encode_frame(kind: u64, payload: &[u8], out: &mut Vec<u8>) {
     encode_varint(kind, out);
     encode_varint(payload.len() as u64, out);
     out.extend_from_slice(payload);
+}
+
+pub fn encode_frame_header(kind: u64, length: u64, out: &mut [u8]) -> usize {
+    let mut used = encode_varint_into(kind, out);
+    used += encode_varint_into(length, &mut out[used..]);
+    used
 }
 
 pub fn decode_settings(payload: &[u8]) -> Result<Vec<(u64, u64)>, SettingsError> {

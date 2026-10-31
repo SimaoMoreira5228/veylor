@@ -83,7 +83,7 @@ pub(crate) fn start_multi(server: Server) -> Result<RunningServer, ServerError> 
     } = server;
     let count = config.worker_count;
     let addr = template.local_addr().map_err(ServerError::Bind)?;
-    let h3 = crate::static_server::h3::start(&config, addr.ip(), &h2_routes)?.map(Box::new);
+    let h3 = crate::static_server::h3::start(&config, addr.ip(), &h2_routes, &host)?.map(Box::new);
     let h3_addr = h3.as_ref().map(|server| server.address());
     let h2c_addr = h2c_template
         .as_ref()

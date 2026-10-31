@@ -5,10 +5,12 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 mod http_date;
+mod plan;
 mod ranges;
 
 pub(crate) use http_date::system_time_secs;
 pub use http_date::{HTTP_DATE_BYTES, parse_http_date, write_http_date};
+pub use plan::{FileHead, plan_file_head, write_content_range};
 pub use ranges::{FilePlan, MAX_RANGES, RangeApply, read_chunk};
 
 pub const MAX_MOUNTS: usize = 16;

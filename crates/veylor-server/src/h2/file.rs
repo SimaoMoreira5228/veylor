@@ -9,11 +9,11 @@ use veylor_http2::{
     DataWriteError, ErrorCode, H2ServerDriver, HpackHeader, ServerError, StreamState,
 };
 
-use crate::static_files::{FilePlan, FileReject, RangeApply, parse_http_date, read_chunk};
+use crate::static_files::{FileHead, FilePlan, FileReject, plan_file_head, read_chunk};
 use crate::static_routes::MAX_STATIC_BODY_BYTES;
 
 use super::STREAM_SLOTS;
-use super::send::{FileHead, send_file_head};
+use super::send::send_file_head;
 use super::serve::Serve;
 
 // NOTE: per-stream file progress: the plan owns its fs path, offset counts plan-relative
@@ -144,65 +144,15 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         if declared > MAX_STATIC_BODY_BYTES {
             return FileDecision::TooLarge;
         }
-        let mut plan = match self.routes.resolve_file(method, path) {
+        let plan = match self.routes.resolve_file(method, path) {
             Ok(plan) => plan,
             Err(FileReject::TooLarge) => return FileDecision::TooLarge,
             Err(_) => return FileDecision::Miss,
         };
         let since = self.request_header(fields, b"if-modified-since");
-        let fresh = since
-            .and_then(parse_http_date)
-            .is_some_and(|date| plan.mtime <= date);
-        if fresh {
-            let head = FileHead {
-                status: 304,
-                content_length: 0,
-                content_type: None,
-                mtime: Some(plan.mtime),
-                total: plan.total,
-                window: None,
-                accept_ranges: false,
-                multipart: false,
-            };
-            return FileDecision::Serve(plan, head, false);
-        }
-        if plan.head_only {
-            let head = file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, None);
-            return FileDecision::Serve(plan, head, false);
-        }
-        let range = (method == b"GET")
-            .then(|| self.request_header(fields, b"range"))
-            .flatten();
-        match plan.apply_range(range) {
-            RangeApply::Multipart => {
-                let head = file_head_206_multipart(plan.size, plan.mtime, plan.total);
-                FileDecision::Serve(plan, head, true)
-            }
-            RangeApply::Unsatisfiable => {
-                let head = FileHead {
-                    status: 416,
-                    content_length: 0,
-                    content_type: None,
-                    mtime: None,
-                    total: plan.total,
-                    window: None,
-                    accept_ranges: false,
-                    multipart: false,
-                };
-                FileDecision::Serve(plan, head, false)
-            }
-            RangeApply::Ranged => {
-                let window = Some((plan.start, plan.start + plan.size - 1));
-                let head =
-                    file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, window);
-                FileDecision::Serve(plan, head, true)
-            }
-            RangeApply::Ignored => {
-                let head =
-                    file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, None);
-                FileDecision::Serve(plan, head, true)
-            }
-        }
+        let range = self.request_header(fields, b"range");
+        let (plan, head, send_body) = plan_file_head(plan, method, range, since);
+        FileDecision::Serve(plan, head, send_body)
     }
 
     // NOTE: a declared body at or under the cap with the stream still open mirrors the
@@ -344,38 +294,6 @@ pub(crate) enum FileDecision {
     Miss,
     TooLarge,
     Serve(FilePlan, FileHead, bool),
-}
-
-fn file_head_200(
-    size: u64,
-    content_type: &'static str,
-    mtime: u64,
-    total: u64,
-    window: Option<(u64, u64)>,
-) -> FileHead {
-    FileHead {
-        status: if window.is_some() { 206 } else { 200 },
-        content_length: size,
-        content_type: Some(content_type),
-        mtime: Some(mtime),
-        total,
-        window,
-        accept_ranges: true,
-        multipart: false,
-    }
-}
-
-fn file_head_206_multipart(size: u64, mtime: u64, total: u64) -> FileHead {
-    FileHead {
-        status: 206,
-        content_length: size,
-        content_type: None,
-        mtime: Some(mtime),
-        total,
-        window: None,
-        accept_ranges: true,
-        multipart: true,
-    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

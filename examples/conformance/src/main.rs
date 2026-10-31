@@ -15,6 +15,7 @@ struct Options {
     workers: usize,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    assets: Option<PathBuf>,
 }
 
 fn parse() -> Result<Options, String> {
@@ -25,6 +26,7 @@ fn parse() -> Result<Options, String> {
         workers: 1,
         tls_cert: None,
         tls_key: None,
+        assets: None,
     };
     let mut args = std::env::args_os().skip(1);
     while let Some(flag) = args.next() {
@@ -61,6 +63,7 @@ fn parse() -> Result<Options, String> {
             }
             "--tls-cert" => options.tls_cert = Some(PathBuf::from(value)),
             "--tls-key" => options.tls_key = Some(PathBuf::from(value)),
+            "--assets" => options.assets = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown option: {flag}")),
         }
     }
@@ -97,6 +100,9 @@ fn main() -> Result<(), String> {
         .register_managed(b"GET", b"/", 1024 * 1024)
         .map_err(|error| format!("managed GET /: {error:?}"))?;
     server
+        .register_managed(b"GET", b"/stream", 1024 * 1024)
+        .map_err(|error| format!("managed GET /stream: {error:?}"))?;
+    server
         .register_managed_with_trailers(
             b"POST",
             b"/",
@@ -104,10 +110,16 @@ fn main() -> Result<(), String> {
             &[b"x-test", b"x-trailer", b"trailer", b"digest"],
         )
         .map_err(|error| format!("managed POST /: {error:?}"))?;
+    if let Some(assets) = &options.assets {
+        server
+            .register_file_mount(b"/assets/", assets)
+            .map_err(|error| format!("file mount /assets: {error:?}"))?;
+    }
     for (path, body) in [
         (b"/hello".as_slice(), b"hello\n".as_slice()),
         (b"/empty".as_slice(), b"".as_slice()),
         (b"/fixed".as_slice(), b"fixed-body-1234".as_slice()),
+        (b"/items/:id".as_slice(), b"item\n".as_slice()),
     ] {
         server
             .register_route(b"GET", path, 200, b"OK", body, 1024 * 1024)
@@ -151,6 +163,7 @@ struct Pending {
     token: ConnectionToken,
     body: [u8; BODY_CAP],
     used: usize,
+    stream: bool,
 }
 
 fn dispatch(host: HostHandle, stop: Arc<AtomicBool>) {
@@ -178,10 +191,12 @@ fn dispatch(host: HostHandle, stop: Arc<AtomicBool>) {
                 host.respond(event.token, 503, b"Service Unavailable", b"busy\n");
                 continue;
             }
+            let path = &paths[event.path_offset..][..event.path_len];
             pending.push(Pending {
                 token: event.token,
                 body: [0; BODY_CAP],
                 used: 0,
+                stream: path == b"/stream",
             });
         }
 
@@ -205,7 +220,35 @@ fn dispatch(host: HostHandle, stop: Arc<AtomicBool>) {
                 continue;
             }
             let request = pending.swap_remove(index);
-            host.respond(request.token, 200, b"OK", b"ok\n");
+            if request.stream {
+                stream_response(&host, request.token);
+            } else {
+                host.respond(request.token, 200, b"OK", b"ok\n");
+            }
         }
+    }
+}
+
+fn stream_response(host: &HostHandle, token: ConnectionToken) {
+    if host.begin_stream(token, 200, b"OK") != RespondOutcome::Ok {
+        return;
+    }
+    for chunk in [b"stream-1;".as_slice(), b"stream-2;", b"stream-3"] {
+        wait_writable(host, token);
+        if host.write_stream(token, chunk) != RespondOutcome::Ok {
+            host.cancel(token);
+            return;
+        }
+    }
+    wait_writable(host, token);
+    host.end_stream(token);
+}
+
+fn wait_writable(host: &HostHandle, token: ConnectionToken) {
+    for _ in 0..1000 {
+        if host.is_writable(token) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }

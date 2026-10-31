@@ -505,7 +505,7 @@ impl Server {
             .map(|bound| bound.local_addr().map_err(ServerError::Bind))
             .transpose()?;
         let tls = config.tls.is_some();
-        let h3 = h3::start(&config, addr.ip(), &h2_routes)?.map(Box::new);
+        let h3 = h3::start(&config, addr.ip(), &h2_routes, &host)?.map(Box::new);
         let h3_addr = h3.as_ref().map(|server| server.address());
         let stop = Arc::new(AtomicBool::new(false));
         let force = Arc::new(AtomicBool::new(false));
@@ -548,7 +548,7 @@ pub struct RunningServer {
     pub(crate) force: Arc<AtomicBool>,
     pub(crate) addr: SocketAddr,
     pub(crate) h2c_addr: Option<SocketAddr>,
-    pub(crate) h3: Option<Box<veylor_h3::RunningServer>>,
+    pub(crate) h3: Option<Box<h3::H3Server>>,
     pub(crate) h3_addr: Option<SocketAddr>,
     pub(crate) host: HostHandle,
     pub(crate) tls: bool,
@@ -636,7 +636,7 @@ impl RunningServer {
     pub fn join_per_worker(mut self) -> Result<Vec<CloseCounts>, ServerError> {
         if let Some(h3) = self.h3.take() {
             h3.join()
-                .map_err(|error| ServerError::Join(format!("h3: {error}")))?;
+                .map_err(|error| ServerError::Join(format!("h3: {error:?}")))?;
         }
         let mut counts = Vec::with_capacity(self.handles.len());
         let mut first_error: Option<ServerError> = None;

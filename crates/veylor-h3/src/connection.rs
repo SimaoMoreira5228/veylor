@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::header::{HeaderName, HeaderValue};
+use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri};
 use quinn::{Connection, ReadExactError, RecvStream, SendStream, VarInt};
 use veylor_http3::frame::SettingsError;
@@ -14,7 +14,7 @@ use veylor_http3::{
     SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
 };
 
-use crate::{Handler, Limits};
+use crate::{Body, Handler, Limits, ManagedOutcome};
 
 pub(crate) async fn serve(connection: Connection, handler: Arc<dyn Handler>, limits: Limits) {
     if setup_control(&connection, limits).await.is_err() {
@@ -344,8 +344,22 @@ async fn handle_request(
     }
 
     let is_head = request.method() == Method::HEAD;
-    let response = handler.handle(request, Bytes::from(body));
-    let response = if response.body().len() > limits.max_response_body {
+    let outcome = {
+        let mut writer = crate::ResponseWriter::new(&mut send);
+        handler
+            .managed(request, Bytes::from(body), &mut writer)
+            .await
+    };
+    let response = match outcome {
+        ManagedOutcome::Handled(response) => response,
+        ManagedOutcome::Pass(request, body) => handler.handle(request, body),
+        ManagedOutcome::Streamed => return Ok(()),
+    };
+    let response = if response
+        .body()
+        .content_length()
+        .is_some_and(|length| length > limits.max_response_body as u64)
+    {
         crate::text_response(StatusCode::INTERNAL_SERVER_ERROR, "response too large")
     } else {
         response
@@ -354,13 +368,27 @@ async fn handle_request(
     Ok(())
 }
 
-async fn write_response(send: &mut SendStream, response: Response<Bytes>, is_head: bool) {
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+async fn write_response(send: &mut SendStream, response: Response<Body>, is_head: bool) {
     let (parts, body) = response.into_parts();
-    let status = parts.status.as_u16().to_string();
+    let status = parts.status;
+    let status_text = status.as_u16().to_string();
     let mut fields: Vec<(&[u8], &[u8])> = Vec::with_capacity(parts.headers.len() + 2);
-    fields.push((b":status", status.as_bytes()));
-    let length = body.len().to_string();
-    fields.push((b"content-length", length.as_bytes()));
+    fields.push((b":status", status_text.as_bytes()));
+    let header_length = is_head
+        .then(|| parts.headers.get(CONTENT_LENGTH))
+        .flatten()
+        .and_then(|value| value.to_str().ok());
+    let length = header_length
+        .map(str::to_owned)
+        .or_else(|| body.content_length().map(|length| length.to_string()));
+    let sheds_length = matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
+    if let Some(length) = length.as_deref() {
+        if !sheds_length {
+            fields.push((b"content-length", length.as_bytes()));
+        }
+    }
     for (name, value) in &parts.headers {
         if matches!(
             name.as_str(),
@@ -383,11 +411,40 @@ async fn write_response(send: &mut SendStream, response: Response<Bytes>, is_hea
     if send.write_all(&encoded).await.is_err() {
         return;
     }
-    if !is_head && !body.is_empty() {
-        let mut data = Vec::with_capacity(body.len() + 16);
-        frame::encode_frame(frame::DATA, &body, &mut data);
-        if send.write_all(&data).await.is_err() {
-            return;
+
+    let sends_body = !is_head && !sheds_length && status != StatusCode::RESET_CONTENT;
+    if sends_body {
+        match body {
+            Body::Bytes(body) => {
+                if !body.is_empty() {
+                    let mut data = Vec::with_capacity(body.len() + 16);
+                    frame::encode_frame(frame::DATA, &body, &mut data);
+                    if send.write_all(&data).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Body::Stream(mut body) => {
+                let mut scratch = vec![0u8; STREAM_CHUNK_BYTES];
+                let mut head = [0u8; 16];
+                loop {
+                    let read = match body.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(_) => {
+                            let _ = send.reset(VarInt::from_u32(0));
+                            return;
+                        }
+                    };
+                    let header = frame::encode_frame_header(frame::DATA, read as u64, &mut head);
+                    if send.write_all(&head[..header]).await.is_err() {
+                        return;
+                    }
+                    if send.write_all(&scratch[..read]).await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
     let _ = send.finish();

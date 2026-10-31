@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use veylor_runtime::ConnectionToken;
 
@@ -366,6 +367,7 @@ impl HostShared {
         };
         if result == RespondOutcome::Ok {
             self.note_staged(token.worker_id as usize);
+            self.wake.notify_all();
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }
@@ -410,6 +412,7 @@ impl HostShared {
         };
         if result == CancelOutcome::Ok {
             self.note_staged(token.worker_id as usize);
+            self.wake.notify_all();
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }
@@ -454,6 +457,30 @@ impl HostShared {
         if let Some(epoch) = self.staged_epoch.get(worker) {
             epoch.fetch_add(1, Ordering::Release);
         }
+    }
+
+    pub(crate) fn take_stream_command(
+        &self,
+        token: ConnectionToken,
+    ) -> Option<crate::connection::streams::StreamCmd> {
+        self.with_inner(|inner| {
+            (
+                crate::connection::streams::take_stream_cmd(inner, token),
+                None,
+            )
+        })
+        .and_then(|(command, _)| command)
+    }
+
+    pub(crate) fn wait_staged(&self, worker_id: u32, timeout: Duration) -> Vec<StagedWork> {
+        let (staged, _) = self.take_staged(worker_id);
+        if !staged.is_empty() {
+            return staged;
+        }
+        if let Ok(guard) = self.inner.lock() {
+            let _ = self.wake.wait_timeout(guard, timeout);
+        }
+        self.take_staged(worker_id).0
     }
 
     pub fn take_staged(&self, worker_id: u32) -> (Vec<StagedWork>, u64) {

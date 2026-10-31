@@ -5,7 +5,9 @@ use veylor_http2::{
     ErrorCode, H2ServerDriver, HpackFieldToEncode, HpackRepresentation, status_sheds_length,
 };
 
-use crate::static_files::{FilePlan, HTTP_DATE_BYTES, write_http_date};
+use crate::static_files::{
+    FileHead, FilePlan, HTTP_DATE_BYTES, write_content_range, write_http_date,
+};
 use crate::static_routes::now_http_date;
 
 use super::pending::PendingResponses;
@@ -21,17 +23,6 @@ use super::{DECIMAL_CAP, HPACK_BLOCK_CAP};
 // content-range */total. Single-range
 // 206 adds content-range; multipart 206 carries the dynamic boundary content-type instead
 // of the file type and no top-level content-range (H1 parity, body pages via read_chunk).
-pub(crate) struct FileHead {
-    pub(crate) status: u16,
-    pub(crate) content_length: u64,
-    pub(crate) content_type: Option<&'static str>,
-    pub(crate) mtime: Option<u64>,
-    pub(crate) total: u64,
-    pub(crate) window: Option<(u64, u64)>,
-    pub(crate) accept_ranges: bool,
-    pub(crate) multipart: bool,
-}
-
 pub(crate) fn send_file_head(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
@@ -53,7 +44,7 @@ pub(crate) fn send_file_head(
     let now_len = now_http_date(&mut now_buf);
     let mut range_buf = [0; CONTENT_RANGE_BYTES];
     let range_len = if head.status == 416 || head.window.is_some() {
-        write_file_content_range(&mut range_buf, head.window, head.total)
+        write_content_range(&mut range_buf, head.window, head.total)
     } else {
         0
     };
@@ -103,21 +94,6 @@ pub(crate) fn send_file_head(
         .map_err(|_| ErrorCode::InternalError)?;
     *used += sent.writer.pending_bytes().len();
     Ok(())
-}
-
-fn write_file_content_range(out: &mut [u8], window: Option<(u64, u64)>, total: u64) -> usize {
-    use crate::static_files::{push_bytes, push_decimal};
-    let mut len = push_bytes(out, 0, b"bytes ");
-    match window {
-        Some((start, last)) => {
-            len = push_decimal(out, len, start);
-            len = push_bytes(out, len, b"-");
-            len = push_decimal(out, len, last);
-            len = push_bytes(out, len, b"/");
-        }
-        None => len = push_bytes(out, len, b"*/"),
-    }
-    push_decimal(out, len, total)
 }
 
 // NOTE: RFC 9113 forbids content-length on 1xx/204 responses and the driver rejects it

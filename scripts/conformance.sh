@@ -26,12 +26,17 @@ if command -v openssl >/dev/null 2>&1 && [ ! -f "$CERT" ]; then
         -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
 fi
 
+ASSETS="$LOG_DIR/assets"
+mkdir -p "$ASSETS"
+printf 'file-body-1234567890\n' >"$ASSETS/hello.txt"
+
 SERVER_LOG="$LOG_DIR/server.log"
 "$ROOT/target/release/veylor-conformance" \
     --address 127.0.0.1:0 \
     --h2c-port 0 \
     --h3-port 0 \
     --workers "$WORKERS" \
+    --assets "$ASSETS" \
     --tls-cert "$CERT" \
     --tls-key "$KEY" \
     >"$SERVER_LOG" 2>&1 &
@@ -77,6 +82,31 @@ if curl -fsS --max-time 5 --http2-prior-knowledge "http://$H2C/hello" >/dev/null
     pass "curl HTTP/2 prior knowledge"
 else
     fail "curl HTTP/2 prior knowledge"
+fi
+
+H1_BASE="${H1_URL%/hello}"
+ASSET_EXPECT="$(printf 'file-body-1234567890\n')"
+if [ "$(curl -fsS --max-time 5 $H1_FLAGS --http1.1 "$H1_BASE/assets/hello.txt")" = "$ASSET_EXPECT" ]; then
+    pass "curl HTTP/1.1 file mount"
+else
+    fail "curl HTTP/1.1 file mount"
+fi
+if [ "$(curl -fsS --max-time 5 --http2-prior-knowledge "http://$H2C/assets/hello.txt")" = "$ASSET_EXPECT" ]; then
+    pass "curl HTTP/2 file mount"
+else
+    fail "curl HTTP/2 file mount"
+fi
+
+STREAM_EXPECT="stream-1;stream-2;stream-3"
+if [ "$(curl -fsS --max-time 5 $H1_FLAGS --http1.1 "$H1_BASE/stream")" = "$STREAM_EXPECT" ]; then
+    pass "curl HTTP/1.1 managed stream"
+else
+    fail "curl HTTP/1.1 managed stream"
+fi
+if [ "$(curl -fsS --max-time 5 --http2-prior-knowledge "http://$H2C/stream")" = "$STREAM_EXPECT" ]; then
+    pass "curl HTTP/2 managed stream"
+else
+    fail "curl HTTP/2 managed stream"
 fi
 
 if curl -kfsS --max-time 5 --http2 "https://$H1/hello" >/dev/null; then
@@ -131,6 +161,26 @@ if [ "$H3" != "-" ] && [ -n "$H3" ]; then
             pass "curl HTTP/3"
         else
             fail "curl HTTP/3"
+        fi
+        if [ "$(curl -kfsS --max-time 5 --http3-only "https://$H3/assets/hello.txt")" = "$ASSET_EXPECT" ]; then
+            pass "curl HTTP/3 file mount"
+        else
+            fail "curl HTTP/3 file mount"
+        fi
+        if [ "$(curl -kfsS --max-time 5 --http3-only -r 5-9 "https://$H3/assets/hello.txt")" = "body-" ]; then
+            pass "curl HTTP/3 range"
+        else
+            fail "curl HTTP/3 range"
+        fi
+        if [ "$(curl -kfsS --max-time 5 --http3-only "https://$H3/items/42")" = "item" ]; then
+            pass "curl HTTP/3 pattern route"
+        else
+            fail "curl HTTP/3 pattern route"
+        fi
+        if [ "$(curl -kfsS --max-time 5 --http3-only "https://$H3/stream")" = "$STREAM_EXPECT" ]; then
+            pass "curl HTTP/3 managed stream"
+        else
+            fail "curl HTTP/3 managed stream"
         fi
     else
         skip "curl HTTP/3 (curl built without HTTP/3)"

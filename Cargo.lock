@@ -1341,6 +1341,7 @@ dependencies = [
  "flate2",
  "rustix",
  "rustls",
+ "tokio",
  "veylor-h3",
  "veylor-http1",
  "veylor-http2",
