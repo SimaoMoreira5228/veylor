@@ -28,6 +28,8 @@ use veylor_server::{
 
 #[path = "h2_tests/managed_requests.rs"]
 mod h2_managed_requests;
+#[path = "h2_tests/tunnel.rs"]
+mod h2_tunnel;
 
 const DEADLINE: Duration = Duration::from_secs(5);
 

@@ -1,0 +1,33 @@
+pub mod frame;
+pub mod qpack;
+
+pub const H3_NO_ERROR: u64 = 0x100;
+pub const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
+pub const H3_INTERNAL_ERROR: u64 = 0x102;
+pub const H3_STREAM_CREATION_ERROR: u64 = 0x103;
+pub const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
+pub const H3_FRAME_UNEXPECTED: u64 = 0x105;
+pub const H3_FRAME_ERROR: u64 = 0x106;
+pub const H3_EXCESSIVE_LOAD: u64 = 0x107;
+pub const H3_ID_ERROR: u64 = 0x108;
+pub const H3_SETTINGS_ERROR: u64 = 0x109;
+pub const H3_MISSING_SETTINGS: u64 = 0x10a;
+pub const H3_REQUEST_REJECTED: u64 = 0x10b;
+pub const H3_REQUEST_CANCELLED: u64 = 0x10c;
+pub const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
+pub const H3_MESSAGE_ERROR: u64 = 0x10e;
+pub const H3_CONNECT_ERROR: u64 = 0x10f;
+pub const H3_VERSION_FALLBACK: u64 = 0x110;
+
+pub const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
+pub const QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
+pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
+
+pub const CONTROL_STREAM: u64 = 0x00;
+pub const PUSH_STREAM: u64 = 0x01;
+pub const QPACK_ENCODER_STREAM: u64 = 0x02;
+pub const QPACK_DECODER_STREAM: u64 = 0x03;
+
+pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
+pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x6;
+pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;

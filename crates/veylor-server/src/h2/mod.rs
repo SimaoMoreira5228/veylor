@@ -34,6 +34,7 @@ pub(crate) use step::apply_h2_streams;
 
 pub const INPUT_STAGING_CAP: usize = 16_384 + 64;
 pub const STREAM_SLOTS: usize = 32;
+pub(crate) const TUNNEL_STEP: usize = 16_384;
 // NOTE: managed H2 connection ceiling: 8 concurrent connections per worker; the 9th
 // accept finds no free slot and is dropped with a TransportError close (pinned by the
 // 9th-connection test), the same fail-closed shape as the per-stream ceiling.
@@ -158,6 +159,7 @@ pub struct H2Conn<'a> {
     pending_responses: pending::PendingResponses,
     file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
     file_scratch: Box<[u8; crate::connection::OUTPUT_CAP]>,
+    tunnel_scratch: Box<[u8; TUNNEL_STEP]>,
 }
 
 impl<'a> H2Conn<'a> {
@@ -190,6 +192,7 @@ impl<'a> H2Conn<'a> {
             pending_responses: pending::PendingResponses::new(),
             file_transfers: Box::new(std::array::from_fn(|_| None)),
             file_scratch: Box::new([0; crate::connection::OUTPUT_CAP]),
+            tunnel_scratch: Box::new([0; TUNNEL_STEP]),
         }
     }
 
@@ -607,7 +610,7 @@ impl<'a> H2Conn<'a> {
     }
 }
 
-fn grant_window(
+pub(crate) fn grant_window(
     server: &mut H2ServerDriver<'_, '_, '_, '_>,
     stream: u32,
     owed: u32,

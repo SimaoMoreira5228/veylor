@@ -4,8 +4,7 @@ use veylor_websocket::{accept_key, encode_server_accept};
 use crate::connection::streams::{StreamCmd, StreamState};
 use crate::host::staged::ParkedEntry;
 use crate::host::{
-    HOST_MAX_METHOD_BYTES, HOST_QUEUE_DEPTH, HostEvent, HostEventKind, HostInner, HostShared,
-    RespondOutcome, TombCause, find_tomb,
+    HostEventKind, HostInner, HostShared, RespondOutcome, TombCause, find_tomb, stage_tunnel_signal,
 };
 
 pub const HOST_TUNNEL_CAP: usize = 64 * 1024;
@@ -79,6 +78,17 @@ fn trim(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
+enum UpgradePlan {
+    H1,
+    H2 { buffered: bool, closed: bool },
+}
+
+fn request_offers_protocol(request: &super::request::RequestSnapshot, protocol: &[u8]) -> bool {
+    request.fields().any(|(name, value)| {
+        name.eq_ignore_ascii_case(b"sec-websocket-protocol") && offers_protocol(value, protocol)
+    })
+}
+
 fn websocket_response(entry: &ParkedEntry, protocol: Option<&[u8]>) -> Option<Vec<u8>> {
     if &entry.method[..usize::from(entry.method_len)] != b"GET" {
         return None;
@@ -146,30 +156,66 @@ impl HostShared {
         {
             return RespondOutcome::Invalid;
         }
-        let Some((result, waker)) = self.with_inner(|inner| {
-            let Some(entry) = tunnel_entry(inner, token) else {
-                return (missing_outcome(inner, token), None);
+        let Some(((result, signals), waker)) = self.with_inner(|inner| {
+            let plan = {
+                let Some(entry) = tunnel_entry(inner, token) else {
+                    return ((missing_outcome(inner, token), None), None);
+                };
+                if entry.staged.is_some() || entry.stream.is_some() {
+                    return ((RespondOutcome::Duplicate, None), None);
+                }
+                if entry.h2_tunnel {
+                    if protocol.is_some_and(|protocol| {
+                        entry
+                            .request
+                            .as_ref()
+                            .is_none_or(|request| !request_offers_protocol(request, protocol))
+                    }) {
+                        return ((RespondOutcome::Invalid, None), None);
+                    }
+                    entry.stream = Some(StreamState {
+                        upgraded: true,
+                        ..StreamState::default()
+                    });
+                    entry.stream_cmd = Some(StreamCmd::H2Upgrade {
+                        protocol: protocol.map(Vec::from),
+                    });
+                    let buffered = entry.tunnel_in_start < entry.tunnel_in.len();
+                    let closed = entry.tunnel_eof;
+                    UpgradePlan::H2 { buffered, closed }
+                } else {
+                    let Some(response) = websocket_response(entry, protocol) else {
+                        return ((RespondOutcome::Invalid, None), None);
+                    };
+                    entry.stream = Some(StreamState {
+                        upgraded: true,
+                        ..StreamState::default()
+                    });
+                    entry.stream_cmd = Some(StreamCmd::Upgrade { response });
+                    UpgradePlan::H1
+                }
             };
-            if entry.staged.is_some() || entry.stream.is_some() {
-                return (RespondOutcome::Duplicate, None);
-            }
-            let Some(response) = websocket_response(entry, protocol) else {
-                return (RespondOutcome::Invalid, None);
+            let signals = match plan {
+                UpgradePlan::H1 => None,
+                UpgradePlan::H2 { buffered, closed } => Some((buffered, closed)),
             };
-            entry.stream = Some(StreamState {
-                upgraded: true,
-                ..StreamState::default()
-            });
-            entry.stream_cmd = Some(StreamCmd::Upgrade { response });
             let waker = inner
                 .wakers
                 .get(token.worker_id as usize)
                 .and_then(Clone::clone);
-            (RespondOutcome::Ok, waker)
+            ((RespondOutcome::Ok, signals), waker)
         }) else {
             return RespondOutcome::Stale;
         };
         if result == RespondOutcome::Ok {
+            if let Some((buffered, closed)) = signals {
+                if buffered {
+                    self.stage_tunnel_data(token);
+                }
+                if closed {
+                    self.stage_tunnel_closed(token);
+                }
+            }
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }
@@ -189,6 +235,7 @@ impl HostShared {
                     &entry.tunnel_in[entry.tunnel_in_start..entry.tunnel_in_start + take],
                 );
                 entry.tunnel_in_start += take;
+                entry.tunnel_grant = entry.tunnel_grant.saturating_add(take as u32);
                 if entry.tunnel_in_start == entry.tunnel_in.len() {
                     entry.tunnel_in.clear();
                     entry.tunnel_in_start = 0;
@@ -343,6 +390,64 @@ impl HostShared {
         .is_some_and(|(done, _)| done)
     }
 
+    pub(crate) fn mark_h2_tunnel(&self, token: ConnectionToken) {
+        let marked = self
+            .with_inner(|inner| {
+                let Some(entry) = tunnel_entry(inner, token) else {
+                    return (false, None);
+                };
+                if entry.h2_tunnel {
+                    return (false, None);
+                }
+                entry.h2_tunnel = true;
+                (true, None)
+            })
+            .is_some_and(|(marked, _)| marked);
+        if marked {
+            if let Some(count) = self.h2_tunnels.get(token.worker_id as usize) {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn h2_tunnel_active(&self, worker: u32) -> bool {
+        self.h2_tunnels
+            .get(worker as usize)
+            .is_some_and(|count| count.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    }
+
+    pub(crate) fn peek_tunnel_out(&self, token: ConnectionToken, out: &mut [u8]) -> usize {
+        self.with_inner(|inner| {
+            let Some(entry) = tunnel_entry(inner, token) else {
+                return (0, None);
+            };
+            let available = entry.tunnel_out.len() - entry.tunnel_out_start;
+            let take = out.len().min(available);
+            out[..take].copy_from_slice(
+                &entry.tunnel_out[entry.tunnel_out_start..entry.tunnel_out_start + take],
+            );
+            (take, None)
+        })
+        .map(|(take, _)| take)
+        .unwrap_or(0)
+    }
+
+    pub(crate) fn consume_tunnel_out(&self, token: ConnectionToken, bytes: usize) {
+        self.with_inner(|inner| {
+            let Some(entry) = tunnel_entry(inner, token) else {
+                return ((), None);
+            };
+            let available = entry.tunnel_out.len() - entry.tunnel_out_start;
+            let take = bytes.min(available);
+            entry.tunnel_out_start += take;
+            if entry.tunnel_out_start == entry.tunnel_out.len() {
+                entry.tunnel_out.clear();
+                entry.tunnel_out_start = 0;
+            }
+            ((), None)
+        });
+    }
+
     pub(crate) fn tunnel_close_requested(&self, token: ConnectionToken) -> bool {
         self.with_inner(|inner| {
             let closed = tunnel_entry(inner, token).is_none_or(|entry| entry.tunnel_close);
@@ -354,63 +459,25 @@ impl HostShared {
 
     pub(crate) fn stage_tunnel_data(&self, token: ConnectionToken) {
         self.with_inner(|inner| {
-            let worker = token.worker_id as usize;
-            let Some(queue) = inner.events.get_mut(worker) else {
-                return ((), None);
-            };
-            if queue
-                .iter()
-                .any(|event| event.kind == HostEventKind::TunnelData && event.token == token)
-            {
-                return ((), None);
-            }
-            if queue.len() >= HOST_QUEUE_DEPTH {
-                inner.counters.queue_full += 1;
-                return ((), None);
-            }
-            queue.push_back(HostEvent {
-                kind: HostEventKind::TunnelData,
+            stage_tunnel_signal(
+                inner,
+                token.worker_id as usize,
                 token,
-                route_id: 0,
-                method_len: 0,
-                method: [0; HOST_MAX_METHOD_BYTES],
-                path_len: 0,
-                path: [0; crate::host::HOST_MAX_PATH_BYTES],
-                body_ready: 0,
-                body_complete: false,
-            });
+                HostEventKind::TunnelData,
+            );
             ((), None)
         });
     }
 
     pub(crate) fn stage_tunnel_closed(&self, token: ConnectionToken) -> bool {
         self.with_inner(|inner| {
-            let worker = token.worker_id as usize;
-            let Some(queue) = inner.events.get_mut(worker) else {
-                return (false, None);
-            };
-            if queue
-                .iter()
-                .any(|event| event.kind == HostEventKind::TunnelClosed && event.token == token)
-            {
-                return (true, None);
-            }
-            if queue.len() >= HOST_QUEUE_DEPTH {
-                inner.counters.queue_full += 1;
-                return (false, None);
-            }
-            queue.push_back(HostEvent {
-                kind: HostEventKind::TunnelClosed,
+            let staged = stage_tunnel_signal(
+                inner,
+                token.worker_id as usize,
                 token,
-                route_id: 0,
-                method_len: 0,
-                method: [0; HOST_MAX_METHOD_BYTES],
-                path_len: 0,
-                path: [0; crate::host::HOST_MAX_PATH_BYTES],
-                body_ready: 0,
-                body_complete: false,
-            });
-            (true, None)
+                HostEventKind::TunnelClosed,
+            );
+            (staged, None)
         })
         .is_some_and(|(staged, _)| staged)
     }

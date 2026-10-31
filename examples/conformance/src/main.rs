@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
+use veylor_h3::http::{Method, Request, Response, StatusCode};
 use veylor_runtime::ConnectionToken;
 use veylor_server::{
     EventSlot, HostEventKind, HostHandle, RespondOutcome, Server, ServerConfig, TlsConfig,
@@ -11,6 +13,7 @@ use veylor_server::{
 struct Options {
     address: SocketAddr,
     h2c_port: u16,
+    h3_port: Option<u16>,
     workers: usize,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -20,6 +23,7 @@ fn parse() -> Result<Options, String> {
     let mut options = Options {
         address: SocketAddr::from(([127, 0, 0, 1], 0)),
         h2c_port: 0,
+        h3_port: None,
         workers: 1,
         tls_cert: None,
         tls_key: None,
@@ -43,6 +47,14 @@ fn parse() -> Result<Options, String> {
                     .parse()
                     .map_err(|_| "invalid h2c port".to_owned())?;
             }
+            "--h3-port" => {
+                options.h3_port = Some(
+                    value
+                        .to_string_lossy()
+                        .parse()
+                        .map_err(|_| "invalid h3 port".to_owned())?,
+                );
+            }
             "--workers" => {
                 options.workers = value
                     .to_string_lossy()
@@ -56,6 +68,9 @@ fn parse() -> Result<Options, String> {
     }
     if options.tls_cert.is_some() != options.tls_key.is_some() {
         return Err("TLS needs both --tls-cert and --tls-key".to_owned());
+    }
+    if options.h3_port.is_some() && options.tls_cert.is_none() {
+        return Err("HTTP/3 needs --tls-cert and --tls-key".to_owned());
     }
     Ok(options)
 }
@@ -103,6 +118,37 @@ fn main() -> Result<(), String> {
     let running = server
         .start()
         .map_err(|error| format!("start: {error:?}"))?;
+    let h3 = match options.h3_port {
+        None => None,
+        Some(port) => {
+            let cert = options
+                .tls_cert
+                .as_ref()
+                .ok_or_else(|| "HTTP/3 needs TLS".to_owned())?;
+            let key = options
+                .tls_key
+                .as_ref()
+                .ok_or_else(|| "HTTP/3 needs TLS".to_owned())?;
+            let tls = veylor_h3::Tls::from_files(cert, key)
+                .map_err(|error| format!("h3 TLS identity: {error}"))?;
+            let server = veylor_h3::Server::bind(
+                SocketAddr::new(options.address.ip(), port),
+                veylor_h3::Config {
+                    tls,
+                    limits: veylor_h3::Limits::default(),
+                },
+            );
+            Some(
+                server
+                    .start(h3_response)
+                    .map_err(|error| format!("h3 start: {error}"))?,
+            )
+        }
+    };
+    let h3_address = h3
+        .as_ref()
+        .map(|server| server.address().to_string())
+        .unwrap_or_else(|| "-".to_owned());
     let stop = Arc::new(AtomicBool::new(false));
     let host = running.host();
     let dispatch_stop = Arc::clone(&stop);
@@ -115,9 +161,10 @@ fn main() -> Result<(), String> {
         .map(|address| address.to_string())
         .unwrap_or_else(|| "-".to_owned());
     println!(
-        "READY h1={} h2c={} tls={}",
+        "READY h1={} h2c={} h3={} tls={}",
         running.addr(),
         h2c,
+        h3_address,
         if encrypted { 1 } else { 0 }
     );
     loop {
@@ -188,5 +235,17 @@ fn dispatch(host: HostHandle, stop: Arc<AtomicBool>) {
             let request = pending.swap_remove(index);
             host.respond(request.token, 200, b"OK", b"ok\n");
         }
+    }
+}
+
+fn h3_response(request: Request<()>, _body: Bytes) -> Response<Bytes> {
+    match (request.method(), request.uri().path()) {
+        (&Method::GET, "/hello") => veylor_h3::text_response(StatusCode::OK, "hello\n"),
+        (&Method::GET, "/empty") => veylor_h3::text_response(StatusCode::OK, ""),
+        (&Method::GET, "/fixed") => veylor_h3::text_response(StatusCode::OK, "fixed-body-1234"),
+        (&Method::GET, "/") | (&Method::POST, "/") => {
+            veylor_h3::text_response(StatusCode::OK, "ok\n")
+        }
+        _ => veylor_h3::text_response(StatusCode::NOT_FOUND, "not found\n"),
     }
 }

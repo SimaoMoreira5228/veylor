@@ -48,6 +48,8 @@ pub(crate) struct ParkedEntry {
     pub(crate) tunnel_out_start: usize,
     pub(crate) tunnel_eof: bool,
     pub(crate) tunnel_close: bool,
+    pub(crate) tunnel_grant: u32,
+    pub(crate) h2_tunnel: bool,
 }
 
 pub struct StagedWork {
@@ -225,12 +227,20 @@ impl HostShared {
                 Some(entry) => {
                     retire_signals(inner, worker, entry.token);
                     push_tomb(inner, worker, entry.token, TombCause::Gone);
-                    (true, None)
+                    ((true, entry.h2_tunnel), None)
                 }
-                None => (false, None),
+                None => ((false, false), None),
             }
         });
-        done.is_some_and(|(closed, _)| closed)
+        let Some(((closed, tunnel), _)) = done else {
+            return false;
+        };
+        if tunnel {
+            if let Some(count) = self.h2_tunnels.get(worker_id as usize) {
+                count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        closed
     }
 
     pub fn push_body(&self, token: ConnectionToken, bytes: &[u8]) -> bool {

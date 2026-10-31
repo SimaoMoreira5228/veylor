@@ -6,9 +6,9 @@ use super::connection::{
 };
 use super::flow_control::FlowWindowError;
 use super::frame::{
-    ErrorCode, FRAME_HEADER_LEN, GOAWAY_FIXED_LEN, SETTINGS_ENTRY_LEN, SETTINGS_HEADER_TABLE_SIZE,
-    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-    SettingsParameter,
+    ErrorCode, FRAME_HEADER_LEN, GOAWAY_FIXED_LEN, SETTINGS_ENABLE_CONNECT_PROTOCOL,
+    SETTINGS_ENTRY_LEN, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS,
+    SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE, SettingsParameter,
 };
 use super::hpack::{HpackHeader, HpackTable};
 use super::stream::{H2Role, SettingsError, StreamTable};
@@ -20,7 +20,7 @@ pub const H2C_MAX_FRAME_SIZE: u32 = 16_384;
 // effective ceiling is 32 today (pinned by the managed 33rd-stream refusal test).
 // This constant only binds if a larger table ever exists; keep it if the table grows.
 pub const H2C_MAX_CONCURRENT_STREAMS: u32 = 100;
-pub const H2C_SERVER_SETTINGS_LEN: usize = FRAME_HEADER_LEN + 4 * SETTINGS_ENTRY_LEN;
+pub const H2C_SERVER_SETTINGS_LEN: usize = FRAME_HEADER_LEN + 5 * SETTINGS_ENTRY_LEN;
 pub const H2C_GOAWAY_LEN: usize = FRAME_HEADER_LEN + GOAWAY_FIXED_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +134,10 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
             SettingsParameter {
                 id: SETTINGS_MAX_HEADER_LIST_SIZE,
                 value: self.max_header_list_size,
+            },
+            SettingsParameter {
+                id: SETTINGS_ENABLE_CONNECT_PROTOCOL,
+                value: 1,
             },
         ];
         writer.queue_settings(&local)?;

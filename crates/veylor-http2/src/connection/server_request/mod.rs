@@ -28,6 +28,8 @@ pub enum ServerRequestError {
     InvalidTe,
     InvalidContentLength,
     InvalidConnectPseudoHeaders,
+    InvalidProtocol,
+    ProtocolNotAllowed,
     OptionsAsteriskOnly,
     InvalidHpackField,
     WrongRole,
@@ -39,6 +41,7 @@ pub struct ValidatedServerRequest<'decoded> {
     pub scheme: Option<&'decoded [u8]>,
     pub authority: Option<&'decoded [u8]>,
     pub path: Option<&'decoded [u8]>,
+    pub protocol: Option<&'decoded [u8]>,
     pub content_length: Option<u64>,
 }
 
@@ -55,6 +58,7 @@ pub fn validate_server_request_fields<'decoded>(
     let mut scheme = None;
     let mut authority = None;
     let mut path = None;
+    let mut protocol = None;
     let mut content_length = None;
 
     for field in fields {
@@ -73,6 +77,7 @@ pub fn validate_server_request_fields<'decoded>(
                 b":scheme" => set_once(&mut scheme, value)?,
                 b":authority" => set_once(&mut authority, value)?,
                 b":path" => set_once(&mut path, value)?,
+                b":protocol" => set_once(&mut protocol, value)?,
                 _ => return Err(ServerRequestError::UnsupportedPseudoHeader),
             }
 
@@ -116,6 +121,39 @@ pub fn validate_server_request_fields<'decoded>(
     }
 
     if method == b"CONNECT" {
+        if let Some(protocol) = protocol {
+            if !valid_token(protocol) {
+                return Err(ServerRequestError::InvalidProtocol);
+            }
+
+            let scheme = scheme.ok_or(ServerRequestError::MissingScheme)?;
+
+            if !valid_scheme(scheme) {
+                return Err(ServerRequestError::InvalidScheme);
+            }
+
+            let path = path.ok_or(ServerRequestError::MissingPath)?;
+
+            if !valid_origin_path(path) {
+                return Err(ServerRequestError::InvalidPath);
+            }
+
+            let authority = authority.ok_or(ServerRequestError::MissingAuthority)?;
+
+            if !valid_uri_authority(authority, false, is_http_scheme(scheme), None) {
+                return Err(ServerRequestError::InvalidAuthority);
+            }
+
+            return Ok(ValidatedServerRequest {
+                method,
+                scheme: Some(scheme),
+                authority: Some(authority),
+                path: Some(path),
+                protocol: Some(protocol),
+                content_length,
+            });
+        }
+
         if scheme.is_some() || path.is_some() {
             return Err(ServerRequestError::InvalidConnectPseudoHeaders);
         }
@@ -131,8 +169,13 @@ pub fn validate_server_request_fields<'decoded>(
             scheme: None,
             authority: Some(authority),
             path: None,
+            protocol: None,
             content_length,
         });
+    }
+
+    if protocol.is_some() {
+        return Err(ServerRequestError::ProtocolNotAllowed);
     }
 
     let scheme = scheme.ok_or(ServerRequestError::MissingScheme)?;
@@ -157,6 +200,7 @@ pub fn validate_server_request_fields<'decoded>(
             scheme: Some(scheme),
             authority: None,
             path: Some(path),
+            protocol: None,
             content_length,
         });
     }
@@ -178,6 +222,7 @@ pub fn validate_server_request_fields<'decoded>(
         scheme: Some(scheme),
         authority,
         path: Some(path),
+        protocol: None,
         content_length,
     })
 }

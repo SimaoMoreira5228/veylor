@@ -9,7 +9,7 @@ use veylor_runtime::ConnectionToken;
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
 use crate::connection::trailers::StagedTrailer;
 use crate::connection::trailers::trailer_allowed;
-use crate::host::HOST_MAX_REASON_BYTES;
+use crate::host::{HOST_MAX_REASON_BYTES, HOST_TUNNEL_CAP, HostEventKind, stage_tunnel_signal};
 use crate::static_files::FileReject;
 use crate::static_routes::{
     CONTENT_ENCODING_GZIP, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler,
@@ -362,6 +362,35 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     _ => return self.deny(stream, ErrorCode::RefusedStream, false),
                 };
                 let is_head = request.method == b"HEAD";
+                if request.method == b"CONNECT" {
+                    if request.protocol != Some(&b"websocket"[..]) {
+                        return self.deny(stream, ErrorCode::RefusedStream, false);
+                    }
+                    if request.content_length.is_some() {
+                        return self.deny(stream, ErrorCode::ProtocolError, false);
+                    }
+                    let Some(ctx) = self.host else {
+                        return self.deny(stream, ErrorCode::RefusedStream, false);
+                    };
+                    if !self.routes.is_managed(request.method, path) {
+                        return self.deny(stream, ErrorCode::RefusedStream, false);
+                    }
+                    if park_stream(
+                        ctx,
+                        self.routes,
+                        stream,
+                        request,
+                        end,
+                        HOST_TUNNEL_CAP as u64,
+                        fields,
+                        self.server,
+                        self.outcome,
+                        true,
+                    ) {
+                        return;
+                    }
+                    return self.deny(stream, ErrorCode::RefusedStream, false);
+                }
                 // NOTE: 414 before every dispatch (static, native, managed, file): the decoded
                 // :path length is known exactly, so an over-long target answers here instead of
                 // missing to 404. Per-stream fail-closed like the 404 tail below (HEADERS+DATA
@@ -441,6 +470,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                             fields,
                             self.server,
                             self.outcome,
+                            false,
                         ) {
                             return;
                         }
@@ -657,11 +687,16 @@ fn park_stream(
     headers: &[HpackHeader],
     server: &H2ServerDriver<'_, '_, '_, '_>,
     outcome: &mut StepOutcome,
+    tunnel: bool,
 ) -> bool {
-    let total = match request.content_length {
-        Some(total) => total,
-        None if end => 0,
-        None => u64::MAX,
+    let total = if tunnel {
+        0
+    } else {
+        match request.content_length {
+            Some(total) => total,
+            None if end => 0,
+            None => u64::MAX,
+        }
     };
     let path = request.path.unwrap_or(b"/");
     let route_id = routes.find(request.method, path).map(|index| index as u64);
@@ -689,7 +724,10 @@ fn park_stream(
         Some(body_limit),
         request_headers,
     ) {
-        Ok(_) => {
+        Ok(event_token) => {
+            if tunnel {
+                ctx.host.mark_h2_tunnel(event_token);
+            }
             outcome.parked += 1;
             true
         }
@@ -756,6 +794,65 @@ fn push_h2_data(ctx: H2HostCtx<'_>, stream: u32, bytes: &[u8], end: bool) -> H2D
         let Some(live) = live else {
             return (H2DataOutcome::Gone, None);
         };
+        if live.h2_tunnel {
+            live.tunnel_eof |= end;
+            if bytes.is_empty() {
+                if end {
+                    let token = live.token;
+                    if live.stream.as_ref().is_some_and(|stream| stream.upgraded) {
+                        stage_tunnel_signal(
+                            inner,
+                            ctx.base.worker_id as usize,
+                            token,
+                            HostEventKind::TunnelClosed,
+                        );
+                    }
+                }
+                return (H2DataOutcome::Stored, None);
+            }
+            let available = live.tunnel_in.len() - live.tunnel_in_start;
+            if available.saturating_add(bytes.len()) > HOST_TUNNEL_CAP {
+                return (H2DataOutcome::OverLimit, None);
+            }
+            if live.tunnel_in.len().saturating_add(bytes.len()) > HOST_TUNNEL_CAP {
+                live.tunnel_in.drain(..live.tunnel_in_start);
+                live.tunnel_in_start = 0;
+            }
+            live.tunnel_in.extend_from_slice(bytes);
+            let token = live.token;
+            let upgraded = live.stream.as_ref().is_some_and(|stream| stream.upgraded);
+            if !upgraded {
+                return (H2DataOutcome::Stored, None);
+            }
+            if !stage_tunnel_signal(
+                inner,
+                ctx.base.worker_id as usize,
+                token,
+                HostEventKind::TunnelData,
+            ) {
+                let back = inner
+                    .parked
+                    .get_mut(ctx.base.worker_id as usize)
+                    .and_then(|table| table.get_mut(slot as usize))
+                    .and_then(|entry| entry.as_mut())
+                    .filter(|entry| entry.token == token);
+                if let Some(entry) = back {
+                    entry
+                        .tunnel_in
+                        .truncate(entry.tunnel_in.len() - bytes.len());
+                }
+                return (H2DataOutcome::OverLimit, None);
+            }
+            if end {
+                stage_tunnel_signal(
+                    inner,
+                    ctx.base.worker_id as usize,
+                    token,
+                    HostEventKind::TunnelClosed,
+                );
+            }
+            return (H2DataOutcome::Stored, None);
+        }
         let received = live.body_pulled + live.body.len() as u64;
         if live
             .body_limit

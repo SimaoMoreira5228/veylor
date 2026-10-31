@@ -613,6 +613,8 @@ impl ParkedEntry {
             tunnel_out_start: 0,
             tunnel_eof: false,
             tunnel_close: false,
+            tunnel_grant: 0,
+            h2_tunnel: false,
         }
     }
 }

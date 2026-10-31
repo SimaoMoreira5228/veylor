@@ -20,7 +20,7 @@ pub use request::{
     MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_HEADERS, RequestHeadError, RequestHeadReport,
     RequestHeader, RequestSpan,
 };
-pub(crate) use signals::stage_body_available;
+pub(crate) use signals::{stage_body_available, stage_tunnel_signal};
 
 // NOTE: park/stage/take booking lives in staged.rs; re-exported here so existing
 // crate::host:: paths resolve.
@@ -204,6 +204,7 @@ pub struct HostShared {
     wake: Condvar,
     tls_rotation_epoch: AtomicU64,
     staged_epoch: Vec<AtomicU64>,
+    h2_tunnels: Vec<AtomicU64>,
 }
 
 impl HostShared {
@@ -239,6 +240,7 @@ impl HostShared {
             wake: Condvar::new(),
             tls_rotation_epoch: AtomicU64::new(0),
             staged_epoch,
+            h2_tunnels: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 

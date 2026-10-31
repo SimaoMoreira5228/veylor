@@ -1,10 +1,11 @@
 use super::{FrameDirection, H2Role, StreamAction, StreamTable};
 use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, MAX_FLOW_WINDOW_SIZE};
 use crate::frame::{
-    DEFAULT_MAX_FRAME_SIZE, ErrorCode, FrameHeader, FrameType, SETTINGS_ACK, SETTINGS_ENABLE_PUSH,
-    SETTINGS_ENABLE_PUSH_MAX, SETTINGS_ENTRY_LEN, SETTINGS_HEADER_TABLE_SIZE,
-    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE,
-    SETTINGS_MAX_HEADER_LIST_SIZE, SettingsParameter, settings_parameter_valid,
+    DEFAULT_MAX_FRAME_SIZE, ErrorCode, FrameHeader, FrameType, SETTINGS_ACK,
+    SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_ENABLE_PUSH, SETTINGS_ENABLE_PUSH_MAX,
+    SETTINGS_ENTRY_LEN, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
+    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
+    SettingsParameter, settings_parameter_valid,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +16,7 @@ pub struct EndpointSettings {
     pub initial_window_size: u32,
     pub max_frame_size: u32,
     pub max_header_list_size: u32,
+    pub enable_connect_protocol: u32,
 }
 
 // NOTE: RFC 9113 §6.5.2 protocol defaults, named so deployments can cite them:
@@ -40,6 +42,10 @@ impl EndpointSettings {
             initial_window_size: DEFAULT_FLOW_WINDOW_SIZE as u32,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_header_list_size: DEFAULT_MAX_HEADER_LIST_SIZE,
+            enable_connect_protocol: match role {
+                H2Role::Client => 0,
+                H2Role::Server => 1,
+            },
         }
     }
 }
@@ -273,6 +279,7 @@ impl<'a> StreamTable<'a> {
                 SETTINGS_INITIAL_WINDOW_SIZE => next.initial_window_size = value,
                 SETTINGS_MAX_FRAME_SIZE => next.max_frame_size = value,
                 SETTINGS_MAX_HEADER_LIST_SIZE => next.max_header_list_size = value,
+                SETTINGS_ENABLE_CONNECT_PROTOCOL => next.enable_connect_protocol = value,
                 _ => {}
             }
         }

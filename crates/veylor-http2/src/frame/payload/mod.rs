@@ -31,6 +31,7 @@ pub const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 pub const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 pub const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u16 = 0x8;
 
 pub const SETTINGS_ENABLE_PUSH_MAX: u32 = 1;
 pub const SETTINGS_INITIAL_WINDOW_SIZE_MAX: u32 = MAX_WINDOW_INCREMENT;
@@ -376,6 +377,7 @@ pub fn settings_parameter_valid(id: u16, value: u32) -> bool {
         SETTINGS_MAX_FRAME_SIZE => {
             (SETTINGS_MAX_FRAME_SIZE_MIN..=SETTINGS_MAX_FRAME_SIZE_MAX).contains(&value)
         }
+        SETTINGS_ENABLE_CONNECT_PROTOCOL => value <= 1,
         _ => true,
     }
 }

@@ -11,7 +11,7 @@ use crate::host::HostShared;
 use super::routes::project_extra_headers;
 use super::send::{field, send_begin};
 use super::serve::valid_trailer_field;
-use super::{H2Conn, Phase, STREAM_SLOTS};
+use super::{H2Conn, Phase, STREAM_SLOTS, TUNNEL_STEP};
 use super::{slots, turn};
 
 #[derive(Clone, Copy)]
@@ -55,6 +55,121 @@ fn is_head_park(host: &HostShared, token: ConnectionToken) -> bool {
     gated.is_some_and(|(head, _)| head)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn tunnel_step(
+    meta: &mut slots::H2Meta,
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    host: &HostShared,
+    worker: u32,
+    base: u32,
+    scratch: &mut [u8; TUNNEL_STEP],
+) -> bool {
+    let start = usize::from(meta.tunnel_cursor) % STREAM_SLOTS;
+
+    for offset in 0..STREAM_SLOTS {
+        let sub = (start + offset) % STREAM_SLOTS;
+        let slot = base + sub as u32;
+        let info = host.with_inner(|inner| {
+            let entry = inner
+                .parked
+                .get_mut(worker as usize)
+                .and_then(|table| table.get_mut(slot as usize))
+                .and_then(|entry| entry.as_mut())
+                .filter(|entry| {
+                    entry.token.stream_id != 0
+                        && entry.stream_cmd.is_none()
+                        && entry
+                            .stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.upgraded && stream.head_sent)
+                });
+            let Some(entry) = entry else {
+                return (None, None);
+            };
+            let grant = std::mem::take(&mut entry.tunnel_grant);
+            let out = entry.tunnel_out.len() - entry.tunnel_out_start;
+            (Some((entry.token, grant, entry.tunnel_close, out)), None)
+        });
+        let Some((token, grant, close, out)) = info.and_then(|(info, _)| info) else {
+            continue;
+        };
+        let stream = token.stream_id;
+        meta.tunnel_cursor = ((sub + 1) % STREAM_SLOTS) as u8;
+        let mut used = 0;
+
+        if grant > 0 {
+            let spare = slots::pending_spare(meta);
+            if spare.len() >= 26 {
+                used += super::grant_window(server, 0, grant, &mut spare[used..]);
+                used += super::grant_window(server, stream, grant, &mut spare[used..]);
+            }
+        }
+
+        if out > 0 {
+            let spare = slots::pending_spare(meta);
+            let room = spare.len().saturating_sub(used);
+            if room < 10 {
+                meta.pending_len += used;
+                return true;
+            }
+            let want = out.min(scratch.len()).min(room - 9);
+            let chunk = host.peek_tunnel_out(token, &mut scratch[..want]);
+            let mut sent = 0;
+
+            while sent < chunk {
+                match server.send_data(stream, &scratch[sent..chunk], false, &mut spare[used..]) {
+                    Ok(frame) => {
+                        let payload = frame.frame.payload_length;
+                        used += frame.writer.pending_bytes().len();
+                        sent += payload;
+                        if payload == 0 {
+                            break;
+                        }
+                    }
+                    Err(ServerError::Data(DataWriteError::NoSendCredit)) => break,
+                    Err(ServerError::StreamClosed | ServerError::UnknownStream) => {
+                        host.unpark_closed(token.worker_id, token.slot);
+                        meta.pending_len += used;
+                        return true;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            if sent > 0 {
+                host.consume_tunnel_out(token, sent);
+                host.stage_writable(token);
+            }
+            if sent < out {
+                meta.pending_len += used;
+                return true;
+            }
+        }
+
+        if close {
+            let spare = slots::pending_spare(meta);
+            if spare.len().saturating_sub(used) < 9 {
+                meta.pending_len += used;
+                return true;
+            }
+            match server.send_data(stream, &[], true, &mut spare[used..]) {
+                Ok(frame) => used += frame.writer.pending_bytes().len(),
+                Err(ServerError::StreamClosed | ServerError::UnknownStream) => {}
+                Err(_) => {}
+            }
+            host.stage_tunnel_closed(token);
+            host.unpark_closed(token.worker_id, token.slot);
+            meta.pending_len += used;
+            return true;
+        }
+
+        meta.pending_len += used;
+        return used > 0;
+    }
+
+    false
+}
+
 pub(crate) fn apply_h2_streams(
     meta: &mut slots::H2Meta,
     conn: &mut Option<H2Conn<'_>>,
@@ -70,6 +185,17 @@ pub(crate) fn apply_h2_streams(
     let base = (crate::static_server::MAX_CONNECTIONS + index * STREAM_SLOTS) as u32;
     let host = turn.host;
     let fail = ErrorCode::InternalError;
+    let mut progressed = false;
+    if host.h2_tunnel_active(turn.worker_id) {
+        let H2Conn {
+            phase,
+            tunnel_scratch,
+            ..
+        } = &mut *live;
+        if let Phase::Serving(server) = phase {
+            progressed = tunnel_step(meta, server, host, turn.worker_id, base, tunnel_scratch);
+        }
+    }
     let peek = host.with_inner(|inner| {
         let mut found = None;
         let mut rearmed: [Option<ConnectionToken>; STREAM_SLOTS] = [None; STREAM_SLOTS];
@@ -98,7 +224,7 @@ pub(crate) fn apply_h2_streams(
             }
             if entry.staged.is_none() {
                 if let Some(stream) = entry.stream.as_mut() {
-                    if stream.head_sent {
+                    if stream.head_sent && !stream.upgraded {
                         stream.writable = true;
                         // NOTE: one coalesced WRITABLE per release, staged after unlock below:
                         // HostShared::stage_writable would deadlock under with_inner and the
@@ -113,13 +239,13 @@ pub(crate) fn apply_h2_streams(
         ((found, rearmed, rearmed_len), None)
     });
     let Some(((found, rearmed, rearmed_len), _)) = peek else {
-        return false;
+        return progressed;
     };
     for token in rearmed[..rearmed_len].iter().flatten() {
         host.stage_writable(*token);
     }
     let Some((token, write)) = found else {
-        return false;
+        return progressed;
     };
     let stream = token.stream_id;
     let Phase::Serving(server) = &mut live.phase else {
@@ -135,7 +261,7 @@ pub(crate) fn apply_h2_streams(
         let send = server.driver().connection_send_window().value();
         let flow = credit.unwrap_or(0);
         if spare < 10 || send <= 0 || flow <= 0 {
-            return false;
+            return progressed;
         }
     }
 
@@ -143,10 +269,10 @@ pub(crate) fn apply_h2_streams(
         let command = take_stream_cmd(inner, token);
         (command, None)
     }) else {
-        return false;
+        return progressed;
     };
     let Some(cmd) = cmd else {
-        return false;
+        return progressed;
     };
 
     let spare = slots::pending_spare(meta);
@@ -295,6 +421,25 @@ pub(crate) fn apply_h2_streams(
         StreamCmd::Upgrade { .. } => {
             abort_stream(server, host, token, fail, slots::pending_spare(meta))
         }
+        StreamCmd::H2Upgrade { protocol } => {
+            let mut extra = [(&b""[..], &b""[..]); 1];
+            let extra_len = match protocol.as_deref() {
+                Some(protocol) => {
+                    extra[0] = (b"sec-websocket-protocol", protocol);
+                    1
+                }
+                None => 0,
+            };
+            let mut used = 0;
+            match send_begin(server, stream, 200, &extra[..extra_len], spare, &mut used) {
+                Ok(()) => StreamStep::Done {
+                    used,
+                    served: false,
+                    refused: false,
+                },
+                Err(_) => abort_stream(server, host, token, fail, slots::pending_spare(meta)),
+            }
+        }
         StreamCmd::Cancel => {
             let used =
                 match server.rst_stream(stream, ErrorCode::Cancel, slots::pending_spare(meta)) {
@@ -320,5 +465,5 @@ pub(crate) fn apply_h2_streams(
     meta.pending_len += used;
     turn.counts.h2_served += u64::from(served);
     turn.counts.h2_refused += u64::from(refused);
-    progress
+    progress || progressed
 }

@@ -100,6 +100,9 @@ pub(crate) enum StreamCmd {
     Upgrade {
         response: Vec<u8>,
     },
+    H2Upgrade {
+        protocol: Option<Vec<u8>>,
+    },
 }
 
 fn stream_entry(inner: &mut HostInner, token: ConnectionToken) -> Option<&mut ParkedEntry> {
@@ -114,7 +117,10 @@ fn stream_entry(inner: &mut HostInner, token: ConnectionToken) -> Option<&mut Pa
 pub(crate) fn take_stream_cmd(inner: &mut HostInner, token: ConnectionToken) -> Option<StreamCmd> {
     let entry = stream_entry(inner, token)?;
     if let Some(cmd) = entry.stream_cmd.take() {
-        if matches!(cmd, StreamCmd::Begin { .. } | StreamCmd::Upgrade { .. }) {
+        if matches!(
+            cmd,
+            StreamCmd::Begin { .. } | StreamCmd::Upgrade { .. } | StreamCmd::H2Upgrade { .. }
+        ) {
             if let Some(stream) = entry.stream.as_mut() {
                 stream.head_sent = true;
                 stream.writable = true;
@@ -404,7 +410,7 @@ impl HostShared {
                         stream.ending = true;
                     }
                 }
-                StreamCmd::Upgrade { .. } => {
+                StreamCmd::H2Upgrade { .. } | StreamCmd::Upgrade { .. } => {
                     if entry.stream.is_some() || entry.staged.is_some() {
                         inner.counters.responds_duplicate += 1;
                         return (RespondOutcome::Duplicate, None);
@@ -592,6 +598,9 @@ pub(crate) fn apply_stream_cmd(
             conn.phase = ConnPhase::SendingResponse;
             host.unpark_closed(token.worker_id, token.slot);
             length
+        }
+        StreamCmd::H2Upgrade { .. } => {
+            return PumpOutcome::Close(ConnClose::ProtocolError);
         }
         StreamCmd::Upgrade { response } => {
             let ConnPhase::Parked {

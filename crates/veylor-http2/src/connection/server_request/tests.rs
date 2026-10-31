@@ -253,7 +253,7 @@ fn rejects_missing_duplicate_and_misplaced_pseudo_headers() {
             Err(ServerRequestError::PseudoHeaderAfterRegular)
         );
 
-        for name in [b":status".as_slice(), b":protocol", b":unknown"] {
+        for name in [b":status".as_slice(), b":unknown"] {
             let unknown = [
                 field(b":method", b"GET"),
                 field(b":scheme", b"https"),
@@ -265,6 +265,86 @@ fn rejects_missing_duplicate_and_misplaced_pseudo_headers() {
                 Err(ServerRequestError::UnsupportedPseudoHeader)
             );
         }
+
+        let protocol_on_get = [
+            field(b":method", b"GET"),
+            field(b":scheme", b"https"),
+            field(b":path", b"/"),
+            field(b":protocol", b"websocket"),
+        ];
+        assert_eq!(
+            validate_server_request_fields(driver, &protocol_on_get),
+            Err(ServerRequestError::ProtocolNotAllowed)
+        );
+    });
+}
+
+#[test]
+fn validates_extended_connect_pseudo_headers() {
+    with_server_driver(|driver| {
+        let extended = [
+            field(b":method", b"CONNECT"),
+            field(b":protocol", b"websocket"),
+            field(b":scheme", b"https"),
+            field(b":path", b"/chat"),
+            field(b":authority", b"example.com"),
+        ];
+        let request = validate_server_request_fields(driver, &extended).unwrap();
+        assert_eq!(request.method, b"CONNECT");
+        assert_eq!(request.protocol, Some(&b"websocket"[..]));
+        assert_eq!(request.scheme, Some(&b"https"[..]));
+        assert_eq!(request.path, Some(&b"/chat"[..]));
+        assert_eq!(request.authority, Some(&b"example.com"[..]));
+
+        let missing_scheme = [
+            field(b":method", b"CONNECT"),
+            field(b":protocol", b"websocket"),
+            field(b":path", b"/chat"),
+        ];
+        assert_eq!(
+            validate_server_request_fields(driver, &missing_scheme),
+            Err(ServerRequestError::MissingScheme)
+        );
+
+        let missing_path = [
+            field(b":method", b"CONNECT"),
+            field(b":protocol", b"websocket"),
+            field(b":scheme", b"https"),
+        ];
+        assert_eq!(
+            validate_server_request_fields(driver, &missing_path),
+            Err(ServerRequestError::MissingPath)
+        );
+
+        let missing_authority = [
+            field(b":method", b"CONNECT"),
+            field(b":protocol", b"websocket"),
+            field(b":scheme", b"https"),
+            field(b":path", b"/chat"),
+        ];
+        assert_eq!(
+            validate_server_request_fields(driver, &missing_authority),
+            Err(ServerRequestError::MissingAuthority)
+        );
+
+        let invalid_protocol = [
+            field(b":method", b"CONNECT"),
+            field(b":protocol", b"bad protocol"),
+            field(b":scheme", b"https"),
+            field(b":path", b"/chat"),
+        ];
+        assert_eq!(
+            validate_server_request_fields(driver, &invalid_protocol),
+            Err(ServerRequestError::InvalidProtocol)
+        );
+
+        let plain_connect = [
+            field(b":method", b"CONNECT"),
+            field(b":authority", b"example.com:443"),
+        ];
+        let request = validate_server_request_fields(driver, &plain_connect).unwrap();
+        assert_eq!(request.protocol, None);
+        assert_eq!(request.path, None);
     });
 }
 

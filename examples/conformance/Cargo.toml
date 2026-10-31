@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes = "1"
+veylor-h3 = { version = "0.1.0", path = "../../crates/veylor-h3" }
 veylor-runtime = { version = "0.1.0", path = "../../crates/veylor-runtime" }
 veylor-server = { version = "0.1.0", path = "../../crates/veylor-server" }
 

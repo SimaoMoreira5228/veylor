@@ -98,6 +98,48 @@ pub(crate) fn stage_writable_locked(
     true
 }
 
+pub(crate) fn stage_tunnel_signal(
+    inner: &mut HostInner,
+    worker: usize,
+    token: ConnectionToken,
+    kind: HostEventKind,
+) -> bool {
+    let Some(queue) = inner.events.get_mut(worker) else {
+        return false;
+    };
+    let live = inner
+        .parked
+        .get(worker)
+        .and_then(|table| table.get(token.slot as usize))
+        .and_then(|entry| entry.as_ref())
+        .is_some_and(|entry| entry.token == token);
+    if !live {
+        return false;
+    }
+    if queue
+        .iter()
+        .any(|event| event.kind == kind && event.token == token)
+    {
+        return true;
+    }
+    if queue.len() >= HOST_QUEUE_DEPTH {
+        inner.counters.queue_full += 1;
+        return false;
+    }
+    queue.push_back(HostEvent {
+        kind,
+        token,
+        route_id: 0,
+        method_len: 0,
+        method: [0; HOST_MAX_METHOD_BYTES],
+        path_len: 0,
+        path: [0; HOST_MAX_PATH_BYTES],
+        body_ready: 0,
+        body_complete: false,
+    });
+    true
+}
+
 // NOTE: admission rollback: the appended tail belongs to this call (append-only under the
 // lock), so truncating it restores the pre-push staging exactly.
 pub(crate) fn retract_body_append(inner: &mut HostInner, token: ConnectionToken, appended: usize) {

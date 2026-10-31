@@ -1037,6 +1037,10 @@ vyl_http1_result vyl_managed_static_host_is_writable(
     vyl_managed_static_token token,
     uint32_t* out_writable
 );
+/* NOTE: Turns a managed request into a raw byte tunnel. An HTTP/1.1 WebSocket request
+   answers 101 with the computed accept key; an HTTP/2 extended-CONNECT stream answers 200.
+   The server validates the handshake from the parked snapshot, so INVALID_ARGUMENT means the
+   request was not a valid upgrade (and nothing was staged). */
 vyl_http1_result vyl_managed_static_host_upgrade_websocket(
     vyl_managed_static_server* server,
     vyl_managed_static_token token

@@ -72,6 +72,7 @@ pub(crate) struct H2Meta {
     pub(crate) flood_window_start_ns: u64,
     pub(crate) flood_rst_base: u32,
     pub(crate) flood_settings_base: u32,
+    pub(crate) tunnel_cursor: u8,
 }
 
 impl H2Meta {

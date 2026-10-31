@@ -30,6 +30,7 @@ SERVER_LOG="$LOG_DIR/server.log"
 "$ROOT/target/release/veylor-conformance" \
     --address 127.0.0.1:0 \
     --h2c-port 0 \
+    --h3-port 0 \
     --workers "$WORKERS" \
     --tls-cert "$CERT" \
     --tls-key "$KEY" \
@@ -55,6 +56,7 @@ READY="$(grep -m1 '^READY ' "$SERVER_LOG")"
 H1="$(printf '%s\n' "$READY" | sed -n 's/.* h1=\([^ ]*\).*/\1/p')"
 H2C="$(printf '%s\n' "$READY" | sed -n 's/.* h2c=\([^ ]*\).*/\1/p')"
 H2C_PORT="${H2C##*:}"
+H3="$(printf '%s\n' "$READY" | sed -n 's/.* h3=\([^ ]*\).*/\1/p')"
 TLS_ENABLED="$(printf '%s\n' "$READY" | sed -n 's/.* tls=\([^ ]*\).*/\1/p')"
 printf 'server %s\n' "$READY"
 
@@ -123,8 +125,33 @@ else
     skip "h2load (install the nghttp2 tools package)"
 fi
 
-skip "h3spec (HTTP/3 is not implemented yet)"
-skip "curl HTTP/3 (HTTP/3 is not implemented yet)"
+if [ "$H3" != "-" ] && [ -n "$H3" ]; then
+    if curl --version | grep -q 'ngtcp2\|nghttp3\|HTTP3'; then
+        if curl -kfsS --max-time 5 --http3-only "https://$H3/hello" >/dev/null; then
+            pass "curl HTTP/3"
+        else
+            fail "curl HTTP/3"
+        fi
+    else
+        skip "curl HTTP/3 (curl built without HTTP/3)"
+    fi
+else
+    skip "curl HTTP/3 (server started without --h3-port)"
+fi
+
+H3SPEC="$(command -v h3spec || true)"
+if [ -n "$H3SPEC" ] && [ "$H3" != "-" ] && [ -n "$H3" ]; then
+    H3_PORT="${H3##*:}"
+    if timeout 180 "$H3SPEC" --host 127.0.0.1 --port "$H3_PORT" --ca "$CERT" \
+        >"$LOG_DIR/h3spec.log" 2>&1; then
+        pass "h3spec"
+    else
+        fail "h3spec"
+        tail -40 "$LOG_DIR/h3spec.log"
+    fi
+else
+    skip "h3spec (not installed)"
+fi
 
 printf '\n%d failure(s); logs in %s\n' "$failures" "$LOG_DIR"
 exit "$failures"
