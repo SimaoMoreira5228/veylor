@@ -62,6 +62,9 @@ pub(crate) fn inspect_pattern(path: &[u8]) -> Option<usize> {
 }
 
 pub(crate) fn compare_paths(left: &[u8], right: &[u8]) -> Ordering {
+    if left == right {
+        return Ordering::Equal;
+    }
     let mut left_offset = 0;
     let mut right_offset = 0;
     while left_offset < left.len() && right_offset < right.len() {
@@ -301,7 +304,7 @@ fn valid_path(path: &[u8]) -> bool {
             offset += 3;
             continue;
         }
-        if !is_unreserved(byte) && !is_sub_delimiter(byte) && !matches!(byte, b':' | b'@' | b'/') {
+        if !PATH_BYTE[byte as usize] {
             return false;
         }
         offset += 1;
@@ -368,10 +371,56 @@ fn hex_value(byte: u8) -> u8 {
     }
 }
 
-fn is_unreserved(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)
+macro_rules! byte_table {
+    ($name:ident, |$byte:ident| $classify:expr) => {
+        const $name: [bool; 256] = {
+            let mut table = [false; 256];
+            let mut index = 0usize;
+            while index < 256 {
+                let $byte = index as u8;
+                table[index] = $classify;
+                index += 1;
+            }
+            table
+        };
+    };
 }
 
-fn is_sub_delimiter(byte: u8) -> bool {
-    b"!$&'()*+,;=".contains(&byte)
+byte_table!(UNRESERVED, |byte| {
+    matches!(
+        byte,
+        b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'.' | b'_' | b'~'
+    )
+});
+
+byte_table!(PATH_BYTE, |byte| {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+            | b'/'
+    )
+});
+
+#[inline]
+fn is_unreserved(byte: u8) -> bool {
+    UNRESERVED[byte as usize]
 }

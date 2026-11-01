@@ -21,20 +21,20 @@ pub(crate) mod turn;
 pub(crate) use turn::worker_main;
 
 // NOTE: per-worker connection ceiling: 1024 makes the 10k-idle ladder reachable
-// via fan-out (10 workers x 1024) within MAX_WORKERS. Beyond it the first breaks
-// are fd limits (one fd per conn plus pollers), then the const-sized host park
-// tables, then per-worker memory (~1 KiB fixed per slot, ~16 KiB slabs per active
-// conn once input/output materialize). H1 tables ride ServerConfig::max_connections
+// via fan-out within MAX_WORKERS. Beyond it the first breaks are fd limits (one
+// fd per conn plus pollers), then the const-sized host park tables, then
+// per-worker memory (~1 KiB fixed per slot, ~16 KiB slabs per active conn once
+// input/output materialize). H1 tables ride ServerConfig::max_connections
 // (1..=MAX_CONNECTIONS); the H2/host slot space still rides this const, so the
 // config value can never index out of range there.
 pub const MAX_CONNECTIONS: usize = 1024;
 // NOTE: default() keeps the historical 128-conn behavior; opt in per worker via
 // ServerConfig::max_connections. A named const keeps the literal in one place.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
-pub const MAX_WORKERS: usize = 16;
+pub const MAX_WORKERS: usize = 64;
 pub const LISTENER_TOKEN: usize = 0;
 pub const SHUTDOWN_TIMER_ID: u64 = 0xFFFF_FFFE;
-pub(crate) const MAX_EVENTS_PER_TURN: usize = 64;
+pub(crate) const MAX_EVENTS_PER_TURN: usize = 256;
 const SHUTDOWN_GRACE_DEFAULT_NS: u64 = 5_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -233,6 +233,8 @@ fn deadlines_bind_on_admit_expire_by_kind_and_cancel_on_close() {
     .unwrap();
     assert_eq!(first.accepted, 1);
     assert_eq!(first.expired_deadlines, 0);
+    let token_a = take_token(&mut admitted, 0);
+    worker.ensure_head_deadline(token_a, start).unwrap();
 
     let due = drive(
         &mut worker,
@@ -248,7 +250,6 @@ fn deadlines_bind_on_admit_expire_by_kind_and_cancel_on_close() {
     assert_eq!(expired[0].kind, ConnectionDeadlineKind::RequestHead);
     assert_eq!(worker.live_count(), 1);
 
-    let token_a = take_token(&mut admitted, 0);
     assert_eq!(expired[0].token, token_a);
     worker.close(token_a).unwrap();
     assert_eq!(worker.live_count(), 0);
@@ -463,7 +464,7 @@ fn timer_exhaustion_fails_closed_without_losing_the_slot() {
     let mut expired = [deadline_placeholder(); 2];
     let mut admitted = [(); 2].map(|()| None);
 
-    let full = drive(
+    let first = drive(
         &mut worker,
         &mut listener,
         1_000_000,
@@ -471,13 +472,20 @@ fn timer_exhaustion_fails_closed_without_losing_the_slot() {
         &mut events,
         &mut expired,
         &mut admitted,
-    );
-    assert!(matches!(full, Err(WorkerError::TimerCapacity)));
-    assert_eq!(worker.live_count(), 1);
+    )
+    .unwrap();
+    assert_eq!(first.accepted, 2);
+    let token_a = take_token(&mut admitted, 0);
+    let token_b = take_token(&mut admitted, 1);
+    worker.ensure_head_deadline(token_a, 1_000_000).unwrap();
+    assert!(matches!(
+        worker.ensure_head_deadline(token_b, 1_000_000),
+        Err(WorkerError::TimerCapacity)
+    ));
+    assert_eq!(worker.live_count(), 2);
     assert_eq!(worker.pending_accepts(), 0);
-
-    let token = take_token(&mut admitted, 0);
-    worker.close(token).unwrap();
+    worker.close(token_a).unwrap();
+    worker.close(token_b).unwrap();
     assert_eq!(worker.live_count(), 0);
 
     let _client_c = connect(address);

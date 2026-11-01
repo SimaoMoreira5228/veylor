@@ -266,7 +266,7 @@ int main(void) {
     assert(server != NULL);
     assert(vyl_managed_static_set_worker_count(NULL, 2) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_set_worker_count(server, 0) == VYL_HTTP1_INVALID_ARGUMENT);
-    assert(vyl_managed_static_set_worker_count(server, 17) == VYL_HTTP1_INVALID_ARGUMENT);
+    assert(vyl_managed_static_set_worker_count(server, VYL_MANAGED_STATIC_MAX_WORKERS + 1) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_set_worker_count(server, 2) == VYL_HTTP1_OK);
     assert(vyl_managed_static_enable_h2c(NULL, 0) == VYL_HTTP1_INVALID_ARGUMENT);
     assert(vyl_managed_static_enable_h2c(server, 0) == VYL_HTTP1_OK);

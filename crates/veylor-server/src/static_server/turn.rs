@@ -197,7 +197,6 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let mut h2_c6: Option<H2Conn<'_>> = None;
     let mut h2_c7: Option<H2Conn<'_>> = None;
     let base = Instant::now();
-    let mut turn_offset = 0usize;
     let mut stop_seen = false;
     let mut h1_quiet = false;
     let mut parked_live = false;
@@ -511,11 +510,23 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             && !parked_live;
         h1_quiet = skip_pump;
         let sweep_steps = if skip_pump { 0 } else { max_conns };
-        for step in 0..sweep_steps {
-            let index = (turn_offset + step) % max_conns;
-            let Some(conn) = conns[index].as_mut() else {
+        let h1_live = worker.live_count();
+        let mut swept = 0;
+        let mut parked_now = false;
+        let mut index = 0usize;
+        let mut step = 0;
+        while step < sweep_steps && swept < h1_live {
+            let slot = index;
+            index += 1;
+            if index == max_conns {
+                index = 0;
+            }
+            step += 1;
+            let Some(conn) = conns[slot].as_mut() else {
                 continue;
             };
+            swept += 1;
+            parked_now |= conn.is_parked();
             if draining {
                 conn.begin_drain();
             }
@@ -534,7 +545,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         apply_pump_hooks(&mut worker, token, progress, now_ns)
                     } else if !h2_enabled {
                         Some(ConnClose::TransportError)
-                    } else if let Some(h1) = conns[index].take() {
+                    } else if let Some(h1) = conns[slot].take() {
                         let token = h1.token();
                         let mut h1 = h1;
                         let tls = h1.tls.take();
@@ -544,8 +555,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         };
                         let mut stream = h1.into_stream();
                         let _ = stream_poller.deregister(&mut stream);
-                        let slot = h2_slots::free_slot(&h2_meta);
-                        match (slot, tls) {
+                        let h2_slot = h2_slots::free_slot(&h2_meta);
+                        match (h2_slot, tls) {
                             (Some(0), Some(tls)) => {
                                 move_h2_tls_slot!(
                                     0,
@@ -734,7 +745,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             };
             if let Some(reason) = hook_close {
                 close_conn(
-                    index,
+                    slot,
                     reason,
                     &host,
                     &mut conns,
@@ -745,7 +756,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 );
                 continue;
             }
-            if let Some(conn) = conns[index].as_mut() {
+            if let Some(conn) = conns[slot].as_mut() {
                 let want = conn.write_blocked;
                 if want != conn.write_interest {
                     conn.write_interest = want;
@@ -754,20 +765,17 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     } else {
                         PollInterest::Readable
                     };
-                    let _ = stream_poller.reregister(
-                        &mut conn.stream,
-                        conn_poll_token(index),
-                        interest,
-                    );
+                    let _ =
+                        stream_poller.reregister(&mut conn.stream, conn_poll_token(slot), interest);
                 }
             }
         }
         if !skip_pump {
-            parked_live = conns.iter().flatten().any(|conn| conn.is_parked());
-            turn_offset = (turn_offset + 1) % max_conns;
+            parked_live = parked_now;
         }
+        let h2_pump_enabled = h2_enabled && h2_slots::occupied(&h2_meta) > 0;
         drive_h2_pumps!(
-            h2_enabled,
+            h2_pump_enabled,
             h2_view,
             draining,
             per_conn_budget,

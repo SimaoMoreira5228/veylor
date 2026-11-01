@@ -91,6 +91,45 @@ pub(crate) fn valid_uri_component(bytes: &[u8]) -> bool {
 }
 
 fn valid_authority(authority: &[u8], require_port: bool) -> Option<usize> {
+    if !require_port {
+        let mut colon = None;
+        let mut special = false;
+        for (index, byte) in authority.iter().enumerate() {
+            match *byte {
+                b':' => {
+                    if colon.replace(index).is_some() {
+                        special = true;
+                    }
+                }
+                b'@' | b'[' => special = true,
+                _ => {}
+            }
+        }
+        if !special {
+            let (host, port) = match colon {
+                Some(colon) => (&authority[..colon], Some(&authority[colon + 1..])),
+                None => (authority, None),
+            };
+            if host.is_empty() {
+                return None;
+            }
+            if let Some(port) = port {
+                if port.is_empty() {
+                    return None;
+                }
+                let mut value = 0_u32;
+                for digit in port {
+                    if !digit.is_ascii_digit() {
+                        return None;
+                    }
+                    value = value
+                        .checked_mul(10)?
+                        .checked_add(u32::from(*digit - b'0'))?;
+                }
+            }
+            return Some(0);
+        }
+    }
     let userinfo_end = if require_port {
         None
     } else {

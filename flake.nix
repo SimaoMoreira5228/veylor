@@ -47,6 +47,9 @@
               curlHTTP3
               jq
               valgrind
+              flamegraph
+              cargo-flamegraph
+              heaptrack
             ] ++ nixpkgs.lib.optionals (h3spec != null) [ h3spec ];
           };
         });

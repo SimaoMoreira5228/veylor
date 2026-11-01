@@ -792,6 +792,7 @@ vyl_http1_result vyl_h3_response_body(
 vyl_http1_result vyl_h3_response_destroy(vyl_h3_response* response);
 
 #define VYL_MANAGED_STATIC_ABI_VERSION 2u
+#define VYL_MANAGED_STATIC_MAX_WORKERS 64u
 
 typedef struct vyl_managed_static_server vyl_managed_static_server;
 

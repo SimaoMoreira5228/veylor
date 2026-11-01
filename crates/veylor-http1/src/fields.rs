@@ -75,8 +75,40 @@ pub(crate) fn parse_connection_options(value: &[u8]) -> Option<ConnectionOptions
     }
 }
 
+const TOKEN_TABLE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut index = 0usize;
+    while index < 256 {
+        let byte = index as u8;
+        table[index] = matches!(
+            byte,
+            b'0'..=b'9'
+                | b'a'..=b'z'
+                | b'A'..=b'Z'
+                | b'!'
+                | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        );
+        index += 1;
+    }
+    table
+};
+
+#[inline]
 pub fn is_token(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    TOKEN_TABLE[byte as usize]
 }
 
 pub(crate) fn is_ows(byte: u8) -> bool {

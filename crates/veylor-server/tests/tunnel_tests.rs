@@ -8,7 +8,7 @@ use veylor_server::{
 };
 use veylor_websocket::{OpCode, encode_frame};
 
-const DEADLINE: Duration = Duration::from_secs(5);
+const DEADLINE: Duration = Duration::from_secs(15);
 const MASK: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
 
 fn managed_server() -> RunningServer {

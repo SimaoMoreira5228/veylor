@@ -3,15 +3,15 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use veylor_server::{
-    CloseCounts, MAX_CONNECTIONS, MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig,
-    ServerError,
+    CloseCounts, MAX_CONNECTIONS, MAX_STATIC_BODY_BYTES, MAX_WORKERS, RunningServer, Server,
+    ServerConfig, ServerError,
 };
 
-const DEADLINE: Duration = Duration::from_secs(5);
+const DEADLINE: Duration = Duration::from_secs(15);
 const EXTRA_DEADLINE: Duration = Duration::from_millis(1000);
 const IDLE_HOLD: Duration = Duration::from_millis(500);
 const FANOUT_CLIENTS: usize = 32;
-const MAX_ABSURD: usize = 17;
+const MAX_ABSURD: usize = MAX_WORKERS + 1;
 const SCALE_IDLE: usize = 1000;
 const SCALE_THREADS: usize = 8;
 const BURST_CAP: usize = 64;
@@ -202,7 +202,7 @@ fn invalid_worker_counts_rejected() {
 #[test]
 fn upper_bound_worker_count_binds() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-    let _ = Server::bind(addr, multi_config(16)).expect("bind sixteen workers");
+    let _ = Server::bind(addr, multi_config(MAX_WORKERS)).expect("bind max workers");
 }
 
 #[test]

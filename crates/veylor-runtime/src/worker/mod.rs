@@ -21,7 +21,7 @@ pub struct TurnConfig {
 impl TurnConfig {
     pub const DEFAULT: Self = Self {
         max_accepts_per_turn: 8,
-        max_events_per_turn: 64,
+        max_events_per_turn: 256,
         byte_budget_per_turn: 65_536,
     };
 
@@ -264,7 +264,7 @@ impl<'a> Worker<'a> {
                 self.accept_into_staging(listener)?;
             }
 
-            outcome.accepted = self.admit_staged(now_ns, admitted)?;
+            outcome.accepted = self.admit_staged(admitted)?;
         } else {
             self.drop_staged();
         }
@@ -378,6 +378,71 @@ impl<'a> Worker<'a> {
             let _ = self.table.transition(token, ConnectionPhase::Closing);
             return Err(error.into());
         }
+        Ok(())
+    }
+
+    pub fn ensure_head_deadline(
+        &mut self,
+        token: ConnectionToken,
+        now_ns: u64,
+    ) -> Result<(), WorkerError> {
+        if self.table.phase(token)? != ConnectionPhase::ReadingRequestHead {
+            return Ok(());
+        }
+        if self
+            .table
+            .deadline(token)
+            .map_err(WorkerError::from)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        schedule_phase_deadline(
+            &mut self.table,
+            &mut self.timers,
+            token,
+            now_ns,
+            self.timeouts,
+        )?;
+        Ok(())
+    }
+
+    // NOTE: fully flushed response fast path: the request and its response
+    // completed in one turn, so only the keep-alive idle deadline is needed.
+    // The normal transition chain would arm and cancel a response deadline
+    // around a write that never blocked.
+    pub fn complete_response(
+        &mut self,
+        token: ConnectionToken,
+        now_ns: u64,
+    ) -> Result<(), WorkerError> {
+        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+            Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let phase = self.table.phase(token)?;
+        if matches!(
+            phase,
+            ConnectionPhase::ReadingRequestHead
+                | ConnectionPhase::ReadingRequestBody
+                | ConnectionPhase::AwaitingHandler
+        ) {
+            self.table
+                .transition(token, ConnectionPhase::WritingResponse)
+                .map_err(WorkerError::from)?;
+        }
+        if phase != ConnectionPhase::KeepAliveIdle {
+            self.table
+                .transition(token, ConnectionPhase::KeepAliveIdle)
+                .map_err(WorkerError::from)?;
+        }
+        schedule_phase_deadline(
+            &mut self.table,
+            &mut self.timers,
+            token,
+            now_ns,
+            self.timeouts,
+        )?;
         Ok(())
     }
 
@@ -531,7 +596,6 @@ impl<'a> Worker<'a> {
 
     fn admit_staged(
         &mut self,
-        now_ns: u64,
         admitted: &mut [Option<AdmittedConnection>],
     ) -> Result<usize, WorkerError> {
         let mut done = 0;
@@ -583,26 +647,6 @@ impl<'a> Worker<'a> {
                 self.compact_staging(done);
                 release.map_err(WorkerError::from)?;
                 return Err(WorkerError::Invalid);
-            }
-
-            if let Err(error) = schedule_phase_deadline(
-                &mut self.table,
-                &mut self.timers,
-                token,
-                now_ns,
-                self.timeouts,
-            ) {
-                let release = self.table.release(token);
-                close_connection(&mut *self.shutdown, Some(&mut self.timers));
-                drop(accepted);
-                self.compact_staging(done);
-                release.map_err(WorkerError::from)?;
-
-                if error == DeadlineError::Full {
-                    return Err(WorkerError::TimerCapacity);
-                }
-
-                return Err(error.into());
             }
 
             let live_slot = self

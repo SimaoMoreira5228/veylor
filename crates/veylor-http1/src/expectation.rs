@@ -1,3 +1,5 @@
+use crate::fields::is_token;
+
 pub(crate) fn parse(value: &[u8]) -> Result<bool, ExpectationError> {
     let mut offset = 0;
     let mut expect_continue = false;
@@ -129,10 +131,6 @@ fn skip_ows(value: &[u8], offset: &mut usize) {
     {
         *offset += 1;
     }
-}
-
-fn is_token(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 #[cfg(test)]

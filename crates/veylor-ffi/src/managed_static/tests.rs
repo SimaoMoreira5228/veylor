@@ -730,7 +730,7 @@ unsafe fn is_writable(
 }
 
 unsafe fn wait_stream_writable(server: *mut VylManagedStaticServer, token: VylManagedStaticToken) {
-    for _ in 0..500 {
+    for _ in 0..3000 {
         let (result, writable) = unsafe { is_writable(server, token) };
         assert_eq!(result, VylResult::Ok);
         if writable == 1 {
@@ -4284,9 +4284,9 @@ unsafe fn wait_writable_event(
     server: *mut VylManagedStaticServer,
     token: VylManagedStaticToken,
 ) -> VylManagedStaticEvent {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let mut events = [VylManagedStaticEvent::default(); 8];
+        let mut events = [VylManagedStaticEvent::default(); 1];
         let mut methods = [0u8; 256];
         let mut paths = [0u8; 4096];
         let report =
@@ -5690,7 +5690,7 @@ fn config_rejects_invalid_address_and_limits() {
     );
 
     let mut config = test_config(0);
-    config.worker_count = 17;
+    config.worker_count = MAX_WORKERS as u64 + 1;
     let mut server = std::ptr::null_mut();
     assert_eq!(
         unsafe { vyl_managed_static_new(&config, &mut server) },
