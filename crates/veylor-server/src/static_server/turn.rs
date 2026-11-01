@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use veylor_http2::{HpackTable, StreamTable};
 use veylor_router::RouteSlot;
+#[cfg(target_os = "linux")]
+use veylor_runtime::BatchRing;
 use veylor_runtime::{
     AcceptedConnection, AdmittedConnection, ConnectionDeadline, ConnectionDeadlineKind,
     ConnectionPhase, ConnectionSlot, ConnectionToken, PollInterest, Poller, Readiness,
@@ -12,9 +14,11 @@ use veylor_runtime::{
     WAKE_TOKEN, Worker, WorkerError, WorkerStorage,
 };
 
+#[cfg(target_os = "linux")]
+use super::{batch_recv, batch_send};
 use crate::connection::tls::tls_alpn_is_h2;
 use crate::connection::{
-    ConnClose, ConnPhase, ConnState, PumpOutcome, PumpProgress, pump_connection,
+    ConnClose, ConnPhase, ConnState, PumpOutcome, PumpProgress, pump_connection, reuse_keep_alive,
 };
 use crate::h2::H2Conn;
 use crate::h2::slots as h2_slots;
@@ -197,6 +201,12 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let mut h2_c6: Option<H2Conn<'_>> = None;
     let mut h2_c7: Option<H2Conn<'_>> = None;
     let base = Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut batch_ring = BatchRing::new(MAX_EVENTS_PER_TURN as u32).ok();
+    #[cfg(target_os = "linux")]
+    let mut read_slots: Vec<usize> = Vec::with_capacity(MAX_EVENTS_PER_TURN);
+    #[cfg(target_os = "linux")]
+    let mut send_slots: Vec<usize> = Vec::with_capacity(MAX_EVENTS_PER_TURN);
     let mut stop_seen = false;
     let mut h1_quiet = false;
     let mut parked_live = false;
@@ -206,6 +216,11 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let mut tls_epoch_seen = 0u64;
 
     loop {
+        #[cfg(target_os = "linux")]
+        {
+            read_slots.clear();
+            send_slots.clear();
+        }
         let now_ns = base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         if force.load(Ordering::Acquire) {
             worker.force_shutdown();
@@ -245,7 +260,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         let pending = if h1_quiet {
             h2_want
         } else {
-            work_pending(&conns, h2_want)
+            let horizon = worker.slot_horizon().min(max_conns);
+            work_pending(&conns[..horizon], h2_want)
         };
         let stream_wait_ms = if pending { 0 } else { config.poll_wait_ms };
         let worker_wait_ms = if live_streams == 0 { stream_wait_ms } else { 0 };
@@ -272,14 +288,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 if h2_turn::note_readiness(&mut h2_meta, &event) {
                     continue;
                 }
-                let Some(conn) = conns
-                    .get_mut(event.token.wrapping_sub(1))
-                    .and_then(|slot| slot.as_mut())
-                else {
+                let slot = event.token.wrapping_sub(1);
+                let Some(conn) = conns.get_mut(slot).and_then(|entry| entry.as_mut()) else {
                     continue;
                 };
                 if event.readable || event.read_closed_hint {
                     conn.mark_readable();
+                    #[cfg(target_os = "linux")]
+                    read_slots.push(slot);
                 }
                 if event.writable {
                     conn.mark_writable();
@@ -509,6 +525,12 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             && h1_staged_empty
             && !parked_live;
         h1_quiet = skip_pump;
+        #[cfg(target_os = "linux")]
+        if !skip_pump {
+            if let Some(ring) = batch_ring.as_mut() {
+                batch_recv::recv_ready(ring, &mut conns, &read_slots, per_conn_budget);
+            }
+        }
         let sweep_steps = if skip_pump { 0 } else { max_conns };
         let h1_live = worker.live_count();
         let mut swept = 0;
@@ -525,6 +547,10 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             let Some(conn) = conns[slot].as_mut() else {
                 continue;
             };
+            #[cfg(target_os = "linux")]
+            if batch_ring.is_some() {
+                conn.defer_write = true;
+            }
             swept += 1;
             parked_now |= conn.is_parked();
             if draining {
@@ -757,6 +783,10 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 continue;
             }
             if let Some(conn) = conns[slot].as_mut() {
+                #[cfg(target_os = "linux")]
+                if conn.write_deferred && conn.has_pending_output() {
+                    send_slots.push(slot);
+                }
                 let want = conn.write_blocked;
                 if want != conn.write_interest {
                     conn.write_interest = want;
@@ -772,6 +802,22 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         }
         if !skip_pump {
             parked_live = parked_now;
+            #[cfg(target_os = "linux")]
+            if let Some(ring) = batch_ring.as_mut() {
+                if !send_slots.is_empty() {
+                    batch_send::send_pending(ring, &mut conns, &send_slots, per_conn_budget);
+                    flush_deferred_sends(
+                        &send_slots,
+                        &mut conns,
+                        &mut worker,
+                        &mut stream_poller,
+                        &host,
+                        &mut result.counts,
+                        &mut tls_acceptor,
+                        now_ns,
+                    );
+                }
+            }
         }
         let h2_pump_enabled = h2_enabled && h2_slots::occupied(&h2_meta) > 0;
         drive_h2_pumps!(
@@ -1159,6 +1205,117 @@ fn apply_pump_hooks(
     None
 }
 
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn flush_deferred_sends(
+    slots: &[usize],
+    conns: &mut [Option<ConnState>],
+    worker: &mut Worker<'_>,
+    stream_poller: &mut Poller,
+    host: &HostShared,
+    counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
+    now_ns: u64,
+) {
+    for &slot in slots {
+        let (token, sent, error, done, closing, reason) = {
+            let Some(conn) = conns[slot].as_mut() else {
+                continue;
+            };
+            conn.write_deferred = false;
+            conn.defer_write = false;
+            let sent = conn.deferred_sent;
+            conn.deferred_sent = 0;
+            (
+                conn.token(),
+                sent,
+                conn.error_hint,
+                conn.phase == ConnPhase::SendingResponse && !conn.has_pending_output(),
+                conn.closing,
+                conn.close_reason,
+            )
+        };
+        if error {
+            close_conn(
+                slot,
+                ConnClose::TransportError,
+                host,
+                conns,
+                stream_poller,
+                worker,
+                counts,
+                tls_acceptor,
+            );
+            continue;
+        }
+        if done {
+            if closing {
+                close_conn(
+                    slot,
+                    reason,
+                    host,
+                    conns,
+                    stream_poller,
+                    worker,
+                    counts,
+                    tls_acceptor,
+                );
+                continue;
+            }
+            if let Some(conn) = conns[slot].as_mut() {
+                conn.file = None;
+                reuse_keep_alive(conn);
+            }
+            let progress = PumpProgress {
+                response_flushed: true,
+                ..PumpProgress::default()
+            };
+            if let Some(reason) = apply_pump_hooks(worker, token, progress, now_ns) {
+                close_conn(
+                    slot,
+                    reason,
+                    host,
+                    conns,
+                    stream_poller,
+                    worker,
+                    counts,
+                    tls_acceptor,
+                );
+            }
+            continue;
+        }
+        let progress = PumpProgress {
+            bytes_written: sent as u64,
+            ..PumpProgress::default()
+        };
+        if let Some(reason) = apply_pump_hooks(worker, token, progress, now_ns) {
+            close_conn(
+                slot,
+                reason,
+                host,
+                conns,
+                stream_poller,
+                worker,
+                counts,
+                tls_acceptor,
+            );
+            continue;
+        }
+        if let Some(conn) = conns[slot].as_mut() {
+            let want = conn.write_blocked;
+            if want != conn.write_interest {
+                conn.write_interest = want;
+                let interest = if want {
+                    PollInterest::ReadWrite
+                } else {
+                    PollInterest::Readable
+                };
+                let _ = stream_poller.reregister(&mut conn.stream, conn_poll_token(slot), interest);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn close_conn(
     index: usize,
@@ -1242,11 +1399,18 @@ fn cleanup_all(
 }
 
 fn work_pending(conns: &[Option<ConnState>], h2_pending: bool) -> bool {
-    conns
-        .iter()
-        .flatten()
-        .any(|conn| conn.has_pending_output() || conn.has_unparsed_input() || conn.read_armed())
-        || h2_pending
+    if h2_pending {
+        return true;
+    }
+    for slot in conns {
+        let Some(conn) = slot else {
+            continue;
+        };
+        if conn.has_pending_output() || conn.has_unparsed_input() || conn.read_armed() {
+            return true;
+        }
+    }
+    false
 }
 
 fn close_idle_for_drain(

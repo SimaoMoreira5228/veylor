@@ -92,6 +92,7 @@ pub struct ConnState {
     pub(crate) trailer_slots: Option<Box<[Header; crate::connection::parked::TRAILER_SLOTS]>>,
     pub(crate) trailer_staged: usize,
     pub(crate) len: usize,
+    pub(crate) batched_read: usize,
     pub(crate) head_len: usize,
     pub(crate) output: Option<Box<[u8; OUTPUT_CAP]>>,
     pub(crate) out_len: usize,
@@ -103,6 +104,9 @@ pub struct ConnState {
     pub(crate) file_cache: FdCache,
     pub(crate) read_ready: bool,
     pub(crate) write_blocked: bool,
+    pub(crate) defer_write: bool,
+    pub(crate) write_deferred: bool,
+    pub(crate) deferred_sent: usize,
     pub(crate) write_interest: bool,
     pub(crate) closing: bool,
     pub(crate) close_reason: ConnClose,
@@ -130,6 +134,7 @@ impl ConnState {
             trailer_slots: None,
             trailer_staged: 0,
             len: 0,
+            batched_read: 0,
             head_len: 0,
             output: None,
             out_len: 0,
@@ -141,6 +146,9 @@ impl ConnState {
             file_cache: FdCache::default(),
             read_ready: true,
             write_blocked: false,
+            defer_write: false,
+            write_deferred: false,
+            deferred_sent: 0,
             write_interest: false,
             closing: false,
             close_reason: ConnClose::Completed,
@@ -331,7 +339,12 @@ pub fn pump_connection(
     let draining_body = matches!(conn.phase, ConnPhase::DrainingBody { .. });
     let reading = (conn.phase == ConnPhase::ReadingHead || draining_body) && conn.len < INPUT_CAP;
     let token = conn.token;
-    let mut progress = PumpProgress::default();
+    let batched_read = conn.batched_read;
+    conn.batched_read = 0;
+    let mut progress = PumpProgress {
+        bytes_read: batched_read as u64,
+        ..PumpProgress::default()
+    };
     let read_ready = conn.read_ready;
     let out_sent = conn.out_sent;
     let out_len = conn.out_len;
@@ -346,18 +359,17 @@ pub fn pump_connection(
     let sending = conn.phase == ConnPhase::SendingResponse || conn.phase == ConnPhase::SendingFile;
     let flushing_interim =
         matches!(conn.phase, ConnPhase::DrainingBody { .. }) && out_sent < out_len;
-    let write_ready = (sending || flushing_interim) && out_sent < out_len && !conn.write_blocked;
+    let wants_write = (sending || flushing_interim) && out_sent < out_len && !conn.write_blocked;
+    let defer = conn.defer_write && conn.phase == ConnPhase::SendingResponse;
+    if defer && wants_write {
+        conn.write_deferred = true;
+    }
+    let write_ready = wants_write && !defer;
     // NOTE: slabs materialize on activity, not on phase: a quiet conn (reads wanted but
     // nothing signaled) keeps zero slabs through pump turns; the empty scratch dispatches
     // an Idle read that attempts nothing.
     if reading && read_ready {
         ConnState::materialize_input(&mut conn.input);
-    } else if conn.is_idle() {
-        // NOTE: retain-vs-reclaim invariant: keep-alive exchanges retain every slab so the
-        // hot loop never reallocs; only this idle-gated reclaim drops input+headers+output.
-        conn.input = None;
-        conn.headers = None;
-        conn.output = None;
     }
     let len = conn.len;
     let read_scratch: &mut [u8] = match conn.input.as_mut() {
@@ -388,7 +400,7 @@ pub fn pump_connection(
     match read {
         ReadStatus::Progress(bytes) => {
             conn.len += bytes;
-            progress.bytes_read = bytes as u64;
+            progress.bytes_read += bytes as u64;
         }
         ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
         ReadStatus::Closed(CloseReason::PeerClosed) => {
@@ -486,6 +498,63 @@ pub fn pump_connection(
         }
     }
 
+    // NOTE: the encode above happens after this turn's dispatch, so without this flush the
+    // response would wait a whole poll turn for its write. A response just encoded into an
+    // empty socket writes immediately; blocked/oversize tails keep the normal next-turn path.
+    if progress.entered_response
+        && conn.phase == ConnPhase::SendingResponse
+        && conn.file.is_none()
+        && !conn.write_blocked
+        && progress.bytes_written == 0
+    {
+        if conn.defer_write {
+            conn.write_deferred = true;
+        } else {
+            let out_sent = conn.out_sent;
+            let out_len = conn.out_len;
+            if out_len > out_sent {
+                let write_src = match conn.output.as_ref() {
+                    Some(output) => &output[out_sent..out_len],
+                    None => &[][..],
+                };
+                let budget = byte_budget.saturating_sub(progress.bytes_read);
+                if !write_src.is_empty() && budget > 0 {
+                    let mut batch = [IoBatch::new(
+                        token,
+                        &mut conn.stream,
+                        &mut [],
+                        false,
+                        write_src,
+                        true,
+                    )];
+                    dispatch(budget, &mut batch);
+                    match batch[0].write {
+                        WriteStatus::Progress(accepted)
+                        | WriteStatus::WouldBlock(accepted)
+                        | WriteStatus::BudgetExhausted(accepted)
+                        | WriteStatus::Interrupted(accepted) => {
+                            if matches!(batch[0].write, WriteStatus::WouldBlock(_)) {
+                                conn.write_blocked = true;
+                            }
+                            conn.out_sent += accepted;
+                            progress.bytes_written = accepted as u64;
+                        }
+                        WriteStatus::Closed(CloseReason::PeerClosed) => {
+                            return PumpOutcome::Close(ConnClose::PeerClosed);
+                        }
+                        WriteStatus::Closed(CloseReason::Reset) => {
+                            return PumpOutcome::Close(ConnClose::Reset);
+                        }
+                        WriteStatus::Closed(CloseReason::Error(_)) | WriteStatus::Error(_) => {
+                            return PumpOutcome::Close(ConnClose::TransportError);
+                        }
+                        WriteStatus::Idle => {}
+                    }
+                }
+            }
+        }
+    }
+
     // NOTE: a file transfer completes only when its staged offset reaches plan size, so
     // partial flushes keep their WritingResponse deadline via byte progress; the re-arm
     // keeps the poll wait at zero between chunks instead of paying a cadence per slice.
@@ -521,14 +590,7 @@ fn pump_tls_full(
     let mut progress = PumpProgress::default();
     let read_ready_before = conn.read_ready;
 
-    if conn.is_idle() {
-        conn.input = None;
-        conn.headers = None;
-
-        if conn.tls_unflushed() == 0 && conn.out_sent >= conn.out_len {
-            conn.output = None;
-        }
-    } else if conn.len < INPUT_CAP {
+    if conn.len < INPUT_CAP {
         ConnState::materialize_input(&mut conn.input);
     }
 
@@ -620,15 +682,17 @@ fn pump_tls_full(
     PumpOutcome::Keep(progress)
 }
 
-fn reuse_keep_alive(conn: &mut ConnState) {
+pub(crate) fn reuse_keep_alive(conn: &mut ConnState) {
     // NOTE: mechanics only, not the reuse decision: admission is the shared
     // veylor_http1::response_permits_reuse verdict folded into conn.closing at the encode
     // sites (static/parked keep_open) with request-body drain enforced by the DrainingBody
     // phase; this function only shifts the pipelined tail, resets the parser, and re-arms
     // read_ready for the next exchange.
     let tail = conn.len - conn.head_len;
-    if let Some(input) = conn.input.as_mut() {
-        input.copy_within(conn.head_len..conn.len, 0);
+    if tail > 0 {
+        if let Some(input) = conn.input.as_mut() {
+            input.copy_within(conn.head_len..conn.len, 0);
+        }
     }
     conn.len = tail;
     conn.head_len = 0;
@@ -672,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn first_exchange_materializes_and_reuse_retains_until_quiet_reclaim() {
+    fn first_exchange_materializes_and_reuse_retains_slabs_while_quiet() {
         let mut conn = test_conn();
         let request = b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let input = ConnState::materialize_input(&mut conn.input);
@@ -699,10 +763,13 @@ mod tests {
         assert!(conn.output.is_some());
         assert!(conn.is_idle());
         assert!(!conn.read_ready);
+        let input_ptr = conn.input.as_ref().map(|slab| slab.as_ptr());
+        let headers_ptr = conn.headers.as_ref().map(|slab| slab.as_ptr());
+        let output_ptr = conn.output.as_ref().map(|slab| slab.as_ptr());
         let _ = pump_connection(&mut conn, &routes, &table, u64::MAX, 0, &host, false);
-        assert!(conn.input.is_none());
-        assert!(conn.headers.is_none());
-        assert!(conn.output.is_none());
+        assert_eq!(conn.input.as_ref().map(|slab| slab.as_ptr()), input_ptr);
+        assert_eq!(conn.headers.as_ref().map(|slab| slab.as_ptr()), headers_ptr);
+        assert_eq!(conn.output.as_ref().map(|slab| slab.as_ptr()), output_ptr);
         assert!(conn.is_idle());
     }
 

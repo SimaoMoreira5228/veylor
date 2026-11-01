@@ -105,6 +105,7 @@ pub struct ConnectionTable<'slots, 'free> {
     slots: &'slots mut [ConnectionSlot],
     free_stack: &'free mut [u32],
     free_count: usize,
+    slot_horizon: usize,
 }
 
 pub fn deadline_timer_id(token: ConnectionToken) -> u64 {
@@ -141,6 +142,7 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
             worker_id,
             worker_generation,
             free_count: slots.len(),
+            slot_horizon: 0,
             slots,
             free_stack,
         })
@@ -165,6 +167,7 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
         }
 
         self.free_count = stack_index;
+        self.slot_horizon = self.slot_horizon.max(slot_index as usize + 1);
         slot.resource_id = resource_id;
         slot.deadline_timer_id = 0;
         slot.deadline_ns = 0;
@@ -179,6 +182,13 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
             worker_generation: self.worker_generation,
             generation: slot.generation,
         })
+    }
+
+    // NOTE: every occupied slot sits strictly below this horizon (allocate raises it,
+    // release never lowers it), so callers that only need to touch live slots can
+    // bound a scan instead of walking the whole table.
+    pub fn slot_horizon(&self) -> usize {
+        self.slot_horizon
     }
 
     pub fn lookup(&self, token: ConnectionToken) -> Result<u64, TableError> {

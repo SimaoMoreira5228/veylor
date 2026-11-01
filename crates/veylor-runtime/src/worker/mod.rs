@@ -529,6 +529,10 @@ impl<'a> Worker<'a> {
         self.live_count
     }
 
+    pub fn slot_horizon(&self) -> usize {
+        self.table.slot_horizon()
+    }
+
     fn accept_into_staging(&mut self, listener: &mut TcpListener) -> Result<(), WorkerError> {
         let free = self.staging.len() - self.staged;
 

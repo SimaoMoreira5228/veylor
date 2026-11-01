@@ -15,6 +15,11 @@ use crate::host::{HostHandle, HostShared};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::{MAX_ROUTES, NativeHandler, RouteBuildError, StaticRoutes};
 
+#[cfg(target_os = "linux")]
+mod batch_recv;
+#[cfg(target_os = "linux")]
+mod batch_send;
+
 pub(crate) mod h3;
 pub(crate) mod turn;
 
@@ -23,8 +28,8 @@ pub(crate) use turn::worker_main;
 // NOTE: per-worker connection ceiling: 1024 makes the 10k-idle ladder reachable
 // via fan-out within MAX_WORKERS. Beyond it the first breaks are fd limits (one
 // fd per conn plus pollers), then the const-sized host park tables, then
-// per-worker memory (~1 KiB fixed per slot, ~16 KiB slabs per active conn once
-// input/output materialize). H1 tables ride ServerConfig::max_connections
+// per-worker memory (~1 KiB fixed per slot, ~19 KiB retained slabs per
+// materialized keep-alive conn). H1 tables ride ServerConfig::max_connections
 // (1..=MAX_CONNECTIONS); the H2/host slot space still rides this const, so the
 // config value can never index out of range there.
 pub const MAX_CONNECTIONS: usize = 1024;

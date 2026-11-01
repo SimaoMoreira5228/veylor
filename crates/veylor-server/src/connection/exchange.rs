@@ -163,10 +163,13 @@ fn encode_static(
             // drain waits on poll instead of spinning the worker turn.
             let buffered = (conn.len - conn.head_len) as u64;
             let skip = buffered.min(drain_total) as usize;
-            if let Some(input) = conn.input.as_mut() {
-                input.copy_within(conn.head_len + skip..conn.len, 0);
+            let consumed = conn.head_len + skip;
+            if consumed < conn.len {
+                if let Some(input) = conn.input.as_mut() {
+                    input.copy_within(consumed..conn.len, 0);
+                }
             }
-            conn.len -= conn.head_len + skip;
+            conn.len -= consumed;
             conn.head_len = 0;
             let remaining = drain_total - skip as u64;
             // NOTE: HEAD and empty files complete with the head alone; only GET bodies
