@@ -577,6 +577,11 @@ fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) ->
             conn.pending_len = 0;
             conn.closing = true;
             conn.close_reason = ConnClose::Completed;
+            conn.close_drain_remaining = if head.is_chunked {
+                u64::MAX
+            } else {
+                head.content_length.unwrap_or(0)
+            };
             conn.phase = ConnPhase::SendingResponse;
             ExchangeOutcome::Responded
         }

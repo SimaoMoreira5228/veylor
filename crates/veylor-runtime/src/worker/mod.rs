@@ -257,7 +257,8 @@ impl<'a> Worker<'a> {
             }
         }
 
-        for index in 0..self.live.len() {
+        let horizon = self.table.slot_horizon().min(self.live.len());
+        for index in 0..horizon {
             if expired_count == expired.len() {
                 break;
             }

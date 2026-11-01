@@ -124,6 +124,7 @@ pub fn decode_header_block(
     table: &mut HpackTable<'_>,
     headers_output: &mut [HpackHeader],
 ) -> Result<(usize, usize), HpackError> {
+    table.compact_scratch();
     let required_size_update = table.required_size_update();
     if let Some(maximum) = required_size_update {
         if !input.first().is_some_and(|byte| byte & 0xe0 == 0x20) {
@@ -184,6 +185,7 @@ fn decode_literal_field(
     let (name_index, index_length) =
         decode_hpack_integer(input, prefix_bits).map_err(HpackError::Integer)?;
     let mut offset = index_length;
+    let name_is_fresh = name_index == 0;
     let name = if name_index == 0 {
         let (name, consumed) = decode_string_into_table(&input[offset..], table)?;
         offset += consumed;
@@ -191,13 +193,35 @@ fn decode_literal_field(
     } else {
         table.get(name_index).ok_or(HpackError::InvalidIndex)?.name
     };
+    if representation == HpackRepresentation::Incremental {
+        let name = if name_is_fresh {
+            name
+        } else {
+            table.copy_span_forward(name).map_err(HpackError::Table)?
+        };
+        let (value, value_length) = decode_string_into_table(&input[offset..], table)?;
+        offset += value_length;
+        let HpackBytes::Scratch(value_span) = value else {
+            return Err(HpackError::InvalidIndex);
+        };
+        table
+            .insert_owned_parts(name, value_span)
+            .map_err(HpackError::Table)?;
+        return Ok((
+            HpackHeader {
+                field: HpackField {
+                    name,
+                    value: HpackBytes::Scratch(value_span),
+                },
+                representation,
+            },
+            offset,
+        ));
+    }
+
     let (value, value_length) = decode_string_into_table(&input[offset..], table)?;
     offset += value_length;
     let field = HpackField { name, value };
-
-    if representation == HpackRepresentation::Incremental {
-        table.insert_field(field).map_err(HpackError::Table)?;
-    }
 
     Ok((
         HpackHeader {

@@ -1,5 +1,5 @@
 use std::io;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use veylor_runtime::{
 use super::{batch_recv, batch_send};
 use crate::connection::tls::tls_alpn_is_h2;
 use crate::connection::{
-    ConnClose, ConnPhase, ConnState, PumpOutcome, PumpProgress, pump_connection, reuse_keep_alive,
+    CLOSE_DRAIN_BYTES, ConnClose, ConnPhase, ConnState, PumpOutcome, PumpProgress, pump_connection,
 };
 use crate::h2::H2Conn;
 use crate::h2::slots as h2_slots;
@@ -32,7 +32,7 @@ use super::{CloseCounts, LISTENER_TOKEN, MAX_CONNECTIONS, MAX_EVENTS_PER_TURN, S
 const MAX_EXPIRED_PER_TURN: usize = 64;
 const SENTINEL_SLOT: u32 = u32::MAX;
 
-fn conn_poll_token(slot: usize) -> usize {
+pub(super) fn conn_poll_token(slot: usize) -> usize {
     slot + 1
 }
 
@@ -806,7 +806,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             if let Some(ring) = batch_ring.as_mut() {
                 if !send_slots.is_empty() {
                     batch_send::send_pending(ring, &mut conns, &send_slots, per_conn_budget);
-                    flush_deferred_sends(
+                    batch_send::flush_deferred_sends(
                         &send_slots,
                         &mut conns,
                         &mut worker,
@@ -1136,7 +1136,7 @@ pub(crate) fn apply_h2_staged(
 // NOTE: hook failures mean the worker table diverged from connection state; a
 // failed transition already parks the slot in Closing, so the server closes the
 // connection instead of running it deadline-less or retrying into the park.
-fn apply_pump_hooks(
+pub(super) fn apply_pump_hooks(
     worker: &mut Worker<'_>,
     token: ConnectionToken,
     progress: PumpProgress,
@@ -1205,119 +1205,8 @@ fn apply_pump_hooks(
     None
 }
 
-#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn flush_deferred_sends(
-    slots: &[usize],
-    conns: &mut [Option<ConnState>],
-    worker: &mut Worker<'_>,
-    stream_poller: &mut Poller,
-    host: &HostShared,
-    counts: &mut CloseCounts,
-    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
-    now_ns: u64,
-) {
-    for &slot in slots {
-        let (token, sent, error, done, closing, reason) = {
-            let Some(conn) = conns[slot].as_mut() else {
-                continue;
-            };
-            conn.write_deferred = false;
-            conn.defer_write = false;
-            let sent = conn.deferred_sent;
-            conn.deferred_sent = 0;
-            (
-                conn.token(),
-                sent,
-                conn.error_hint,
-                conn.phase == ConnPhase::SendingResponse && !conn.has_pending_output(),
-                conn.closing,
-                conn.close_reason,
-            )
-        };
-        if error {
-            close_conn(
-                slot,
-                ConnClose::TransportError,
-                host,
-                conns,
-                stream_poller,
-                worker,
-                counts,
-                tls_acceptor,
-            );
-            continue;
-        }
-        if done {
-            if closing {
-                close_conn(
-                    slot,
-                    reason,
-                    host,
-                    conns,
-                    stream_poller,
-                    worker,
-                    counts,
-                    tls_acceptor,
-                );
-                continue;
-            }
-            if let Some(conn) = conns[slot].as_mut() {
-                conn.file = None;
-                reuse_keep_alive(conn);
-            }
-            let progress = PumpProgress {
-                response_flushed: true,
-                ..PumpProgress::default()
-            };
-            if let Some(reason) = apply_pump_hooks(worker, token, progress, now_ns) {
-                close_conn(
-                    slot,
-                    reason,
-                    host,
-                    conns,
-                    stream_poller,
-                    worker,
-                    counts,
-                    tls_acceptor,
-                );
-            }
-            continue;
-        }
-        let progress = PumpProgress {
-            bytes_written: sent as u64,
-            ..PumpProgress::default()
-        };
-        if let Some(reason) = apply_pump_hooks(worker, token, progress, now_ns) {
-            close_conn(
-                slot,
-                reason,
-                host,
-                conns,
-                stream_poller,
-                worker,
-                counts,
-                tls_acceptor,
-            );
-            continue;
-        }
-        if let Some(conn) = conns[slot].as_mut() {
-            let want = conn.write_blocked;
-            if want != conn.write_interest {
-                conn.write_interest = want;
-                let interest = if want {
-                    PollInterest::ReadWrite
-                } else {
-                    PollInterest::Readable
-                };
-                let _ = stream_poller.reregister(&mut conn.stream, conn_poll_token(slot), interest);
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn close_conn(
+pub(super) fn close_conn(
     index: usize,
     reason: ConnClose,
     host: &HostShared,
@@ -1349,6 +1238,18 @@ fn close_conn(
                         Err(_) => break,
                     }
                 }
+            }
+        }
+    }
+    if !had_tls && conn.close_drain_remaining != 0 {
+        let mut scratch = [0u8; 4096];
+        let mut budget = conn.close_drain_remaining.min(CLOSE_DRAIN_BYTES);
+        while budget > 0 {
+            match conn.stream.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(count) => budget = budget.saturating_sub(count as u64),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
     }

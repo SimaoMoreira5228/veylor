@@ -258,26 +258,35 @@ impl<'a> HpackTable<'a> {
 
         let name_span = self.append_bytes(name);
         let value_span = self.append_bytes(value);
-        self.insert_field(HpackField {
-            name: HpackBytes::Scratch(name_span),
-            value: HpackBytes::Scratch(value_span),
-        })
+        self.insert_owned(
+            HpackField {
+                name: HpackBytes::Scratch(name_span),
+                value: HpackBytes::Scratch(value_span),
+            },
+            size,
+        );
+        Ok(TableInsert::Inserted)
     }
 
     pub fn insert_field(&mut self, field: HpackField) -> Result<TableInsert, HpackTableError> {
-        let name = self
-            .resolve(field.name)
-            .ok_or(HpackTableError::InvalidScratchSpan)?;
-        let value = self
-            .resolve(field.value)
-            .ok_or(HpackTableError::InvalidScratchSpan)?;
-        let size = entry_size(name.len(), value.len())?;
+        let name_length = part_length(field.name)?;
+        let value_length = part_length(field.value)?;
+        let size = entry_size(name_length, value_length)?;
         if size > self.max_size {
             self.clear_dynamic_entries();
             return Ok(TableInsert::DiscardedOversized);
         }
         self.ensure_insert_slot(size)?;
 
+        // NOTE: each live entry owns a disjoint scratch run. A name resolved from an
+        // older entry (indexed-name literals) is copied forward instead of sharing the
+        // span, so compaction can rewrite every span in one oldest-to-newest pass.
+        let copied = self.copy_field(field)?;
+        self.insert_owned(copied, size);
+        Ok(TableInsert::Inserted)
+    }
+
+    fn insert_owned(&mut self, field: HpackField, size: u64) {
         while self.size > self.max_size - size {
             self.evict_oldest();
         }
@@ -290,7 +299,141 @@ impl<'a> HpackTable<'a> {
         };
         self.count += 1;
         self.size += size;
+    }
+
+    pub(crate) fn copy_span_forward(
+        &mut self,
+        part: HpackBytes,
+    ) -> Result<HpackBytes, HpackTableError> {
+        match part {
+            HpackBytes::Static(bytes) => Ok(HpackBytes::Static(bytes)),
+            HpackBytes::Scratch(span) => Ok(HpackBytes::Scratch(
+                self.copy_part(HpackBytes::Scratch(span))?,
+            )),
+        }
+    }
+
+    // NOTE: decoder path: the caller has already placed the name (copied forward when it
+    // came from an older entry) and the freshly decoded value in scratch, name first, so
+    // adopting both spans keeps the entry contiguous without a second copy.
+    pub(crate) fn insert_owned_parts(
+        &mut self,
+        name: HpackBytes,
+        value: HpackSpan,
+    ) -> Result<TableInsert, HpackTableError> {
+        let name_length = part_length(name)?;
+        let size = entry_size(name_length, value.length)?;
+        if size > self.max_size {
+            self.clear_dynamic_entries();
+            return Ok(TableInsert::DiscardedOversized);
+        }
+        let end = value
+            .offset
+            .checked_add(value.length)
+            .ok_or(HpackTableError::InvalidScratchSpan)?;
+        if end > self.scratch_used {
+            return Err(HpackTableError::InvalidScratchSpan);
+        }
+        self.ensure_insert_slot(size)?;
+        self.insert_owned(
+            HpackField {
+                name,
+                value: HpackBytes::Scratch(value),
+            },
+            size,
+        );
         Ok(TableInsert::Inserted)
+    }
+
+    fn copy_field(&mut self, field: HpackField) -> Result<HpackField, HpackTableError> {
+        let name = self.copy_part(field.name)?;
+        let value = self.copy_part(field.value)?;
+        Ok(HpackField {
+            name: HpackBytes::Scratch(name),
+            value: HpackBytes::Scratch(value),
+        })
+    }
+
+    fn copy_part(&mut self, part: HpackBytes) -> Result<HpackSpan, HpackTableError> {
+        match part {
+            HpackBytes::Static(bytes) => {
+                let end = self.scratch_used.checked_add(bytes.len()).ok_or(
+                    HpackTableError::ScratchCapacity {
+                        required: usize::MAX,
+                    },
+                )?;
+                if end > self.scratch.len() {
+                    return Err(HpackTableError::ScratchCapacity { required: end });
+                }
+                Ok(self.append_bytes(bytes))
+            }
+            HpackBytes::Scratch(span) => {
+                let end = span
+                    .offset
+                    .checked_add(span.length)
+                    .ok_or(HpackTableError::InvalidScratchSpan)?;
+                if end > self.scratch_used {
+                    return Err(HpackTableError::InvalidScratchSpan);
+                }
+                let dest = self.scratch_used;
+                let dest_end =
+                    dest.checked_add(span.length)
+                        .ok_or(HpackTableError::ScratchCapacity {
+                            required: usize::MAX,
+                        })?;
+                if dest_end > self.scratch.len() {
+                    return Err(HpackTableError::ScratchCapacity { required: dest_end });
+                }
+                if dest != span.offset {
+                    self.scratch.copy_within(span.offset..end, dest);
+                }
+                self.scratch_used = dest_end;
+                Ok(HpackSpan {
+                    offset: dest,
+                    length: span.length,
+                })
+            }
+        }
+    }
+
+    // NOTE: reclaimed scratch, not table size, is what long-lived connections exhaust:
+    // every insert appends bytes and eviction never rewinds the cursor. Rewriting the
+    // live entries to the front keeps `scratch_used` at the live table size. Entries are
+    // stored newest-first while their spans were appended oldest-first, so walking the
+    // array backwards copies each run to a destination at or before its source.
+    pub(crate) fn compact_scratch(&mut self) {
+        if self.count == 0 {
+            self.scratch_used = 0;
+            return;
+        }
+        let mut write = 0usize;
+        for index in (0..self.count).rev() {
+            let Some(mut field) = self.entries[index].field else {
+                continue;
+            };
+            field.name = self.compact_part(field.name, &mut write);
+            field.value = self.compact_part(field.value, &mut write);
+            self.entries[index].field = Some(field);
+        }
+        self.scratch_used = write;
+    }
+
+    fn compact_part(&mut self, part: HpackBytes, write: &mut usize) -> HpackBytes {
+        match part {
+            HpackBytes::Static(bytes) => HpackBytes::Static(bytes),
+            HpackBytes::Scratch(span) => {
+                let dest = *write;
+                if dest != span.offset {
+                    self.scratch
+                        .copy_within(span.offset..span.offset + span.length, dest);
+                }
+                *write += span.length;
+                HpackBytes::Scratch(HpackSpan {
+                    offset: dest,
+                    length: span.length,
+                })
+            }
+        }
     }
 
     fn ensure_insert_slot(&self, new_size: u64) -> Result<(), HpackTableError> {
@@ -327,6 +470,18 @@ impl<'a> HpackTable<'a> {
         self.entries[..self.count].fill(HpackEntrySlot::EMPTY);
         self.count = 0;
         self.size = 0;
+    }
+}
+
+fn part_length(part: HpackBytes) -> Result<usize, HpackTableError> {
+    match part {
+        HpackBytes::Static(bytes) => Ok(bytes.len()),
+        HpackBytes::Scratch(span) => {
+            if span.offset.checked_add(span.length).is_none() {
+                return Err(HpackTableError::InvalidScratchSpan);
+            }
+            Ok(span.length)
+        }
     }
 }
 

@@ -208,6 +208,42 @@ fn peer_limit_shrinks_encoder_and_tracks_later_limit_increases() {
     assert_eq!(table.pending_min_size(), Some(128));
 }
 
+// NOTE: long-lived connections decode one header block after another; before compaction
+// the append-only scratch filled and the connection died with COMPRESSION_ERROR after a
+// few hundred requests even though the dynamic table itself stayed small.
+#[test]
+fn repeated_header_blocks_reclaim_scratch_on_both_tables() {
+    use crate::hpack::{
+        HpackFieldToEncode, HpackHeader, HpackRepresentation, decode_header_block,
+        encode_header_block,
+    };
+
+    let mut enc_entries = [HpackEntrySlot::EMPTY; 4];
+    let mut enc_scratch = [0u8; 128];
+    let mut encoder = HpackTable::new(&mut enc_entries, &mut enc_scratch, 128);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 4];
+    let mut dec_scratch = [0u8; 128];
+    let mut decoder = HpackTable::new(&mut dec_entries, &mut dec_scratch, 128);
+    let mut output = [0u8; 64];
+    let mut headers = [HpackHeader::EMPTY; 4];
+    let fields = [HpackFieldToEncode {
+        name: b"date",
+        value: b"Tue, 03 Nov 2026 06:00:00 GMT",
+        representation: HpackRepresentation::Incremental,
+        huffman_name: false,
+        huffman_value: false,
+    }];
+
+    for _ in 0..2_000 {
+        let written = encode_header_block(&fields, &mut encoder, &mut output).unwrap();
+        let (count, consumed) =
+            decode_header_block(&output[..written], &mut decoder, &mut headers).unwrap();
+        assert_eq!((count, consumed), (1, written));
+    }
+    assert!(encoder.scratch_used() <= 96);
+    assert!(decoder.scratch_used() <= 96);
+}
+
 fn assert_field(table: &HpackTable<'_>, index: u64, name: &[u8], value: &[u8]) {
     let field = table.get(index).unwrap();
     assert_eq!(table.resolve(field.name), Some(name));

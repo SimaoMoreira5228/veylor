@@ -68,7 +68,15 @@ pub struct BatchRing {
 
 impl BatchRing {
     pub fn new(entries: u32) -> io::Result<Self> {
-        let ring = IoUring::new(entries)?;
+        // NOTE: one worker owns this ring, so single-issuer taskrun removes the
+        // cross-CPU task-work IPIs on every completion. Older kernels reject the
+        // flags; fall back to a plain ring so batching still works there.
+        let ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .setup_defer_taskrun()
+            .build(entries)
+            .or_else(|_| IoUring::new(entries))?;
         let capacity = usize::try_from(entries).unwrap_or(0);
         Ok(Self { ring, capacity })
     }

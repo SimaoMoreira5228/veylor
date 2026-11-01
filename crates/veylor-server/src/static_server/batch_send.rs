@@ -5,9 +5,13 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-use veylor_runtime::{BatchRing, SendOp};
+use veylor_runtime::{BatchRing, PollInterest, Poller, SendOp, Worker};
 
-use crate::connection::{ConnPhase, ConnState};
+use crate::connection::{ConnClose, ConnPhase, ConnState, PumpProgress, reuse_keep_alive};
+use crate::host::HostShared;
+
+use super::CloseCounts;
+use super::turn::{apply_pump_hooks, close_conn, conn_poll_token};
 
 pub(crate) fn send_pending(
     ring: &mut BatchRing,
@@ -70,6 +74,116 @@ pub(crate) fn send_pending(
                     conn.write_blocked = true;
                 }
                 _ => conn.error_hint = true,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn flush_deferred_sends(
+    slots: &[usize],
+    conns: &mut [Option<ConnState>],
+    worker: &mut Worker<'_>,
+    stream_poller: &mut Poller,
+    host: &HostShared,
+    counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
+    now_ns: u64,
+) {
+    for &slot in slots {
+        let (token, sent, error, done, closing, reason) = {
+            let Some(conn) = conns[slot].as_mut() else {
+                continue;
+            };
+            conn.write_deferred = false;
+            conn.defer_write = false;
+            let sent = conn.deferred_sent;
+            conn.deferred_sent = 0;
+            (
+                conn.token(),
+                sent,
+                conn.error_hint,
+                conn.phase == ConnPhase::SendingResponse && !conn.has_pending_output(),
+                conn.closing,
+                conn.close_reason,
+            )
+        };
+        if error {
+            close_conn(
+                slot,
+                ConnClose::TransportError,
+                host,
+                conns,
+                stream_poller,
+                worker,
+                counts,
+                tls_acceptor,
+            );
+            continue;
+        }
+        if done {
+            if closing {
+                close_conn(
+                    slot,
+                    reason,
+                    host,
+                    conns,
+                    stream_poller,
+                    worker,
+                    counts,
+                    tls_acceptor,
+                );
+                continue;
+            }
+            if let Some(conn) = conns[slot].as_mut() {
+                conn.file = None;
+                reuse_keep_alive(conn);
+            }
+            let progress = PumpProgress {
+                response_flushed: true,
+                ..PumpProgress::default()
+            };
+            if let Some(reason) = apply_pump_hooks(worker, token, progress, now_ns) {
+                close_conn(
+                    slot,
+                    reason,
+                    host,
+                    conns,
+                    stream_poller,
+                    worker,
+                    counts,
+                    tls_acceptor,
+                );
+            }
+            continue;
+        }
+        let progress = PumpProgress {
+            bytes_written: sent as u64,
+            ..PumpProgress::default()
+        };
+        if let Some(reason) = apply_pump_hooks(worker, token, progress, now_ns) {
+            close_conn(
+                slot,
+                reason,
+                host,
+                conns,
+                stream_poller,
+                worker,
+                counts,
+                tls_acceptor,
+            );
+            continue;
+        }
+        if let Some(conn) = conns[slot].as_mut() {
+            let want = conn.write_blocked;
+            if want != conn.write_interest {
+                conn.write_interest = want;
+                let interest = if want {
+                    PollInterest::ReadWrite
+                } else {
+                    PollInterest::Readable
+                };
+                let _ = stream_poller.reregister(&mut conn.stream, conn_poll_token(slot), interest);
             }
         }
     }

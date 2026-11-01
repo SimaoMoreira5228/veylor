@@ -548,6 +548,11 @@ fn staged_response(work: StagedWork) -> Response<Body> {
 fn serve_route(routes: &[H2StaticRoute], request: Request<()>, body: Bytes) -> Response<Body> {
     let method = request.method().as_str().as_bytes();
     let path = request.uri().path().as_bytes();
+    let target = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().as_bytes())
+        .unwrap_or(path);
     let gzip = request
         .headers()
         .get_all(ACCEPT_ENCODING)
@@ -566,7 +571,7 @@ fn serve_route(routes: &[H2StaticRoute], request: Request<()>, body: Bytes) -> R
         return text(StatusCode::NOT_FOUND, b"Not Found");
     };
     if found.native {
-        return serve_native(found.route, &body, method, path, gzip);
+        return serve_native(found.route, &body, method, target, gzip);
     }
     if found.route.managed {
         return text(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable");

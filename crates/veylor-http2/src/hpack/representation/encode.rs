@@ -143,6 +143,7 @@ pub fn encode_header_block(
     table: &mut HpackTable<'_>,
     output: &mut [u8],
 ) -> Result<usize, HpackError> {
+    table.compact_scratch();
     let size_update_length = pending_table_size_update_length(table)?;
     let mut table_state = EncoderTableState::new(table);
     // NOTE: per-field resolutions live in this stack buffer for ordinary blocks; only blocks

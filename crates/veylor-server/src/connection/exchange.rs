@@ -155,6 +155,20 @@ fn encode_static(
             conn.out_sent = 0;
             conn.write_blocked = false;
             conn.closing = !keep_open;
+            // NOTE: a rejection closes without draining the declared body (413/417 keep
+            // the early response); remember what is still in flight so the close can
+            // consume it instead of resetting the peer's response.
+            conn.close_drain_remaining = if keep_open {
+                0
+            } else if drain_total == 0 {
+                if head.is_chunked {
+                    u64::MAX
+                } else {
+                    head.content_length.unwrap_or(0)
+                }
+            } else {
+                0
+            };
             conn.close_reason = ConnClose::Completed;
             // NOTE: bytes already buffered past the head are body bytes by position, so
             // skip them in place and drain the rest across pumps; the head is dropped now

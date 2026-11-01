@@ -29,6 +29,10 @@ use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_routes::StaticRoutes;
 
 pub const INPUT_CAP: usize = 8192;
+// NOTE: bytes drained from the receive queue before closing a rejected exchange, so an
+// in-flight body does not make the kernel answer the peer with an RST that swallows the
+// response. Bounded because the declared length is untrusted.
+pub(crate) const CLOSE_DRAIN_BYTES: u64 = 64 * 1024;
 pub const OUTPUT_CAP: usize = 8192;
 // NOTE: H1 request-head slots; the H2 turn has its own HEADER_SLOTS (= 64) because decoded
 // HPACK entries carry dynamic-table state and cost more per slot than these plain ranges.
@@ -110,6 +114,7 @@ pub struct ConnState {
     pub(crate) write_interest: bool,
     pub(crate) closing: bool,
     pub(crate) close_reason: ConnClose,
+    pub(crate) close_drain_remaining: u64,
     pub(crate) error_hint: bool,
     pub(crate) tls: Option<Box<TlsConn>>,
     pub(crate) tunnel_token: ConnectionToken,
@@ -152,6 +157,7 @@ impl ConnState {
             write_interest: false,
             closing: false,
             close_reason: ConnClose::Completed,
+            close_drain_remaining: 0,
             error_hint: false,
             tls: None,
             tunnel_token: ConnectionToken::default(),
@@ -380,18 +386,20 @@ pub fn pump_connection(
         Some(output) => &output[out_sent..out_len],
         None => &[],
     };
-    let mut batch = [IoBatch::new(
-        token,
-        &mut conn.stream,
-        read_scratch,
-        read_ready,
-        write_src,
-        write_ready,
-    )];
-    dispatch(byte_budget, &mut batch);
-    let read = batch[0].read;
-    let write = batch[0].write;
-    let closed = batch[0].closed;
+    let (read, write, closed) = if read_scratch.is_empty() && write_src.is_empty() {
+        (ReadStatus::Idle, WriteStatus::Idle, None)
+    } else {
+        let mut batch = [IoBatch::new(
+            token,
+            &mut conn.stream,
+            read_scratch,
+            read_ready,
+            write_src,
+            write_ready,
+        )];
+        dispatch(byte_budget, &mut batch);
+        (batch[0].read, batch[0].write, batch[0].closed)
+    };
     // NOTE: edge-triggered readiness fires only on new arrivals, so a read that stopped on
     // partial progress or budget keeps its claim; a drained socket (WouldBlock) waits for the
     // next edge instead. Without the re-arm, budget-split heads stall until more data arrives.
@@ -699,6 +707,7 @@ pub(crate) fn reuse_keep_alive(conn: &mut ConnState) {
     conn.out_len = 0;
     conn.out_sent = 0;
     conn.phase = ConnPhase::ReadingHead;
+    conn.close_drain_remaining = 0;
     conn.parser.reset();
     conn.read_ready = tail > 0;
 }

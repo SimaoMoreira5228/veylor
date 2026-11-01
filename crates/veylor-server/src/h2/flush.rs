@@ -218,6 +218,11 @@ fn tls_flush_h2(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64)
         H2Flush::Done => {
             meta.tls_pending.clear();
             meta.tls_pending_sent = 0;
+            // NOTE: the plaintext stays in `pending` until its ciphertext is fully sent;
+            // Done is the point that buffer retires. Leaving pending_len set made the
+            // next responses append past the already-sent prefix and filled the buffer.
+            meta.pending_len = 0;
+            meta.pending_sent = 0;
             meta.write_blocked = false;
             if meta.watching_write {
                 meta.watching_write = false;
