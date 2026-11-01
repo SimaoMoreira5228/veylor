@@ -8,7 +8,7 @@ use veylor_router::{RouteBodyPolicy, RouteConfig, RouteError, RouteKind, RouteSl
 use crate::static_files::{FileMounts, MountError};
 
 pub const MAX_ROUTES: usize = 64;
-pub const MAX_RESPONSE_BODY: usize = 4096;
+pub const MAX_RESPONSE_BODY: usize = 15 * 1024;
 pub(crate) const MAX_TRAILER_NAMES: usize = 32;
 pub(crate) const MAX_TRAILER_NAME_BYTES: usize = 128;
 // NOTE: default per-route body cap for callers that keep the old behavior: static routes never

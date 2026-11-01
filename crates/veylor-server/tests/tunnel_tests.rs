@@ -252,3 +252,48 @@ fn managed_tunnel_peer_close_retires_token() {
     let counts = server.join().expect("join");
     assert_eq!(counts.peer_closed, 1, "counts: {counts:?}");
 }
+
+#[test]
+fn native_websocket_echo_round_trip() {
+    let server = managed_server();
+    let host = server.host();
+    let mut client = connect(&server);
+    let request = b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    client.write_all(request).expect("write handshake");
+
+    let event = poll_request(&host);
+    assert_eq!(host.upgrade_websocket_echo(event.token), RespondOutcome::Ok);
+    let head = read_head(&mut client);
+    assert!(
+        head.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
+        "unexpected handshake: {}",
+        String::from_utf8_lossy(&head)
+    );
+
+    let mut frame = [0u8; 64];
+    let frame_len = encode_frame(true, OpCode::Text, Some(MASK), b"hello", &mut frame).unwrap();
+    client.write_all(&frame[..frame_len]).expect("write frame");
+
+    let mut expected = [0u8; 64];
+    let expected_len = encode_frame(true, OpCode::Text, None, b"hello", &mut expected).unwrap();
+    let mut echoed = [0u8; 64];
+    client
+        .read_exact(&mut echoed[..expected_len])
+        .expect("read echo");
+    assert_eq!(&echoed[..expected_len], &expected[..expected_len]);
+
+    let mut ping = [0u8; 64];
+    let ping_len = encode_frame(true, OpCode::Ping, Some(MASK), b"p", &mut ping).unwrap();
+    client.write_all(&ping[..ping_len]).expect("write ping");
+    let mut pong = [0u8; 64];
+    let pong_len = encode_frame(true, OpCode::Pong, None, b"p", &mut pong).unwrap();
+    let mut answered = [0u8; 64];
+    client
+        .read_exact(&mut answered[..pong_len])
+        .expect("read pong");
+    assert_eq!(&answered[..pong_len], &pong[..pong_len]);
+
+    drop(client);
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}

@@ -259,6 +259,12 @@ impl From<&'static str> for Body {
 pub trait Handler: Send + Sync + 'static {
     fn handle(&self, request: Request<()>, body: Bytes) -> Response<Body>;
 
+    // NOTE: synchronous routes bypass `managed` entirely, so a native/static request
+    // does not allocate a boxed future only to be handed straight back to `handle`.
+    fn is_direct(&self, _request: &Request<()>) -> bool {
+        false
+    }
+
     fn managed<'a>(
         &'a self,
         request: Request<()>,

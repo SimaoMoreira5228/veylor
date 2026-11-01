@@ -24,9 +24,7 @@ use crate::connection::streams::StreamCmd;
 use crate::host::{H3_PARK_SLOTS, HOST_MAX_REASON_BYTES, HostShared, RespondOutcome, StagedWork};
 use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::now_http_date;
-use crate::static_routes::{
-    MAX_RESPONSE_BODY, NativeRequestView, accepts_gzip_value, compress_route_body,
-};
+use crate::static_routes::{NativeRequestView, accepts_gzip_value, compress_route_body};
 
 use super::{H2StaticRoute, ServerConfig, ServerError};
 
@@ -234,6 +232,12 @@ struct RouteMatch<'a> {
 impl veylor_h3::Handler for Handler {
     fn handle(&self, request: Request<()>, body: Bytes) -> Response<Body> {
         serve_route(&self.routes, request, body)
+    }
+
+    fn is_direct(&self, request: &Request<()>) -> bool {
+        let method = request.method().as_str().as_bytes();
+        let path = request.uri().path().as_bytes();
+        select(&self.routes, method, path).is_none_or(|found| found.native || !found.route.managed)
     }
 
     fn connect<'a>(
@@ -615,15 +619,15 @@ fn serve_native(
         },
     };
     let mut reason = [0u8; HOST_MAX_REASON_BYTES];
-    let mut body_scratch = [0u8; MAX_RESPONSE_BODY];
-    match view.invoke(handler, user_data, &mut reason, &mut body_scratch) {
+    match view.invoke(handler, user_data, &mut reason) {
         Ok(invoked) => {
+            let body = invoked.body();
             if gzip && native_gzip {
-                if let Ok(Some(twin)) = compress_route_body(invoked.body) {
+                if let Ok(Some(twin)) = compress_route_body(body) {
                     return gzip_response(invoked.status, &twin);
                 }
             }
-            status_response(invoked.status, invoked.body)
+            status_response(invoked.status, body)
         }
         Err(_) => text(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error"),
     }

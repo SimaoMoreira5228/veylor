@@ -12,8 +12,8 @@ use crate::connection::trailers::{trailer_allowed, valid_trailer_field};
 use crate::host::{HOST_MAX_REASON_BYTES, HOST_TUNNEL_CAP, HostEventKind, stage_tunnel_signal};
 use crate::static_files::FileReject;
 use crate::static_routes::{
-    CONTENT_ENCODING_GZIP, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler,
-    NativeRequestView, compress_route_body,
+    CONTENT_ENCODING_GZIP, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
+    compress_route_body,
 };
 
 use super::file::FileDecision;
@@ -116,14 +116,13 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             return self.deny(stream, ErrorCode::ProtocolError, false);
         }
         let mut reason_scratch = [0u8; HOST_MAX_REASON_BYTES];
-        let mut body_scratch = [0u8; MAX_RESPONSE_BODY];
-        let invoked = match view.invoke(handler, user_data, &mut reason_scratch, &mut body_scratch)
-        {
+        let invoked = match view.invoke(handler, user_data, &mut reason_scratch) {
             Ok(invoked) => invoked,
             Err(_) => return self.deny(stream, ErrorCode::InternalError, false),
         };
+        let body = invoked.body();
         let twin = if encode {
-            match compress_route_body(invoked.body) {
+            match compress_route_body(body) {
                 Ok(twin) => twin,
                 Err(_) => return self.fail(ErrorCode::InternalError),
             }
@@ -132,7 +131,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
         };
         let (body, content_encoding, vary) = match twin {
             Some(ref twin) => (twin.as_slice(), Some(CONTENT_ENCODING_GZIP), true),
-            None => (invoked.body, None, gzip),
+            None => (body, None, gzip),
         };
         if !end {
             let refused = send_full(

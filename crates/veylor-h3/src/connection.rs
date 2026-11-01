@@ -307,15 +307,24 @@ async fn handle_request(
         close(&connection, H3_FRAME_UNEXPECTED, "expected headers");
         return Ok(());
     }
-    let Some(fields) = qpack::decode(&payload, limits.max_field_section as usize).ok() else {
+    let mut header_scratch = Vec::with_capacity(1024);
+    let mut fields = Vec::with_capacity(16);
+    if qpack::decode_into(
+        &payload,
+        limits.max_field_section as usize,
+        &mut header_scratch,
+        &mut fields,
+    )
+    .is_err()
+    {
         close(
             &connection,
             QPACK_DECOMPRESSION_FAILED,
             "header block decode failed",
         );
         return Ok(());
-    };
-    let Some(mut request) = request_from_fields(&fields) else {
+    }
+    let Some(mut request) = request_from_fields(&fields, &header_scratch) else {
         close(&connection, H3_MESSAGE_ERROR, "malformed request");
         return Ok(());
     };
@@ -387,16 +396,19 @@ async fn handle_request(
         request.extensions_mut().insert(RequestTrailers(trailers));
     }
     let is_head = request.method() == Method::HEAD;
-    let outcome = {
-        let mut writer = crate::ResponseWriter::new(&mut send);
-        handler
-            .managed(request, Bytes::from(body), &mut writer)
-            .await
-    };
-    let response = match outcome {
-        ManagedOutcome::Handled(response) => response,
-        ManagedOutcome::Pass(request, body) => handler.handle(request, body),
-        ManagedOutcome::Streamed => return Ok(()),
+    let body = Bytes::from(body);
+    let response = if handler.is_direct(&request) {
+        handler.handle(request, body)
+    } else {
+        let outcome = {
+            let mut writer = crate::ResponseWriter::new(&mut send);
+            handler.managed(request, body, &mut writer).await
+        };
+        match outcome {
+            ManagedOutcome::Handled(response) => response,
+            ManagedOutcome::Pass(request, body) => handler.handle(request, body),
+            ManagedOutcome::Streamed => return Ok(()),
+        }
     };
     let response = if response
         .body()
@@ -519,7 +531,7 @@ fn append_trailers(
     true
 }
 
-fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
+fn request_from_fields(fields: &[qpack::FieldView], scratch: &[u8]) -> Option<Request<()>> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
@@ -528,12 +540,14 @@ fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
     let mut regular = false;
     let mut headers = Vec::new();
 
-    for (name, value) in fields {
+    for view in fields {
+        let name = &scratch[view.name.clone()];
+        let value = &scratch[view.value.clone()];
         if name.first() == Some(&b':') {
             if regular {
                 return None;
             }
-            match name.as_slice() {
+            match name {
                 b":method" => set_once(&mut method, value)?,
                 b":scheme" => set_once(&mut scheme, value)?,
                 b":authority" => set_once(&mut authority, value)?,
@@ -549,7 +563,7 @@ fn request_from_fields(fields: &[qpack::Field]) -> Option<Request<()>> {
             return None;
         }
         if matches!(
-            name.as_slice(),
+            name,
             b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding" | b"upgrade"
         ) {
             return None;

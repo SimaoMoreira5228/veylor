@@ -33,7 +33,7 @@ pub const INPUT_CAP: usize = 8192;
 // in-flight body does not make the kernel answer the peer with an RST that swallows the
 // response. Bounded because the declared length is untrusted.
 pub(crate) const CLOSE_DRAIN_BYTES: u64 = 64 * 1024;
-pub const OUTPUT_CAP: usize = 8192;
+pub const OUTPUT_CAP: usize = 16 * 1024;
 // NOTE: H1 request-head slots; the H2 turn has its own HEADER_SLOTS (= 64) because decoded
 // HPACK entries carry dynamic-table state and cost more per slot than these plain ranges.
 // A peer sending 65-100 headers is served over H1 and refused over H2 — protocol cost,
@@ -118,6 +118,7 @@ pub struct ConnState {
     pub(crate) error_hint: bool,
     pub(crate) tls: Option<Box<TlsConn>>,
     pub(crate) tunnel_token: ConnectionToken,
+    pub(crate) tunnel_echo: Option<veylor_websocket::WebSocket>,
     pub(crate) tunnel_eof: bool,
     pub(crate) tunnel_notified: bool,
     pub(crate) tls_pending: Vec<u8>,
@@ -161,6 +162,7 @@ impl ConnState {
             error_hint: false,
             tls: None,
             tunnel_token: ConnectionToken::default(),
+            tunnel_echo: None,
             tunnel_eof: false,
             tunnel_notified: false,
             tls_pending: Vec::new(),

@@ -77,10 +77,9 @@ pub(super) fn respond_native(
         body,
     };
     let mut reason_buf = [0u8; HOST_MAX_REASON_BYTES];
-    let mut body_buf = [0u8; MAX_RESPONSE_BODY];
-    let invoked = request.invoke(handler, user_data, &mut reason_buf, &mut body_buf)?;
+    let invoked = request.invoke(handler, user_data, &mut reason_buf)?;
     let reason = invoked.reason;
-    let body = invoked.body;
+    let body = invoked.body();
     let status = invoked.status;
     let response_close = status == 404;
     let connection = connection_header_for_response(
@@ -172,20 +171,35 @@ pub(super) fn respond_native(
 // (serve): reentrancy guard, unwind boundary, code/status validation, bounded out-param
 // copies. Framing and response encoding stay per protocol at the call sites. An inherent
 // method rather than a re-export so both seams reach it while the module stays private.
-pub(crate) struct InvokedNative<'r, 'b> {
+pub(crate) struct InvokedNative<'r> {
     pub(crate) status: u16,
     pub(crate) reason: &'r [u8],
-    pub(crate) body: &'b [u8],
+    body: *const u8,
+    body_len: usize,
+}
+
+impl InvokedNative<'_> {
+    // NOTE: handler-owned body bytes. The ABI contract is that they stay valid until the
+    // response is assembled (the engine used to copy them into a 15 KiB stack scratch
+    // right after the call). Borrowing through `&self` keeps every caller inside that
+    // window while dropping a full body copy and a 15 KiB memset per native request.
+    #[allow(unsafe_code)]
+    pub(crate) fn body(&self) -> &[u8] {
+        if self.body_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.body, self.body_len) }
+        }
+    }
 }
 
 impl NativeRequestView {
-    pub(crate) fn invoke<'r, 'b>(
+    pub(crate) fn invoke<'r>(
         &self,
         handler: NativeHandler,
         user_data: usize,
         reason_scratch: &'r mut [u8; HOST_MAX_REASON_BYTES],
-        body_scratch: &'b mut [u8; MAX_RESPONSE_BODY],
-    ) -> Result<InvokedNative<'r, 'b>, RouteBuildError> {
+    ) -> Result<InvokedNative<'r>, RouteBuildError> {
         let mut response = NativeResponseOut {
             status: 0,
             reason: std::ptr::null(),
@@ -221,18 +235,18 @@ impl NativeRequestView {
         ) {
             return Err(RouteBuildError::Invalid);
         }
-        if !copy_handler_bytes(response.body, response.body_len, &mut body_scratch[..]) {
+        if !valid_handler_bytes(response.body, response.body_len, MAX_RESPONSE_BODY) {
             return Err(RouteBuildError::Invalid);
         }
         let reason = &reason_scratch[..response.reason_len];
-        let body = &body_scratch[..response.body_len];
         if !valid_reason(reason) {
             return Err(RouteBuildError::Invalid);
         }
         Ok(InvokedNative {
             status: response.status as u16,
             reason,
-            body,
+            body: response.body,
+            body_len: response.body_len,
         })
     }
 }
@@ -249,8 +263,15 @@ fn invoke_native(
     unsafe { handler(user_data as *mut std::ffi::c_void, request, response) }
 }
 
-// NOTE: single unsafe funnel for handler-owned out bytes: empty outputs skip the slice so
-// null+0 never forms one, and bounded lengths copy before the handler's memory can lapse.
+// NOTE: empty outputs skip the pointer check so null+0 stays legal.
+#[allow(unsafe_code)]
+fn valid_handler_bytes(src: *const u8, len: usize, cap: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    len <= cap && !src.is_null()
+}
+
 #[allow(unsafe_code)]
 fn copy_handler_bytes(src: *const u8, len: usize, dst: &mut [u8]) -> bool {
     if len == 0 {

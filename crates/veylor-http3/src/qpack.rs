@@ -1,6 +1,16 @@
-use veylor_http2::{decode_hpack_integer, decode_huffman, encode_hpack_integer};
+use std::ops::Range;
+
+use veylor_http2::{HuffmanError, decode_hpack_integer, decode_huffman, encode_hpack_integer};
 
 pub type Field = (Vec<u8>, Vec<u8>);
+
+// NOTE: borrowed decode result into a caller scratch. One scratch + one view Vec per
+// header block replaces two heap Vecs per field (static fields included).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldView {
+    pub name: Range<usize>,
+    pub value: Range<usize>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QpackError {
@@ -130,6 +140,23 @@ pub fn encode(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
 }
 
 pub fn decode(block: &[u8], max_field_section: usize) -> Result<Vec<Field>, QpackError> {
+    let mut scratch = Vec::new();
+    let mut views = Vec::new();
+    decode_into(block, max_field_section, &mut scratch, &mut views)?;
+    Ok(views
+        .into_iter()
+        .map(|view| (scratch[view.name].to_vec(), scratch[view.value].to_vec()))
+        .collect())
+}
+
+pub fn decode_into(
+    block: &[u8],
+    max_field_section: usize,
+    scratch: &mut Vec<u8>,
+    fields: &mut Vec<FieldView>,
+) -> Result<(), QpackError> {
+    scratch.clear();
+    fields.clear();
     let (required, used) =
         decode_hpack_integer(block, 8).map_err(|_| QpackError::InvalidInteger)?;
     if required != 0 {
@@ -138,19 +165,119 @@ pub fn decode(block: &[u8], max_field_section: usize) -> Result<Vec<Field>, Qpac
     let (_, base_length) =
         decode_hpack_integer(&block[used..], 7).map_err(|_| QpackError::InvalidInteger)?;
     let mut offset = used + base_length;
-    let mut fields = Vec::new();
     let mut size = 0usize;
 
     while offset < block.len() {
-        let (field, consumed) = decode_field(&block[offset..])?;
+        let (field, consumed) = decode_field_into(&block[offset..], scratch)?;
         offset += consumed;
-        size = size.saturating_add(field.0.len() + field.1.len() + 32);
+        size = size.saturating_add(field.name.len() + field.value.len() + 32);
         if size > max_field_section {
             return Err(QpackError::FieldSectionTooLarge);
         }
         fields.push(field);
     }
-    Ok(fields)
+    Ok(())
+}
+
+fn append(scratch: &mut Vec<u8>, bytes: &[u8]) -> Range<usize> {
+    let start = scratch.len();
+    scratch.extend_from_slice(bytes);
+    start..scratch.len()
+}
+
+fn decode_field_into(
+    input: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<(FieldView, usize), QpackError> {
+    let Some(&first) = input.first() else {
+        return Err(QpackError::DecompressionFailed);
+    };
+
+    if first & 0x80 != 0 {
+        let (index, used) =
+            decode_hpack_integer(input, 6).map_err(|_| QpackError::InvalidInteger)?;
+        if first & 0x40 == 0 {
+            return Err(QpackError::DecompressionFailed);
+        }
+        let (name, value) = static_field(index).ok_or(QpackError::DecompressionFailed)?;
+        return Ok((
+            FieldView {
+                name: append(scratch, name),
+                value: append(scratch, value),
+            },
+            used,
+        ));
+    }
+
+    if first & 0xC0 == 0x40 {
+        let (index, used) =
+            decode_hpack_integer(input, 4).map_err(|_| QpackError::InvalidInteger)?;
+        if first & 0x10 == 0 {
+            return Err(QpackError::DecompressionFailed);
+        }
+        let (name, _) = static_field(index).ok_or(QpackError::DecompressionFailed)?;
+        let name = append(scratch, name);
+        let (value, consumed) = decode_string_into(&input[used..], scratch)?;
+        return Ok((FieldView { name, value }, used + consumed));
+    }
+
+    if first & 0xE0 == 0x20 {
+        let (name_length, used) =
+            decode_hpack_integer(input, 3).map_err(|_| QpackError::InvalidInteger)?;
+        let end = used
+            .checked_add(name_length as usize)
+            .ok_or(QpackError::DecompressionFailed)?;
+        let raw = input.get(used..end).ok_or(QpackError::InvalidString)?;
+        let name = if first & 0x08 != 0 {
+            decode_huffman_into(raw, scratch)?
+        } else {
+            append(scratch, raw)
+        };
+        let (value, consumed) = decode_string_into(&input[end..], scratch)?;
+        return Ok((FieldView { name, value }, end + consumed));
+    }
+
+    Err(QpackError::DecompressionFailed)
+}
+
+fn decode_string_into(
+    input: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<(Range<usize>, usize), QpackError> {
+    let Some(&first) = input.first() else {
+        return Err(QpackError::InvalidString);
+    };
+    let (length, used) = decode_hpack_integer(input, 7).map_err(|_| QpackError::InvalidInteger)?;
+    let end = used
+        .checked_add(length as usize)
+        .ok_or(QpackError::InvalidString)?;
+    let raw = input.get(used..end).ok_or(QpackError::InvalidString)?;
+    let range = if first & 0x80 != 0 {
+        decode_huffman_into(raw, scratch)?
+    } else {
+        append(scratch, raw)
+    };
+    Ok((range, end))
+}
+
+fn decode_huffman_into(input: &[u8], scratch: &mut Vec<u8>) -> Result<Range<usize>, QpackError> {
+    let mut small = [0u8; 256];
+    match decode_huffman(input, &mut small) {
+        Ok(length) => {
+            let start = scratch.len();
+            scratch.extend_from_slice(&small[..length]);
+            Ok(start..scratch.len())
+        }
+        Err(HuffmanError::OutputTooSmall { required }) => {
+            let start = scratch.len();
+            scratch.resize(start + required, 0);
+            let length = decode_huffman(input, &mut scratch[start..])
+                .map_err(|_| QpackError::InvalidString)?;
+            scratch.truncate(start + length);
+            Ok(start..scratch.len())
+        }
+        Err(_) => Err(QpackError::InvalidString),
+    }
 }
 
 fn encode_field(name: &[u8], value: &[u8], out: &mut Vec<u8>) {
@@ -180,74 +307,6 @@ fn encode_string(value: &[u8], out: &mut Vec<u8>) {
     let length = encode_hpack_integer(value.len() as u64, 7, &mut header).expect("length fits");
     out.extend_from_slice(&header[..length]);
     out.extend_from_slice(value);
-}
-
-fn decode_field(input: &[u8]) -> Result<(Field, usize), QpackError> {
-    let Some(&first) = input.first() else {
-        return Err(QpackError::DecompressionFailed);
-    };
-
-    if first & 0x80 != 0 {
-        let (index, used) =
-            decode_hpack_integer(input, 6).map_err(|_| QpackError::InvalidInteger)?;
-        if first & 0x40 == 0 {
-            return Err(QpackError::DecompressionFailed);
-        }
-        let (name, value) = static_field(index).ok_or(QpackError::DecompressionFailed)?;
-        return Ok(((name.to_vec(), value.to_vec()), used));
-    }
-
-    if first & 0xC0 == 0x40 {
-        let (index, used) =
-            decode_hpack_integer(input, 4).map_err(|_| QpackError::InvalidInteger)?;
-        if first & 0x10 == 0 {
-            return Err(QpackError::DecompressionFailed);
-        }
-        let (name, _) = static_field(index).ok_or(QpackError::DecompressionFailed)?;
-        let (value, consumed) = decode_string(&input[used..])?;
-        return Ok(((name.to_vec(), value), used + consumed));
-    }
-
-    if first & 0xE0 == 0x20 {
-        let (name_length, used) =
-            decode_hpack_integer(input, 3).map_err(|_| QpackError::InvalidInteger)?;
-        let end = used
-            .checked_add(name_length as usize)
-            .ok_or(QpackError::DecompressionFailed)?;
-        let raw = input.get(used..end).ok_or(QpackError::InvalidString)?;
-        let name = if first & 0x08 != 0 {
-            decode_huffman_value(raw)?
-        } else {
-            raw.to_vec()
-        };
-        let (value, consumed) = decode_string(&input[end..])?;
-        return Ok(((name, value), end + consumed));
-    }
-
-    Err(QpackError::DecompressionFailed)
-}
-
-fn decode_string(input: &[u8]) -> Result<(Vec<u8>, usize), QpackError> {
-    let Some(&first) = input.first() else {
-        return Err(QpackError::InvalidString);
-    };
-    let (length, used) = decode_hpack_integer(input, 7).map_err(|_| QpackError::InvalidInteger)?;
-    let end = used
-        .checked_add(length as usize)
-        .ok_or(QpackError::InvalidString)?;
-    let raw = input.get(used..end).ok_or(QpackError::InvalidString)?;
-    let value = if first & 0x80 != 0 {
-        decode_huffman_value(raw)?
-    } else {
-        raw.to_vec()
-    };
-    Ok((value, end))
-}
-
-fn decode_huffman_value(input: &[u8]) -> Result<Vec<u8>, QpackError> {
-    let mut output = [0u8; 32 * 1024];
-    let length = decode_huffman(input, &mut output).map_err(|_| QpackError::InvalidString)?;
-    Ok(output[..length].to_vec())
 }
 
 fn static_field(index: u64) -> Option<(&'static [u8], &'static [u8])> {

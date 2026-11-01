@@ -1397,7 +1397,7 @@ fn managed_stream_write_without_writable_rejected_then_admitted() {
         "chunk past MAX_STREAM_WRITE rejects"
     );
     assert_eq!(
-        host.write_stream(event.token, &[b'x'; 9000]),
+        host.write_stream(event.token, &[b'x'; 16_384]),
         RespondOutcome::BodyTooLarge,
         "chunk whose frame cannot fit the output rejects at stage"
     );

@@ -965,7 +965,7 @@ fn stream_pacing_rejects_unarmed_then_admits() {
         VylResult::BodyTooLong,
         "chunk past 16 KiB rejects"
     );
-    let unframeable = vec![b'x'; 9000];
+    let unframeable = vec![b'x'; 16_384];
     assert_eq!(
         unsafe { vyl_managed_static_host_write_stream(server, token, bytes(&unframeable)) },
         VylResult::BodyTooLong,
@@ -1784,7 +1784,7 @@ fn dispatch_rejects_invalid_answers_without_consuming_one_shot() {
         unsafe { vyl_managed_static_host_respond(server, token, 200, bytes(b""), bytes(b"x")) },
         VylResult::InvalidArgument
     );
-    let oversized = vec![b'x'; 4096 + 1];
+    let oversized = vec![b'x'; 15 * 1024 + 1];
     assert_eq!(
         unsafe {
             vyl_managed_static_host_respond(server, token, 200, bytes(b"OK"), bytes(&oversized))

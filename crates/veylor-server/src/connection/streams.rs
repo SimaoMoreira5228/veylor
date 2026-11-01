@@ -99,6 +99,7 @@ pub(crate) enum StreamCmd {
     Cancel,
     Upgrade {
         response: Vec<u8>,
+        echo: bool,
     },
     H2Upgrade {
         protocol: Option<Vec<u8>>,
@@ -603,7 +604,7 @@ pub(crate) fn apply_stream_cmd(
         StreamCmd::H2Upgrade { .. } => {
             return PumpOutcome::Close(ConnClose::ProtocolError);
         }
-        StreamCmd::Upgrade { response } => {
+        StreamCmd::Upgrade { response, echo } => {
             let ConnPhase::Parked {
                 request_version,
                 body_total,
@@ -639,6 +640,8 @@ pub(crate) fn apply_stream_cmd(
             conn.closing = false;
             conn.tunnel_token = token;
             conn.tunnel_eof = false;
+            conn.tunnel_echo = echo
+                .then(|| veylor_websocket::WebSocket::server(veylor_websocket::Limits::default()));
             conn.phase = ConnPhase::Tunnel;
             progress.tunnel_upgraded = true;
             return PumpOutcome::Keep(progress);

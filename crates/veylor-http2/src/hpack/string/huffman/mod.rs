@@ -129,10 +129,83 @@ pub(super) fn encode_huffman_with_length(
     Ok(written)
 }
 
+const FAST_FALLBACK: u16 = u16::MAX;
+
+// NOTE: HPACK's common symbols (digits, lowercase, '-', '.') fit in eight bits, so one
+// byte-wide lookup replaces eight tree steps for those strings. Longer codes fall back
+// to the tree walk, which keeps the table small and the decoder unchanged semantically.
+const FAST_TABLE: [u16; 256] = build_fast_table();
+
+const fn build_fast_table() -> [u16; 256] {
+    let mut table = [FAST_FALLBACK; 256];
+    let mut symbol = 0;
+    while symbol < HUFFMAN_CODES.len() {
+        let code = HUFFMAN_CODES[symbol];
+        let length = code.bit_length() as usize;
+        if length <= 8 {
+            let base = ((code.code() << (8 - length)) & 0xFF) as usize;
+            let count = 1 << (8 - length);
+            let mut offset = 0;
+            while offset < count {
+                table[base + offset] = ((symbol as u16) << 4) | length as u16;
+                offset += 1;
+            }
+        }
+        symbol += 1;
+    }
+    table
+}
+
+fn decode_huffman_fast(input: &[u8], output: &mut [u8], required: usize) -> Option<usize> {
+    let mut accumulator = 0_u64;
+    let mut bits = 0_u32;
+    let mut index = 0usize;
+    let mut written = 0usize;
+    loop {
+        while bits < 24 && index < input.len() {
+            accumulator = (accumulator << 8) | u64::from(input[index]);
+            bits += 8;
+            index += 1;
+        }
+        if bits < 8 {
+            break;
+        }
+        let prefix = ((accumulator >> (bits - 8)) & 0xFF) as usize;
+        let entry = FAST_TABLE[prefix];
+        if entry == FAST_FALLBACK {
+            return None;
+        }
+        let length = u32::from(entry & 0xF);
+        let symbol = (entry >> 4) as u8;
+        bits -= length;
+        *output.get_mut(written)? = symbol;
+        written += 1;
+    }
+    if bits > 7 {
+        return None;
+    }
+    if bits > 0 {
+        let mask = (1_u64 << bits) - 1;
+        if accumulator & mask != mask {
+            return None;
+        }
+    }
+    // The size pass already validated the stream; matching length means every code hit
+    // and the padding bytes decoded to nothing extra.
+    if written == required {
+        Some(written)
+    } else {
+        None
+    }
+}
+
 pub fn decode_huffman(input: &[u8], output: &mut [u8]) -> Result<usize, HuffmanError> {
     let required = decode_huffman_inner(input, None)?;
     if output.len() < required {
         return Err(HuffmanError::OutputTooSmall { required });
+    }
+    if let Some(length) = decode_huffman_fast(input, &mut output[..required], required) {
+        return Ok(length);
     }
     decode_huffman_inner(input, Some(&mut output[..required]))
 }

@@ -1370,7 +1370,7 @@ fn route_view_rejects_bad_input() {
         method: b"GET",
         path: b"/a",
         status: 200,
-        body: &[0; 4097],
+        body: &[0; 15 * 1024 + 1],
         gzip_body: None,
         managed: false,
         max_body_bytes: 0,
@@ -4114,7 +4114,7 @@ static H2N_PRE_NATIVES: [FrozenNativeRoute<'static>; 1] = [FrozenNativeRoute {
     gzip: false,
 }];
 
-static H2N_BIG: [u8; 4097] = [b'x'; 4097];
+static H2N_BIG: [u8; 15 * 1024 + 1] = [b'x'; 15 * 1024 + 1];
 static H2N_BAD_REASON_BYTES: [u8; 3] = *b"B\nd";
 static H2N_END_HIT: Mutex<bool> = Mutex::new(false);
 static H2N_CAP_HIT: Mutex<bool> = Mutex::new(false);

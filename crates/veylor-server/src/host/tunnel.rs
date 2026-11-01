@@ -146,10 +146,23 @@ impl HostShared {
         self.upgrade_websocket_with_protocol(token, None)
     }
 
+    pub fn upgrade_websocket_echo(&self, token: ConnectionToken) -> RespondOutcome {
+        self.upgrade_websocket_mode(token, None, true)
+    }
+
     pub fn upgrade_websocket_with_protocol(
         &self,
         token: ConnectionToken,
         protocol: Option<&[u8]>,
+    ) -> RespondOutcome {
+        self.upgrade_websocket_mode(token, protocol, false)
+    }
+
+    fn upgrade_websocket_mode(
+        &self,
+        token: ConnectionToken,
+        protocol: Option<&[u8]>,
+        echo: bool,
     ) -> RespondOutcome {
         if protocol
             .is_some_and(|protocol| protocol.len() > HOST_MAX_PROTOCOL_BYTES || !is_token(protocol))
@@ -191,7 +204,7 @@ impl HostShared {
                         upgraded: true,
                         ..StreamState::default()
                     });
-                    entry.stream_cmd = Some(StreamCmd::Upgrade { response });
+                    entry.stream_cmd = Some(StreamCmd::Upgrade { response, echo });
                     UpgradePlan::H1
                 }
             };
@@ -475,6 +488,10 @@ impl crate::host::HostHandle {
     ) -> RespondOutcome {
         self.shared
             .upgrade_websocket_with_protocol(token, Some(protocol))
+    }
+
+    pub fn upgrade_websocket_echo(&self, token: ConnectionToken) -> RespondOutcome {
+        self.shared.upgrade_websocket_echo(token)
     }
 
     pub fn tunnel_read(&self, token: ConnectionToken, out: &mut [u8]) -> (RespondOutcome, usize) {

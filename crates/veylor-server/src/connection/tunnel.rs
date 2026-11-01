@@ -1,5 +1,7 @@
 use veylor_runtime::{CloseReason, ConnectionToken, IoBatch, ReadStatus, WriteStatus, dispatch};
 
+use veylor_websocket::{Event as WsEvent, OpCode};
+
 use crate::host::HostShared;
 
 use super::tls::{tls_encrypt_output, tls_flush_pending, tls_read_available};
@@ -122,11 +124,148 @@ fn settle_eof(
     Some(PumpOutcome::Keep(progress))
 }
 
+// NOTE: native WebSocket echo runs in the worker: the upgrade handshake is already in
+// the output buffer, then every complete client frame is unmasked and answered with an
+// unmasked server frame. No host park/pull/wake round trip is involved.
+fn pump_echo(conn: &mut ConnState, byte_budget: u64) -> PumpOutcome {
+    let mut progress = PumpProgress::default();
+    if conn.out_sent < conn.out_len {
+        match write_pending(conn, byte_budget) {
+            Ok((wrote, flushed)) => {
+                progress.bytes_written = wrote;
+                if !flushed {
+                    return PumpOutcome::Keep(progress);
+                }
+            }
+            Err(reason) => return PumpOutcome::Close(reason),
+        }
+    }
+    if conn.read_ready {
+        if conn.len >= INPUT_CAP {
+            conn.read_ready = false;
+        } else {
+            ConnState::materialize_input(&mut conn.input);
+            let len = conn.len;
+            let read_scratch: &mut [u8] = match conn.input.as_mut() {
+                Some(input) => &mut input[len..],
+                None => &mut [],
+            };
+            let mut batch = [IoBatch::new(
+                conn.tunnel_token,
+                &mut conn.stream,
+                read_scratch,
+                true,
+                &[],
+                false,
+            )];
+            dispatch(byte_budget, &mut batch);
+            match batch[0].read {
+                ReadStatus::Progress(bytes) => {
+                    conn.len += bytes;
+                    conn.read_ready = true;
+                    progress.bytes_read = bytes as u64;
+                }
+                ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
+                ReadStatus::Closed(CloseReason::PeerClosed) => {
+                    return PumpOutcome::Close(ConnClose::PeerClosed);
+                }
+                ReadStatus::Closed(CloseReason::Reset) => {
+                    return PumpOutcome::Close(ConnClose::Reset);
+                }
+                ReadStatus::Closed(CloseReason::Error(_)) | ReadStatus::Error(_) => {
+                    return PumpOutcome::Close(ConnClose::TransportError);
+                }
+                ReadStatus::BudgetExhausted => conn.read_ready = true,
+                ReadStatus::Idle
+                | ReadStatus::WouldBlock
+                | ReadStatus::PausedForWrite
+                | ReadStatus::Interrupted => conn.read_ready = false,
+            }
+        }
+    }
+    if let Err(reason) = echo_frames(conn, &mut progress, byte_budget) {
+        return PumpOutcome::Close(reason);
+    }
+    PumpOutcome::Keep(progress)
+}
+
+fn echo_frames(
+    conn: &mut ConnState,
+    progress: &mut PumpProgress,
+    budget: u64,
+) -> Result<(), ConnClose> {
+    loop {
+        let len = conn.len;
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(ws) = conn.tunnel_echo.as_mut() else {
+            return Err(ConnClose::TransportError);
+        };
+        let Some(input) = conn.input.as_mut() else {
+            return Ok(());
+        };
+        let feed = ws
+            .feed(&mut input[..len])
+            .map_err(|_| ConnClose::ProtocolError)?;
+        if feed.need_more {
+            return Ok(());
+        }
+        let consumed = feed.consumed;
+        let mut frame = [0u8; super::OUTPUT_CAP];
+        let mut close_after = false;
+        let frame_len = if let Some(event) = feed.event {
+            let (fin, opcode, payload) = match event {
+                WsEvent::Text { payload, fin } => (fin, OpCode::Text, payload),
+                WsEvent::Binary { payload, fin } => (fin, OpCode::Binary, payload),
+                WsEvent::Continuation { payload, fin } => (fin, OpCode::Continuation, payload),
+                WsEvent::Ping(payload) => (true, OpCode::Pong, payload),
+                WsEvent::Pong(_) => (true, OpCode::Pong, &[][..]),
+                WsEvent::Close(_) => {
+                    close_after = true;
+                    (true, OpCode::Close, &[][..])
+                }
+            };
+            ws.encode(fin, opcode, None, payload, &mut frame)
+                .map_err(|_| ConnClose::ProtocolError)?
+        } else {
+            0
+        };
+        if consumed > 0 {
+            if let Some(input) = conn.input.as_mut() {
+                input.copy_within(consumed..len, 0);
+            }
+            conn.len -= consumed;
+        }
+        if frame_len > 0 {
+            let output = ConnState::materialize_output(&mut conn.output);
+            output[..frame_len].copy_from_slice(&frame[..frame_len]);
+            conn.out_len = frame_len;
+            conn.out_sent = 0;
+            match write_pending(conn, budget) {
+                Ok((wrote, flushed)) => {
+                    progress.bytes_written += wrote;
+                    if !flushed {
+                        return Ok(());
+                    }
+                }
+                Err(reason) => return Err(reason),
+            }
+        }
+        if close_after {
+            return Err(ConnClose::Completed);
+        }
+    }
+}
+
 pub(crate) fn pump_tunnel(
     conn: &mut ConnState,
     host: &HostShared,
     byte_budget: u64,
 ) -> PumpOutcome {
+    if conn.tunnel_echo.is_some() {
+        return pump_echo(conn, byte_budget);
+    }
     let token = conn.tunnel_token;
     let mut progress = PumpProgress::default();
 
