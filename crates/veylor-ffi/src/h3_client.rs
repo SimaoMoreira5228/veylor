@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use veylor_h3::bytes::Bytes;
-use veylor_h3::http::{Method, Request, Uri};
+use veylor_h3::http::{HeaderValue, Method, Request, Uri};
 use veylor_h3::{Client, ClientConfig, ClientError, ClientTls, Limits};
 
 use crate::abi::{VylBytes, VylResult, catch_ffi, slice_length_valid};
@@ -38,6 +38,11 @@ pub struct VylH3Response {
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     trailers: Vec<(Vec<u8>, Vec<u8>)>,
     body: Vec<u8>,
+}
+
+pub struct VylH3Tunnel {
+    tunnel: veylor_h3::ClientTunnel,
+    last_read: Vec<u8>,
 }
 
 #[unsafe(no_mangle)]
@@ -184,6 +189,142 @@ unsafe fn request(
     });
     unsafe {
         out_response.write(Box::into_raw(response));
+    }
+    VylResult::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_client_connect_tunnel(
+    client: *mut VylH3Client,
+    url: VylBytes,
+    protocol: VylBytes,
+    subprotocol: VylBytes,
+    out_tunnel: *mut *mut VylH3Tunnel,
+) -> VylResult {
+    catch_ffi(|| unsafe { connect_tunnel(client, url, protocol, subprotocol, out_tunnel) })
+}
+
+unsafe fn connect_tunnel(
+    client: *mut VylH3Client,
+    url: VylBytes,
+    protocol: VylBytes,
+    subprotocol: VylBytes,
+    out_tunnel: *mut *mut VylH3Tunnel,
+) -> VylResult {
+    if client.is_null() || out_tunnel.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    unsafe {
+        out_tunnel.write(ptr::null_mut());
+    }
+    let url = match unsafe { read_bytes(url) } {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    let protocol = match unsafe { read_bytes(protocol) } {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    let subprotocol = match unsafe { read_bytes(subprotocol) } {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    if protocol.is_empty() {
+        return VylResult::InvalidArgument;
+    }
+    let Ok(url) = std::str::from_utf8(url) else {
+        return VylResult::InvalidArgument;
+    };
+    let Ok(uri) = Uri::try_from(url) else {
+        return VylResult::InvalidArgument;
+    };
+    let mut request = Request::new(());
+    *request.method_mut() = Method::CONNECT;
+    *request.uri_mut() = uri;
+    if !subprotocol.is_empty() {
+        let Ok(value) = HeaderValue::from_bytes(subprotocol) else {
+            return VylResult::InvalidArgument;
+        };
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", value);
+    }
+    let client = unsafe { &*client };
+    let tunnel = match client.client.connect_tunnel(request, protocol) {
+        Ok(tunnel) => tunnel,
+        Err(error) => return client_error(error),
+    };
+    unsafe {
+        out_tunnel.write(Box::into_raw(Box::new(VylH3Tunnel {
+            tunnel,
+            last_read: Vec::new(),
+        })));
+    }
+    VylResult::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_tunnel_write(
+    tunnel: *mut VylH3Tunnel,
+    data: VylBytes,
+) -> VylResult {
+    if tunnel.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let data = match unsafe { read_bytes(data) } {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    let tunnel = unsafe { &*tunnel };
+    match tunnel.tunnel.write(data) {
+        Ok(()) => VylResult::Ok,
+        Err(error) => client_error(error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_tunnel_read(
+    tunnel: *mut VylH3Tunnel,
+    out_data: *mut VylBytes,
+) -> VylResult {
+    if tunnel.is_null() || out_data.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    let tunnel = unsafe { &mut *tunnel };
+    match tunnel.tunnel.read() {
+        Ok(Some(data)) => {
+            tunnel.last_read = data;
+            unsafe {
+                out_data.write(VylBytes {
+                    data: tunnel.last_read.as_ptr(),
+                    length: tunnel.last_read.len(),
+                });
+            }
+            VylResult::Ok
+        }
+        Ok(None) => VylResult::Gone,
+        Err(error) => client_error(error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_tunnel_close(tunnel: *mut VylH3Tunnel) -> VylResult {
+    if tunnel.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    unsafe {
+        (*tunnel).tunnel.close();
+    }
+    VylResult::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vyl_h3_tunnel_destroy(tunnel: *mut VylH3Tunnel) -> VylResult {
+    if tunnel.is_null() {
+        return VylResult::InvalidArgument;
+    }
+    unsafe {
+        drop(Box::from_raw(tunnel));
     }
     VylResult::Ok
 }

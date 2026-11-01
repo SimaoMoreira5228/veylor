@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use veylor_h3::http::{Request, StatusCode};
-use veylor_h3::{ManagedOutcome, RequestStream, ResponseWriter};
+use veylor_h3::{Bytes, ManagedOutcome, RequestStream, ResponseWriter};
 use veylor_runtime::ConnectionToken;
 
 use crate::connection::streams::StreamCmd;
@@ -105,6 +105,22 @@ impl super::Handler {
         ManagedOutcome::Streamed
     }
 
+    async fn push_tunnel_in(&self, token: ConnectionToken, mut bytes: Bytes) -> bool {
+        while !bytes.is_empty() {
+            let accepted = self.host.push_tunnel_in(token, &bytes);
+            if accepted == 0 {
+                if self.host.tunnel_close_requested(token) {
+                    return false;
+                }
+                tokio::time::sleep(TUNNEL_TICK).await;
+                continue;
+            }
+            bytes = bytes.slice(accepted..);
+            self.host.stage_tunnel_data(token);
+        }
+        true
+    }
+
     async fn pump_tunnel(
         &self,
         token: ConnectionToken,
@@ -138,12 +154,9 @@ impl super::Handler {
                 chunk = stream.read_data(TUNNEL_CHUNK), if !eof => {
                     match chunk {
                         Ok(Some(bytes)) => {
-                            let accepted = self.host.push_tunnel_in(token, &bytes);
-                            if accepted < bytes.len() {
-                                stream.stop(0);
+                            if !self.push_tunnel_in(token, bytes).await {
                                 break;
                             }
-                            self.host.stage_tunnel_data(token);
                         }
                         Ok(None) => {
                             self.host.mark_tunnel_eof(token);

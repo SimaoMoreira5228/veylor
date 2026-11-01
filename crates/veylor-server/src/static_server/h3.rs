@@ -240,10 +240,6 @@ impl veylor_h3::Handler for Handler {
             .get::<ConnectProtocol>()
             .map(|protocol| protocol.0.clone())
             .unwrap_or_default();
-        eprintln!(
-            "connect protocol: {protocol:?} path: {}",
-            request.uri().path()
-        );
         if protocol != b"websocket" {
             return Box::pin(async move {
                 ManagedOutcome::Handled(text(StatusCode::NOT_IMPLEMENTED, b"Not Implemented"))

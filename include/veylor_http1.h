@@ -717,6 +717,7 @@ vyl_http1_result vyl_h2_server_goaway_drain(
 
 typedef struct vyl_h3_client vyl_h3_client;
 typedef struct vyl_h3_response vyl_h3_response;
+typedef struct vyl_h3_tunnel vyl_h3_tunnel;
 
 /* NOTE: address is a numeric IPv4/IPv6 string and root_cert is a DER certificate
    chain. Requests block until the response completes; every returned span points
@@ -753,7 +754,21 @@ vyl_http1_result vyl_h3_client_request(
     vyl_http1_bytes body,
     vyl_h3_response** out_response
 );
+vyl_http1_result vyl_h3_client_connect_tunnel(
+    vyl_h3_client* client,
+    vyl_http1_bytes url,
+    vyl_http1_bytes protocol,
+    vyl_http1_bytes subprotocol,
+    vyl_h3_tunnel** out_tunnel
+);
 vyl_http1_result vyl_h3_client_destroy(vyl_h3_client* client);
+
+/* NOTE: out_data points into the tunnel and stays valid until the next read or destroy.
+   VYL_HTTP1_GONE means the peer closed the tunnel. */
+vyl_http1_result vyl_h3_tunnel_read(vyl_h3_tunnel* tunnel, vyl_http1_bytes* out_data);
+vyl_http1_result vyl_h3_tunnel_write(vyl_h3_tunnel* tunnel, vyl_http1_bytes data);
+vyl_http1_result vyl_h3_tunnel_close(vyl_h3_tunnel* tunnel);
+vyl_http1_result vyl_h3_tunnel_destroy(vyl_h3_tunnel* tunnel);
 
 uint16_t vyl_h3_response_status(const vyl_h3_response* response);
 size_t vyl_h3_response_header_count(const vyl_h3_response* response);

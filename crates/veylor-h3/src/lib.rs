@@ -17,7 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 pub use bytes;
 pub use bytes::Bytes;
-pub use client::{Client, ClientConfig, ClientError, ClientResponse, ClientTls};
+pub use client::{Client, ClientConfig, ClientError, ClientResponse, ClientTls, ClientTunnel};
 pub use http;
 pub use response_writer::ResponseWriter;
 
@@ -116,11 +116,15 @@ pub struct ConnectProtocol(pub Vec<u8>);
 
 pub struct RequestStream {
     recv: quinn::RecvStream,
+    data_remaining: u64,
 }
 
 impl RequestStream {
     pub(crate) fn new(recv: quinn::RecvStream) -> Self {
-        Self { recv }
+        Self {
+            recv,
+            data_remaining: 0,
+        }
     }
 
     pub async fn read(&mut self, max: usize) -> io::Result<Option<Bytes>> {
@@ -132,16 +136,42 @@ impl RequestStream {
     }
 
     pub async fn read_data(&mut self, max: usize) -> io::Result<Option<Bytes>> {
+        if max == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tunnel chunk must be nonzero",
+            ));
+        }
         loop {
-            match crate::frame_io::read_frame(&mut self.recv, max).await {
-                Ok(Some((veylor_http3::frame::DATA, payload))) => {
-                    return Ok(Some(Bytes::from(payload)));
-                }
-                Ok(Some((veylor_http3::frame::HEADERS, _))) => {}
-                Ok(Some(_)) => {}
+            if self.data_remaining > 0 {
+                let take = self.data_remaining.min(max as u64) as usize;
+                let mut buffer = vec![0u8; take];
+                self.recv
+                    .read_exact(&mut buffer)
+                    .await
+                    .map_err(io::Error::other)?;
+                self.data_remaining -= take as u64;
+                return Ok(Some(Bytes::from(buffer)));
+            }
+            let kind = match crate::frame_io::read_varint(&mut self.recv).await {
+                Ok(Some(kind)) => kind,
                 Ok(None) => return Ok(None),
                 Err(()) => return Err(io::Error::other("invalid tunnel frame")),
+            };
+            let length = match crate::frame_io::read_varint(&mut self.recv).await {
+                Ok(Some(length)) => {
+                    usize::try_from(length).map_err(|_| io::Error::other("tunnel frame length"))?
+                }
+                Ok(None) => return Ok(None),
+                Err(()) => return Err(io::Error::other("invalid tunnel frame")),
+            };
+            if kind == veylor_http3::frame::DATA {
+                self.data_remaining = length as u64;
+                continue;
             }
+            crate::frame_io::discard(&mut self.recv, length)
+                .await
+                .map_err(|_| io::Error::other("truncated tunnel frame"))?;
         }
     }
 
