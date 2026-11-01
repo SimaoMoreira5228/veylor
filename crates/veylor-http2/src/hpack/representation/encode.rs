@@ -378,13 +378,8 @@ fn block_table_index(
     name: &[u8],
     value: Option<&[u8]>,
 ) -> Option<u64> {
-    for index in 1..=HPACK_STATIC_TABLE_LEN as u64 {
-        let field = table.get(index)?;
-        if table.resolve(field.name)? == name
-            && value.is_none_or(|expected| table.resolve(field.value) == Some(expected))
-        {
-            return Some(index);
-        }
+    if let Some(index) = table.static_index(name, value) {
+        return Some(index);
     }
 
     let mut newer_insertions = 0_u64;

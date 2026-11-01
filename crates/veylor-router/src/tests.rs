@@ -59,3 +59,51 @@ fn trailer_allowlist_bounds_reject_overflow() {
         Err(RouteError::Invalid)
     );
 }
+
+#[test]
+fn validated_matcher_agrees_with_route_matching() {
+    use super::{MAX_ROUTE_CAPTURES, RouteCapture, match_route, matches_route};
+
+    let patterns: [&[u8]; 9] = [
+        b"/",
+        b"/a",
+        b"/a/b",
+        b"/a/b/",
+        b"/a/:name",
+        b"/a/:name/b",
+        b"/a/:name/:value",
+        b"/a/*rest",
+        b"/json/:count",
+    ];
+    let paths: [&[u8]; 15] = [
+        b"/",
+        b"//",
+        b"/a",
+        b"/a/",
+        b"/a/b",
+        b"/a/b/",
+        b"/a/b/c",
+        b"/a/x",
+        b"/a/x/b",
+        b"/a/x/y",
+        b"/json/25",
+        b"/json/25/extra",
+        b"/A/B",
+        b"/a/x?from=10",
+        b"/json/25?m=4",
+    ];
+    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+    for pattern in patterns {
+        for path in paths {
+            let fast = matches_route(pattern, path);
+            let full = match_route(pattern, path, &mut captures).is_some();
+            assert_eq!(
+                fast,
+                full,
+                "pattern={} path={} fast={fast} full={full}",
+                String::from_utf8_lossy(pattern),
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+}

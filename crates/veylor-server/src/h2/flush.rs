@@ -7,6 +7,10 @@ use crate::connection::tls::{TlsWriteOutcome, tls_encrypt_bytes, tls_write_once}
 
 use super::slots::H2Meta;
 
+// NOTE: TLS record payload ceiling (RFC 8446 5.1); also keeps rustls below its writer
+// buffer limit when one flush carries a whole connection window.
+const TLS_RECORD_PLAINTEXT: usize = 16_384;
+
 pub(crate) enum H2Flush {
     Done,
     Blocked,
@@ -163,8 +167,13 @@ fn tls_flush_h2(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64)
         let Some(tls) = meta.tls.as_mut() else {
             return H2Flush::Closed(ConnClose::TransportError);
         };
-        if tls_encrypt_bytes(tls, &staged[plain_start..plain_end], &mut meta.tls_pending).is_err() {
-            return H2Flush::Closed(ConnClose::TransportError);
+        // NOTE: rustls bounds its internal plaintext buffer (64 KiB by default), so a
+        // window-sized H2 staging buffer cannot be encrypted in one call; feed it as TLS
+        // records and drain each record's ciphertext before the next one.
+        for chunk in staged[plain_start..plain_end].chunks(TLS_RECORD_PLAINTEXT) {
+            if tls_encrypt_bytes(tls, chunk, &mut meta.tls_pending).is_err() {
+                return H2Flush::Closed(ConnClose::TransportError);
+            }
         }
         meta.pending_sent = meta.pending_len;
     }

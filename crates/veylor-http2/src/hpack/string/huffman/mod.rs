@@ -156,7 +156,11 @@ const fn build_fast_table() -> [u16; 256] {
     table
 }
 
-fn decode_huffman_fast(input: &[u8], output: &mut [u8], required: usize) -> Option<usize> {
+pub const fn decoded_bound(input_len: usize) -> usize {
+    input_len.saturating_mul(8) / 5 + 1
+}
+
+fn decode_huffman_fast(input: &[u8], output: &mut [u8]) -> Option<usize> {
     let mut accumulator = 0_u64;
     let mut bits = 0_u32;
     let mut index = 0usize;
@@ -171,6 +175,9 @@ fn decode_huffman_fast(input: &[u8], output: &mut [u8], required: usize) -> Opti
             break;
         }
         let prefix = ((accumulator >> (bits - 8)) & 0xFF) as usize;
+        if prefix == 0xFF {
+            return None;
+        }
         let entry = FAST_TABLE[prefix];
         if entry == FAST_FALLBACK {
             return None;
@@ -190,21 +197,22 @@ fn decode_huffman_fast(input: &[u8], output: &mut [u8], required: usize) -> Opti
             return None;
         }
     }
-    // The size pass already validated the stream; matching length means every code hit
-    // and the padding bytes decoded to nothing extra.
-    if written == required {
-        Some(written)
-    } else {
-        None
-    }
+
+    Some(written)
 }
 
 pub fn decode_huffman(input: &[u8], output: &mut [u8]) -> Result<usize, HuffmanError> {
+    if output.len() >= decoded_bound(input.len()) {
+        if let Some(length) = decode_huffman_fast(input, output) {
+            return Ok(length);
+        }
+        return decode_huffman_inner(input, Some(output));
+    }
     let required = decode_huffman_inner(input, None)?;
     if output.len() < required {
         return Err(HuffmanError::OutputTooSmall { required });
     }
-    if let Some(length) = decode_huffman_fast(input, &mut output[..required], required) {
+    if let Some(length) = decode_huffman_fast(input, &mut output[..required]) {
         return Ok(length);
     }
     decode_huffman_inner(input, Some(&mut output[..required]))

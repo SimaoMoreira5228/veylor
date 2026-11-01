@@ -17,7 +17,7 @@ use veylor_h3::{
     RunningServer, Server, Tls,
 };
 use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, join_allow_value};
-use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route};
+use veylor_router::{compare_route_patterns, matches_route};
 use veylor_runtime::ConnectionToken;
 
 use crate::connection::streams::StreamCmd;
@@ -677,8 +677,7 @@ fn select_route<'a>(
 }
 
 fn route_matches(pattern: &[u8], target: &[u8]) -> bool {
-    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
-    match_route(pattern, target, &mut captures).is_some()
+    matches_route(pattern, target)
 }
 
 fn allow_value(routes: &[H2StaticRoute], path: &[u8]) -> Option<([u8; ALLOW_BYTES], usize)> {

@@ -196,6 +196,45 @@ pub(crate) fn match_pattern(
     }
 }
 
+pub fn matches_route(pattern: &[u8], path: &[u8]) -> bool {
+    let Some(path) = path.split(|byte| *byte == b'?').next() else {
+        return false;
+    };
+    if path.first() != Some(&b'/') {
+        return false;
+    }
+    let mut pattern_start = 1;
+    let mut path_start = 1;
+    loop {
+        let pattern_end = segment_end(pattern, pattern_start);
+        let path_end = segment_end(path, path_start);
+        match segment_kind(pattern, pattern_start, pattern_end) {
+            1 => {
+                if path_start == path_end {
+                    return false;
+                }
+            }
+            2 => return true,
+            _ => {
+                if compare_paths(
+                    &pattern[pattern_start..pattern_end],
+                    &path[path_start..path_end],
+                ) != Ordering::Equal
+                {
+                    return false;
+                }
+            }
+        }
+        let pattern_finished = pattern_end == pattern.len();
+        let path_finished = path_end == path.len();
+        if pattern_finished || path_finished {
+            return pattern_finished && path_finished;
+        }
+        pattern_start = pattern_end + 1;
+        path_start = path_end + 1;
+    }
+}
+
 pub fn match_route(
     pattern: &[u8],
     target: &[u8],

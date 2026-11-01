@@ -36,11 +36,7 @@ pub(crate) async fn serve(connection: Connection, handler: Arc<dyn Handler>, lim
         let Ok((send, recv)) = connection.accept_bi().await else {
             return;
         };
-        let handler = Arc::clone(&handler);
-        let control = connection.clone();
-        tokio::spawn(async move {
-            let _ = handle_request(send, recv, handler, control, limits).await;
-        });
+        let _ = handle_request(send, recv, Arc::clone(&handler), connection.clone(), limits).await;
     }
 }
 
@@ -428,20 +424,26 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 async fn write_response(send: &mut SendStream, response: Response<Body>, is_head: bool) {
     let (parts, body) = response.into_parts();
     let status = parts.status;
-    let status_text = status.as_u16().to_string();
-    let mut fields: Vec<(&[u8], &[u8])> = Vec::with_capacity(parts.headers.len() + 2);
-    fields.push((b":status", status_text.as_bytes()));
-    let header_length = is_head
-        .then(|| parts.headers.get(CONTENT_LENGTH))
-        .flatten()
-        .and_then(|value| value.to_str().ok());
-    let length = header_length
-        .map(str::to_owned)
-        .or_else(|| body.content_length().map(|length| length.to_string()));
+    let mut status_buf = [0u8; 3];
+    let status_len = write_decimal(&mut status_buf, u64::from(status.as_u16()));
+    let status_text = &status_buf[..status_len];
     let sheds_length = matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
-    if let Some(length) = length.as_deref() {
+
+    let mut length_buf = [0u8; 20];
+    let declared = is_head.then(|| parts.headers.get(CONTENT_LENGTH)).flatten();
+    let length: Option<&[u8]> = match declared {
+        Some(value) => Some(value.as_bytes()),
+        None => body.content_length().map(|length| {
+            let written = write_decimal(&mut length_buf, length);
+            &length_buf[..written]
+        }),
+    };
+
+    let mut fields: Vec<(&[u8], &[u8])> = Vec::with_capacity(parts.headers.len() + 2);
+    fields.push((b":status", status_text));
+    if let Some(length) = length {
         if !sheds_length {
-            fields.push((b"content-length", length.as_bytes()));
+            fields.push((b"content-length", length));
         }
     }
     for (name, value) in &parts.headers {
@@ -460,49 +462,72 @@ async fn write_response(send: &mut SendStream, response: Response<Body>, is_head
         fields.push((name.as_str().as_bytes(), value.as_bytes()));
     }
 
-    let block = qpack::encode(&fields);
-    let mut encoded = Vec::with_capacity(block.len() + 16);
-    frame::encode_frame(frame::HEADERS, &block, &mut encoded);
-    if send.write_all(&encoded).await.is_err() {
-        return;
-    }
-
+    let block_length = qpack::encoded_len(&fields);
     let sends_body = !is_head && !sheds_length && status != StatusCode::RESET_CONTENT;
-    if sends_body {
-        match body {
-            Body::Bytes(body) => {
-                if !body.is_empty() {
-                    let mut data = Vec::with_capacity(body.len() + 16);
-                    frame::encode_frame(frame::DATA, &body, &mut data);
-                    if send.write_all(&data).await.is_err() {
-                        return;
-                    }
-                }
+    let mut head = Vec::with_capacity(12 + block_length);
+    let mut header = [0u8; 12];
+    let written = frame::encode_frame_header(frame::HEADERS, block_length as u64, &mut header);
+    head.extend_from_slice(&header[..written]);
+    qpack::encode_into(&fields, &mut head);
+
+    match body {
+        Body::Bytes(body) if sends_body && !body.is_empty() => {
+            let written = frame::encode_frame_header(frame::DATA, body.len() as u64, &mut header);
+            head.extend_from_slice(&header[..written]);
+            let mut chunks = [Bytes::from(head), body];
+            if send.write_all_chunks(&mut chunks).await.is_err() {
+                return;
             }
-            Body::Stream(mut body) => {
-                let mut scratch = vec![0u8; STREAM_CHUNK_BYTES];
-                let mut head = [0u8; 16];
-                loop {
-                    let read = match body.read(&mut scratch) {
-                        Ok(0) => break,
-                        Ok(read) => read,
-                        Err(_) => {
-                            let _ = send.reset(VarInt::from_u32(0));
-                            return;
-                        }
-                    };
-                    let header = frame::encode_frame_header(frame::DATA, read as u64, &mut head);
-                    if send.write_all(&head[..header]).await.is_err() {
+        }
+        Body::Bytes(_) => {
+            if send.write_all(&head).await.is_err() {
+                return;
+            }
+        }
+        Body::Stream(mut body) => {
+            if send.write_all(&head).await.is_err() {
+                return;
+            }
+            let mut scratch = vec![0u8; STREAM_CHUNK_BYTES];
+            let mut frame_header = [0u8; 16];
+            loop {
+                let read = match body.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => {
+                        let _ = send.reset(VarInt::from_u32(0));
                         return;
                     }
-                    if send.write_all(&scratch[..read]).await.is_err() {
-                        return;
-                    }
+                };
+                let written =
+                    frame::encode_frame_header(frame::DATA, read as u64, &mut frame_header);
+                if send.write_all(&frame_header[..written]).await.is_err() {
+                    return;
+                }
+                if send.write_all(&scratch[..read]).await.is_err() {
+                    return;
                 }
             }
         }
     }
     let _ = send.finish();
+}
+
+fn write_decimal(out: &mut [u8], mut value: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for index in 0..count {
+        out[index] = digits[count - 1 - index];
+    }
+    count
 }
 
 fn append_trailers(

@@ -70,3 +70,21 @@ const fn field(name: &'static [u8], value: &'static [u8]) -> HpackField {
         value: HpackBytes::Static(value),
     }
 }
+
+pub(super) const STATIC_FIRST_MASK: [u64; 256] = build_first_mask();
+
+const fn build_first_mask() -> [u64; 256] {
+    let mut mask = [0u64; 256];
+    let mut index = 0;
+    while index < STATIC_TABLE.len() {
+        let name = match STATIC_TABLE[index].name {
+            HpackBytes::Static(name) => name,
+            HpackBytes::Scratch(_) => &[],
+        };
+        if !name.is_empty() {
+            mask[name[0] as usize] |= 1u64 << index;
+        }
+        index += 1;
+    }
+    mask
+}

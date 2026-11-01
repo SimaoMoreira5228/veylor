@@ -13,10 +13,8 @@ use super::{
 // above the whole H1 table instead of at MAX_CONNECTIONS.
 pub(crate) const H2_STREAM_TOKEN_BASE: usize = crate::static_server::MAX_CONNECTIONS + 1;
 pub(crate) const H2_ACCEPT_STAGING: usize = 8;
-pub(crate) const H2_PENDING_CAP: usize = 16_384 + 512;
+pub(crate) const H2_PENDING_CAP: usize = 65_536 + 512;
 
-// NOTE: per-conn backing stores, boxed so idle slots cost two words (~57 KiB live per
-// active conn; 17 KiB pending rides the meta). Sizes mirror the step-driver harness.
 pub(crate) struct H2Buffers {
     pub(crate) staging: Box<[u8; INPUT_STAGING_CAP]>,
     pub(crate) slots: Box<[StreamSlot; STREAM_SLOTS]>,

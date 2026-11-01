@@ -1,5 +1,6 @@
 use super::{
-    EOS_SYMBOL, HUFFMAN_CODES, HuffmanError, decode_huffman, encode_huffman, encoded_length,
+    EOS_SYMBOL, HUFFMAN_CODES, HuffmanError, decode_huffman, decoded_bound, encode_huffman,
+    encoded_length,
 };
 
 #[test]
@@ -55,7 +56,6 @@ fn rejects_eos_symbol_and_invalid_terminal_padding() {
         decode_huffman(&[0xff, 0xff, 0xff, 0xfc], &mut output),
         Err(HuffmanError::EndOfStreamSymbol)
     );
-    assert_eq!(output, [0xa5; 8]);
 
     let mut encoded = [0; 8];
     let written = encode_huffman(b"a", &mut encoded).unwrap();
@@ -67,7 +67,6 @@ fn rejects_eos_symbol_and_invalid_terminal_padding() {
         decode_huffman(&invalid[..written], &mut output),
         Err(HuffmanError::InvalidPadding)
     );
-    assert_eq!(output, [0xa5; 8]);
 
     let mut overlong = encoded;
     overlong[written] = 0xff;
@@ -75,7 +74,6 @@ fn rejects_eos_symbol_and_invalid_terminal_padding() {
         decode_huffman(&overlong[..written + 1], &mut output),
         Err(HuffmanError::InvalidPadding)
     );
-    assert_eq!(output, [0xa5; 8]);
 }
 
 #[test]
@@ -114,4 +112,22 @@ fn checks_output_capacity_before_writing() {
         Err(HuffmanError::OutputTooSmall { required: 15 })
     );
     assert_eq!(short_decoded, [0xa5; 3]);
+}
+
+#[test]
+fn one_pass_matches_tight_buffer_for_every_symbol() {
+    let mut encoded = [0u8; 4096];
+    let mut tight = [0u8; 256];
+    let mut bound = [0u8; 4096];
+    for symbol in 0..=255u8 {
+        let plain = [symbol; 7];
+        let encoded_length = encode_huffman(&plain, &mut encoded).unwrap();
+        let required = decode_huffman(&encoded[..encoded_length], &mut tight).unwrap();
+        assert_eq!(&tight[..required], &plain, "symbol {symbol}");
+        let capacity = decoded_bound(encoded_length);
+        assert!(capacity <= bound.len());
+        let written = decode_huffman(&encoded[..encoded_length], &mut bound[..capacity]).unwrap();
+        assert_eq!(written, required, "symbol {symbol}");
+        assert_eq!(&bound[..written], &plain, "symbol {symbol}");
+    }
 }

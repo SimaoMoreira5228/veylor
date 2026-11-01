@@ -2,7 +2,7 @@ mod static_table;
 #[cfg(test)]
 mod tests;
 
-use static_table::STATIC_TABLE;
+use static_table::{STATIC_FIRST_MASK, STATIC_TABLE};
 
 pub const HPACK_STATIC_TABLE_LEN: usize = 61;
 
@@ -165,11 +165,25 @@ impl<'a> HpackTable<'a> {
         self.entries[dynamic_index].field
     }
 
-    pub fn find_name_index(&self, name: &[u8]) -> Option<u64> {
-        for (index, field) in STATIC_TABLE.iter().enumerate() {
-            if self.resolve(field.name)? == name {
+    pub(crate) fn static_index(&self, name: &[u8], value: Option<&[u8]>) -> Option<u64> {
+        let first = *name.first()? as usize;
+        let mut bits = STATIC_FIRST_MASK[first];
+        while bits != 0 {
+            let index = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let field = STATIC_TABLE[index];
+            if self.resolve(field.name)? == name
+                && value.is_none_or(|expected| self.resolve(field.value) == Some(expected))
+            {
                 return Some(index as u64 + 1);
             }
+        }
+        None
+    }
+
+    pub fn find_name_index(&self, name: &[u8]) -> Option<u64> {
+        if let Some(index) = self.static_index(name, None) {
+            return Some(index);
         }
         for index in 0..self.count {
             let field = self.entries[index].field?;
@@ -181,10 +195,8 @@ impl<'a> HpackTable<'a> {
     }
 
     pub fn find_exact_index(&self, name: &[u8], value: &[u8]) -> Option<u64> {
-        for (index, field) in STATIC_TABLE.iter().enumerate() {
-            if self.resolve(field.name)? == name && self.resolve(field.value)? == value {
-                return Some(index as u64 + 1);
-            }
+        if let Some(index) = self.static_index(name, Some(value)) {
+            return Some(index);
         }
         for index in 0..self.count {
             let field = self.entries[index].field?;

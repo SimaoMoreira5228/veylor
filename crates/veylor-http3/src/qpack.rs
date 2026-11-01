@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use veylor_http2::{HuffmanError, decode_hpack_integer, decode_huffman, encode_hpack_integer};
+use veylor_http2::{decode_hpack_integer, decode_huffman, decoded_bound, encode_hpack_integer};
 
 pub type Field = (Vec<u8>, Vec<u8>);
 
@@ -132,11 +132,42 @@ pub(crate) static STATIC_TABLE: [(&[u8], &[u8]); 99] = [
 ];
 
 pub fn encode(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
-    let mut out = vec![0, 0];
-    for (name, value) in fields {
-        encode_field(name, value, &mut out);
-    }
+    let mut out = Vec::with_capacity(encoded_len(fields));
+    encode_into(fields, &mut out);
     out
+}
+
+pub fn encode_into(fields: &[(&[u8], &[u8])], out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0, 0]);
+    for (name, value) in fields {
+        encode_field(name, value, out);
+    }
+}
+
+pub fn encoded_len(fields: &[(&[u8], &[u8])]) -> usize {
+    2 + fields
+        .iter()
+        .map(|(name, value)| field_len(name, value))
+        .sum::<usize>()
+}
+
+fn field_len(name: &[u8], value: &[u8]) -> usize {
+    if let Some(index) = find(name, value) {
+        return integer_len(index, 6);
+    }
+    if let Some(index) = find_name(name) {
+        return integer_len(index, 4) + string_len(value);
+    }
+    integer_len(name.len() as u64, 3) + name.len() + string_len(value)
+}
+
+fn integer_len(value: u64, bits: u8) -> usize {
+    let mut header = [0u8; 10];
+    encode_hpack_integer(value, bits, &mut header).expect("integer fits")
+}
+
+fn string_len(value: &[u8]) -> usize {
+    integer_len(value.len() as u64, 7) + value.len()
 }
 
 pub fn decode(block: &[u8], max_field_section: usize) -> Result<Vec<Field>, QpackError> {
@@ -261,22 +292,26 @@ fn decode_string_into(
 }
 
 fn decode_huffman_into(input: &[u8], scratch: &mut Vec<u8>) -> Result<Range<usize>, QpackError> {
+    let bound = decoded_bound(input.len());
     let mut small = [0u8; 256];
-    match decode_huffman(input, &mut small) {
+    if bound <= small.len() {
+        let length =
+            decode_huffman(input, &mut small[..bound]).map_err(|_| QpackError::InvalidString)?;
+        let start = scratch.len();
+        scratch.extend_from_slice(&small[..length]);
+        return Ok(start..scratch.len());
+    }
+    let start = scratch.len();
+    scratch.resize(start + bound, 0);
+    match decode_huffman(input, &mut scratch[start..]) {
         Ok(length) => {
-            let start = scratch.len();
-            scratch.extend_from_slice(&small[..length]);
-            Ok(start..scratch.len())
-        }
-        Err(HuffmanError::OutputTooSmall { required }) => {
-            let start = scratch.len();
-            scratch.resize(start + required, 0);
-            let length = decode_huffman(input, &mut scratch[start..])
-                .map_err(|_| QpackError::InvalidString)?;
             scratch.truncate(start + length);
             Ok(start..scratch.len())
         }
-        Err(_) => Err(QpackError::InvalidString),
+        Err(_) => {
+            scratch.truncate(start);
+            Err(QpackError::InvalidString)
+        }
     }
 }
 
@@ -329,7 +364,7 @@ fn find_name(name: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{QpackError, decode, encode};
+    use super::{QpackError, decode, encode, encoded_len};
 
     #[test]
     fn round_trips_static_and_literal_fields() {
@@ -346,6 +381,32 @@ mod tests {
             assert_eq!(decoded[index].0, *name);
             assert_eq!(decoded[index].1, *value);
         }
+    }
+
+    #[test]
+    fn encoded_len_matches_encode() {
+        let cases: [&[(&[u8], &[u8])]; 4] = [
+            &[(b":status", b"200")],
+            &[(b":status", b"200"), (b"content-length", b"1")],
+            &[
+                (b":status", b"404"),
+                (b"content-type", b"text/plain"),
+                (b"x-custom-header", b"some longer value"),
+            ],
+            &[(b":status", b"200"), (b"content-type", b"application/json")],
+        ];
+        for fields in cases {
+            assert_eq!(encoded_len(fields), encode(fields).len(), "{fields:?}");
+        }
+    }
+
+    #[test]
+    fn encode_into_appends_at_the_current_offset() {
+        let fields: &[(&[u8], &[u8])] = &[(b":status", b"200")];
+        let mut out = vec![0xff, 0xfe];
+        super::encode_into(fields, &mut out);
+        assert_eq!(&out[..2], &[0xff, 0xfe]);
+        assert_eq!(&out[2..], encode(fields).as_slice());
     }
 
     #[test]

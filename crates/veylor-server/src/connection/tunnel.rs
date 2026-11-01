@@ -124,12 +124,19 @@ fn settle_eof(
     Some(PumpOutcome::Keep(progress))
 }
 
-// NOTE: native WebSocket echo runs in the worker: the upgrade handshake is already in
-// the output buffer, then every complete client frame is unmasked and answered with an
-// unmasked server frame. No host park/pull/wake round trip is involved.
 fn pump_echo(conn: &mut ConnState, byte_budget: u64) -> PumpOutcome {
-    let mut progress = PumpProgress::default();
+    let mut progress = PumpProgress {
+        bytes_read: std::mem::take(&mut conn.batched_read) as u64,
+        ..PumpProgress::default()
+    };
+    if conn.tunnel_close && conn.out_sent >= conn.out_len {
+        return PumpOutcome::Close(ConnClose::Completed);
+    }
     if conn.out_sent < conn.out_len {
+        if conn.defer_write {
+            conn.write_deferred = true;
+            return PumpOutcome::Keep(progress);
+        }
         match write_pending(conn, byte_budget) {
             Ok((wrote, flushed)) => {
                 progress.bytes_written = wrote;
@@ -140,7 +147,7 @@ fn pump_echo(conn: &mut ConnState, byte_budget: u64) -> PumpOutcome {
             Err(reason) => return PumpOutcome::Close(reason),
         }
     }
-    if conn.read_ready {
+    if progress.bytes_read == 0 && conn.read_ready {
         if conn.len >= INPUT_CAP {
             conn.read_ready = false;
         } else {
@@ -163,7 +170,7 @@ fn pump_echo(conn: &mut ConnState, byte_budget: u64) -> PumpOutcome {
                 ReadStatus::Progress(bytes) => {
                     conn.len += bytes;
                     conn.read_ready = true;
-                    progress.bytes_read = bytes as u64;
+                    progress.bytes_read += bytes as u64;
                 }
                 ReadStatus::Eof => return PumpOutcome::Close(ConnClose::PeerClosed),
                 ReadStatus::Closed(CloseReason::PeerClosed) => {
@@ -194,26 +201,31 @@ fn echo_frames(
     progress: &mut PumpProgress,
     budget: u64,
 ) -> Result<(), ConnClose> {
+    let capacity = ConnState::materialize_output(&mut conn.output).len();
+    let mut staged = 0usize;
+    let mut close_after = false;
+
     loop {
         let len = conn.len;
         if len == 0 {
-            return Ok(());
+            break;
         }
+
         let Some(ws) = conn.tunnel_echo.as_mut() else {
             return Err(ConnClose::TransportError);
         };
         let Some(input) = conn.input.as_mut() else {
-            return Ok(());
+            break;
         };
         let feed = ws
             .feed(&mut input[..len])
             .map_err(|_| ConnClose::ProtocolError)?;
         if feed.need_more {
-            return Ok(());
+            break;
         }
+
         let consumed = feed.consumed;
         let mut frame = [0u8; super::OUTPUT_CAP];
-        let mut close_after = false;
         let frame_len = if let Some(event) = feed.event {
             let (fin, opcode, payload) = match event {
                 WsEvent::Text { payload, fin } => (fin, OpCode::Text, payload),
@@ -231,17 +243,29 @@ fn echo_frames(
         } else {
             0
         };
+
         if consumed > 0 {
             if let Some(input) = conn.input.as_mut() {
                 input.copy_within(consumed..len, 0);
             }
             conn.len -= consumed;
         }
-        if frame_len > 0 {
-            let output = ConnState::materialize_output(&mut conn.output);
-            output[..frame_len].copy_from_slice(&frame[..frame_len]);
-            conn.out_len = frame_len;
-            conn.out_sent = 0;
+        if frame_len == 0 {
+            if close_after {
+                break;
+            }
+            continue;
+        }
+        if close_after {
+            conn.tunnel_close = true;
+        }
+
+        if staged + frame_len > capacity {
+            stage_len(conn, staged);
+            if conn.defer_write {
+                conn.write_deferred = true;
+                return Ok(());
+            }
             match write_pending(conn, budget) {
                 Ok((wrote, flushed)) => {
                     progress.bytes_written += wrote;
@@ -251,11 +275,41 @@ fn echo_frames(
                 }
                 Err(reason) => return Err(reason),
             }
+            staged = 0;
         }
+        let output = ConnState::materialize_output(&mut conn.output);
+        output[staged..staged + frame_len].copy_from_slice(&frame[..frame_len]);
+        staged += frame_len;
         if close_after {
-            return Err(ConnClose::Completed);
+            break;
         }
     }
+
+    if staged > 0 {
+        stage_len(conn, staged);
+        if conn.defer_write {
+            conn.write_deferred = true;
+            return Ok(());
+        }
+        match write_pending(conn, budget) {
+            Ok((wrote, flushed)) => {
+                progress.bytes_written += wrote;
+                if !flushed {
+                    return Ok(());
+                }
+            }
+            Err(reason) => return Err(reason),
+        }
+    }
+    if close_after {
+        return Err(ConnClose::Completed);
+    }
+    Ok(())
+}
+
+fn stage_len(conn: &mut ConnState, len: usize) {
+    conn.out_len = len;
+    conn.out_sent = 0;
 }
 
 pub(crate) fn pump_tunnel(

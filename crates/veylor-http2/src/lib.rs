@@ -51,7 +51,7 @@ pub use hpack::{
     DecodedHpackString, HPACK_STATIC_TABLE_LEN, HpackBytes, HpackEntrySlot, HpackError, HpackField,
     HpackFieldToEncode, HpackHeader, HpackIntegerError, HpackRepresentation, HpackSpan,
     HpackStringError, HpackTable, HpackTableError, HuffmanError, TableInsert, decode_header_block,
-    decode_header_field, decode_hpack_integer, decode_hpack_string, decode_huffman,
+    decode_header_field, decode_hpack_integer, decode_hpack_string, decode_huffman, decoded_bound,
     default_literal_representation, encode_header_block, encode_hpack_integer, encode_hpack_string,
     encode_huffman, encode_indexed_header, encode_literal_header,
     encode_pending_table_size_updates, encode_table_size_update,

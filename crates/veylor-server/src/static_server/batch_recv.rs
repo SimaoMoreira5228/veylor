@@ -26,9 +26,10 @@ pub(crate) fn recv_ready(
         let Some(conn) = conns.get_mut(slot).and_then(|entry| entry.as_mut()) else {
             continue;
         };
+        let tunneling = conn.phase == ConnPhase::Tunnel && conn.tunnel_echo.is_some();
         if !conn.read_ready
             || conn.has_tls()
-            || conn.phase != ConnPhase::ReadingHead
+            || !(conn.phase == ConnPhase::ReadingHead || tunneling)
             || conn.len >= INPUT_CAP
         {
             continue;

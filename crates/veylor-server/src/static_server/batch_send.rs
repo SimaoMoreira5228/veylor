@@ -33,10 +33,16 @@ pub(crate) fn send_pending(
         if !conn.write_deferred
             || conn.write_blocked
             || conn.has_tls()
-            || conn.phase != ConnPhase::SendingResponse
-            || conn.file.is_some()
             || conn.out_sent >= conn.out_len
         {
+            continue;
+        }
+        let batched = match conn.phase {
+            ConnPhase::SendingResponse => conn.file.is_none(),
+            ConnPhase::Tunnel => conn.tunnel_echo.is_some(),
+            _ => false,
+        };
+        if !batched {
             continue;
         }
         let fd = conn.stream.as_raw_fd();

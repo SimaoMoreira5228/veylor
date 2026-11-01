@@ -4,7 +4,8 @@ mod table;
 mod tests;
 
 pub use path::{
-    MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route, valid_route_pattern,
+    MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route, matches_route,
+    valid_route_pattern,
 };
 pub use table::{RouteBodyPolicy, RouteConfig, RouteKind, RouteMatch, RouteSlot, RouteTable};
 

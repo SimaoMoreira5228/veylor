@@ -3,7 +3,9 @@ use std::path::Path;
 
 use veylor_http1::{ALLOW_METHODS, is_token, join_allow_value};
 use veylor_http2::{H2ServerDriver, HpackHeader};
-use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route};
+use veylor_router::{
+    MAX_ROUTE_CAPTURES, RouteCapture, compare_route_patterns, match_route, matches_route,
+};
 
 use crate::static_files::{FileMounts, FilePlan, FileReject};
 use crate::static_routes::{
@@ -80,8 +82,7 @@ enum RouteSelection {
 }
 
 fn route_matches(pattern: &[u8], target: &[u8]) -> bool {
-    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
-    match_route(pattern, target, &mut captures).is_some()
+    matches_route(pattern, target)
 }
 
 fn select_route<'a>(
