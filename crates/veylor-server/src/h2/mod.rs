@@ -38,7 +38,7 @@ pub(crate) const TUNNEL_STEP: usize = 16_384;
 // NOTE: managed H2 connection ceiling: 8 concurrent connections per worker; the 9th
 // accept finds no free slot and is dropped with a TransportError close (pinned by the
 // 9th-connection test), the same fail-closed shape as the per-stream ceiling.
-pub const MAX_H2_CONNS: usize = 8;
+pub const MAX_H2_CONNS: usize = 64;
 // NOTE: H2 decoded-header slots; the H1 pump has its own HEADER_SLOTS (= 100) since plain
 // ranges are cheaper than HPACK entries with dynamic-table state. See the H1 site for the
 // deliberate split (65-100 headers: served on H1, refused on H2).
@@ -95,6 +95,8 @@ pub(crate) enum StreamEvent {
     PeerReset,
     PeerGoAway,
 }
+
+const MIN_EVENT_ROOM: usize = 1024;
 
 pub(crate) enum Phase<'a> {
     Handshake(H2cServerHandshake<'a, 'a, 'a, 'a>),
@@ -157,6 +159,8 @@ pub struct H2Conn<'a> {
     // route table): one entry per servable stream at most, plus a single OUTPUT_CAP chunk
     // scratch reused every turn, so file bytes frame in bounded slices and never stage whole.
     pending_responses: pending::PendingResponses,
+    pending_events: [Option<StreamEvent>; MAX_STREAMS_PER_STEP],
+    pending_event_len: usize,
     file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
     file_scratch: Box<[u8; crate::connection::OUTPUT_CAP]>,
     tunnel_scratch: Box<[u8; TUNNEL_STEP]>,
@@ -190,9 +194,21 @@ impl<'a> H2Conn<'a> {
             settings_sent: false,
             terminal,
             pending_responses: pending::PendingResponses::new(),
+            pending_events: [None; MAX_STREAMS_PER_STEP],
+            pending_event_len: 0,
             file_transfers: Box::new(std::array::from_fn(|_| None)),
             file_scratch: Box::new([0; crate::connection::OUTPUT_CAP]),
             tunnel_scratch: Box::new([0; TUNNEL_STEP]),
+        }
+    }
+
+    // NOTE: HPACK scratch is append-only across header blocks; compact only once the
+    // turn's decoded headers are consumed, never between blocks (their spans are live).
+    pub(crate) fn compact_decoder(&mut self) {
+        match &mut self.phase {
+            Phase::Handshake(handshake) => handshake.compact_decoder(),
+            Phase::Serving(server) => server.compact_decoder(),
+            Phase::Dead => {}
         }
     }
 
@@ -385,8 +401,10 @@ impl<'a> H2Conn<'a> {
         if !self.settings_sent && !self.send_settings(output, &mut used, &mut outcome) {
             return outcome;
         }
-        let mut events: [Option<StreamEvent>; MAX_STREAMS_PER_STEP] = [None; MAX_STREAMS_PER_STEP];
-        let mut event_len = 0;
+        let mut events = self.pending_events;
+        let mut event_len = self.pending_event_len;
+        self.pending_events = [None; MAX_STREAMS_PER_STEP];
+        self.pending_event_len = 0;
         let mut databuf = Vec::new();
         if !self.is_serving() {
             if !self.run_handshake(
@@ -441,6 +459,7 @@ impl<'a> H2Conn<'a> {
             }
         }
 
+        let output_len = output.len();
         let mut serve = serve::Serve {
             server,
             headers: &*self.headers,
@@ -455,11 +474,28 @@ impl<'a> H2Conn<'a> {
             files: &mut self.file_transfers,
             scratch: &mut self.file_scratch[..],
         };
+        let mut served_events = 0;
         for event in events.iter().take(event_len).flatten() {
+            // NOTE: a file HEADERS emits its head plus the first DATA slice into the
+            // shared pending buffer. Serving the next stream with too little room would
+            // fail the connection, so leave the rest of the batch queued for the next
+            // step, which starts with a flush.
+            if *serve.used + MIN_EVENT_ROOM > output_len {
+                break;
+            }
             serve.serve_one(*event);
+            served_events += 1;
             if serve.outcome.closed {
                 break;
             }
+        }
+        if !serve.outcome.closed && served_events < event_len {
+            let mut slot = 0;
+            for event in events[served_events..event_len].iter().flatten() {
+                self.pending_events[slot] = Some(*event);
+                slot += 1;
+            }
+            self.pending_event_len = slot;
         }
         // NOTE: file DATA resumes here every step (not only on new HEADERS), so a transfer
         // wider than one output buffer streams across steps and turns through the same

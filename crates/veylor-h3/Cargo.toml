@@ -10,7 +10,7 @@ bytes = "1"
 http = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
-tokio = { version = "1", features = ["rt", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 veylor-http3 = { version = "0.1.0", path = "../veylor-http3" }
 veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
 

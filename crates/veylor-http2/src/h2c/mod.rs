@@ -192,6 +192,10 @@ impl<'borrow, 'streams, 'decoder, 'encoder>
         &mut self.server
     }
 
+    pub fn compact_decoder(&mut self) {
+        self.server.compact_decoder();
+    }
+
     pub fn into_server(self) -> H2ServerDriver<'borrow, 'streams, 'decoder, 'encoder> {
         self.server
     }

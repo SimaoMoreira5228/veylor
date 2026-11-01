@@ -124,7 +124,6 @@ pub fn decode_header_block(
     table: &mut HpackTable<'_>,
     headers_output: &mut [HpackHeader],
 ) -> Result<(usize, usize), HpackError> {
-    table.compact_scratch();
     let required_size_update = table.required_size_update();
     if let Some(maximum) = required_size_update {
         if !input.first().is_some_and(|byte| byte & 0xe0 == 0x20) {

@@ -150,6 +150,9 @@ pub struct ServerConfig {
     // untouched; each worker binds its own reuse-port h2c listener like H1.
     pub h2c_port: Option<u16>,
     pub h3_port: Option<u16>,
+    // NOTE: 0 follows the host's available parallelism. QUIC crypto is userspace CPU
+    // work, so this is the knob that lets H3 use more than one core.
+    pub h3_runtime_threads: usize,
     pub tls: Option<TlsConfig>,
     pub io_backend: veylor_runtime::PollBackend,
 }
@@ -166,6 +169,7 @@ impl Default for ServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             h2c_port: None,
             h3_port: None,
+            h3_runtime_threads: 0,
             tls: None,
             io_backend: veylor_runtime::PollBackend::Mio,
         }

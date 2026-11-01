@@ -3,7 +3,6 @@ use std::io::{Read as _, Write as _};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use veylor_http2::{HpackTable, StreamTable};
 use veylor_router::RouteSlot;
 #[cfg(target_os = "linux")]
 use veylor_runtime::BatchRing;
@@ -22,7 +21,7 @@ use crate::connection::{
 };
 use crate::h2::H2Conn;
 use crate::h2::slots as h2_slots;
-use crate::h2::turn::{self as h2_turn, drive_h2_accepts, drive_h2_pumps, move_h2_tls_slot};
+use crate::h2::turn as h2_turn;
 use crate::host::{HostShared, StagedWork};
 use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::MAX_ROUTES;
@@ -160,46 +159,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         .collect();
     let mut admitted: Vec<Option<AdmittedConnection>> = (0..staging_cap).map(|_| None).collect();
     let mut ready: Vec<Readiness> = Vec::new();
-    let mut h2_meta = h2_slots::H2MetaSlots::default();
-    let mut h2_bufs = h2_slots::H2BufSlots::default();
+    let mut h2 = h2_slots::H2Slots::new();
     let mut h2_staging = h2_slots::accept_staging();
-    // NOTE: pre-allocated before any borrow exists and never moved: Option-
-    // wrapped buffers would force as_mut bindings that the borrow checker
-    // rejects for spanning borrows. ~57 KiB per slot, ~456 KiB per worker.
-    // Direct locals (not struct fields): only same-site overwrites visibly end
-    // the old regions for the next accept.
-    let mut h2_ts0: Option<StreamTable<'_>>;
-    let mut h2_ts1: Option<StreamTable<'_>>;
-    let mut h2_ts2: Option<StreamTable<'_>>;
-    let mut h2_ts3: Option<StreamTable<'_>>;
-    let mut h2_ts4: Option<StreamTable<'_>>;
-    let mut h2_ts5: Option<StreamTable<'_>>;
-    let mut h2_ts6: Option<StreamTable<'_>>;
-    let mut h2_ts7: Option<StreamTable<'_>>;
-    let mut h2_dec0: Option<HpackTable<'_>>;
-    let mut h2_dec1: Option<HpackTable<'_>>;
-    let mut h2_dec2: Option<HpackTable<'_>>;
-    let mut h2_dec3: Option<HpackTable<'_>>;
-    let mut h2_dec4: Option<HpackTable<'_>>;
-    let mut h2_dec5: Option<HpackTable<'_>>;
-    let mut h2_dec6: Option<HpackTable<'_>>;
-    let mut h2_dec7: Option<HpackTable<'_>>;
-    let mut h2_enc0: Option<HpackTable<'_>>;
-    let mut h2_enc1: Option<HpackTable<'_>>;
-    let mut h2_enc2: Option<HpackTable<'_>>;
-    let mut h2_enc3: Option<HpackTable<'_>>;
-    let mut h2_enc4: Option<HpackTable<'_>>;
-    let mut h2_enc5: Option<HpackTable<'_>>;
-    let mut h2_enc6: Option<HpackTable<'_>>;
-    let mut h2_enc7: Option<HpackTable<'_>>;
-    let mut h2_c0: Option<H2Conn<'_>> = None;
-    let mut h2_c1: Option<H2Conn<'_>> = None;
-    let mut h2_c2: Option<H2Conn<'_>> = None;
-    let mut h2_c3: Option<H2Conn<'_>> = None;
-    let mut h2_c4: Option<H2Conn<'_>> = None;
-    let mut h2_c5: Option<H2Conn<'_>> = None;
-    let mut h2_c6: Option<H2Conn<'_>> = None;
-    let mut h2_c7: Option<H2Conn<'_>> = None;
     let base = Instant::now();
     #[cfg(target_os = "linux")]
     let mut batch_ring = BatchRing::new(MAX_EVENTS_PER_TURN as u32).ok();
@@ -237,7 +198,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     worker.begin_shutdown(now_ns, config.shutdown_grace_ns, SHUTDOWN_TIMER_ID);
                 if result == veylor_runtime::ShutdownResult::Draining {
                     drain_start_ns = now_ns;
-                } else if h2_slots::occupied(&h2_meta) > 0 {
+                } else if h2.occupied() > 0 {
                     h2_turn::restart_h2_drain(
                         &mut drain_start_ns,
                         &mut h2_force_ns,
@@ -255,8 +216,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         // worker poller carries the wait as before (no spin either way). Stop/force wake
         // only worker-poller wakers, so a stop sleeping in the stream poll is observed at
         // loop top within one stream cadence; new accepts likewise wait out one cadence.
-        let live_streams = worker.live_count() + h2_slots::occupied(&h2_meta);
-        let h2_want = h2_slots::wants_pump(&h2_meta);
+        let live_streams = worker.live_count() + h2.occupied();
+        let h2_want = h2.wants_pump();
         let pending = if h1_quiet {
             h2_want
         } else {
@@ -285,7 +246,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     continue;
                 }
                 stream_touched = true;
-                if h2_turn::note_readiness(&mut h2_meta, &event) {
+                if h2.note_readiness(&event) {
                     continue;
                 }
                 let slot = event.token.wrapping_sub(1);
@@ -315,7 +276,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut tls_acceptor,
                 );
                 h2_turn::abandon_slots(
-                    &mut h2_meta,
+                    &mut h2,
                     &host,
                     worker_id,
                     &mut result.counts,
@@ -403,7 +364,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 // NOTE: the shutdown state only tracks H1 slots, so it can
                 // report complete while h2c conns are still draining; hold the
                 // worker until they finish (force still bounds the wait).
-                if outcome.shutdown_complete && h2_slots::occupied(&h2_meta) == 0 {
+                if outcome.shutdown_complete && h2.occupied() == 0 {
                     cleanup_all(
                         &host,
                         &mut conns,
@@ -413,7 +374,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         &mut tls_acceptor,
                     );
                     h2_turn::abandon_slots(
-                        &mut h2_meta,
+                        &mut h2,
                         &host,
                         worker_id,
                         &mut result.counts,
@@ -427,8 +388,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 // H2 connection that keeps progressing would otherwise never see a
                 // force bound; arm it here exactly once, with the same grace the
                 // stop path grants when H1 is already gone.
-                if outcome.shutdown_complete && h2_force_ns == 0 && h2_slots::occupied(&h2_meta) > 0
-                {
+                if outcome.shutdown_complete && h2_force_ns == 0 && h2.occupied() > 0 {
                     h2_turn::restart_h2_drain(
                         &mut drain_start_ns,
                         &mut h2_force_ns,
@@ -449,7 +409,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut tls_acceptor,
                 );
                 h2_turn::abandon_slots(
-                    &mut h2_meta,
+                    &mut h2,
                     &host,
                     worker_id,
                     &mut result.counts,
@@ -460,55 +420,22 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 break;
             }
         }
-        drive_h2_accepts!(
-            h2c_listener,
+        h2_turn::drive_accepts(
+            &mut h2,
+            h2c_listener.as_mut(),
             h2_enabled,
             draining,
             h2_accept_budget,
             now_ns,
-            h2_staging,
-            h2_meta,
-            h2_bufs,
-            stream_poller,
-            config,
-            result,
-            h2_ts0,
-            h2_ts1,
-            h2_ts2,
-            h2_ts3,
-            h2_ts4,
-            h2_ts5,
-            h2_ts6,
-            h2_ts7,
-            h2_dec0,
-            h2_dec1,
-            h2_dec2,
-            h2_dec3,
-            h2_dec4,
-            h2_dec5,
-            h2_dec6,
-            h2_dec7,
-            h2_enc0,
-            h2_enc1,
-            h2_enc2,
-            h2_enc3,
-            h2_enc4,
-            h2_enc5,
-            h2_enc6,
-            h2_enc7,
-            h2_c0,
-            h2_c1,
-            h2_c2,
-            h2_c3,
-            h2_c4,
-            h2_c5,
-            h2_c6,
-            h2_c7
+            config.timeouts.request_head_ns,
+            &mut stream_poller,
+            &mut result.counts,
+            &mut h2_staging,
         );
 
         // NOTE: the per-conn byte budget divides across H1+H2 conns together:
         // one turn's bytes split fairly instead of each family taking a full share.
-        let live_count = (worker.live_count() + h2_slots::occupied(&h2_meta)).max(1) as u64;
+        let live_count = (worker.live_count() + h2.occupied()).max(1) as u64;
         let per_conn_budget = config.turn.byte_budget_per_turn.div_ceil(live_count).max(1);
         // NOTE: idle-turn skip: with no arrivals, admits, expiries, staged host work, H1
         // backlog, parks, or shutdown signal the sweep would repeat last turn's no-ops, so
@@ -581,174 +508,19 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                         };
                         let mut stream = h1.into_stream();
                         let _ = stream_poller.deregister(&mut stream);
-                        let h2_slot = h2_slots::free_slot(&h2_meta);
-                        match (h2_slot, tls) {
-                            (Some(0), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    0,
-                                    h2_meta,
-                                    m0,
-                                    h2_bufs,
-                                    b0,
-                                    h2_ts0,
-                                    h2_dec0,
-                                    h2_enc0,
-                                    h2_c0,
+                        match (h2.free_slot(), tls) {
+                            (Some(index), Some(tls)) => {
+                                h2_turn::move_tls_slot(
+                                    &mut h2,
+                                    index,
                                     stream,
                                     tls,
-                                    prefix,
+                                    &prefix,
                                     now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(1), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    1,
-                                    h2_meta,
-                                    m1,
-                                    h2_bufs,
-                                    b1,
-                                    h2_ts1,
-                                    h2_dec1,
-                                    h2_enc1,
-                                    h2_c1,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(2), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    2,
-                                    h2_meta,
-                                    m2,
-                                    h2_bufs,
-                                    b2,
-                                    h2_ts2,
-                                    h2_dec2,
-                                    h2_enc2,
-                                    h2_c2,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(3), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    3,
-                                    h2_meta,
-                                    m3,
-                                    h2_bufs,
-                                    b3,
-                                    h2_ts3,
-                                    h2_dec3,
-                                    h2_enc3,
-                                    h2_c3,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(4), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    4,
-                                    h2_meta,
-                                    m4,
-                                    h2_bufs,
-                                    b4,
-                                    h2_ts4,
-                                    h2_dec4,
-                                    h2_enc4,
-                                    h2_c4,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(5), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    5,
-                                    h2_meta,
-                                    m5,
-                                    h2_bufs,
-                                    b5,
-                                    h2_ts5,
-                                    h2_dec5,
-                                    h2_enc5,
-                                    h2_c5,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(6), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    6,
-                                    h2_meta,
-                                    m6,
-                                    h2_bufs,
-                                    b6,
-                                    h2_ts6,
-                                    h2_dec6,
-                                    h2_enc6,
-                                    h2_c6,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
-                                );
-                            }
-                            (Some(7), Some(tls)) => {
-                                move_h2_tls_slot!(
-                                    7,
-                                    h2_meta,
-                                    m7,
-                                    h2_bufs,
-                                    b7,
-                                    h2_ts7,
-                                    h2_dec7,
-                                    h2_enc7,
-                                    h2_c7,
-                                    stream,
-                                    tls,
-                                    prefix,
-                                    now_ns,
-                                    config,
-                                    stream_poller,
-                                    result,
-                                    tls_acceptor
+                                    config.timeouts.request_head_ns,
+                                    &mut stream_poller,
+                                    &mut result.counts,
+                                    &mut tls_acceptor,
                                 );
                             }
                             (_, tls_opt) => {
@@ -760,7 +532,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                                 }
                                 result.counts.add(ConnClose::TransportError);
                             }
-                        };
+                        }
                         let _ = worker.close(token);
                         None
                     } else {
@@ -819,57 +591,30 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 }
             }
         }
-        let h2_pump_enabled = h2_enabled && h2_slots::occupied(&h2_meta) > 0;
-        drive_h2_pumps!(
-            h2_pump_enabled,
-            h2_view,
-            draining,
+        let h2_pump_enabled = h2_enabled && h2.occupied() > 0;
+        h2_turn::drive_pumps(
+            &mut h2,
+            if h2_pump_enabled {
+                h2_view.as_ref()
+            } else {
+                None
+            },
+            &host,
+            worker_id,
+            &mut h2_staged,
             per_conn_budget,
             now_ns,
-            h2_meta,
-            stream_poller,
-            config,
-            result,
-            worker,
-            force,
-            h2_force_ns,
-            drain_start_ns,
-            h2_ts0,
-            h2_ts1,
-            h2_ts2,
-            h2_ts3,
-            h2_ts4,
-            h2_ts5,
-            h2_ts6,
-            h2_ts7,
-            h2_dec0,
-            h2_dec1,
-            h2_dec2,
-            h2_dec3,
-            h2_dec4,
-            h2_dec5,
-            h2_dec6,
-            h2_dec7,
-            h2_enc0,
-            h2_enc1,
-            h2_enc2,
-            h2_enc3,
-            h2_enc4,
-            h2_enc5,
-            h2_enc6,
-            h2_enc7,
-            h2_c0,
-            h2_c1,
-            h2_c2,
-            h2_c3,
-            h2_c4,
-            h2_c5,
-            h2_c6,
-            h2_c7,
-            host,
-            worker_id,
-            h2_staged,
-            tls_acceptor
+            config.timeouts,
+            draining,
+            draining
+                && drain_start_ns > 0
+                && now_ns.saturating_sub(drain_start_ns) >= config.drain_idle_linger_ns,
+            worker.shutdown_phase() == ShutdownPhase::Forcing
+                || force.load(Ordering::Acquire)
+                || (h2_force_ns > 0 && now_ns >= h2_force_ns),
+            &mut result.counts,
+            tls_acceptor.as_mut(),
+            &mut stream_poller,
         );
 
         // NOTE: drain serves in-flight exchanges to completion (each conn closes

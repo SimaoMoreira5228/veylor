@@ -127,6 +127,10 @@ impl<'a> HpackTable<'a> {
         self.scratch_used
     }
 
+    pub const fn scratch_capacity(&self) -> usize {
+        self.scratch.len()
+    }
+
     pub(super) fn mark_size_updates_sent(&mut self) {
         self.signalled_max = self.max_size;
         self.pending_min_size = None;

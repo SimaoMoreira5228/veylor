@@ -1,14 +1,13 @@
 use veylor_runtime::{
-    ConnectionTimeouts, ConnectionToken, PollInterest, Poller, Readiness, TcpListener, TcpStream,
+    ConnectionTimeouts, ConnectionToken, PollInterest, Poller, TcpListener, TcpStream,
 };
 use veylor_tls::TlsAcceptor;
 
 use super::flush::{H2Flush, H2Read, flush_h2, read_once};
 use super::slots::{
-    H2_PENDING_CAP, H2_STREAM_TOKEN_BASE, H2Meta, H2MetaSlots, idle_for_drain, meta_at,
-    pending_spare,
+    H2_PENDING_CAP, H2_STREAM_TOKEN_BASE, H2Meta, H2Slots, idle_for_drain, pending_spare,
 };
-use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView, H2Conn, MAX_H2_CONNS, STREAM_SLOTS};
+use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView, H2Conn, STREAM_SLOTS};
 use crate::connection::ConnClose;
 use crate::connection::tls::tls_read_decrypted;
 use crate::host::{HostShared, StagedWork};
@@ -90,45 +89,6 @@ pub(crate) fn abort_slot(meta: &mut H2Meta, stream_poller: &mut Poller, counts: 
 
 // NOTE: driver-chain construction expands inline once per slot over buffer FIELDS;
 // Option temporaries and helper params are rejected; transient helpers stay plain fns.
-macro_rules! build_h2_conn {
-    ($bufs:ident, $b:ident, $ts:ident, $dec:ident, $enc:ident, $c:ident) => {{
-        // NOTE: killing the conn first ends the previous generation's regions; without
-        // this the fallthrough would merge stale and fresh borrows.
-        $c = None;
-        $ts = Some(veylor_http2::StreamTable::new(
-            &mut $bufs.$b.slots[..],
-            veylor_http2::H2Role::Server,
-            &mut $bufs.$b.block[..],
-            $crate::h2::HEADER_BLOCK_CAP as u32,
-        ));
-        $dec = Some(veylor_http2::HpackTable::new(
-            &mut $bufs.$b.dec_entries[..],
-            &mut $bufs.$b.dec_scratch[..],
-            4_096,
-        ));
-        $enc = Some(veylor_http2::HpackTable::new(
-            &mut $bufs.$b.enc_entries[..],
-            &mut $bufs.$b.enc_scratch[..],
-            4_096,
-        ));
-        match ($ts.as_mut(), $dec.as_mut(), $enc.as_mut()) {
-            (Some(live_streams), Some(live_decoder), Some(live_encoder)) => {
-                $c = Some($crate::h2::H2Conn::new(
-                    live_streams,
-                    live_decoder,
-                    live_encoder,
-                    &mut $bufs.$b.staging[..],
-                    &mut $bufs.$b.ack[..],
-                    &mut $bufs.$b.headers[..],
-                ));
-                true
-            }
-            _ => false,
-        }
-    }};
-}
-
-pub(crate) use build_h2_conn;
 
 // NOTE: teardown unparks the conn's full stream-keyed range (empty slots no-op).
 fn unpark_conn(host: &HostShared, worker: u32, meta: &H2Meta) {
@@ -271,8 +231,10 @@ pub(crate) fn pump_slot(
     if let H2Flush::Closed(reason) = flush_h2(meta, stream_poller, &mut turn.budget) {
         close_reason = Some(reason);
     }
-    // NOTE: reads pause while output is pending: bytes behind a saturated socket only grow work.
-    let wants_read = meta.readable && close_reason.is_none() && !meta.pending_unflushed();
+    // NOTE: keep reading even while output is pending. A response larger than the
+    // connection window makes the peer's WINDOW_UPDATE the only thing that can unblock
+    // the flush, so pausing reads here deadlocks any multi-stream file transfer.
+    let wants_read = meta.readable && close_reason.is_none();
     if wants_read {
         if meta.tls.is_some() {
             let Some(live) = conn.as_mut() else {
@@ -411,25 +373,30 @@ pub(crate) fn pump_slot(
 
 // NOTE: fatal-path abandon (worker exiting): streams drop, slots count Shutdown.
 pub(crate) fn abandon_slots(
-    metas: &mut H2MetaSlots,
+    slots: &mut H2Slots,
     host: &HostShared,
     worker: u32,
     counts: &mut CloseCounts,
     tls_acceptor: &mut Option<TlsAcceptor>,
 ) {
-    for index in 0..MAX_H2_CONNS {
-        let meta = meta_at(metas, index);
-        if meta.occupied {
-            unpark_conn(host, worker, meta);
-            meta.occupied = false;
-            meta.stream.take();
-            if meta.tls.take().is_some() {
+    for index in 0..slots.capacity() {
+        let Some(slot) = slots.slot_mut(index) else {
+            continue;
+        };
+        if slot.meta.occupied {
+            unpark_conn(host, worker, &slot.meta);
+            slot.meta.occupied = false;
+            slot.meta.stream.take();
+            if slot.meta.tls.take().is_some() {
                 if let Some(acceptor) = tls_acceptor.as_mut() {
                     acceptor.release();
                 }
             }
             counts.add(ConnClose::Shutdown);
         }
+    }
+    for index in 0..slots.capacity() {
+        slots.close(index);
     }
 }
 
@@ -443,25 +410,6 @@ pub(crate) fn restart_h2_drain(
     // h2c conns still get their GOAWAY drain (bounded by the same grace).
     *drain_start_ns = now_ns;
     *h2_force_ns = now_ns.saturating_add(shutdown_grace_ns);
-}
-
-pub(crate) fn note_readiness(metas: &mut H2MetaSlots, event: &Readiness) -> bool {
-    if event.token < H2_STREAM_TOKEN_BASE || event.token >= H2_STREAM_TOKEN_BASE + MAX_H2_CONNS {
-        return false;
-    }
-    let meta = meta_at(metas, event.token - H2_STREAM_TOKEN_BASE);
-    if meta.occupied {
-        if event.readable || event.read_closed_hint {
-            meta.readable = true;
-        }
-        if event.writable {
-            meta.write_blocked = false;
-        }
-        if event.error_hint {
-            meta.error = true;
-        }
-    }
-    true
 }
 
 pub(crate) fn register_listener(
@@ -521,182 +469,180 @@ pub(crate) fn project_routes<'a>(
     (flat, natives)
 }
 // NOTE: single accept-arm definition, invoked once per slot index below.
-macro_rules! accept_h2_slot {
-    ($slot:literal, $metas:ident, $meta:ident, $bufs:ident, $buf:ident, $ts:ident, $dec:ident, $enc:ident, $conn:ident, $accepted:ident, $now:ident, $config:ident, $poller:ident, $result:ident) => {
-        if $crate::h2::turn::open_slot(
-            &mut $metas.$meta,
-            $accepted.stream,
-            $slot,
-            $now,
-            $config.timeouts.request_head_ns,
-            &mut $poller,
-            &mut $result.counts,
-        ) && !$crate::h2::turn::build_h2_conn!($bufs, $buf, $ts, $dec, $enc, $conn)
-        {
-            $crate::h2::turn::abort_slot(&mut $metas.$meta, &mut $poller, &mut $result.counts);
-        }
+pub(crate) fn accept_slot(
+    slots: &mut H2Slots,
+    index: usize,
+    accepted: veylor_runtime::AcceptedConnection,
+    now_ns: u64,
+    head_budget_ns: u64,
+    poller: &mut Poller,
+    counts: &mut CloseCounts,
+) {
+    let Some(slot) = slots.ensure(index) else {
+        counts.add(ConnClose::TransportError);
+        return;
     };
+    if !open_slot(
+        &mut slot.meta,
+        accepted.stream,
+        index,
+        now_ns,
+        head_budget_ns,
+        poller,
+        counts,
+    ) {
+        slots.close(index);
+        return;
+    }
+    if !slot.open() {
+        abort_slot(&mut slot.meta, poller, counts);
+        slots.close(index);
+    }
 }
 
-pub(crate) use accept_h2_slot;
+// NOTE: per-turn h2c accept dispatch. h2c shares the H1 accept budget; on an H1-error
+// turn the budget is unknown, so h2c skips (fail closed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_accepts(
+    slots: &mut H2Slots,
+    listener: Option<&mut veylor_runtime::TcpListener>,
+    enabled: bool,
+    draining: bool,
+    budget: usize,
+    now_ns: u64,
+    head_budget_ns: u64,
+    poller: &mut Poller,
+    counts: &mut CloseCounts,
+    staging: &mut [Option<veylor_runtime::AcceptedConnection>],
+) {
+    if !(enabled && !draining && budget > 0) {
+        return;
+    }
+    let Some(bound) = listener else {
+        return;
+    };
+    // NOTE: one nonblocking accept per turn; WouldBlock short-circuits empty.
+    if veylor_runtime::accept_ready(bound, staging, budget).is_err() {
+        return;
+    }
+    for entry in staging.iter_mut() {
+        let Some(accepted) = entry.take() else {
+            continue;
+        };
+        let Some(index) = slots.free_slot() else {
+            counts.add(ConnClose::TransportError);
+            continue;
+        };
+        accept_slot(
+            slots,
+            index,
+            accepted,
+            now_ns,
+            head_budget_ns,
+            poller,
+            counts,
+        );
+    }
+}
 
-macro_rules! move_h2_tls_slot {
-    ($slot:literal, $metas:ident, $meta:ident, $bufs:ident, $buf:ident, $ts:ident, $dec:ident, $enc:ident, $conn:ident, $stream:ident, $tls:ident, $prefix:ident, $now:ident, $config:ident, $poller:ident, $result:ident, $tlsacc:ident) => {{
-        let mut moved = false;
-        if $crate::h2::turn::open_slot(
-            &mut $metas.$meta,
-            $stream,
-            $slot,
-            $now,
-            $config.timeouts.request_head_ns,
-            &mut $poller,
-            &mut $result.counts,
-        ) {
-            if $crate::h2::turn::build_h2_conn!($bufs, $buf, $ts, $dec, $enc, $conn) {
-                $crate::h2::slots::meta_at(&mut $metas, $slot).tls = Some($tls);
-                moved = $conn
-                    .as_mut()
-                    .is_some_and(|live| live.push_input(&$prefix).is_ok());
-                if !moved {
-                    $crate::h2::turn::abort_tls_slot(
-                        &mut $metas.$meta,
-                        &mut $poller,
-                        &mut $result.counts,
-                        &mut $tlsacc,
-                    );
-                }
-            } else {
-                $crate::h2::turn::abort_slot(&mut $metas.$meta, &mut $poller, &mut $result.counts);
-                if let Some(acceptor) = $tlsacc.as_mut() {
-                    acceptor.release();
-                }
-            }
-        } else if let Some(acceptor) = $tlsacc.as_mut() {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn move_tls_slot(
+    slots: &mut H2Slots,
+    index: usize,
+    stream: veylor_runtime::TcpStream,
+    tls: Box<veylor_tls::TlsConn>,
+    prefix: &[u8],
+    now_ns: u64,
+    head_budget_ns: u64,
+    poller: &mut Poller,
+    counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<TlsAcceptor>,
+) -> bool {
+    let Some(slot) = slots.ensure(index) else {
+        if let Some(acceptor) = tls_acceptor.as_mut() {
             acceptor.release();
         }
-        moved
-    }};
+        return false;
+    };
+    if !open_slot(
+        &mut slot.meta,
+        stream,
+        index,
+        now_ns,
+        head_budget_ns,
+        poller,
+        counts,
+    ) {
+        if let Some(acceptor) = tls_acceptor.as_mut() {
+            acceptor.release();
+        }
+        slots.close(index);
+        return false;
+    }
+    slot.meta.tls = Some(tls);
+    let moved = slot.open()
+        && slot
+            .conn
+            .as_mut()
+            .is_some_and(|live| live.push_input(prefix).is_ok());
+    if !moved {
+        abort_tls_slot(&mut slot.meta, poller, counts, tls_acceptor);
+        slots.close(index);
+    }
+    moved
 }
 
-pub(crate) use move_h2_tls_slot;
-
-// NOTE: per-turn h2c accept dispatch in `worker_main`. h2c shares the H1 accept budget;
-// on an H1-error turn the budget is unknown, so h2c skips (fail closed).
-macro_rules! drive_h2_accepts {
-    ($listener:ident, $enabled:ident, $draining:ident, $budget:ident, $now:ident, $staging:ident, $metas:ident, $bufs:ident, $poller:ident, $config:ident, $result:ident, $ts0:ident, $ts1:ident, $ts2:ident, $ts3:ident, $ts4:ident, $ts5:ident, $ts6:ident, $ts7:ident, $dec0:ident, $dec1:ident, $dec2:ident, $dec3:ident, $dec4:ident, $dec5:ident, $dec6:ident, $dec7:ident, $enc0:ident, $enc1:ident, $enc2:ident, $enc3:ident, $enc4:ident, $enc5:ident, $enc6:ident, $enc7:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident) => {
-        if $enabled && !$draining && $budget > 0 {
-            if let Some(bound) = $listener.as_mut() {
-                // NOTE: one nonblocking accept per turn; WouldBlock short-circuits empty.
-                if veylor_runtime::accept_ready(bound, &mut $staging, $budget).is_ok() {
-                    for entry in $staging.iter_mut() {
-                        let Some(accepted) = entry.take() else {
-                            continue;
-                        };
-                        match $crate::h2::slots::free_slot(&$metas) {
-                            Some(0) => $crate::h2::turn::accept_h2_slot!(
-                                0, $metas, m0, $bufs, b0, $ts0, $dec0, $enc0, $c0, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(1) => $crate::h2::turn::accept_h2_slot!(
-                                1, $metas, m1, $bufs, b1, $ts1, $dec1, $enc1, $c1, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(2) => $crate::h2::turn::accept_h2_slot!(
-                                2, $metas, m2, $bufs, b2, $ts2, $dec2, $enc2, $c2, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(3) => $crate::h2::turn::accept_h2_slot!(
-                                3, $metas, m3, $bufs, b3, $ts3, $dec3, $enc3, $c3, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(4) => $crate::h2::turn::accept_h2_slot!(
-                                4, $metas, m4, $bufs, b4, $ts4, $dec4, $enc4, $c4, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(5) => $crate::h2::turn::accept_h2_slot!(
-                                5, $metas, m5, $bufs, b5, $ts5, $dec5, $enc5, $c5, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(6) => $crate::h2::turn::accept_h2_slot!(
-                                6, $metas, m6, $bufs, b6, $ts6, $dec6, $enc6, $c6, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            Some(7) => $crate::h2::turn::accept_h2_slot!(
-                                7, $metas, m7, $bufs, b7, $ts7, $dec7, $enc7, $c7, accepted, $now,
-                                $config, $poller, $result
-                            ),
-                            None | Some(_) => $result
-                                .counts
-                                .add($crate::connection::ConnClose::TransportError),
-                        }
-                    }
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_pumps(
+    slots: &mut H2Slots,
+    view: Option<&FrozenRoutesView<'_>>,
+    host: &HostShared,
+    worker_id: u32,
+    staged: &mut Vec<StagedWork>,
+    budget: u64,
+    now_ns: u64,
+    timeouts: ConnectionTimeouts,
+    draining: bool,
+    linger_due: bool,
+    forcing: bool,
+    counts: &mut CloseCounts,
+    tls_acceptor: Option<&mut TlsAcceptor>,
+    poller: &mut Poller,
+) {
+    let Some(view) = view else {
+        return;
+    };
+    slots.sweep_deadlines(now_ns, timeouts);
+    let mut turn = H2Turn {
+        routes: view,
+        host,
+        worker_id,
+        staged,
+        budget: 0,
+        now_ns,
+        timeouts,
+        draining,
+        linger_due,
+        forcing,
+        counts,
+        tls_acceptor,
+    };
+    for index in 0..slots.capacity() {
+        turn.budget = budget;
+        let mut retire = false;
+        if let Some(slot) = slots.slot_mut(index) {
+            if slot.meta.occupied {
+                let _ = pump_slot(&mut slot.meta, &mut slot.conn, &mut turn, poller, index);
+                if let Some(conn) = slot.conn.as_mut() {
+                    conn.compact_decoder();
                 }
+                retire = !slot.meta.occupied;
+            } else {
+                retire = true;
             }
         }
-    };
-}
-
-pub(crate) use drive_h2_accepts;
-
-// NOTE: single pump-arm definition, invoked once per slot index below.
-macro_rules! pump_h2_one {
-    ($slot:literal, $metas:ident, $meta:ident, $conn:ident, $turn:ident, $poller:ident) => {{
-        let closed = $crate::h2::turn::pump_slot(
-            &mut $metas.$meta,
-            &mut $conn,
-            &mut $turn,
-            &mut $poller,
-            $slot,
-        );
-        if closed.is_some() {
-            $conn = None;
+        if retire {
+            slots.close(index);
         }
-    }};
+    }
 }
-
-pub(crate) use pump_h2_one;
-
-// NOTE: per-turn h2c pump dispatch in `worker_main`; arms invoke pump_h2_one!.
-macro_rules! drive_h2_pumps {
-    ($enabled:ident, $view:ident, $draining:ident, $budget:ident, $now:ident, $metas:ident, $poller:ident, $config:ident, $result:ident, $worker:ident, $force:ident, $h2force:ident, $drainstart:ident, $ts0:ident, $ts1:ident, $ts2:ident, $ts3:ident, $ts4:ident, $ts5:ident, $ts6:ident, $ts7:ident, $dec0:ident, $dec1:ident, $dec2:ident, $dec3:ident, $dec4:ident, $dec5:ident, $dec6:ident, $dec7:ident, $enc0:ident, $enc1:ident, $enc2:ident, $enc3:ident, $enc4:ident, $enc5:ident, $enc6:ident, $enc7:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $host:ident, $wid:ident, $h2staged:ident, $tlsacc:ident) => {
-        if $enabled {
-            $crate::h2::slots::sweep_deadlines(&mut $metas, $now, $config.timeouts);
-            if let Some(view) = $view.as_ref() {
-                let mut turn = $crate::h2::turn::H2Turn {
-                    routes: view,
-                    host: &$host,
-                    worker_id: $wid,
-                    staged: &mut $h2staged,
-                    budget: 0,
-                    now_ns: $now,
-                    timeouts: $config.timeouts,
-                    draining: $draining,
-                    linger_due: $draining
-                        && $drainstart > 0
-                        && $now.saturating_sub($drainstart) >= $config.drain_idle_linger_ns,
-                    forcing: $worker.shutdown_phase() == veylor_runtime::ShutdownPhase::Forcing
-                        || $force.load(std::sync::atomic::Ordering::Acquire)
-                        || ($h2force > 0 && $now >= $h2force),
-                    counts: &mut $result.counts,
-                    tls_acceptor: $tlsacc.as_mut(),
-                };
-                for index in 0..$crate::h2::MAX_H2_CONNS {
-                    turn.budget = $budget;
-                    match index {
-                        0 => $crate::h2::turn::pump_h2_one!(0, $metas, m0, $c0, turn, $poller),
-                        1 => $crate::h2::turn::pump_h2_one!(1, $metas, m1, $c1, turn, $poller),
-                        2 => $crate::h2::turn::pump_h2_one!(2, $metas, m2, $c2, turn, $poller),
-                        3 => $crate::h2::turn::pump_h2_one!(3, $metas, m3, $c3, turn, $poller),
-                        4 => $crate::h2::turn::pump_h2_one!(4, $metas, m4, $c4, turn, $poller),
-                        5 => $crate::h2::turn::pump_h2_one!(5, $metas, m5, $c5, turn, $poller),
-                        6 => $crate::h2::turn::pump_h2_one!(6, $metas, m6, $c6, turn, $poller),
-                        7 => $crate::h2::turn::pump_h2_one!(7, $metas, m7, $c7, turn, $poller),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    };
-}
-
-pub(crate) use drive_h2_pumps;

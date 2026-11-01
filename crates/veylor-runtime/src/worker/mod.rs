@@ -22,7 +22,7 @@ impl TurnConfig {
     pub const DEFAULT: Self = Self {
         max_accepts_per_turn: 8,
         max_events_per_turn: 256,
-        byte_budget_per_turn: 65_536,
+        byte_budget_per_turn: 4 * 1024 * 1024,
     };
 
     pub fn validate(self) -> Result<Self, WorkerError> {

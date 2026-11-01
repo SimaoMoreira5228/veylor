@@ -106,6 +106,10 @@ impl Default for Limits {
 pub struct Config {
     pub tls: Tls,
     pub limits: Limits,
+    // NOTE: QUIC termination is userspace CPU work; a single-thread runtime serialises
+    // every connection's crypto and stream state on one core. The server passes the
+    // host's parallelism so independent connections spread like plod's per-CPU loop.
+    pub runtime_threads: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -306,7 +310,8 @@ impl Server {
         )?;
         let limits = self.config.limits;
         let handler: Arc<dyn Handler> = Arc::new(handler);
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(self.config.runtime_threads.max(1))
             .enable_all()
             .build()
             .map_err(Error::Runtime)?;

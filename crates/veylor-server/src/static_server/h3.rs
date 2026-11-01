@@ -141,6 +141,13 @@ pub(crate) fn start(
         veylor_h3::Config {
             tls,
             limits: veylor_h3::Limits::default(),
+            runtime_threads: if config.h3_runtime_threads == 0 {
+                std::thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(4)
+            } else {
+                config.h3_runtime_threads
+            },
         },
     );
     match server.start(handler) {

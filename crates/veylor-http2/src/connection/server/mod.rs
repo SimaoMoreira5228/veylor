@@ -146,6 +146,10 @@ impl<'borrow, 'streams, 'decoder, 'encoder> H2ServerDriver<'borrow, 'streams, 'd
         Ok(Self { driver })
     }
 
+    pub fn compact_decoder(&mut self) {
+        self.driver.compact_decoder();
+    }
+
     pub fn accept_request(
         &self,
         stream_id: u32,

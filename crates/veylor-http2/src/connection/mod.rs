@@ -211,6 +211,12 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         self.hpack_decoder
     }
 
+    pub fn compact_decoder(&mut self) {
+        if self.hpack_decoder.scratch_used() * 2 > self.hpack_decoder.scratch_capacity() {
+            self.hpack_decoder.compact_scratch();
+        }
+    }
+
     pub fn register_fully_written_local_settings(
         &mut self,
         parameters: &[SettingsParameter],

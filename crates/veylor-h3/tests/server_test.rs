@@ -41,6 +41,7 @@ fn serves_h3_get_and_post() {
         Config {
             tls: Tls::new(vec![cert.clone()], key),
             limits: Limits::default(),
+            runtime_threads: 2,
         },
     );
     let running = server
@@ -136,6 +137,7 @@ fn streams_h3_response_body() {
         Config {
             tls: Tls::new(vec![cert.clone()], key),
             limits: Limits::default(),
+            runtime_threads: 2,
         },
     );
     let running = server
@@ -243,6 +245,7 @@ fn writes_h3_response_through_writer() {
         Config {
             tls: Tls::new(vec![cert.clone()], key),
             limits: Limits::default(),
+            runtime_threads: 2,
         },
     );
     let running = server.start(WriterHandler).expect("start h3 server");
@@ -300,6 +303,7 @@ fn client_requests_reuse_the_connection() {
         Config {
             tls: Tls::new(vec![cert.clone()], key),
             limits: Limits::default(),
+            runtime_threads: 2,
         },
     );
     let running = server
@@ -356,6 +360,7 @@ fn delivers_request_trailers() {
         Config {
             tls: Tls::new(vec![cert.clone()], key),
             limits: Limits::default(),
+            runtime_threads: 2,
         },
     );
     let running = server
@@ -467,6 +472,7 @@ fn client_reads_response_trailers() {
         Config {
             tls: Tls::new(vec![cert.clone()], key),
             limits: Limits::default(),
+            runtime_threads: 2,
         },
     );
     let running = server.start(TrailerHandler).expect("start h3 server");

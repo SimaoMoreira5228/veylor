@@ -239,6 +239,9 @@ fn repeated_header_blocks_reclaim_scratch_on_both_tables() {
         let (count, consumed) =
             decode_header_block(&output[..written], &mut decoder, &mut headers).unwrap();
         assert_eq!((count, consumed), (1, written));
+        // NOTE: the server compacts the decoder once per turn, after the decoded header
+        // spans are consumed; between blocks the table API leaves them alone.
+        decoder.compact_scratch();
     }
     assert!(encoder.scratch_used() <= 96);
     assert!(decoder.scratch_used() <= 96);
