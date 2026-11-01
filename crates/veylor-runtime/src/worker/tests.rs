@@ -455,7 +455,7 @@ fn expired_timer_ids_never_target_a_reused_slot_generation() {
 }
 
 #[test]
-fn timer_exhaustion_fails_closed_without_losing_the_slot() {
+fn independent_head_deadlines_survive_without_a_timer_heap() {
     let mut harness = Harness::<2, 1, 3>::new();
     let (mut worker, mut listener, address) = open_worker(&mut harness, TurnConfig::DEFAULT);
     let _client_a = connect(address);
@@ -478,10 +478,7 @@ fn timer_exhaustion_fails_closed_without_losing_the_slot() {
     let token_a = take_token(&mut admitted, 0);
     let token_b = take_token(&mut admitted, 1);
     worker.ensure_head_deadline(token_a, 1_000_000).unwrap();
-    assert!(matches!(
-        worker.ensure_head_deadline(token_b, 1_000_000),
-        Err(WorkerError::TimerCapacity)
-    ));
+    worker.ensure_head_deadline(token_b, 1_000_000).unwrap();
     assert_eq!(worker.live_count(), 2);
     assert_eq!(worker.pending_accepts(), 0);
     worker.close(token_a).unwrap();

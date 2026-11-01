@@ -4,7 +4,7 @@ use veylor_router::{RouteKind, RouteTable};
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared};
 use crate::static_routes::{
     EncodedStaticResponse, RouteBuildError, StaticRoutes, respond_bad_request,
-    respond_expectation_failed, respond_request_header_fields_too_large, respond_to_head,
+    respond_expectation_failed, respond_request_header_fields_too_large, respond_to_head_matched,
     respond_uri_too_long, route_cap,
 };
 
@@ -118,7 +118,7 @@ fn park_or_respond(
                 trailers,
             )
         }
-        Ok(_) | Err(_) => encode_static(conn, routes, table, head),
+        found => encode_static(conn, routes, table, head, found),
     }
 }
 
@@ -127,6 +127,7 @@ fn encode_static(
     routes: &StaticRoutes,
     table: &RouteTable<'_, '_>,
     head: veylor_http1::RequestHead,
+    found: Result<veylor_router::RouteMatch<'_, '_>, veylor_router::RouteError>,
 ) -> ExchangeOutcome {
     let Some(headers) = conn.headers.as_ref() else {
         return ExchangeOutcome::Close(ConnClose::TransportError);
@@ -135,10 +136,11 @@ fn encode_static(
         return ExchangeOutcome::Close(ConnClose::TransportError);
     };
     let output = ConnState::materialize_output(&mut conn.output);
-    match respond_to_head(
+    match respond_to_head_matched(
         routes,
         table,
         head,
+        found,
         &headers[..],
         &input[..conn.len],
         &mut output[..],

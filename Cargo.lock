@@ -1317,6 +1317,9 @@ dependencies = [
 [[package]]
 name = "veylor-http1"
 version = "0.1.0"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "veylor-http2"

@@ -3,9 +3,11 @@
 use veylor_http1::{
     ALLOW_BYTES, ALLOW_METHODS, ConnectionHeader, Field, Header, RequestHead, RequestVersion,
     ResponseFraming, ResponseToWrite, TargetForm, connection_header_for_response,
-    encode_response_head, join_allow_value, response_permits_reuse,
+    encode_response_head_trusted, join_allow_value, response_permits_reuse,
 };
-use veylor_router::{RouteCapture, RouteError, RouteKind, RouteTable};
+#[cfg(test)]
+use veylor_router::RouteCapture;
+use veylor_router::{RouteError, RouteKind, RouteTable};
 
 use crate::connection::trailers::field;
 use crate::static_files::{FilePlan, HTTP_DATE_BYTES};
@@ -18,6 +20,7 @@ use super::{
     route_cap,
 };
 
+#[cfg(test)]
 const CAPTURE_SLOTS: usize = 8;
 // NOTE: Allow join and range/multipart scratch live in veylor_http1 (response_write):
 // this path shares one join_allow_value plus the four size bounds with H2 routes,
@@ -38,6 +41,7 @@ pub struct EncodedStaticResponse {
     pub file: Option<FilePlan>,
 }
 
+#[cfg(test)]
 pub fn respond_to_head(
     routes: &StaticRoutes,
     table: &RouteTable<'_, '_>,
@@ -46,25 +50,39 @@ pub fn respond_to_head(
     input: &[u8],
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
+    let mut captures = [RouteCapture::default(); CAPTURE_SLOTS];
+    let found = table.find_request(head, input, &mut captures);
+    respond_to_head_matched(routes, table, head, found, headers, input, output)
+}
+
+// NOTE: the connection path resolves the route once for the managed-vs-static verdict, so
+// it hands that match down instead of paying a second frozen-table walk and path scan.
+pub(crate) fn respond_to_head_matched(
+    routes: &StaticRoutes,
+    table: &RouteTable<'_, '_>,
+    head: RequestHead,
+    found: Result<veylor_router::RouteMatch<'_, '_>, RouteError>,
+    headers: &[Header],
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<EncodedStaticResponse, RouteBuildError> {
     if in_native_handler() {
         return Err(RouteBuildError::Invalid);
     }
+    let method = head.method(input).unwrap_or_default();
     if head.target_form == TargetForm::Asterisk
-        && matches!(head.method(input), Some(m) if m == b"OPTIONS")
+        && method == b"OPTIONS"
         && head.content_length.unwrap_or(0) == 0
         && !head.is_chunked
         && !head.expect_continue
     {
         return respond_server_options(table, head, input, output);
     }
-    let mut captures = [RouteCapture::default(); CAPTURE_SLOTS];
-    let found = table.find_request(head, input, &mut captures);
     // NOTE: natives dispatch before statics on the same Static slot (same method+path can
     // never sit in both lists); either hit skips the file fallback below, so natives win
     // over file mounts exactly like statics do.
     if let Ok(matched) = &found {
         if matched.kind == RouteKind::Static {
-            let method = head.method(input).unwrap_or_default();
             if let Some(native) = routes.lookup_native(method, matched.pattern) {
                 let path = head.target(input).unwrap_or(matched.pattern);
                 return respond_native(
@@ -95,7 +113,7 @@ pub fn respond_to_head(
     let (status, reason, body, gzip, cap) = match found {
         Ok(found) => {
             let cap = route_cap(found.body);
-            match routes.lookup(head.method(input).unwrap_or_default(), found.pattern) {
+            match routes.lookup(method, found.pattern) {
                 Some(route) => (
                     route.status,
                     route.reason.as_slice(),
@@ -115,7 +133,6 @@ pub fn respond_to_head(
         ),
         Err(error) => return Err(RouteBuildError::from(error)),
     };
-    let method = head.method(input).unwrap_or_default();
     let request_version = head
         .protocol_version(input)
         .ok_or(RouteBuildError::Invalid)?;
@@ -204,7 +221,7 @@ pub fn respond_to_head(
         .get_mut(interim_len..)
         .ok_or(RouteBuildError::Invalid)?;
     let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+        encode_response_head_trusted(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
     let mut length = interim_len + encoded.length;
     if encoded.body_allowed && !body.is_empty() {
         let end = length + body.len();
@@ -329,7 +346,7 @@ pub(crate) fn encode_method_not_allowed(
         .get_mut(interim_len..)
         .ok_or(RouteBuildError::Invalid)?;
     let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+        encode_response_head_trusted(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
     let mut length = interim_len + encoded.length;
     if encoded.body_allowed && !METHOD_NOT_ALLOWED_BODY.is_empty() {
         let end = length + METHOD_NOT_ALLOWED_BODY.len();
@@ -389,7 +406,8 @@ fn respond_server_options(
         content_length: 0,
         connection,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     Ok(EncodedStaticResponse {
         length: encoded.length,
         keep_open: response_permits_reuse(false, connection),
@@ -424,7 +442,8 @@ pub(crate) fn encode_continue(output: &mut [u8]) -> Result<usize, RouteBuildErro
     // only stages those bytes into pump/host output buffers ahead of the final. Staging,
     // flush timing, and drain ordering stay transport-local in both engines.
     let interim = veylor_http1::continue_interim();
-    let encoded = encode_response_head(&interim, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&interim, output).map_err(|_| RouteBuildError::Invalid)?;
     Ok(encoded.length)
 }
 
@@ -450,7 +469,8 @@ pub fn respond_payload_too_large(
         content_length: PAYLOAD_TOO_LARGE_BODY.len() as u64,
         connection: ConnectionHeader::Close,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     let mut length = encoded.length;
     if encoded.body_allowed && !PAYLOAD_TOO_LARGE_BODY.is_empty() {
         let end = length + PAYLOAD_TOO_LARGE_BODY.len();
@@ -484,7 +504,8 @@ pub fn respond_expectation_failed(
         content_length: EXPECTATION_FAILED_BODY.len() as u64,
         connection: ConnectionHeader::Close,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     let mut length = encoded.length;
     if encoded.body_allowed && !EXPECTATION_FAILED_BODY.is_empty() {
         let end = length + EXPECTATION_FAILED_BODY.len();
@@ -518,7 +539,8 @@ pub fn respond_bad_request(
         content_length: BAD_REQUEST_BODY.len() as u64,
         connection: ConnectionHeader::Close,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     let end = encoded.length + BAD_REQUEST_BODY.len();
     output
         .get_mut(encoded.length..end)
@@ -548,7 +570,8 @@ pub fn respond_request_header_fields_too_large(
         content_length: REQUEST_HEADER_FIELDS_TOO_LARGE_BODY.len() as u64,
         connection: ConnectionHeader::Close,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     let end = encoded.length + REQUEST_HEADER_FIELDS_TOO_LARGE_BODY.len();
     output
         .get_mut(encoded.length..end)
@@ -581,7 +604,8 @@ pub fn respond_uri_too_long(
         content_length: URI_TOO_LONG_BODY.len() as u64,
         connection: ConnectionHeader::Close,
     };
-    let encoded = encode_response_head(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
     let end = encoded.length + URI_TOO_LONG_BODY.len();
     output
         .get_mut(encoded.length..end)

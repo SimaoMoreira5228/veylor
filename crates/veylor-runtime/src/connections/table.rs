@@ -65,6 +65,7 @@ pub struct ConnectionSlot {
     pub(crate) generation: u64,
     resource_id: u64,
     deadline_timer_id: u64,
+    deadline_ns: u64,
     deadline_kind: Option<ConnectionDeadlineKind>,
     state: SlotState,
     phase: Option<ConnectionPhase>,
@@ -75,6 +76,7 @@ impl ConnectionSlot {
         generation: 0,
         resource_id: 0,
         deadline_timer_id: 0,
+        deadline_ns: 0,
         deadline_kind: None,
         state: SlotState::Available,
         phase: None,
@@ -164,6 +166,9 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
 
         self.free_count = stack_index;
         slot.resource_id = resource_id;
+        slot.deadline_timer_id = 0;
+        slot.deadline_ns = 0;
+        slot.deadline_kind = None;
         slot.state = SlotState::Occupied;
         slot.phase = Some(ConnectionPhase::ReadingRequestHead);
         Ok(ConnectionToken {
@@ -229,12 +234,31 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
         Ok(timer_id)
     }
 
+    pub fn set_deadline_ns(
+        &mut self,
+        token: ConnectionToken,
+        deadline_ns: u64,
+    ) -> Result<(), TableError> {
+        let slot = self.slot_for_mut(token)?;
+        if slot.deadline_kind.is_none() {
+            return Err(TableError::NotFound);
+        }
+        slot.deadline_ns = deadline_ns;
+        Ok(())
+    }
+
+    pub fn deadline_ns(&self, token: ConnectionToken) -> Result<Option<u64>, TableError> {
+        let slot = self.slot_for(token)?;
+        Ok(slot.deadline_kind.map(|_| slot.deadline_ns))
+    }
+
     pub fn clear_deadline(&mut self, token: ConnectionToken) -> Result<(), TableError> {
         let slot = self.slot_for_mut(token)?;
         if slot.deadline_kind.is_none() {
             return Err(TableError::NotFound);
         }
         slot.deadline_timer_id = 0;
+        slot.deadline_ns = 0;
         slot.deadline_kind = None;
         Ok(())
     }
@@ -271,6 +295,7 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
             return Err(TableError::NotFound);
         };
         slot.deadline_timer_id = 0;
+        slot.deadline_ns = 0;
         slot.deadline_kind = None;
         Ok(ConnectionDeadline {
             token: ConnectionToken {
@@ -296,6 +321,7 @@ impl<'slots, 'free> ConnectionTable<'slots, 'free> {
         }
         slot.resource_id = 0;
         slot.deadline_timer_id = 0;
+        slot.deadline_ns = 0;
         slot.deadline_kind = None;
         slot.phase = Some(ConnectionPhase::Closing);
 

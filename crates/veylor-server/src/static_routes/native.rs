@@ -5,7 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use veylor_http1::{
     Field, Header, RequestHead, ResponseFraming, ResponseToWrite, connection_header_for_response,
-    encode_response_head, response_body_allowed_for, response_permits_reuse,
+    encode_response_head_trusted, response_body_allowed_for, response_permits_reuse,
 };
 
 use crate::host::HOST_MAX_REASON_BYTES;
@@ -147,7 +147,7 @@ pub(super) fn respond_native(
         .get_mut(interim_len..)
         .ok_or(RouteBuildError::Invalid)?;
     let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+        encode_response_head_trusted(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
     let mut length = interim_len + encoded.length;
     if encoded.body_allowed && !body.is_empty() {
         let end = length + body.len();

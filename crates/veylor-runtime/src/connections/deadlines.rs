@@ -1,7 +1,7 @@
 use super::{
     ConnectionDeadlineKind, ConnectionPhase, ConnectionTable, ConnectionToken, TableError,
 };
-use crate::timers::{TimerExpiration, TimerQueue, TimerQueueError};
+use crate::timers::TimerExpiration;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionTimeouts {
@@ -46,7 +46,6 @@ pub enum DeadlineError {
 
 pub fn schedule_phase_deadline(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
     now_ns: u64,
     timeouts: ConnectionTimeouts,
@@ -63,44 +62,56 @@ pub fn schedule_phase_deadline(
     let deadline_ns = now_ns
         .checked_add(timeout_ns)
         .ok_or(DeadlineError::DeadlineOverflow)?;
-    let timer = TimerExpiration {
+    table.bind_deadline(token, kind).map_err(map_table_error)?;
+    table
+        .set_deadline_ns(token, deadline_ns)
+        .map_err(map_table_error)?;
+    Ok(TimerExpiration {
         timer_id: super::super::deadline_timer_id(token),
         deadline_ns,
-    };
-    timers.schedule(timer).map_err(map_timer_error)?;
+    })
+}
 
-    if let Err(error) = table.bind_deadline(token, kind) {
-        let cancel_result = timers.cancel(timer.timer_id);
-        if cancel_result.is_err() {
-            return Err(DeadlineError::Invalid);
-        }
-        return Err(map_table_error(error));
+pub fn refresh_phase_deadline(
+    table: &mut ConnectionTable<'_, '_>,
+    token: ConnectionToken,
+    now_ns: u64,
+    timeouts: ConnectionTimeouts,
+) -> Result<TimerExpiration, DeadlineError> {
+    let phase = table.phase(token).map_err(map_table_error)?;
+    let kind = phase.deadline_kind().ok_or(DeadlineError::PhaseMismatch)?;
+    let timeout_ns = timeout_for(timeouts, kind);
+    if timeout_ns == 0 {
+        return Err(DeadlineError::InvalidTimeout);
     }
-    Ok(timer)
+    if table.deadline(token).map_err(map_table_error)?.is_none() {
+        return Err(DeadlineError::NotFound);
+    }
+    let deadline_ns = now_ns
+        .checked_add(timeout_ns)
+        .ok_or(DeadlineError::DeadlineOverflow)?;
+    table
+        .set_deadline_ns(token, deadline_ns)
+        .map_err(map_table_error)?;
+    Ok(TimerExpiration {
+        timer_id: super::super::deadline_timer_id(token),
+        deadline_ns,
+    })
 }
 
 pub fn cancel_phase_deadline(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
 ) -> Result<(), DeadlineError> {
-    let deadline = table
+    table
         .deadline(token)
         .map_err(map_table_error)?
         .ok_or(DeadlineError::NotFound)?;
-    timers
-        .cancel(deadline.timer_id)
-        .map_err(|error| match error {
-            TimerQueueError::NotFound => DeadlineError::TimerMissing,
-            TimerQueueError::Invalid => DeadlineError::Invalid,
-            TimerQueueError::Full | TimerQueueError::Duplicate => DeadlineError::Invalid,
-        })?;
     table.clear_deadline(token).map_err(map_table_error)
 }
 
 pub fn start_keep_alive_idle_deadline(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
     now_ns: u64,
     timeouts: ConnectionTimeouts,
@@ -108,7 +119,7 @@ pub fn start_keep_alive_idle_deadline(
     table
         .transition(token, ConnectionPhase::KeepAliveIdle)
         .map_err(map_table_error)?;
-    match schedule_phase_deadline(table, timers, token, now_ns, timeouts) {
+    match schedule_phase_deadline(table, token, now_ns, timeouts) {
         Ok(timer) => Ok(timer),
         Err(error) => {
             let _ = table.transition(token, ConnectionPhase::Closing);
@@ -119,13 +130,12 @@ pub fn start_keep_alive_idle_deadline(
 
 pub fn resume_keep_alive_request(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
 ) -> Result<(), DeadlineError> {
     if table.phase(token).map_err(map_table_error)? != ConnectionPhase::KeepAliveIdle {
         return Err(DeadlineError::PhaseMismatch);
     }
-    cancel_phase_deadline(table, timers, token).map_err(|error| match error {
+    cancel_phase_deadline(table, token).map_err(|error| match error {
         DeadlineError::NotFound => DeadlineError::TimerMissing,
         error => error,
     })?;
@@ -152,13 +162,5 @@ fn map_table_error(error: TableError) -> DeadlineError {
         TableError::DuplicateDeadline => DeadlineError::DuplicateTimer,
         TableError::NotFound => DeadlineError::NotFound,
         TableError::Invalid | TableError::Full => DeadlineError::Invalid,
-    }
-}
-
-fn map_timer_error(error: TimerQueueError) -> DeadlineError {
-    match error {
-        TimerQueueError::Full => DeadlineError::Full,
-        TimerQueueError::Duplicate => DeadlineError::DuplicateTimer,
-        TimerQueueError::NotFound | TimerQueueError::Invalid => DeadlineError::Invalid,
     }
 }

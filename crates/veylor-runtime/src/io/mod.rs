@@ -1,8 +1,6 @@
 use std::io::{self, Read, Write};
 
-use crate::{
-    ConnectionTable, ConnectionToken, DeadlineError, TcpStream, TimerExpiration, TimerQueue,
-};
+use crate::{ConnectionTable, ConnectionToken, DeadlineError, TcpStream, TimerExpiration};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseReason {
@@ -255,6 +253,12 @@ fn read_entry(entry: &mut IoBatch<'_>, allowance: &mut u64) {
                 if bytes == 0 {
                     break;
                 }
+                // NOTE: level-triggered readiness re-reports a socket with more
+                // buffered bytes, so a short read can stop here instead of paying
+                // a second recv that is expected to return EAGAIN.
+                if bytes < limit {
+                    break;
+                }
             }
             ReadAttempt::Blocked => {
                 if total > 0 {
@@ -385,7 +389,6 @@ fn map_write_error(error: &io::Error) -> WriteAttempt {
 // armed deadline alone so slow peers still time out. Completion cancels.
 pub fn note_read_progress(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
     bytes_read: usize,
     now_ns: u64,
@@ -394,12 +397,11 @@ pub fn note_read_progress(
     if bytes_read == 0 {
         return Ok(false);
     }
-    refresh_progress_deadline(table, timers, token, now_ns, timeouts).map(|_| true)
+    refresh_progress_deadline(table, token, now_ns, timeouts).map(|_| true)
 }
 
 pub fn note_write_progress(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
     bytes_written: usize,
     now_ns: u64,
@@ -408,15 +410,14 @@ pub fn note_write_progress(
     if bytes_written == 0 {
         return Ok(false);
     }
-    refresh_progress_deadline(table, timers, token, now_ns, timeouts).map(|_| true)
+    refresh_progress_deadline(table, token, now_ns, timeouts).map(|_| true)
 }
 
 pub fn note_completion(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
 ) -> Result<(), DeadlineError> {
-    match crate::cancel_phase_deadline(table, timers, token) {
+    match crate::cancel_phase_deadline(table, token) {
         Ok(()) => Ok(()),
         Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => Ok(()),
         Err(error) => Err(error),
@@ -425,26 +426,11 @@ pub fn note_completion(
 
 fn refresh_progress_deadline(
     table: &mut ConnectionTable<'_, '_>,
-    timers: &mut TimerQueue<'_, '_>,
     token: ConnectionToken,
     now_ns: u64,
     timeouts: crate::ConnectionTimeouts,
 ) -> Result<TimerExpiration, DeadlineError> {
-    if table.deadline(token).map_err(map_deadline_error)?.is_none() {
-        return Err(DeadlineError::NotFound);
-    }
-    crate::cancel_phase_deadline(table, timers, token)?;
-    crate::schedule_phase_deadline(table, timers, token, now_ns, timeouts)
-}
-
-fn map_deadline_error(error: crate::TableError) -> DeadlineError {
-    match error {
-        crate::TableError::Stale => DeadlineError::StaleConnection,
-        crate::TableError::InvalidTransition => DeadlineError::PhaseMismatch,
-        crate::TableError::DuplicateDeadline => DeadlineError::DuplicateTimer,
-        crate::TableError::NotFound => DeadlineError::NotFound,
-        crate::TableError::Invalid | crate::TableError::Full => DeadlineError::Invalid,
-    }
+    crate::refresh_phase_deadline(table, token, now_ns, timeouts)
 }
 
 #[cfg(test)]

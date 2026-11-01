@@ -219,19 +219,17 @@ fn deadline_refreshes_only_on_byte_progress() {
     let mut table = ConnectionTable::new(1, 1, &mut slots, &mut free).unwrap();
     let mut timers = TimerQueue::new(&mut timer_storage, &mut timer_index).unwrap();
     let live = table.allocate(11).unwrap();
-    schedule_phase_deadline(&mut table, &mut timers, live, 10_000_000, timeouts()).unwrap();
-    assert!(!note_read_progress(&mut table, &mut timers, live, 0, 10_500_000, timeouts()).unwrap());
-    assert!(
-        !note_write_progress(&mut table, &mut timers, live, 0, 10_500_000, timeouts()).unwrap()
-    );
+    schedule_phase_deadline(&mut table, live, 10_000_000, timeouts()).unwrap();
+    assert!(!note_read_progress(&mut table, live, 0, 10_500_000, timeouts()).unwrap());
+    assert!(!note_write_progress(&mut table, live, 0, 10_500_000, timeouts()).unwrap());
     assert!(timers.pop_expired(10_500_000).unwrap().is_none());
-    assert!(note_read_progress(&mut table, &mut timers, live, 5, 50_000_000, timeouts()).unwrap());
+    assert!(note_read_progress(&mut table, live, 5, 50_000_000, timeouts()).unwrap());
     assert!(timers.pop_expired(12_000_000).unwrap().is_none());
-    assert!(note_write_progress(&mut table, &mut timers, live, 5, 60_000_000, timeouts()).unwrap());
+    assert!(note_write_progress(&mut table, live, 5, 60_000_000, timeouts()).unwrap());
     assert!(timers.pop_expired(51_000_000).unwrap().is_none());
-    note_completion(&mut table, &mut timers, live).unwrap();
+    note_completion(&mut table, live).unwrap();
     assert!(table.deadline(live).unwrap().is_none());
-    note_completion(&mut table, &mut timers, live).unwrap();
+    note_completion(&mut table, live).unwrap();
 }
 
 #[test]

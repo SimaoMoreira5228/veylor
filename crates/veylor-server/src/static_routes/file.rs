@@ -1,6 +1,6 @@
 use veylor_http1::{
     CONTENT_RANGE_BYTES, Field, Header, MULTIPART_CTYPE_BYTES, RequestHead, ResponseFraming,
-    ResponseToWrite, TargetForm, connection_header_for_response, encode_response_head,
+    ResponseToWrite, TargetForm, connection_header_for_response, encode_response_head_trusted,
     response_permits_reuse,
 };
 
@@ -157,7 +157,7 @@ pub(crate) fn respond_file(
         .get_mut(interim_len..)
         .ok_or(RouteBuildError::Invalid)?;
     let encoded =
-        encode_response_head(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
+        encode_response_head_trusted(&response, final_buf).map_err(|_| RouteBuildError::Invalid)?;
     let length = interim_len + encoded.length;
     let file = if send_body && plan.size > 0 {
         Some(plan)

@@ -4,7 +4,6 @@ use super::{
     deadline_timer_id, resume_keep_alive_request, schedule_phase_deadline,
     start_keep_alive_idle_deadline,
 };
-use crate::{TimerExpiration, TimerQueue};
 
 #[test]
 fn allocates_releases_and_reuses_slots_with_fresh_generations() {
@@ -198,13 +197,10 @@ fn validates_worker_generation_and_free_stack_storage_at_initialization() {
 }
 
 #[test]
-fn schedules_cancels_and_expires_deadlines_through_the_timer_queue() {
+fn schedules_cancels_and_expires_deadlines() {
     let mut slots = [ConnectionSlot::EMPTY; 1];
     let mut free_stack = [0; 1];
     let mut table = ConnectionTable::new(14, 6, &mut slots, &mut free_stack).unwrap();
-    let mut timer_storage = [TimerExpiration::default(); 2];
-    let mut index_storage = [0; 6];
-    let mut timers = TimerQueue::new(&mut timer_storage, &mut index_storage).unwrap();
     let timeouts = ConnectionTimeouts {
         request_head_ns: 10,
         body_progress_ns: 20,
@@ -213,20 +209,19 @@ fn schedules_cancels_and_expires_deadlines_through_the_timer_queue() {
     };
     let token = table.allocate(201).unwrap();
 
-    let timer = schedule_phase_deadline(&mut table, &mut timers, token, 100, timeouts).unwrap();
+    let timer = schedule_phase_deadline(&mut table, token, 100, timeouts).unwrap();
     assert_eq!(timer.timer_id, deadline_timer_id(token));
     assert_eq!(timer.deadline_ns, 110);
-    assert_eq!(timers.len(), 1);
+    assert_eq!(table.deadline_ns(token), Ok(Some(110)));
     assert_eq!(
-        schedule_phase_deadline(&mut table, &mut timers, token, 100, timeouts),
+        schedule_phase_deadline(&mut table, token, 100, timeouts),
         Err(DeadlineError::ConnectionAlreadyTimed)
     );
-    cancel_phase_deadline(&mut table, &mut timers, token).unwrap();
-    assert!(timers.is_empty());
+    cancel_phase_deadline(&mut table, token).unwrap();
+    assert_eq!(table.deadline_ns(token), Ok(None));
 
-    let timer = schedule_phase_deadline(&mut table, &mut timers, token, 200, timeouts).unwrap();
+    let timer = schedule_phase_deadline(&mut table, token, 200, timeouts).unwrap();
     assert_eq!(timer.deadline_ns, 210);
-    assert_eq!(timers.pop_expired(210), Ok(Some(timer)));
     let deadline = table.expire_deadline(timer.timer_id).unwrap();
     assert_eq!(deadline.token, token);
     assert_eq!(deadline.kind, ConnectionDeadlineKind::RequestHead);
@@ -234,27 +229,27 @@ fn schedules_cancels_and_expires_deadlines_through_the_timer_queue() {
     table
         .transition(token, ConnectionPhase::ReadingRequestBody)
         .unwrap();
-    let timer = schedule_phase_deadline(&mut table, &mut timers, token, 300, timeouts).unwrap();
+    let timer = schedule_phase_deadline(&mut table, token, 300, timeouts).unwrap();
     assert_eq!(timer.deadline_ns, 320);
-    cancel_phase_deadline(&mut table, &mut timers, token).unwrap();
+    cancel_phase_deadline(&mut table, token).unwrap();
     table
         .transition(token, ConnectionPhase::AwaitingHandler)
         .unwrap();
-    let timer = schedule_phase_deadline(&mut table, &mut timers, token, 350, timeouts).unwrap();
+    let timer = schedule_phase_deadline(&mut table, token, 350, timeouts).unwrap();
     assert_eq!(timer.deadline_ns, 370);
-    cancel_phase_deadline(&mut table, &mut timers, token).unwrap();
+    cancel_phase_deadline(&mut table, token).unwrap();
     table
         .transition(token, ConnectionPhase::WritingResponse)
         .unwrap();
-    let timer = schedule_phase_deadline(&mut table, &mut timers, token, 400, timeouts).unwrap();
+    let timer = schedule_phase_deadline(&mut table, token, 400, timeouts).unwrap();
     assert_eq!(timer.deadline_ns, 430);
-    cancel_phase_deadline(&mut table, &mut timers, token).unwrap();
+    cancel_phase_deadline(&mut table, token).unwrap();
     table
         .transition(token, ConnectionPhase::KeepAliveIdle)
         .unwrap();
-    let timer = schedule_phase_deadline(&mut table, &mut timers, token, 500, timeouts).unwrap();
+    let timer = schedule_phase_deadline(&mut table, token, 500, timeouts).unwrap();
     assert_eq!(timer.deadline_ns, 540);
-    cancel_phase_deadline(&mut table, &mut timers, token).unwrap();
+    cancel_phase_deadline(&mut table, token).unwrap();
     assert_eq!(table.release(token), Ok(ReleaseOutcome::Released));
 }
 
@@ -263,9 +258,6 @@ fn keep_alive_deadline_is_cancelled_when_the_next_request_starts() {
     let mut slots = [ConnectionSlot::EMPTY; 1];
     let mut free_stack = [0; 1];
     let mut table = ConnectionTable::new(15, 7, &mut slots, &mut free_stack).unwrap();
-    let mut timer_storage = [TimerExpiration::default(); 1];
-    let mut index_storage = [0; 3];
-    let mut timers = TimerQueue::new(&mut timer_storage, &mut index_storage).unwrap();
     let timeouts = ConnectionTimeouts {
         request_head_ns: 100,
         keep_alive_idle_ns: 10,
@@ -276,12 +268,11 @@ fn keep_alive_deadline_is_cancelled_when_the_next_request_starts() {
         .transition(token, ConnectionPhase::WritingResponse)
         .unwrap();
 
-    let timer =
-        start_keep_alive_idle_deadline(&mut table, &mut timers, token, 100, timeouts).unwrap();
+    let timer = start_keep_alive_idle_deadline(&mut table, token, 100, timeouts).unwrap();
     assert_eq!(timer.deadline_ns, 110);
     assert_eq!(table.phase(token), Ok(ConnectionPhase::KeepAliveIdle));
-    resume_keep_alive_request(&mut table, &mut timers, token).unwrap();
-    assert_eq!(timers.len(), 0);
+    resume_keep_alive_request(&mut table, token).unwrap();
+    assert_eq!(table.deadline(token), Ok(None));
     assert_eq!(table.phase(token), Ok(ConnectionPhase::ReadingRequestHead));
 
     table
@@ -295,7 +286,7 @@ fn keep_alive_deadline_is_cancelled_when_the_next_request_starts() {
         .unwrap();
     let zero_timeout = ConnectionTimeouts::default();
     assert_eq!(
-        start_keep_alive_idle_deadline(&mut table, &mut timers, token, 200, zero_timeout),
+        start_keep_alive_idle_deadline(&mut table, token, 200, zero_timeout),
         Err(DeadlineError::InvalidTimeout)
     );
     assert_eq!(table.phase(token), Ok(ConnectionPhase::Closing));
@@ -307,24 +298,14 @@ fn deadline_scheduling_rejects_zero_overflow_full_and_stale_connections() {
     let mut free_stack = [0; 1];
     let mut table = ConnectionTable::new(16, 8, &mut slots, &mut free_stack).unwrap();
     let token = table.allocate(203).unwrap();
-    let mut timer_storage = [TimerExpiration::default(); 1];
-    let mut index_storage = [0; 3];
-    let mut timers = TimerQueue::new(&mut timer_storage, &mut index_storage).unwrap();
 
     assert_eq!(
-        schedule_phase_deadline(
-            &mut table,
-            &mut timers,
-            token,
-            0,
-            ConnectionTimeouts::default(),
-        ),
+        schedule_phase_deadline(&mut table, token, 0, ConnectionTimeouts::default(),),
         Err(DeadlineError::InvalidTimeout)
     );
     assert_eq!(
         schedule_phase_deadline(
             &mut table,
-            &mut timers,
             token,
             u64::MAX - 1,
             ConnectionTimeouts {
@@ -335,53 +316,8 @@ fn deadline_scheduling_rejects_zero_overflow_full_and_stale_connections() {
         Err(DeadlineError::DeadlineOverflow)
     );
 
-    timers
-        .schedule(TimerExpiration {
-            timer_id: deadline_timer_id(token),
-            deadline_ns: 50,
-        })
-        .unwrap();
-    assert_eq!(
-        schedule_phase_deadline(
-            &mut table,
-            &mut timers,
-            token,
-            10,
-            ConnectionTimeouts {
-                request_head_ns: 2,
-                ..ConnectionTimeouts::default()
-            },
-        ),
-        Err(DeadlineError::DuplicateTimer)
-    );
-    assert_eq!(table.deadline(token), Ok(None));
-    timers.cancel(deadline_timer_id(token)).unwrap();
-
-    timers
-        .schedule(TimerExpiration {
-            timer_id: 999,
-            deadline_ns: 50,
-        })
-        .unwrap();
-    assert_eq!(
-        schedule_phase_deadline(
-            &mut table,
-            &mut timers,
-            token,
-            10,
-            ConnectionTimeouts {
-                request_head_ns: 2,
-                ..ConnectionTimeouts::default()
-            },
-        ),
-        Err(DeadlineError::Full)
-    );
-    assert_eq!(table.deadline(token), Ok(None));
-    timers.cancel(999).unwrap();
-
     schedule_phase_deadline(
         &mut table,
-        &mut timers,
         token,
         10,
         ConnectionTimeouts {
@@ -390,12 +326,11 @@ fn deadline_scheduling_rejects_zero_overflow_full_and_stale_connections() {
         },
     )
     .unwrap();
-    cancel_phase_deadline(&mut table, &mut timers, token).unwrap();
+    cancel_phase_deadline(&mut table, token).unwrap();
     assert_eq!(table.release(token), Ok(ReleaseOutcome::Released));
     assert_eq!(
         schedule_phase_deadline(
             &mut table,
-            &mut timers,
             token,
             10,
             ConnectionTimeouts {

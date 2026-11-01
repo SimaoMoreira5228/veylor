@@ -1,3 +1,5 @@
+use memchr::{memchr, memchr2};
+
 use crate::expectation::{ExpectationError, parse as parse_expectation};
 use crate::fields::{
     ConnectionOptions, is_ows, is_token, parse_connection_options, parse_content_length,
@@ -133,31 +135,28 @@ impl Parser {
             return Ok(Some(self.request_head()));
         }
 
+        // NOTE: line ends come from a vector scan for CR/LF; the byte loop that used to
+        // walk every request byte only ran the per-line work below. CRLF is consumed as
+        // one unit, so an LF found here starts no line and is a bare-LF failure.
         let mut offset = self.scan_offset;
         while offset < input.len() {
-            let byte = input[offset];
-            if self.state == State::Headers && self.header_value_start.is_none() && byte == b':' {
-                self.header_value_start = Some(offset - self.line_start + 1);
+            let Some(found) = memchr2(b'\r', b'\n', &input[offset..]) else {
+                offset = input.len();
+                break;
+            };
+            let line_end = offset + found;
+            if input[line_end] == b'\n' {
+                return self.fail(ParseError::Invalid);
             }
-            if byte == b'\r' {
-                if input.get(offset + 1).is_some_and(|next| *next != b'\n') {
-                    return self.fail(ParseError::Invalid);
-                }
-                offset += 1;
-                continue;
-            }
-
-            if byte != b'\n' {
-                offset += 1;
-                continue;
-            }
-
-            if offset == self.line_start || input[offset - 1] != b'\r' {
+            let Some(next) = input.get(line_end + 1) else {
+                offset = line_end;
+                break;
+            };
+            if *next != b'\n' {
                 return self.fail(ParseError::Invalid);
             }
 
-            let line_end = offset - 1;
-            let line_next = offset + 1;
+            let line_next = line_end + 2;
             match self.state {
                 State::RequestLine => {
                     let line_length = line_end - self.line_start;
@@ -215,9 +214,10 @@ impl Parser {
                     // the caller already provides — a resume loop that never
                     // terminates. Fail it terminally instead.
                     let line = &input[self.line_start..line_end];
-                    let Some(colon) = line.iter().position(|value| *value == b':') else {
+                    let Some(colon) = memchr(b':', line) else {
                         return self.fail(ParseError::Invalid);
                     };
+                    self.header_value_start = Some(colon + 1);
                     if self.header_count >= headers.len() {
                         self.scan_offset = self.line_start;
                         return Err(ParseError::HeaderCapacity);
@@ -351,6 +351,12 @@ impl Parser {
         }
 
         self.scan_offset = offset;
+        if self.state == State::Headers && self.header_value_start.is_none() {
+            let partial = &input[self.line_start..];
+            if let Some(colon) = memchr(b':', partial) {
+                self.header_value_start = Some(colon + 1);
+            }
+        }
         let mut partial_line_length = input.len().saturating_sub(self.line_start);
         if partial_line_length > 0 && input.last() == Some(&b'\r') {
             partial_line_length -= 1;

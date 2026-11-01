@@ -11,8 +11,8 @@ mod worker;
 pub use connections::{
     ConnectionDeadline, ConnectionDeadlineKind, ConnectionPhase, ConnectionSlot, ConnectionTable,
     ConnectionTimeouts, ConnectionToken, DeadlineError, ReleaseOutcome, TableError,
-    cancel_phase_deadline, deadline_timer_id, resume_keep_alive_request, schedule_phase_deadline,
-    start_keep_alive_idle_deadline,
+    cancel_phase_deadline, deadline_timer_id, refresh_phase_deadline, resume_keep_alive_request,
+    schedule_phase_deadline, start_keep_alive_idle_deadline,
 };
 #[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 pub use io::{

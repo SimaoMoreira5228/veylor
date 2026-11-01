@@ -257,6 +257,24 @@ impl<'a> Worker<'a> {
             }
         }
 
+        for index in 0..self.live.len() {
+            if expired_count == expired.len() {
+                break;
+            }
+            let Some(token) = self.live[index] else {
+                continue;
+            };
+            let Ok(Some(deadline_ns)) = self.table.deadline_ns(token) else {
+                continue;
+            };
+            if deadline_ns == 0 || deadline_ns > now_ns {
+                continue;
+            }
+            if let Ok(deadline) = self.table.expire_deadline(deadline_timer_id(token)) {
+                expired[expired_count] = deadline;
+                expired_count += 1;
+            }
+        }
         outcome.expired_deadlines = expired_count;
 
         if self.shutdown.phase() == ShutdownPhase::Running {
@@ -291,14 +309,6 @@ impl<'a> Worker<'a> {
             .is_some();
 
         if armed {
-            let timer_id = deadline_timer_id(token);
-
-            if let Err(error) = self.timers.cancel(timer_id) {
-                if error != TimerQueueError::NotFound {
-                    return Err(error.into());
-                }
-            }
-
             self.table
                 .clear_deadline(token)
                 .map_err(WorkerError::from)?;
@@ -331,21 +341,17 @@ impl<'a> Worker<'a> {
         if bytes == 0 {
             return Ok(false);
         }
-        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
-            Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {}
-            Err(error) => return Err(error.into()),
-        }
         if self.table.phase(token)? == ConnectionPhase::Tunnel {
             return Ok(true);
         }
-        schedule_phase_deadline(
-            &mut self.table,
-            &mut self.timers,
-            token,
-            now_ns,
-            self.timeouts,
-        )?;
-        Ok(true)
+        match crate::refresh_phase_deadline(&mut self.table, token, now_ns, self.timeouts) {
+            Ok(_) => Ok(true),
+            Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {
+                schedule_phase_deadline(&mut self.table, token, now_ns, self.timeouts)?;
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     // NOTE: the armed deadline is cancelled before the move because the table
@@ -357,7 +363,7 @@ impl<'a> Worker<'a> {
         next: ConnectionPhase,
         now_ns: u64,
     ) -> Result<(), WorkerError> {
-        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+        match cancel_phase_deadline(&mut self.table, token) {
             Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {}
             Err(error) => return Err(error.into()),
         }
@@ -368,13 +374,7 @@ impl<'a> Worker<'a> {
         if next.deadline_kind().is_none() {
             return Ok(());
         }
-        if let Err(error) = schedule_phase_deadline(
-            &mut self.table,
-            &mut self.timers,
-            token,
-            now_ns,
-            self.timeouts,
-        ) {
+        if let Err(error) = schedule_phase_deadline(&mut self.table, token, now_ns, self.timeouts) {
             let _ = self.table.transition(token, ConnectionPhase::Closing);
             return Err(error.into());
         }
@@ -397,13 +397,7 @@ impl<'a> Worker<'a> {
         {
             return Ok(());
         }
-        schedule_phase_deadline(
-            &mut self.table,
-            &mut self.timers,
-            token,
-            now_ns,
-            self.timeouts,
-        )?;
+        schedule_phase_deadline(&mut self.table, token, now_ns, self.timeouts)?;
         Ok(())
     }
 
@@ -416,7 +410,7 @@ impl<'a> Worker<'a> {
         token: ConnectionToken,
         now_ns: u64,
     ) -> Result<(), WorkerError> {
-        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+        match cancel_phase_deadline(&mut self.table, token) {
             Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => {}
             Err(error) => return Err(error.into()),
         }
@@ -436,13 +430,7 @@ impl<'a> Worker<'a> {
                 .transition(token, ConnectionPhase::KeepAliveIdle)
                 .map_err(WorkerError::from)?;
         }
-        schedule_phase_deadline(
-            &mut self.table,
-            &mut self.timers,
-            token,
-            now_ns,
-            self.timeouts,
-        )?;
+        schedule_phase_deadline(&mut self.table, token, now_ns, self.timeouts)?;
         Ok(())
     }
 
@@ -451,13 +439,7 @@ impl<'a> Worker<'a> {
         token: ConnectionToken,
         now_ns: u64,
     ) -> Result<(), WorkerError> {
-        start_keep_alive_idle_deadline(
-            &mut self.table,
-            &mut self.timers,
-            token,
-            now_ns,
-            self.timeouts,
-        )?;
+        start_keep_alive_idle_deadline(&mut self.table, token, now_ns, self.timeouts)?;
         Ok(())
     }
 
@@ -466,16 +448,10 @@ impl<'a> Worker<'a> {
     // the head deadline. A re-arm failure parks the slot in Closing so the
     // server closes it instead of running it deadline-less.
     pub fn resume_idle(&mut self, token: ConnectionToken, now_ns: u64) -> Result<(), WorkerError> {
-        if let Err(error) = resume_keep_alive_request(&mut self.table, &mut self.timers, token) {
+        if let Err(error) = resume_keep_alive_request(&mut self.table, token) {
             return Err(error.into());
         }
-        if let Err(error) = schedule_phase_deadline(
-            &mut self.table,
-            &mut self.timers,
-            token,
-            now_ns,
-            self.timeouts,
-        ) {
+        if let Err(error) = schedule_phase_deadline(&mut self.table, token, now_ns, self.timeouts) {
             let _ = self.table.transition(token, ConnectionPhase::Closing);
             return Err(error.into());
         }
@@ -494,14 +470,14 @@ impl<'a> Worker<'a> {
         if self.table.phase(token)? != ConnectionPhase::KeepAliveIdle {
             return Err(WorkerError::Invalid);
         }
-        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+        match cancel_phase_deadline(&mut self.table, token) {
             Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
 
     pub fn cancel_deadline(&mut self, token: ConnectionToken) -> Result<(), WorkerError> {
-        match cancel_phase_deadline(&mut self.table, &mut self.timers, token) {
+        match cancel_phase_deadline(&mut self.table, token) {
             Ok(()) | Err(DeadlineError::NotFound | DeadlineError::TimerMissing) => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -694,7 +670,6 @@ impl<'a> Worker<'a> {
             let Some(token) = entry.take() else {
                 continue;
             };
-            let _ = self.timers.cancel(deadline_timer_id(token));
             let _ = self.table.clear_deadline(token);
 
             if self.table.release(token).is_ok() {

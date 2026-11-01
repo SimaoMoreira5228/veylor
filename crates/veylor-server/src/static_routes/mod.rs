@@ -471,8 +471,10 @@ pub(crate) use gzip::{CONTENT_ENCODING_GZIP, accepts_gzip_value, compress_route_
 pub(crate) use respond::encode_continue;
 pub(crate) use respond::header_value;
 pub(crate) use respond::reject_payload;
+#[cfg(test)]
+pub use respond::respond_to_head;
+pub(crate) use respond::respond_to_head_matched;
 pub use respond::{
     EncodedStaticResponse, respond_bad_request, respond_expectation_failed,
-    respond_payload_too_large, respond_request_header_fields_too_large, respond_to_head,
-    respond_uri_too_long,
+    respond_payload_too_large, respond_request_header_fields_too_large, respond_uri_too_long,
 };
