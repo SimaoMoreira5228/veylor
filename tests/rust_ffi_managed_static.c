@@ -25,7 +25,7 @@ _Static_assert(
     "token layout must match Rust VylManagedStaticToken"
 );
 _Static_assert(
-    sizeof(vyl_managed_static_event) == 80,
+    sizeof(vyl_managed_static_event) == 88,
     "event layout must match Rust VylManagedStaticEvent"
 );
 _Static_assert(

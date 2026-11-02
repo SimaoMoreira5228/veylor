@@ -1341,8 +1341,8 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "veylor-runtime",
  "veylor-server",
+ "veylor-web",
 ]
 
 [[package]]

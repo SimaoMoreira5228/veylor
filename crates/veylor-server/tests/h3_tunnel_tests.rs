@@ -22,6 +22,7 @@ fn blank_event() -> EventSlot {
         kind: HostEventKind::Request,
         token: ConnectionToken::default(),
         route_id: 0,
+        route_token: 0,
         method_len: 0,
         path_len: 0,
         method_offset: 0,

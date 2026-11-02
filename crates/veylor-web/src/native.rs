@@ -15,12 +15,13 @@ use crate::response::{Response, reason};
 pub(crate) enum Kind {
     Handler,
     Echo,
+    Sse,
 }
 
 pub(crate) struct Route<S: 'static> {
     pub(crate) layers: Arc<[Arc<dyn crate::middleware::Middleware<S>>]>,
     pub(crate) kind: Kind,
-    pub(crate) method: &'static [u8],
+    pub(crate) sse: Option<crate::sse::SseRoute<S>>,
     pub(crate) pattern: Vec<u8>,
     pub(crate) state: &'static S,
     pub(crate) handler: RouteHandler<S>,
@@ -34,6 +35,7 @@ pub(crate) struct App<S: 'static> {
     pub(crate) managed: Vec<Arc<Route<S>>>,
     pub(crate) fallback: Option<RouteHandler<S>>,
     pub(crate) body_cap: usize,
+    pub(crate) pending: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: 'static> App<S> {

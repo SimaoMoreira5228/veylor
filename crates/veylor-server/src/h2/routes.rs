@@ -45,6 +45,7 @@ pub(crate) fn project_extra_headers<'a>(
 pub struct FrozenRoute<'a> {
     pub method: &'a [u8],
     pub path: &'a [u8],
+    pub token: u64,
     pub status: u16,
     pub body: &'a [u8],
     pub gzip_body: Option<&'a [u8]>,
@@ -182,6 +183,10 @@ impl<'a> FrozenRoutesView<'a> {
         }
         self.natives = natives;
         Ok(self)
+    }
+
+    pub(crate) fn token(&self, index: usize) -> u64 {
+        self.routes.get(index).map(|route| route.token).unwrap_or(0)
     }
 
     pub(crate) fn find(&self, method: &[u8], path: &[u8]) -> Option<usize> {
@@ -479,6 +484,7 @@ mod tests {
             FrozenRoute {
                 method: b"GET",
                 path: b"/a",
+                token: 0,
                 status: 200,
                 body: b"a",
                 gzip_body: None,
@@ -490,6 +496,7 @@ mod tests {
             FrozenRoute {
                 method: b"POST",
                 path: b"/a",
+                token: 0,
                 status: 200,
                 body: b"b",
                 gzip_body: None,
@@ -501,6 +508,7 @@ mod tests {
             FrozenRoute {
                 method: b"GET",
                 path: b"/b",
+                token: 0,
                 status: 200,
                 body: b"c",
                 gzip_body: None,
@@ -512,6 +520,7 @@ mod tests {
             FrozenRoute {
                 method: b"GET",
                 path: b"/files/",
+                token: 0,
                 status: 200,
                 body: b"",
                 gzip_body: None,

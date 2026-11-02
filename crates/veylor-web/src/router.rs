@@ -164,6 +164,7 @@ pub fn files(dir: impl Into<PathBuf>) -> Files {
 pub enum RouteTarget<S: 'static> {
     Methods(MethodRouter<S>),
     Files(Files),
+    Sse(crate::sse::SseRoute<S>),
 }
 
 impl<S: 'static> From<MethodRouter<S>> for RouteTarget<S> {
@@ -298,6 +299,13 @@ impl<S: 'static> Router<S> {
 
     pub fn ws_echo(self, path: &str) -> Self {
         self.route(path, MethodRouter::new().ws_echo())
+    }
+
+    pub fn sse<T, H>(self, path: &str, handler: H) -> Self
+    where
+        H: crate::sse::SseHandler<T, S>,
+    {
+        self.route(path, RouteTarget::Sse(crate::sse::erase_sse(handler)))
     }
 
     pub fn mount(mut self, prefix: &str, dir: impl Into<PathBuf>) -> Self {

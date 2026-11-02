@@ -20,6 +20,7 @@ fn request_event(host: &veylor_server::HostHandle) -> veylor_server::EventSlot {
             generation: 0,
         },
         route_id: 0,
+        route_token: 0,
         method_len: 0,
         path_len: 0,
         method_offset: 0,

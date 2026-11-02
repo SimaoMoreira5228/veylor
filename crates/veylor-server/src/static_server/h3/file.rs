@@ -201,6 +201,7 @@ mod tests {
         H2StaticRoute {
             method: b"GET".to_vec(),
             path: b"/assets/".to_vec(),
+            token: 0,
             status: 200,
             body: Vec::new(),
             gzip_body: None,

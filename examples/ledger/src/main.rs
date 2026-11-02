@@ -1,13 +1,16 @@
 mod config;
-mod dispatch;
+mod handlers;
 mod store;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use veylor_server::{Server, ServerConfig, TlsConfig};
+use veylor_web::{MethodRouter, Router, ServeExt};
 
 use crate::config::Config;
+use crate::handlers::App;
 use crate::store::Store;
 
 fn main() -> Result<(), String> {
@@ -30,23 +33,20 @@ fn main() -> Result<(), String> {
         ..ServerConfig::default()
     };
     let store = Store::open(&options.database).map_err(|error| format!("database: {error:?}"))?;
-    let mut server =
-        Server::bind(options.address, config).map_err(|error| format!("bind: {error:?}"))?;
-
-    server
-        .register_route(b"GET", b"/ready", 200, b"OK", b"ready\n", 0)
-        .map_err(|error| format!("readiness: {error:?}"))?;
-
-    server
-        .register_managed(
-            b"POST",
-            b"/accounts/:account/transactions",
-            dispatch::BODY_CAP as u64,
+    let app: Router<App> = Router::with_state(Mutex::new(store))
+        .get("/ready", handlers::ready)
+        .route(
+            "/accounts/:account/statement",
+            MethodRouter::new().get(handlers::statement).managed(),
         )
-        .map_err(|error| format!("register transactions: {error:?}"))?;
-    server
-        .register_managed(b"GET", b"/accounts/:account/statement", 0)
-        .map_err(|error| format!("register statement: {error:?}"))?;
+        .post("/accounts/:account/transactions", handlers::transaction)
+        .body_limit(handlers::BODY_CAP);
+
+    let server =
+        Server::bind(options.address, config).map_err(|error| format!("bind: {error:?}"))?;
+    let running = server
+        .serve(app)
+        .map_err(|error| format!("start: {error:?}"))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = Arc::clone(&shutdown);
@@ -57,25 +57,6 @@ fn main() -> Result<(), String> {
         main_thread.unpark();
     })
     .map_err(|error| format!("signal handler: {error}"))?;
-
-    let running = server
-        .start()
-        .map_err(|error| format!("start: {error:?}"))?;
-    let host = running.host();
-    let stopped = Arc::new(AtomicBool::new(false));
-    let dispatch_stop = Arc::clone(&stopped);
-    let dispatcher = match std::thread::Builder::new()
-        .name("ledger-dispatch".into())
-        .spawn(move || dispatch::run(host, store, dispatch_stop))
-    {
-        Ok(dispatcher) => dispatcher,
-        Err(error) => {
-            running.stop_force();
-            let _ = running.join();
-
-            return Err(format!("dispatcher: {error}"));
-        }
-    };
 
     if encrypted {
         println!("HTTPS: https://{}", running.addr());
@@ -95,14 +76,9 @@ fn main() -> Result<(), String> {
 
     println!("Draining active connections.");
     running.stop_accepting();
-    let joined = running.join();
-
-    stopped.store(true, Ordering::Release);
-    dispatcher
+    let counts = running
         .join()
-        .map_err(|_| "dispatcher panicked".to_owned())?;
-
-    let counts = joined.map_err(|error| format!("shutdown: {error:?}"))?;
+        .map_err(|error| format!("shutdown: {error:?}"))?;
     println!("{counts:#?}");
 
     Ok(())

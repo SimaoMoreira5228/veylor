@@ -19,6 +19,7 @@ fn parse_request(input: &[u8]) -> (RequestHead, [Header; 16]) {
 fn route_config(kind: RouteKind) -> RouteConfig<'static> {
     RouteConfig {
         kind,
+        token: 0,
         body: RouteBodyPolicy::Reject,
     }
 }
@@ -149,6 +150,7 @@ fn route_admission_policy_gates_expect_continue_body_reads() {
     let allowed = [b"Digest".as_slice()];
     let config = RouteConfig {
         kind: RouteKind::Managed,
+        token: 0,
         body: RouteBodyPolicy::Stream {
             max_body_bytes: 16,
             permitted_trailers: &allowed,

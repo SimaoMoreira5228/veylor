@@ -89,6 +89,7 @@ unsafe fn poll_events(
             generation: 0,
         },
         route_id: 0,
+        route_token: 0,
         method_len: 0,
         path_len: 0,
         method_offset: 0,
@@ -418,6 +419,7 @@ pub(super) fn event_from_slot(slot: EventSlot) -> VylManagedStaticEvent {
         kind,
         token: token_from_server(slot.token),
         route_id: slot.route_id,
+        route_token: 0,
         method_len: slot.method_len,
         path_len: slot.path_len,
         method_offset: slot.method_offset,
@@ -481,4 +483,4 @@ pub(super) unsafe fn raw_trailer_fields<'a>(
     unsafe { slice::from_raw_parts(trailers, trailer_count) }
 }
 
-const _: () = assert!(std::mem::size_of::<VylManagedStaticEvent>() == 4 + 4 + 32 + 8 + 8 * 4);
+const _: () = assert!(std::mem::size_of::<VylManagedStaticEvent>() == 4 + 4 + 32 + 8 + 8 * 5);

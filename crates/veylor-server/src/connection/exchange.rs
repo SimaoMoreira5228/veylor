@@ -111,6 +111,7 @@ fn park_or_respond(
                 conn,
                 head,
                 found.route_id,
+                found.token,
                 worker_id,
                 host,
                 draining,

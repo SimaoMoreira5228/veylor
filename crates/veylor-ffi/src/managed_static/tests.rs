@@ -4230,7 +4230,7 @@ fn dispatch_body_available_partial_signal_precedes_completion() {
 fn dispatch_event_kind_mapping_reuses_length_fields_without_growth() {
     assert_eq!(VYL_MANAGED_STATIC_EVENT_BODY_AVAILABLE, 2);
     assert_eq!(VYL_MANAGED_STATIC_EVENT_WRITABLE, 3);
-    assert_eq!(std::mem::size_of::<VylManagedStaticEvent>(), 80);
+    assert_eq!(std::mem::size_of::<VylManagedStaticEvent>(), 88);
     let token = VylManagedStaticToken {
         worker_id: 7,
         slot: 9,
@@ -4251,6 +4251,7 @@ fn dispatch_event_kind_mapping_reuses_length_fields_without_growth() {
         kind: veylor_server::HostEventKind::BodyAvailable,
         token: server_token,
         route_id: 0,
+        route_token: 0,
         method_len: 5,
         path_len: 1,
         method_offset: 0,
@@ -4268,6 +4269,7 @@ fn dispatch_event_kind_mapping_reuses_length_fields_without_growth() {
         kind: veylor_server::HostEventKind::Writable,
         token: server_token,
         route_id: 0,
+        route_token: 0,
         method_len: 0,
         path_len: 0,
         method_offset: 0,

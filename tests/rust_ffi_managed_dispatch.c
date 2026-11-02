@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 _Static_assert(sizeof(vyl_managed_static_token) == 32, "token layout must match Rust");
-_Static_assert(sizeof(vyl_managed_static_event) == 80, "event layout must match Rust");
+_Static_assert(sizeof(vyl_managed_static_event) == 88, "event layout must match Rust");
 _Static_assert(sizeof(vyl_managed_static_poll_report) == 32, "report layout must match Rust");
 _Static_assert(
     sizeof(vyl_managed_static_trailer_report) == 40,

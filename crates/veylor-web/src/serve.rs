@@ -46,21 +46,49 @@ impl ServeExt for Server {
                     mounts.push((prefix.to_vec(), files.0));
                     continue;
                 }
+                RouteTarget::Sse(handler) => {
+                    let route = Arc::new(Route {
+                        layers: Arc::clone(&layers),
+                        kind: crate::native::Kind::Sse,
+                        sse: Some(handler),
+                        pattern: spec.path.clone(),
+                        state,
+                        handler: Box::new(|_, _| crate::response::Response::not_found()),
+                    });
+                    let route_token = managed.len() as u64 + 1;
+                    self.register_managed_with_token(
+                        b"GET",
+                        &spec.path,
+                        body_cap as u64,
+                        route_token,
+                    )
+                    .map_err(ServeError::Server)?;
+                    managed.push(Arc::clone(&route));
+                    registered.push(route);
+                    continue;
+                }
             };
 
             for entry in methods.entries {
                 let route = Arc::new(Route {
                     layers: Arc::clone(&layers),
                     kind: entry.kind,
-                    method: entry.method,
+                    sse: None,
                     pattern: spec.path.clone(),
                     state,
                     handler: entry.handler,
                 });
 
                 if entry.managed || needs_managed(entry.method) {
-                    self.register_managed(entry.method, &spec.path, body_cap as u64)
-                        .map_err(ServeError::Server)?;
+                    // NOTE: 1-based so 0 stays "untagged" for routes registered directly.
+                    let route_token = managed.len() as u64 + 1;
+                    self.register_managed_with_token(
+                        entry.method,
+                        &spec.path,
+                        body_cap as u64,
+                        route_token,
+                    )
+                    .map_err(ServeError::Server)?;
                     managed.push(Arc::clone(&route));
                 } else {
                     let user_data = Arc::as_ptr(&route) as usize;
@@ -83,14 +111,16 @@ impl ServeExt for Server {
             managed,
             fallback,
             body_cap,
+            pending: std::sync::atomic::AtomicUsize::new(0),
         }));
 
         let workers = self.worker_count();
+        let h3_worker = self.h3_worker_id();
         let server = self.start().map_err(ServeError::Server)?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut pool = Vec::new();
         if !app.managed.is_empty() {
-            for worker in 0..workers {
+            for worker in (0..workers).chain(h3_worker) {
                 pool.push(crate::managed::spawn(
                     worker,
                     server.host(),

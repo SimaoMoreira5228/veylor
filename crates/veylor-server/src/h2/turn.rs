@@ -443,6 +443,7 @@ pub(crate) fn project_routes<'a>(
         .map(|route| FrozenRoute {
             method: &route.method,
             path: &route.path,
+            token: route.token,
             status: route.status,
             body: &route.body,
             gzip_body: route.gzip_body.as_deref(),

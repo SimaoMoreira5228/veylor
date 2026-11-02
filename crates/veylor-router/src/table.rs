@@ -30,6 +30,7 @@ pub enum RouteBodyPolicy<'a> {
 pub struct RouteConfig<'a> {
     pub kind: RouteKind,
     pub body: RouteBodyPolicy<'a>,
+    pub token: u64,
 }
 
 impl RouteBodyPolicy<'_> {
@@ -50,6 +51,7 @@ pub struct RouteSlot<'a> {
     path: &'a [u8],
     kind: RouteKind,
     body: RouteBodyPolicy<'a>,
+    token: u64,
     route_id: u64,
     dynamic_segments: usize,
 }
@@ -60,6 +62,7 @@ impl<'a> RouteSlot<'a> {
         path: b"",
         kind: RouteKind::Static,
         body: RouteBodyPolicy::Reject,
+        token: 0,
         route_id: 0,
         dynamic_segments: 0,
     };
@@ -81,6 +84,7 @@ pub struct RouteTable<'slots, 'data> {
 
 pub struct RouteMatch<'capture, 'data> {
     pub route_id: u64,
+    pub token: u64,
     pub kind: RouteKind,
     pub body: RouteBodyPolicy<'data>,
     pub pattern: &'data [u8],
@@ -126,6 +130,7 @@ impl<'slots, 'data> RouteTable<'slots, 'data> {
             path,
             kind: config.kind,
             body: config.body,
+            token: config.token,
             route_id: 0,
             dynamic_segments,
         };
@@ -341,6 +346,7 @@ fn route_match<'capture, 'data>(
 ) -> RouteMatch<'capture, 'data> {
     RouteMatch {
         route_id: route.route_id,
+        token: route.token,
         kind: route.kind,
         body: route.body,
         pattern: route.path,

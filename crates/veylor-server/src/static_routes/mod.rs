@@ -51,6 +51,7 @@ pub struct StaticRoute {
 pub struct ManagedRoute {
     method: Vec<u8>,
     path: Vec<u8>,
+    pub(crate) token: u64,
     max_body_bytes: u64,
     trailers: Vec<Vec<u8>>,
 }
@@ -263,6 +264,17 @@ impl StaticRoutes {
         max_body_bytes: u64,
         trailers: &[&[u8]],
     ) -> Result<(), RouteBuildError> {
+        self.register_managed_with_token(method, path, max_body_bytes, trailers, 0)
+    }
+
+    pub fn register_managed_with_token(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        max_body_bytes: u64,
+        trailers: &[&[u8]],
+        token: u64,
+    ) -> Result<(), RouteBuildError> {
         if in_native_handler() {
             return Err(RouteBuildError::Invalid);
         }
@@ -295,6 +307,7 @@ impl StaticRoutes {
         self.managed.push(ManagedRoute {
             method: method.to_vec(),
             path: path.to_vec(),
+            token,
             max_body_bytes,
             trailers: trailers.iter().map(|name| name.to_vec()).collect(),
         });
@@ -380,6 +393,7 @@ impl StaticRoutes {
         for route in self.routes.iter() {
             let config = RouteConfig {
                 kind: RouteKind::Static,
+                token: 0,
                 body: RouteBodyPolicy::Stream {
                     max_body_bytes: route.max_body_bytes,
                     permitted_trailers: &[],
@@ -393,6 +407,7 @@ impl StaticRoutes {
         for route in self.managed.iter() {
             let config = RouteConfig {
                 kind: RouteKind::Managed,
+                token: route.token,
                 body: RouteBodyPolicy::Stream {
                     max_body_bytes: route.max_body_bytes,
                     permitted_trailers: &[],
@@ -405,6 +420,7 @@ impl StaticRoutes {
         for route in self.natives.iter() {
             let config = RouteConfig {
                 kind: RouteKind::Static,
+                token: 0,
                 body: RouteBodyPolicy::Stream {
                     max_body_bytes: MAX_STATIC_BODY_BYTES,
                     permitted_trailers: &[],

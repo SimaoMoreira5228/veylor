@@ -9,6 +9,7 @@ mod request;
 mod response;
 mod router;
 mod serve;
+mod sse;
 
 pub use handler::{
     AsyncHandler, Handler, HeadersArg, PathQueryArg, PathStateQueryArg, QueryArg, RequestArg,
@@ -21,6 +22,7 @@ pub use request::{
 pub use response::{Body as ResponseBody, IntoResponse, Response};
 pub use router::{Files, MethodRouter, RouteTarget, Router, files};
 pub use serve::{RunningApp, ServeError, ServeExt};
+pub use sse::{SseArg, SseEvent, SseHandler, SseSender, SseStateArg};
 
 #[cfg(feature = "json")]
 pub use request::Json;

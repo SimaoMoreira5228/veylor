@@ -365,6 +365,7 @@ pub struct VylManagedStaticEvent {
     pub kind: u32,
     pub token: VylManagedStaticToken,
     pub route_id: u64,
+    pub route_token: u64,
     pub method_len: usize,
     pub path_len: usize,
     pub method_offset: usize,

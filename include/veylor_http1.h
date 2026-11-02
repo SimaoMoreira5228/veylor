@@ -976,6 +976,7 @@ typedef struct {
     uint32_t kind;
     vyl_managed_static_token token;
     uint64_t route_id;
+    uint64_t route_token;
     size_t method_len;
     size_t path_len;
     size_t method_offset;

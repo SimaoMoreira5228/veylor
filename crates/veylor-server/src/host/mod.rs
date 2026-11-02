@@ -117,6 +117,7 @@ pub(crate) struct HostEvent {
     kind: HostEventKind,
     token: ConnectionToken,
     route_id: u64,
+    route_token: u64,
     method_len: u8,
     method: [u8; HOST_MAX_METHOD_BYTES],
     path_len: u16,
@@ -130,6 +131,7 @@ pub struct EventSlot {
     pub kind: HostEventKind,
     pub token: ConnectionToken,
     pub route_id: u64,
+    pub route_token: u64,
     pub method_len: usize,
     pub path_len: usize,
     pub method_offset: usize,
@@ -463,6 +465,7 @@ impl HostShared {
                         generation: 0,
                     },
                     route_id: 0,
+                    route_token: 0,
                     method_len: 0,
                     method: [0; HOST_MAX_METHOD_BYTES],
                     path_len: 0,
@@ -536,6 +539,10 @@ impl HostHandle {
         paths: &mut [u8],
     ) -> PollReport {
         self.shared.poll(timeout_ns, events, methods, paths)
+    }
+
+    pub fn h3_worker_id(&self) -> u32 {
+        self.shared.h3_worker_id()
     }
 
     pub fn poll_worker(
@@ -655,7 +662,8 @@ fn drain_pending(
             cursor = (cursor + 1) % workers;
             continue;
         };
-        let (kind, token, route_id) = (event.kind, event.token, event.route_id);
+        let (kind, token, route_id, route_token) =
+            (event.kind, event.token, event.route_id, event.route_token);
         // NOTE: signal events carry advisory counts in the reused length fields and no bytes:
         // BodyAvailable reports staged-ready bytes with the end flag, Writable carries the
         // token alone. Both always fit; only Request/Shutdown touch the caller buffers.
@@ -695,6 +703,7 @@ fn drain_pending(
             kind,
             token,
             route_id,
+            route_token,
             method_len,
             path_len,
             method_offset,

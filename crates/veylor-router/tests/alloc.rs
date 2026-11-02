@@ -85,6 +85,7 @@ fn router_exact_match_performs_no_heap_allocation() {
             let path_bytes: &'static [u8] = Box::leak(path.as_bytes().to_vec().into_boxed_slice());
             let config = RouteConfig {
                 kind: RouteKind::Static,
+                token: 0,
                 body: RouteBodyPolicy::Reject,
             };
             table.register(b"GET", path_bytes, config).unwrap();

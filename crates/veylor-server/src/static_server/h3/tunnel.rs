@@ -59,6 +59,7 @@ impl super::Handler {
             self.worker,
             token,
             route_id,
+            0,
             b"CONNECT",
             path,
             0,

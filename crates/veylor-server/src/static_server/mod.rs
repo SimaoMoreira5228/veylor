@@ -219,6 +219,7 @@ pub struct Server {
 pub(crate) struct H2StaticRoute {
     pub(crate) method: Vec<u8>,
     pub(crate) path: Vec<u8>,
+    pub(crate) token: u64,
     pub(crate) status: u16,
     pub(crate) body: Vec<u8>,
     pub(crate) gzip_body: Option<Vec<u8>>,
@@ -299,6 +300,7 @@ impl Server {
             self.h2_routes.push(H2StaticRoute {
                 method: method.to_vec(),
                 path: path.to_vec(),
+                token: 0,
                 status,
                 body: body.to_vec(),
                 gzip_body: None,
@@ -328,6 +330,7 @@ impl Server {
             self.h2_routes.push(H2StaticRoute {
                 method: method.to_vec(),
                 path: path.to_vec(),
+                token: 0,
                 status,
                 body: body.to_vec(),
                 gzip_body: self
@@ -350,15 +353,25 @@ impl Server {
         path: &[u8],
         max_body_bytes: u64,
     ) -> Result<(), ServerError> {
+        self.register_managed_with_token(method, path, max_body_bytes, 0)
+    }
+
+    pub fn register_managed_with_token(
+        &mut self,
+        method: &[u8],
+        path: &[u8],
+        max_body_bytes: u64,
+        token: u64,
+    ) -> Result<(), ServerError> {
         self.routes
-            .register_managed(method, path, max_body_bytes, &[])
+            .register_managed_with_token(method, path, max_body_bytes, &[], token)
             .map_err(ServerError::from)?;
-        // NOTE: park-only mirror (valid dummy status/body pass the projection filter);
-        // the turn parks these instead of serving them synchronously (H1 parity).
+
         if self.h2_routes.len() < MAX_ROUTES {
             self.h2_routes.push(H2StaticRoute {
                 method: method.to_vec(),
                 path: path.to_vec(),
+                token,
                 status: 200,
                 body: Vec::new(),
                 gzip_body: None,
@@ -380,13 +393,11 @@ impl Server {
         self.routes
             .register_file_mount(prefix, root)
             .map_err(ServerError::from)?;
-        // NOTE: prefix entry for the H2 projection: method is a GET-shaped dummy (mounts
-        // serve GET and HEAD through the prefix match, never the exact table), status and
-        // body dummies pass the projection filter, and the view skips file entries there.
         if self.h2_routes.len() < MAX_ROUTES {
             self.h2_routes.push(H2StaticRoute {
                 method: b"GET".to_vec(),
                 path: prefix.to_vec(),
+                token: 0,
                 status: 200,
                 body: Vec::new(),
                 gzip_body: None,
@@ -410,12 +421,11 @@ impl Server {
         self.routes
             .register_managed(method, path, max_body_bytes, trailers)
             .map_err(ServerError::from)?;
-        // NOTE: allowlist rides the mirror beside the park-only dummies: register validated
-        // names and order, so the projection resolves the same list H1 reads at park.
         if self.h2_routes.len() < MAX_ROUTES {
             self.h2_routes.push(H2StaticRoute {
                 method: method.to_vec(),
                 path: path.to_vec(),
+                token: 0,
                 status: 200,
                 body: Vec::new(),
                 gzip_body: None,
@@ -442,13 +452,12 @@ impl Server {
         self.routes
             .register_native(method, path, handler, user_data)
             .map_err(ServerError::from)?;
-        // NOTE: register validated, so the mirror cannot fail: same bounds, same order.
-        // Handler and user_data copy (both Copy); the H2 projection reads them straight.
         if self.h2_routes.len() < MAX_ROUTES {
             if let Some(handler) = handler {
                 self.h2_routes.push(H2StaticRoute {
                     method: method.to_vec(),
                     path: path.to_vec(),
+                    token: 0,
                     status: 200,
                     body: Vec::new(),
                     gzip_body: None,
@@ -478,6 +487,7 @@ impl Server {
                 self.h2_routes.push(H2StaticRoute {
                     method: method.to_vec(),
                     path: path.to_vec(),
+                    token: 0,
                     status: 200,
                     body: Vec::new(),
                     gzip_body: None,
@@ -494,6 +504,12 @@ impl Server {
 
     pub fn worker_count(&self) -> usize {
         self.config.worker_count.clamp(1, MAX_WORKERS)
+    }
+
+    pub fn h3_worker_id(&self) -> Option<usize> {
+        self.config
+            .h3_port
+            .map(|_| self.host.h3_worker_id() as usize)
     }
 
     pub fn start(self) -> Result<RunningServer, ServerError> {

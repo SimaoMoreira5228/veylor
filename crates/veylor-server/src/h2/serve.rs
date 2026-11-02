@@ -766,6 +766,10 @@ fn park_stream(
     };
     let path = request.path.unwrap_or(b"/");
     let route_id = routes.find(request.method, path).map(|index| index as u64);
+    let route_token = routes
+        .find(request.method, path)
+        .map(|index| routes.token(index))
+        .unwrap_or(0);
     let route_id = route_id.unwrap_or(u64::MAX);
     let trailers = routes.managed_trailers(request.method, path);
     let sub = (stream >> 1) as usize % STREAM_SLOTS;
@@ -783,6 +787,7 @@ fn park_stream(
         ctx.base.worker_id,
         base,
         route_id,
+        route_token,
         request.method,
         path,
         total,

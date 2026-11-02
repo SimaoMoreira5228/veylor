@@ -306,6 +306,7 @@ impl veylor_h3::Handler for Handler {
             });
         }
         let route_id = found.index as u64;
+        let route_token = found.route.token;
         let body_limit = found.route.max_body_bytes;
         let trailer_allow = found.route.trailers.clone();
         Box::pin(async move {
@@ -313,6 +314,7 @@ impl veylor_h3::Handler for Handler {
                 request,
                 body,
                 route_id,
+                route_token,
                 &method,
                 &path,
                 body_limit,
@@ -332,6 +334,7 @@ impl Handler {
         request: Request<()>,
         body: Bytes,
         route_id: u64,
+        route_token: u64,
         method: &[u8],
         path: &[u8],
         body_limit: u64,
@@ -375,6 +378,7 @@ impl Handler {
             self.worker,
             token,
             route_id,
+            route_token,
             method,
             path,
             body.len() as u64,

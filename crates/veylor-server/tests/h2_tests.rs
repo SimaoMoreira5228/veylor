@@ -37,6 +37,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
     FrozenRoute {
         method: b"GET",
         path: b"/hello",
+        token: 0,
         status: 200,
         body: b"",
         gzip_body: None,
@@ -48,6 +49,7 @@ static ROUTES: [FrozenRoute<'static>; 2] = [
     FrozenRoute {
         method: b"GET",
         path: b"/empty",
+        token: 0,
         status: 200,
         body: b"",
         gzip_body: None,
@@ -1339,6 +1341,7 @@ fn route_view_rejects_bad_input() {
     let bad_status = FrozenRoute {
         method: b"GET",
         path: b"/a",
+        token: 0,
         status: 204,
         body: b"",
         gzip_body: None,
@@ -1354,6 +1357,7 @@ fn route_view_rejects_bad_input() {
     let bad_method = FrozenRoute {
         method: b"GE T",
         path: b"/a",
+        token: 0,
         status: 200,
         body: b"x",
         gzip_body: None,
@@ -1369,6 +1373,7 @@ fn route_view_rejects_bad_input() {
     let big_body = FrozenRoute {
         method: b"GET",
         path: b"/a",
+        token: 0,
         status: 200,
         body: &[0; 15 * 1024 + 1],
         gzip_body: None,
@@ -1384,6 +1389,7 @@ fn route_view_rejects_bad_input() {
     let first = FrozenRoute {
         method: b"GET",
         path: b"/a",
+        token: 0,
         status: 200,
         body: b"a",
         gzip_body: None,
@@ -1395,6 +1401,7 @@ fn route_view_rejects_bad_input() {
     let dupe = FrozenRoute {
         method: b"GET",
         path: b"/a",
+        token: 0,
         status: 200,
         body: b"b",
         gzip_body: None,
@@ -1416,6 +1423,7 @@ fn route_view_rejects_bad_input() {
         .map(|path| FrozenRoute {
             method: b"GET",
             path,
+            token: 0,
             status: 200,
             body: b"x",
             gzip_body: None,
@@ -1573,6 +1581,7 @@ fn host_slot() -> EventSlot {
         kind: HostEventKind::Shutdown,
         token: host_base(),
         route_id: 0,
+        route_token: 0,
         method_len: 0,
         path_len: 0,
         method_offset: 0,
@@ -1736,6 +1745,7 @@ fn host_request_body_refused_without_staging() {
     static STATIC: [FrozenRoute<'static>; 1] = [FrozenRoute {
         method: b"GET",
         path: b"/hello",
+        token: 0,
         status: 200,
         body: b"hello",
         gzip_body: None,
@@ -4097,6 +4107,7 @@ static H2N_SELECT: [FrozenNativeRoute<'static>; 2] = [
 static H2N_PRE_ROUTES: [FrozenRoute<'static>; 1] = [FrozenRoute {
     method: b"HEAD",
     path: b"/x",
+    token: 0,
     status: 200,
     body: b"static-head",
     gzip_body: None,

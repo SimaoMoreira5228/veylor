@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
-use veylor_h3::{Client, ClientConfig, ClientTls, Limits, http};
+use veylor_h3::{Bytes, Client, ClientConfig, ClientTls, Limits, http};
 use veylor_server::{Server, ServerConfig, TlsConfig};
-use veylor_web::{Path, Query, Router, ServeExt};
+use veylor_web::{Path, Query, Router, ServeExt, SseEvent, SseSender};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(
@@ -14,6 +14,19 @@ fn fixture(name: &str) -> Vec<u8> {
 
 fn statement(Path(account): Path<i64>, Query(query): Query<'_>) -> String {
     format!("{account}:{}", query.parse::<i64>("m").unwrap_or(1))
+}
+
+fn move_funds(Path(account): Path<i64>) -> String {
+    format!("moved:{account}")
+}
+
+fn close_account(Path(account): Path<i64>) -> String {
+    format!("closed:{account}")
+}
+
+fn events(sender: SseSender) {
+    sender.send(SseEvent::data("h3"));
+    sender.close();
 }
 
 #[test]
@@ -32,7 +45,13 @@ fn h3_serves_the_same_router() {
     };
     let server = Server::bind(SocketAddr::from(([127, 0, 0, 1], 0)), config).expect("bind");
     let running = server
-        .serve(Router::new().get("/accounts/:account/statement", statement))
+        .serve(
+            Router::new()
+                .get("/accounts/:account/statement", statement)
+                .post("/accounts/:account/move", move_funds)
+                .post("/accounts/:account/close", close_account)
+                .sse("/events", events),
+        )
         .expect("serve");
 
     let address = running.h3_addr().expect("h3 address");
@@ -49,12 +68,41 @@ fn h3_serves_the_same_router() {
         .uri("https://localhost/accounts/42/statement?m=3")
         .body(())
         .expect("request");
-    let response = client
-        .request(request, veylor_h3::Bytes::new())
-        .expect("response");
-
+    let response = client.request(request, Bytes::new()).expect("response");
     assert_eq!(response.status, http::StatusCode::OK);
     assert_eq!(&response.body[..], b"42:3");
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://localhost/accounts/42/move")
+        .body(())
+        .expect("request");
+    let response = client.request(request, Bytes::new()).expect("response");
+    assert_eq!(
+        response.status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert_eq!(&response.body[..], b"moved:42");
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://localhost/accounts/42/close")
+        .body(())
+        .expect("request");
+    let response = client.request(request, Bytes::new()).expect("response");
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert_eq!(&response.body[..], b"closed:42");
+
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri("https://localhost/events")
+        .body(())
+        .expect("request");
+    let response = client.request(request, Bytes::new()).expect("response");
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert_eq!(&response.body[..], b"data: h3\n\n");
 
     running.join().expect("join");
 }

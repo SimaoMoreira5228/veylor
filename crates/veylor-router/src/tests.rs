@@ -3,6 +3,7 @@ use super::{RouteBodyPolicy, RouteConfig, RouteError, RouteKind, RouteSlot, Rout
 fn config() -> RouteConfig<'static> {
     RouteConfig {
         kind: RouteKind::Static,
+        token: 0,
         body: RouteBodyPolicy::Reject,
     }
 }
@@ -35,6 +36,7 @@ fn trailer_allowlist_bounds_reject_overflow() {
             b"/upload",
             RouteConfig {
                 kind: RouteKind::Managed,
+                token: 0,
                 body: RouteBodyPolicy::Stream {
                     max_body_bytes: u64::MAX,
                     permitted_trailers: &names,
@@ -50,6 +52,7 @@ fn trailer_allowlist_bounds_reject_overflow() {
             b"/upload",
             RouteConfig {
                 kind: RouteKind::Managed,
+                token: 0,
                 body: RouteBodyPolicy::Stream {
                     max_body_bytes: u64::MAX,
                     permitted_trailers: &[&long],
