@@ -31,9 +31,9 @@ Two paths, picked per route:
 
 Async handlers run on an `Executor` you supply. The default runs them inline on the
 dispatcher, which is fine when the future completes immediately. `ThreadExecutor` runs each
-task on its own thread for real overlap without pulling in a runtime. For Tokio or smol, or
-anything else, implement `Executor::spawn` and pass it to `Router::executor`. The crate
-depends on no runtime. `RunningApp::join` waits for in-flight handler tasks.
+task on its own thread for real overlap without pulling in a runtime. For Tokio, use
+`veylor-web-tokio`; for smol or anything else, implement `Executor::spawn` and pass it to
+`Router::executor`. The facade itself depends on no runtime. `RunningApp::join` waits for in-flight handler tasks.
 
 State is one `&'static` reference handed out through `State<T>`. It is never cloned per
 request.

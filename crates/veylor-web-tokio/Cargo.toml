@@ -1,0 +1,17 @@
+[package]
+name = "veylor-web-tokio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt"] }
+veylor-web = { version = "0.1.0", path = "../veylor-web" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+veylor-server = { version = "0.1.0", path = "../veylor-server" }
+
+[lints]
+workspace = true

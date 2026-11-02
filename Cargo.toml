@@ -11,10 +11,13 @@ members = [
     "crates/veylor-http3",
     "crates/veylor-router",
     "crates/veylor-runtime",
+    "crates/veylor-runtime-smol",
+    "crates/veylor-runtime-tokio",
     "crates/veylor-server",
     "crates/veylor-server-conn",
     "crates/veylor-tls",
     "crates/veylor-web",
+    "crates/veylor-web-tokio",
     "crates/veylor-websocket",
 ]
 default-members = [
@@ -26,10 +29,13 @@ default-members = [
     "crates/veylor-http3",
     "crates/veylor-router",
     "crates/veylor-runtime",
+    "crates/veylor-runtime-smol",
+    "crates/veylor-runtime-tokio",
     "crates/veylor-server",
     "crates/veylor-server-conn",
     "crates/veylor-tls",
     "crates/veylor-web",
+    "crates/veylor-web-tokio",
     "crates/veylor-websocket",
 ]
 exclude = ["fuzz"]
