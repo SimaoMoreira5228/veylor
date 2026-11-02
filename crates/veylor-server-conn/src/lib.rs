@@ -101,3 +101,14 @@ impl Default for ServerConnection<'_> {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConnection;
+
+    #[test]
+    fn connection_can_move_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ServerConnection<'static>>();
+    }
+}

@@ -7,13 +7,14 @@ use veylor_server::{
     MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, NativeHeader, NativeRequestView, NativeResponseOut,
 };
 
-use crate::handler::RouteHandler;
+use crate::handler::{AsyncRouteHandler, RouteHandler};
 use crate::request::{Param, Request};
 use crate::response::{Response, reason};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Kind {
     Handler,
+    Async,
     Echo,
     Sse,
 }
@@ -22,6 +23,7 @@ pub(crate) struct Route<S: 'static> {
     pub(crate) layers: Arc<[Arc<dyn crate::middleware::Middleware<S>>]>,
     pub(crate) kind: Kind,
     pub(crate) sse: Option<crate::sse::SseRoute<S>>,
+    pub(crate) async_handler: Option<AsyncRouteHandler<S>>,
     pub(crate) pattern: Vec<u8>,
     pub(crate) state: &'static S,
     pub(crate) handler: RouteHandler<S>,
@@ -36,6 +38,8 @@ pub(crate) struct App<S: 'static> {
     pub(crate) fallback: Option<RouteHandler<S>>,
     pub(crate) body_cap: usize,
     pub(crate) pending: std::sync::atomic::AtomicUsize,
+    pub(crate) executor: Arc<dyn crate::executor::Executor>,
+    pub(crate) inflight: Arc<crate::executor::Inflight>,
 }
 
 impl<S: 'static> App<S> {

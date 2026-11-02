@@ -1399,6 +1399,8 @@ dependencies = [
 name = "veylor-web"
 version = "0.1.0"
 dependencies = [
+ "memchr",
+ "pin-project-lite",
  "serde",
  "serde_json",
  "veylor-h3",

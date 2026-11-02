@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::handler::{AsyncHandler, Handler, RouteHandler, erase, erase_async};
+use crate::executor::Executor;
+use crate::handler::{AsyncHandler, AsyncRouteHandler, Handler, RouteHandler, erase, erase_async};
 use crate::middleware::Middleware;
 use crate::native::Kind;
 use crate::response::Response;
@@ -13,6 +14,7 @@ pub struct MethodRouter<S: 'static> {
 pub(crate) struct MethodEntry<S: 'static> {
     pub(crate) method: &'static [u8],
     pub(crate) handler: RouteHandler<S>,
+    pub(crate) async_handler: Option<AsyncRouteHandler<S>>,
     pub(crate) managed: bool,
     pub(crate) kind: Kind,
 }
@@ -37,6 +39,7 @@ impl<S: 'static> MethodRouter<S> {
         self.entries.push(MethodEntry {
             method,
             handler: erase(handler),
+            async_handler: None,
             managed: false,
             kind: Kind::Handler,
         });
@@ -51,6 +54,7 @@ impl<S: 'static> MethodRouter<S> {
         self.entries.push(MethodEntry {
             method,
             handler: Box::new(|_, _| Response::new(500, &b"not a handler"[..])),
+            async_handler: None,
             managed: true,
             kind: Kind::Echo,
         });
@@ -99,50 +103,51 @@ impl<S: 'static> MethodRouter<S> {
         self.on(b"HEAD", handler)
     }
 
-    pub fn get_async<T, H>(self, handler: H) -> Self
+    pub fn get_async<T: 'static, H>(self, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.on_async(b"GET", handler)
     }
 
-    pub fn post_async<T, H>(self, handler: H) -> Self
+    pub fn post_async<T: 'static, H>(self, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.on_async(b"POST", handler)
     }
 
-    pub fn put_async<T, H>(self, handler: H) -> Self
+    pub fn put_async<T: 'static, H>(self, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.on_async(b"PUT", handler)
     }
 
-    pub fn patch_async<T, H>(self, handler: H) -> Self
+    pub fn patch_async<T: 'static, H>(self, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.on_async(b"PATCH", handler)
     }
 
-    pub fn delete_async<T, H>(self, handler: H) -> Self
+    pub fn delete_async<T: 'static, H>(self, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.on_async(b"DELETE", handler)
     }
 
-    pub fn on_async<T, H>(mut self, method: &'static [u8], handler: H) -> Self
+    pub fn on_async<T: 'static, H>(mut self, method: &'static [u8], handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.entries.push(MethodEntry {
             method,
-            handler: erase_async(handler),
+            handler: Box::new(|_, _| Response::new(500, &b"not a handler"[..])),
+            async_handler: Some(erase_async(handler)),
             managed: true,
-            kind: Kind::Handler,
+            kind: Kind::Async,
         });
         self
     }
@@ -186,6 +191,7 @@ pub struct Router<S: 'static = ()> {
     pub(crate) fallback: Option<RouteHandler<S>>,
     pub(crate) body_cap: usize,
     pub(crate) layers: Vec<Arc<dyn Middleware<S>>>,
+    pub(crate) executor: Arc<dyn Executor>,
 }
 
 pub(crate) struct RouteSpec<S: 'static> {
@@ -216,6 +222,7 @@ impl<S: 'static> Router<S> {
             fallback: None,
             body_cap: DEFAULT_BODY_CAP,
             layers: Vec::new(),
+            executor: Arc::new(crate::executor::InlineExecutor),
         }
     }
 
@@ -262,35 +269,35 @@ impl<S: 'static> Router<S> {
         self.route(path, MethodRouter::new().delete(handler))
     }
 
-    pub fn get_async<T, H>(self, path: &str, handler: H) -> Self
+    pub fn get_async<T: 'static, H>(self, path: &str, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.route(path, MethodRouter::new().get_async(handler))
     }
 
-    pub fn post_async<T, H>(self, path: &str, handler: H) -> Self
+    pub fn post_async<T: 'static, H>(self, path: &str, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.route(path, MethodRouter::new().post_async(handler))
     }
 
-    pub fn put_async<T, H>(self, path: &str, handler: H) -> Self
+    pub fn put_async<T: 'static, H>(self, path: &str, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.route(path, MethodRouter::new().put_async(handler))
     }
 
-    pub fn patch_async<T, H>(self, path: &str, handler: H) -> Self
+    pub fn patch_async<T: 'static, H>(self, path: &str, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
         self.route(path, MethodRouter::new().patch_async(handler))
     }
 
-    pub fn delete_async<T, H>(self, path: &str, handler: H) -> Self
+    pub fn delete_async<T: 'static, H>(self, path: &str, handler: H) -> Self
     where
         H: AsyncHandler<T, S>,
     {
@@ -323,6 +330,11 @@ impl<S: 'static> Router<S> {
 
     pub fn body_limit(mut self, bytes: usize) -> Self {
         self.body_cap = bytes;
+        self
+    }
+
+    pub fn executor(mut self, executor: Arc<dyn Executor>) -> Self {
+        self.executor = executor;
         self
     }
 

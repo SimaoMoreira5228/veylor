@@ -64,7 +64,7 @@ pub struct BodyDecoder {
     scan_offset: usize,
     line_start: usize,
     pending_length: usize,
-    trailer_base: *mut Header,
+    trailer_base: usize,
     trailer_count: usize,
     required_trailer_count: usize,
     body_limits: BodyLimits,
@@ -92,7 +92,7 @@ impl BodyDecoder {
             scan_offset: 0,
             line_start: 0,
             pending_length: 0,
-            trailer_base: core::ptr::null_mut(),
+            trailer_base: 0,
             trailer_count: 0,
             required_trailer_count: 0,
             body_limits,
@@ -137,7 +137,7 @@ impl BodyDecoder {
             self.required_trailer_count = self.trailer_count;
             return Err(ParseError::HeaderCapacity);
         }
-        if self.trailer_count > 0 && self.trailer_base != trailers.as_mut_ptr() {
+        if self.trailer_count > 0 && self.trailer_base != trailers.as_mut_ptr() as usize {
             return self.fail(ParseError::BufferChanged);
         }
 
@@ -347,7 +347,7 @@ impl BodyDecoder {
                         },
                     };
                     if self.trailer_count == 0 {
-                        self.trailer_base = trailers.as_mut_ptr();
+                        self.trailer_base = trailers.as_mut_ptr() as usize;
                     }
                     self.trailer_count += 1;
                     self.scan_offset = next;

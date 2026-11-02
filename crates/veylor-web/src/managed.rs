@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -241,6 +243,56 @@ fn run_handler<S: Send + Sync + 'static>(
         respond(host, request.token, Response::not_found());
         return;
     };
+
+    if route.kind == Kind::Async {
+        let Some(handler) = route.async_handler.clone() else {
+            respond(host, request.token, internal_error());
+            return;
+        };
+        let task_host = host.clone();
+        let executor = Arc::clone(&app.executor);
+        let guard = app.inflight.add();
+        let token = request.token;
+        let state = route.state;
+        let task: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+            let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+            let count = capture_route(&route.pattern, &request.target, &mut captures).unwrap_or(0);
+            let mut params = [Param {
+                name: &[],
+                value: &[],
+            }; MAX_ROUTE_CAPTURES];
+            for (index, capture) in captures.iter().take(count).enumerate() {
+                params[index] = Param {
+                    name: capture.name(&route.pattern).unwrap_or(&[]),
+                    value: capture.value(&request.target).unwrap_or(&[]),
+                };
+            }
+            let mut pairs = [(&b""[..], &b""[..]); MAX_REQUEST_HEADERS];
+            for (slot, (name, value)) in pairs.iter_mut().zip(request.headers.iter()) {
+                *slot = (name.as_slice(), value.as_slice());
+            }
+            let pairs = &pairs[..request.headers.len()];
+            let incoming = Request::new(
+                &request.method,
+                &request.target,
+                pairs,
+                &request.body,
+                &params[..count],
+                state,
+            );
+            let response =
+                match crate::executor::CatchUnwind::new(handler.call(&incoming, state)).await {
+                    Ok(response) => response,
+                    Err(_) => internal_error(),
+                };
+            respond(&task_host, token, response);
+            drop(guard);
+        });
+        if catch_unwind(AssertUnwindSafe(|| executor.spawn(task))).is_err() {
+            respond(host, token, internal_error());
+        }
+        return;
+    }
 
     let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
     let count = capture_route(&route.pattern, &request.target, &mut captures).unwrap_or(0);

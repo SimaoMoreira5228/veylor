@@ -4,6 +4,7 @@ mod executor;
 mod handler;
 mod managed;
 mod middleware;
+mod multipart;
 mod native;
 mod request;
 mod response;
@@ -11,10 +12,13 @@ mod router;
 mod serve;
 mod sse;
 
+pub use executor::{Executor, ThreadExecutor};
 pub use handler::{
-    AsyncHandler, Handler, HeadersArg, PathQueryArg, PathStateQueryArg, QueryArg, RequestArg,
+    AsyncHandler, Handler, HeadersArg, MultipartArg, PathQueryArg, PathStateQueryArg, QueryArg,
+    RequestArg,
 };
 pub use middleware::{Ctx, Middleware, Next};
+pub use multipart::{Multipart, Part};
 pub use request::{
     Bytes, Form, FormValues, FromForm, FromParams, FromQuery, FromRequest, Headers, HeadersOwned,
     Param, Path, Query, QueryOwned, QueryParams, QueryValues, Reject, Request, State,

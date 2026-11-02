@@ -20,6 +20,7 @@ impl ServeExt for Server {
             fallback,
             body_cap,
             layers,
+            executor,
         } = app;
         let layers: Arc<[Arc<dyn crate::middleware::Middleware<S>>]> = Arc::from(layers);
 
@@ -51,6 +52,7 @@ impl ServeExt for Server {
                         layers: Arc::clone(&layers),
                         kind: crate::native::Kind::Sse,
                         sse: Some(handler),
+                        async_handler: None,
                         pattern: spec.path.clone(),
                         state,
                         handler: Box::new(|_, _| crate::response::Response::not_found()),
@@ -74,6 +76,7 @@ impl ServeExt for Server {
                     layers: Arc::clone(&layers),
                     kind: entry.kind,
                     sse: None,
+                    async_handler: entry.async_handler,
                     pattern: spec.path.clone(),
                     state,
                     handler: entry.handler,
@@ -105,6 +108,7 @@ impl ServeExt for Server {
                 .map_err(ServeError::Server)?;
         }
 
+        let inflight = crate::executor::Inflight::new();
         let app: &'static App<S> = Box::leak(Box::new(App {
             state,
             routes: registered,
@@ -112,6 +116,8 @@ impl ServeExt for Server {
             fallback,
             body_cap,
             pending: std::sync::atomic::AtomicUsize::new(0),
+            executor,
+            inflight: std::sync::Arc::clone(&inflight),
         }));
 
         let workers = self.worker_count();
@@ -134,6 +140,7 @@ impl ServeExt for Server {
             server: Some(server),
             dispatchers: pool,
             stop,
+            inflight,
         })
     }
 }
@@ -158,6 +165,7 @@ pub struct RunningApp {
     server: Option<RunningServer>,
     dispatchers: Vec<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    inflight: Arc<crate::executor::Inflight>,
 }
 
 impl RunningApp {
@@ -200,6 +208,7 @@ impl RunningApp {
         for dispatcher in self.dispatchers.drain(..) {
             let _ = dispatcher.join();
         }
+        self.inflight.wait();
 
         joined
     }

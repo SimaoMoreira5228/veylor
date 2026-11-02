@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+memchr = "2"
+pin-project-lite = "0.2"
 veylor-router = { version = "0.1.0", path = "../veylor-router" }
 veylor-runtime = { version = "0.1.0", path = "../veylor-runtime" }
 veylor-server = { version = "0.1.0", path = "../veylor-server" }

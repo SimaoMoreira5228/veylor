@@ -1,6 +1,8 @@
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use crate::executor::block_on;
+use crate::multipart::Multipart;
 use crate::request::{FromParams, FromRequest, Headers, Path, Query, Reject, Request, State};
 use crate::response::{IntoResponse, Response};
 
@@ -57,6 +59,21 @@ where
 {
     fn call(&self, request: &Request<'_, S>, _state: &'static S) -> Response {
         (self)(Headers(request.headers())).into_response()
+    }
+}
+
+pub struct MultipartArg;
+
+impl<S: 'static, F, R> Handler<MultipartArg, S> for F
+where
+    F: for<'a> Fn(Multipart<'a>) -> R + Send + Sync + 'static,
+    R: IntoResponse,
+{
+    fn call(&self, request: &Request<'_, S>, _state: &'static S) -> Response {
+        match Multipart::parse(request.headers(), request.body()) {
+            Ok(multipart) => (self)(multipart).into_response(),
+            Err(reject) => rejected(reject),
+        }
     }
 }
 
@@ -126,14 +143,49 @@ impl<S: 'static, F, R> Handler<(), S> for F
 impl_handler!();
 
 pub trait AsyncHandler<T, S: 'static>: Send + Sync + 'static {
-    fn call(&self, request: &Request<'_, S>, state: &'static S) -> Response;
+    fn call<'a, 'b>(
+        &'a self,
+        request: &'a Request<'b, S>,
+        state: &'static S,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>>;
 }
 
-pub(crate) fn erase_async<T, S: 'static, H>(handler: H) -> RouteHandler<S>
+pub(crate) trait AsyncRoute<S: 'static>: Send + Sync {
+    fn call<'a, 'b>(
+        &'a self,
+        request: &'a Request<'b, S>,
+        state: &'static S,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>>;
+}
+
+pub(crate) type AsyncRouteHandler<S> = Arc<dyn AsyncRoute<S>>;
+
+struct ErasedAsync<T, S: 'static, H> {
+    handler: H,
+    marker: std::marker::PhantomData<fn() -> (T, S)>,
+}
+
+impl<T, S: 'static, H> AsyncRoute<S> for ErasedAsync<T, S, H>
 where
     H: AsyncHandler<T, S>,
 {
-    Box::new(move |request, state| handler.call(request, state))
+    fn call<'a, 'b>(
+        &'a self,
+        request: &'a Request<'b, S>,
+        state: &'static S,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
+        self.handler.call(request, state)
+    }
+}
+
+pub(crate) fn erase_async<T: 'static, S: 'static, H>(handler: H) -> AsyncRouteHandler<S>
+where
+    H: AsyncHandler<T, S>,
+{
+    Arc::new(ErasedAsync {
+        handler,
+        marker: std::marker::PhantomData,
+    })
 }
 
 macro_rules! impl_async_handler {
@@ -141,11 +193,15 @@ macro_rules! impl_async_handler {
         impl<S: 'static, F, Fut, R> AsyncHandler<(), S> for F
         where
             F: Fn() -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = R>,
+            Fut: Future<Output = R> + Send,
             R: IntoResponse,
         {
-            fn call(&self, _request: &Request<'_, S>, _state: &'static S) -> Response {
-                block_on((self)()).into_response()
+            fn call<'a, 'b>(
+                &'a self,
+                _request: &'a Request<'b, S>,
+                _state: &'static S,
+            ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
+                Box::pin(async move { (self)().await.into_response() })
             }
         }
     };
@@ -154,16 +210,24 @@ macro_rules! impl_async_handler {
         impl<S: 'static, F, Fut, R, $($extractor),*> AsyncHandler<($($extractor,)*), S> for F
         where
             F: Fn($($extractor),*) -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = R>,
+            Fut: Future<Output = R> + Send,
             R: IntoResponse,
-            $($extractor: FromRequest<S>),*
+            $($extractor: FromRequest<S> + Send + 'static),*
         {
-            fn call(&self, request: &Request<'_, S>, state: &'static S) -> Response {
-                let invoked = (|| -> Result<Response, Reject> {
-                    $(let $extractor = $extractor::from_request(request, state)?;)*
-                    Ok(block_on((self)($($extractor),*)).into_response())
+            fn call<'a, 'b>(
+                &'a self,
+                request: &'a Request<'b, S>,
+                state: &'static S,
+            ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
+                let invoked = (|| -> Result<($($extractor,)*), Reject> {
+                    Ok(($($extractor::from_request(request, state)?,)*))
                 })();
-                invoked.unwrap_or_else(rejected)
+                match invoked {
+                    Ok(($($extractor,)*)) => Box::pin(async move {
+                        (self)($($extractor),*).await.into_response()
+                    }),
+                    Err(reject) => Box::pin(async move { rejected(reject) }),
+                }
             }
         }
     };

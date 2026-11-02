@@ -22,9 +22,9 @@ pub struct Parser {
     line_start: usize,
     header_start: usize,
     header_value_start: Option<usize>,
-    input_base: *const u8,
+    input_base: usize,
     input_length: usize,
-    header_base: *mut Header,
+    header_base: usize,
     header_count: usize,
     host_seen: bool,
     transfer_encoding_seen: bool,
@@ -54,9 +54,9 @@ impl Parser {
             line_start: 0,
             header_start: 0,
             header_value_start: None,
-            input_base: core::ptr::null(),
+            input_base: 0,
             input_length: 0,
-            header_base: core::ptr::null_mut(),
+            header_base: 0,
             header_count: 0,
             host_seen: false,
             transfer_encoding_seen: false,
@@ -111,8 +111,8 @@ impl Parser {
             return Err(error);
         }
 
-        let input_base = input.as_ptr();
-        if self.input_base.is_null() {
+        let input_base = input.as_ptr() as usize;
+        if self.input_base == 0 {
             if !input.is_empty() {
                 self.input_base = input_base;
                 self.input_length = input.len();
@@ -127,7 +127,7 @@ impl Parser {
             return Err(ParseError::HeaderCapacity);
         }
 
-        if self.header_count > 0 && self.header_base != headers.as_mut_ptr().cast() {
+        if self.header_count > 0 && self.header_base != headers.as_mut_ptr() as usize {
             return self.fail(ParseError::BufferChanged);
         }
 
@@ -339,7 +339,7 @@ impl Parser {
                     }
                     headers[self.header_count] = entry;
                     if self.header_count == 0 {
-                        self.header_base = headers.as_mut_ptr().cast();
+                        self.header_base = headers.as_mut_ptr() as usize;
                     }
                     self.header_count += 1;
                     self.header_value_start = None;

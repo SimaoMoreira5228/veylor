@@ -82,3 +82,14 @@ impl<'a> ClientConnection<'a> {
         self.writer == request_write::RequestWriteState::Cancelled
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClientConnection;
+
+    #[test]
+    fn connection_can_move_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ClientConnection<'static>>();
+    }
+}

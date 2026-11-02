@@ -73,9 +73,9 @@ pub struct ResponseParser<'a> {
     line_start: usize,
     header_start: usize,
     field_value_start: Option<usize>,
-    input_base: *const u8,
+    input_base: usize,
     input_length: usize,
-    header_base: *mut Header,
+    header_base: usize,
     header_count: usize,
     version: Span,
     reason: Span,
@@ -99,9 +99,9 @@ impl<'a> ResponseParser<'a> {
             line_start: 0,
             header_start: 0,
             field_value_start: None,
-            input_base: core::ptr::null(),
+            input_base: 0,
             input_length: 0,
-            header_base: core::ptr::null_mut(),
+            header_base: 0,
             header_count: 0,
             version: Span {
                 offset: 0,
@@ -144,8 +144,8 @@ impl<'a> ResponseParser<'a> {
             return Err(error);
         }
 
-        let input_base = input.as_ptr();
-        if self.input_base.is_null() {
+        let input_base = input.as_ptr() as usize;
+        if self.input_base == 0 {
             if !input.is_empty() {
                 self.input_base = input_base;
                 self.input_length = input.len();
@@ -159,7 +159,7 @@ impl<'a> ResponseParser<'a> {
         if headers.len() < self.header_count {
             return Err(ParseError::HeaderCapacity);
         }
-        if self.header_count > 0 && self.header_base != headers.as_mut_ptr().cast() {
+        if self.header_count > 0 && self.header_base != headers.as_mut_ptr() as usize {
             return self.fail(ParseError::BufferChanged);
         }
         if self.state == State::Ready {
@@ -324,7 +324,7 @@ impl<'a> ResponseParser<'a> {
 
                     headers[self.header_count] = field;
                     if self.header_count == 0 {
-                        self.header_base = headers.as_mut_ptr().cast();
+                        self.header_base = headers.as_mut_ptr() as usize;
                     }
                     self.header_count += 1;
                     self.field_value_start = None;
@@ -377,7 +377,7 @@ impl<'a> ResponseParser<'a> {
         {
             return Err(ParseError::Invalid);
         }
-        if input.as_ptr() != self.input_base || input.len() < self.input_length {
+        if input.as_ptr() as usize != self.input_base || input.len() < self.input_length {
             return self.fail(ParseError::BufferChanged);
         }
         self.scan_offset = next_offset;
@@ -386,7 +386,7 @@ impl<'a> ResponseParser<'a> {
         self.head_start = next_offset;
         self.field_value_start = None;
         self.header_count = 0;
-        self.header_base = core::ptr::null_mut();
+        self.header_base = 0;
         self.version = Span::default();
         self.reason = Span::default();
         self.status = 0;

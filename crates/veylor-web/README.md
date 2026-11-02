@@ -16,7 +16,7 @@ Server::bind(addr, config)?.serve(app)?;
 
 Handlers are plain functions. Borrowing extractors (`Query<'_>`, `Headers<'_>`) and owned
 ones (`Path<i64>`, `State<Store>`, `QueryOwned<T>`, `HeadersOwned`, `Bytes`, `Form<T>`,
-`Json<T>`) both work, or take a `Request` when you want the raw bytes. `files(dir)` registers
+`Multipart<'_>`, `Json<T>`) both work, or take a `Request` when you want the raw bytes. `files(dir)` registers
 the engine's file mount at the route's prefix, so ranges, gzip twins and ETags keep working.
 
 Two paths, picked per route:
@@ -27,8 +27,13 @@ Two paths, picked per route:
 - **Managed.** Anything with a body, or anything marked `managed()` or `*_async`, parks on
   the host and runs on one dispatcher per worker. The dispatcher keeps up to 128 in-flight
   requests per app and advances every one each turn, so one slow upload does not stall the
-  rest. Async handlers run there too, on a thread-parking executor. Fine for database work,
-  wrong for the hot path. You don't write the dispatch loop.
+  rest. Fine for database work, wrong for the hot path. You don't write the dispatch loop.
+
+Async handlers run on an `Executor` you supply. The default runs them inline on the
+dispatcher, which is fine when the future completes immediately. `ThreadExecutor` runs each
+task on its own thread for real overlap without pulling in a runtime. For Tokio or smol, or
+anything else, implement `Executor::spawn` and pass it to `Router::executor`. The crate
+depends on no runtime. `RunningApp::join` waits for in-flight handler tasks.
 
 State is one `&'static` reference handed out through `State<T>`. It is never cloned per
 request.
