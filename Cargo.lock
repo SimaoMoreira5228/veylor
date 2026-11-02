@@ -1396,6 +1396,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "veylor-web"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "veylor-router",
+ "veylor-runtime",
+ "veylor-server",
+]
+
+[[package]]
 name = "veylor-websocket"
 version = "0.1.0"
 dependencies = [

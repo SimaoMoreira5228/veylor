@@ -235,6 +235,19 @@ pub fn matches_route(pattern: &[u8], path: &[u8]) -> bool {
     }
 }
 
+pub fn capture_route(
+    pattern: &[u8],
+    target: &[u8],
+    captures: &mut [RouteCapture; MAX_ROUTE_CAPTURES],
+) -> Option<usize> {
+    match_pattern(
+        pattern,
+        target.split(|byte| *byte == b'?').next()?,
+        0,
+        captures,
+    )
+}
+
 pub fn match_route(
     pattern: &[u8],
     target: &[u8],

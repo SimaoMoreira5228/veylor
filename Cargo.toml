@@ -14,6 +14,7 @@ members = [
     "crates/veylor-server",
     "crates/veylor-server-conn",
     "crates/veylor-tls",
+    "crates/veylor-web",
     "crates/veylor-websocket",
 ]
 default-members = [
@@ -28,6 +29,7 @@ default-members = [
     "crates/veylor-server",
     "crates/veylor-server-conn",
     "crates/veylor-tls",
+    "crates/veylor-web",
     "crates/veylor-websocket",
 ]
 exclude = ["fuzz"]

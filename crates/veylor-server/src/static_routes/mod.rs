@@ -72,7 +72,29 @@ pub struct NativeRequestView {
     pub has_body: u8,
     pub body_len: u64,
     pub body: *const u8,
+    pub headers: *const NativeHeader,
+    pub header_count: usize,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NativeHeader {
+    pub name: *const u8,
+    pub name_len: usize,
+    pub value: *const u8,
+    pub value_len: usize,
+}
+
+impl NativeHeader {
+    pub const EMPTY: Self = Self {
+        name: std::ptr::null(),
+        name_len: 0,
+        value: std::ptr::null(),
+        value_len: 0,
+    };
+}
+
+pub const MAX_NATIVE_HEADERS: usize = 32;
 
 #[repr(C)]
 pub struct NativeResponseOut {
@@ -81,6 +103,8 @@ pub struct NativeResponseOut {
     pub reason_len: usize,
     pub body: *const u8,
     pub body_len: usize,
+    pub headers: *const NativeHeader,
+    pub header_count: usize,
 }
 
 // NOTE: unsafe because the engine cannot verify the pointer; registration rejects None
@@ -452,6 +476,54 @@ pub(crate) fn route_cap(body: RouteBodyPolicy<'_>) -> u64 {
 pub(crate) fn now_http_date(out: &mut [u8; crate::static_files::HTTP_DATE_BYTES]) -> usize {
     let instant = crate::static_files::system_time_secs(Some(std::time::SystemTime::now()));
     crate::static_files::write_http_date(instant, out)
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn raw_bytes(ptr: *const u8, len: usize) -> Option<&'static [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+pub(crate) fn engine_owned_request_header(name: &[u8]) -> bool {
+    [
+        b"connection".as_slice(),
+        b"keep-alive",
+        b"proxy-connection",
+        b"transfer-encoding",
+        b"upgrade",
+        b"te",
+        b"content-length",
+    ]
+    .iter()
+    .any(|banned| name.eq_ignore_ascii_case(banned))
+}
+
+pub(crate) fn engine_owned_response_header(name: &[u8]) -> bool {
+    [
+        b"connection".as_slice(),
+        b"keep-alive",
+        b"proxy-connection",
+        b"transfer-encoding",
+        b"upgrade",
+        b"content-length",
+    ]
+    .iter()
+    .any(|banned| name.eq_ignore_ascii_case(banned))
+}
+
+pub(crate) fn valid_field_value(value: &[u8]) -> bool {
+    !value.iter().any(|byte| {
+        *byte == b'\r'
+            || *byte == b'\n'
+            || *byte == 0
+            || (*byte < 0x20 && *byte != b'\t')
+            || *byte == 0x7f
+    })
 }
 
 pub(crate) fn valid_reason(reason: &[u8]) -> bool {

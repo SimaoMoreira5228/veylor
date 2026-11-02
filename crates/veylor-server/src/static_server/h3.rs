@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use veylor_h3::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
-use veylor_h3::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use veylor_h3::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use veylor_h3::{
     Body, Bytes, ConnectProtocol, ManagedOutcome, RequestStream, RequestTrailers, ResponseWriter,
     RunningServer, Server, Tls,
@@ -24,7 +24,10 @@ use crate::connection::streams::StreamCmd;
 use crate::host::{H3_PARK_SLOTS, HOST_MAX_REASON_BYTES, HostShared, RespondOutcome, StagedWork};
 use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::now_http_date;
-use crate::static_routes::{NativeRequestView, accepts_gzip_value, compress_route_body};
+use crate::static_routes::{
+    MAX_NATIVE_HEADERS, NativeHeader, NativeRequestView, accepts_gzip_value, compress_route_body,
+    engine_owned_request_header, engine_owned_response_header, raw_bytes, valid_field_value,
+};
 
 use super::{H2StaticRoute, ServerConfig, ServerError};
 
@@ -582,7 +585,7 @@ fn serve_route(routes: &[H2StaticRoute], request: Request<()>, body: Bytes) -> R
         return text(StatusCode::NOT_FOUND, b"Not Found");
     };
     if found.native {
-        return serve_native(found.route, &body, method, target, gzip);
+        return serve_native(found.route, &body, method, target, request.headers(), gzip);
     }
     if found.route.managed {
         return text(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable");
@@ -600,11 +603,28 @@ fn serve_native(
     body: &Bytes,
     method: &[u8],
     path: &[u8],
+    request_headers: &HeaderMap,
     gzip: bool,
 ) -> Response<Body> {
     let Some((handler, user_data, native_gzip)) = route.native else {
         return text(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error");
     };
+    let mut native_headers = [NativeHeader::EMPTY; MAX_NATIVE_HEADERS];
+    let mut native_header_count = 0usize;
+    for (name, value) in request_headers {
+        if native_header_count == MAX_NATIVE_HEADERS
+            || engine_owned_request_header(name.as_str().as_bytes())
+        {
+            continue;
+        }
+        native_headers[native_header_count] = NativeHeader {
+            name: name.as_str().as_ptr(),
+            name_len: name.as_str().len(),
+            value: value.as_bytes().as_ptr(),
+            value_len: value.as_bytes().len(),
+        };
+        native_header_count += 1;
+    }
     let view = NativeRequestView {
         method: method.as_ptr(),
         method_len: method.len(),
@@ -617,6 +637,8 @@ fn serve_native(
         } else {
             body.as_ptr()
         },
+        headers: native_headers.as_ptr(),
+        header_count: native_header_count,
     };
     let mut reason = [0u8; HOST_MAX_REASON_BYTES];
     match view.invoke(handler, user_data, &mut reason) {
@@ -624,10 +646,18 @@ fn serve_native(
             let body = invoked.body();
             if gzip && native_gzip {
                 if let Ok(Some(twin)) = compress_route_body(body) {
-                    return gzip_response(invoked.status, &twin);
+                    let mut response =
+                        status_response_with_headers(invoked.status, &twin, invoked.headers());
+                    response
+                        .headers_mut()
+                        .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                    response
+                        .headers_mut()
+                        .insert(VARY, HeaderValue::from_static("accept-encoding"));
+                    return response;
                 }
             }
-            status_response(invoked.status, body)
+            status_response_with_headers(invoked.status, body, invoked.headers())
         }
         Err(_) => text(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error"),
     }
@@ -738,6 +768,31 @@ fn method_not_allowed(allow: &[u8]) -> Response<Body> {
     let mut response = text(StatusCode::METHOD_NOT_ALLOWED, b"Method Not Allowed");
     if let Ok(value) = HeaderValue::from_bytes(allow) {
         response.headers_mut().insert("allow", value);
+    }
+    response
+}
+
+fn status_response_with_headers(
+    status: u16,
+    body: &[u8],
+    headers: &[NativeHeader],
+) -> Response<Body> {
+    let mut response = status_response(status, body);
+    for header in headers {
+        let (Some(name), Some(value)) = (
+            raw_bytes(header.name, header.name_len),
+            raw_bytes(header.value, header.value_len),
+        ) else {
+            continue;
+        };
+        if engine_owned_response_header(name) || !valid_field_value(value) {
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+        else {
+            continue;
+        };
+        response.headers_mut().append(name, value);
     }
     response
 }

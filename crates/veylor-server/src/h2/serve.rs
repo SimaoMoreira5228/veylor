@@ -12,8 +12,9 @@ use crate::connection::trailers::{trailer_allowed, valid_trailer_field};
 use crate::host::{HOST_MAX_REASON_BYTES, HOST_TUNNEL_CAP, HostEventKind, stage_tunnel_signal};
 use crate::static_files::FileReject;
 use crate::static_routes::{
-    CONTENT_ENCODING_GZIP, MAX_STATIC_BODY_BYTES, NativeHandler, NativeRequestView,
-    compress_route_body,
+    CONTENT_ENCODING_GZIP, MAX_NATIVE_HEADERS, MAX_STATIC_BODY_BYTES, NativeHandler, NativeHeader,
+    NativeRequestView, compress_route_body, engine_owned_request_header,
+    engine_owned_response_header, raw_bytes, valid_field_value,
 };
 
 use super::file::FileDecision;
@@ -120,6 +121,28 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             Ok(invoked) => invoked,
             Err(_) => return self.deny(stream, ErrorCode::InternalError, false),
         };
+        let mut extra = [(&b""[..], &b""[..]); MAX_NATIVE_HEADERS];
+        let mut extra_count = 0usize;
+        for header in invoked.headers() {
+            let (Some(name), Some(value)) = (
+                raw_bytes(header.name, header.name_len),
+                raw_bytes(header.value, header.value_len),
+            ) else {
+                return self.deny(stream, ErrorCode::InternalError, false);
+            };
+            if engine_owned_response_header(name) {
+                continue;
+            }
+            if extra_count == MAX_NATIVE_HEADERS
+                || !name.iter().all(|byte| veylor_http1::is_token(*byte))
+                || !valid_field_value(value)
+            {
+                return self.deny(stream, ErrorCode::InternalError, false);
+            }
+            extra[extra_count] = (name, value);
+            extra_count += 1;
+        }
+        let extra = &extra[..extra_count];
         let body = invoked.body();
         let twin = if encode {
             match compress_route_body(body) {
@@ -141,7 +164,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 Cow::Borrowed(body),
                 content_encoding,
                 vary,
-                &[],
+                extra,
                 false,
                 false,
                 self.output,
@@ -160,7 +183,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             Cow::Borrowed(body),
             content_encoding,
             vary,
-            &[],
+            extra,
             is_head || body.is_empty(),
             true,
             self.output,
@@ -480,6 +503,26 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     self.routes.lookup_native(request.method, path)
                 {
                     let declared = request.content_length.unwrap_or(0);
+                    let mut native_headers = [NativeHeader::EMPTY; MAX_NATIVE_HEADERS];
+                    let mut native_header_count = 0usize;
+                    for header in fields {
+                        let Some((name, value)) = self.server.driver().resolve_header(*header)
+                        else {
+                            continue;
+                        };
+                        if native_header_count == MAX_NATIVE_HEADERS
+                            || engine_owned_request_header(name)
+                        {
+                            continue;
+                        }
+                        native_headers[native_header_count] = NativeHeader {
+                            name: name.as_ptr(),
+                            name_len: name.len(),
+                            value: value.as_ptr(),
+                            value_len: value.len(),
+                        };
+                        native_header_count += 1;
+                    }
                     let view = NativeRequestView {
                         method: request.method.as_ptr(),
                         method_len: request.method.len(),
@@ -488,6 +531,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         has_body: u8::from(declared > 0),
                         body_len: declared,
                         body: std::ptr::null(),
+                        headers: native_headers.as_ptr(),
+                        header_count: native_header_count,
                     };
                     let encode = gzip && FrozenRoutesView::accepts_gzip(fields, self.server);
                     return self.serve_native(

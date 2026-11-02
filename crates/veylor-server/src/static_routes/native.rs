@@ -12,9 +12,10 @@ use crate::host::HOST_MAX_REASON_BYTES;
 use crate::static_files::HTTP_DATE_BYTES;
 
 use super::{
-    CONTENT_ENCODING_GZIP, IN_NATIVE, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES, NativeHandler,
-    NativeRequestView, NativeResponseOut, RouteBuildError, accepts_gzip_value, compress_route_body,
-    header_value, valid_reason,
+    CONTENT_ENCODING_GZIP, IN_NATIVE, MAX_NATIVE_HEADERS, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES,
+    NativeHandler, NativeHeader, NativeRequestView, NativeResponseOut, RouteBuildError,
+    accepts_gzip_value, compress_route_body, engine_owned_request_header,
+    engine_owned_response_header, header_value, raw_bytes, valid_field_value, valid_reason,
 };
 use super::{EncodedStaticResponse, encode_continue, now_http_date, reject_payload};
 
@@ -67,6 +68,26 @@ pub(super) fn respond_native(
         .filter(|_| staged)
         .map(|slice| slice.as_ptr())
         .unwrap_or(std::ptr::null());
+    let mut native_headers = [NativeHeader::EMPTY; MAX_NATIVE_HEADERS];
+    let mut native_header_count = 0usize;
+    for header in headers.iter().take(head.header_count) {
+        let (Some(name), Some(value)) = (
+            span_bytes(input, header.name),
+            span_bytes(input, header.value),
+        ) else {
+            continue;
+        };
+        if native_header_count == MAX_NATIVE_HEADERS || engine_owned_request_header(name) {
+            continue;
+        }
+        native_headers[native_header_count] = NativeHeader {
+            name: name.as_ptr(),
+            name_len: name.len(),
+            value: value.as_ptr(),
+            value_len: value.len(),
+        };
+        native_header_count += 1;
+    }
     let request = NativeRequestView {
         method: method.as_ptr(),
         method_len: method.len(),
@@ -75,6 +96,8 @@ pub(super) fn respond_native(
         has_body: u8::from(declared > 0),
         body_len: declared,
         body,
+        headers: native_headers.as_ptr(),
+        header_count: native_header_count,
     };
     let mut reason_buf = [0u8; HOST_MAX_REASON_BYTES];
     let invoked = request.invoke(handler, user_data, &mut reason_buf)?;
@@ -126,11 +149,37 @@ pub(super) fn respond_native(
         name: b"Vary",
         value: b"Accept-Encoding",
     };
-    let fields: &[Field] = match (content_encoding, gzip) {
-        (Some(_), _) => &[date[0], encoding_field, vary_field],
-        (None, true) => &[date[0], vary_field],
-        (None, false) => &date,
-    };
+    let mut fields = [Field {
+        name: b"",
+        value: b"",
+    }; 2 + MAX_NATIVE_HEADERS + 2];
+    fields[0] = date[0];
+    let mut field_count = 1usize;
+    for header in invoked.headers() {
+        let (Some(name), Some(value)) = (
+            raw_bytes(header.name, header.name_len),
+            raw_bytes(header.value, header.value_len),
+        ) else {
+            return Err(RouteBuildError::Invalid);
+        };
+        if engine_owned_response_header(name) {
+            continue;
+        }
+        if !name.iter().all(|byte| veylor_http1::is_token(*byte)) || !valid_field_value(value) {
+            return Err(RouteBuildError::Invalid);
+        }
+        fields[field_count] = Field { name, value };
+        field_count += 1;
+    }
+    if content_encoding.is_some() {
+        fields[field_count] = encoding_field;
+        fields[field_count + 1] = vary_field;
+        field_count += 2;
+    } else if gzip {
+        fields[field_count] = vary_field;
+        field_count += 1;
+    }
+    let fields = &fields[..field_count];
     let response = ResponseToWrite {
         request_method: method,
         request_version,
@@ -176,6 +225,8 @@ pub(crate) struct InvokedNative<'r> {
     pub(crate) reason: &'r [u8],
     body: *const u8,
     body_len: usize,
+    headers: *const NativeHeader,
+    header_count: usize,
 }
 
 impl InvokedNative<'_> {
@@ -189,6 +240,15 @@ impl InvokedNative<'_> {
             &[]
         } else {
             unsafe { std::slice::from_raw_parts(self.body, self.body_len) }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn headers(&self) -> &[NativeHeader] {
+        if self.header_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.headers, self.header_count) }
         }
     }
 }
@@ -206,6 +266,8 @@ impl NativeRequestView {
             reason_len: 0,
             body: std::ptr::null(),
             body_len: 0,
+            headers: std::ptr::null(),
+            header_count: 0,
         };
         // NOTE: the flag trips nested registry/dispatch entries on this worker. Unwinding
         // through an extern "C" frame aborts the process (nounwind: verified SIGABRT,
@@ -238,6 +300,11 @@ impl NativeRequestView {
         if !valid_handler_bytes(response.body, response.body_len, MAX_RESPONSE_BODY) {
             return Err(RouteBuildError::Invalid);
         }
+        if response.header_count > MAX_NATIVE_HEADERS
+            || (response.header_count > 0 && response.headers.is_null())
+        {
+            return Err(RouteBuildError::Invalid);
+        }
         let reason = &reason_scratch[..response.reason_len];
         if !valid_reason(reason) {
             return Err(RouteBuildError::Invalid);
@@ -247,6 +314,8 @@ impl NativeRequestView {
             reason,
             body: response.body,
             body_len: response.body_len,
+            headers: response.headers,
+            header_count: response.header_count,
         })
     }
 }
@@ -261,6 +330,10 @@ fn invoke_native(
     response: &mut NativeResponseOut,
 ) -> i32 {
     unsafe { handler(user_data as *mut std::ffi::c_void, request, response) }
+}
+
+fn span_bytes(input: &[u8], span: veylor_http1::Span) -> Option<&[u8]> {
+    input.get(span.offset..span.offset.checked_add(span.length)?)
 }
 
 // NOTE: empty outputs skip the pointer check so null+0 stays legal.

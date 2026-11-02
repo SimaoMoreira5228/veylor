@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 
-use veylor_server::{NativeHandler, NativeRequestView, NativeResponseOut};
+use veylor_server::{NativeHandler, NativeHeader, NativeRequestView, NativeResponseOut};
 
 use super::api::read_bytes;
 use super::{ManagedStaticState, ReadyRouteOp, VylManagedStaticServer, server_error_to_result};
@@ -17,6 +17,8 @@ pub struct VylManagedStaticNativeRequest {
     pub has_body: u8,
     pub body_len: u64,
     pub body: *const u8,
+    pub headers: *const NativeHeader,
+    pub header_count: usize,
 }
 
 #[repr(C)]
@@ -27,6 +29,8 @@ pub struct VylManagedStaticNativeResponse {
     pub reason_len: usize,
     pub body: *const u8,
     pub body_len: usize,
+    pub headers: *const NativeHeader,
+    pub header_count: usize,
 }
 
 pub type VylManagedStaticNativeHandlerFn = unsafe extern "C" fn(
@@ -40,8 +44,8 @@ pub type VylManagedStaticNativeHandler = Option<VylManagedStaticNativeHandlerFn>
 const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == size_of::<NativeRequestView>());
 const _: () =
     assert!(size_of::<VylManagedStaticNativeResponse>() == size_of::<NativeResponseOut>());
-const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == 56);
-const _: () = assert!(size_of::<VylManagedStaticNativeResponse>() == 40);
+const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == 72);
+const _: () = assert!(size_of::<VylManagedStaticNativeResponse>() == 56);
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeRequest, has_body) == 4 * size_of::<*const u8>());
 const _: () =
@@ -51,6 +55,10 @@ const _: () =
 const _: () = assert!(offset_of!(VylManagedStaticNativeResponse, reason) == size_of::<*const u8>());
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeResponse, body_len) == 4 * size_of::<*const u8>());
+const _: () =
+    assert!(offset_of!(VylManagedStaticNativeRequest, headers) == 7 * size_of::<*const u8>());
+const _: () =
+    assert!(offset_of!(VylManagedStaticNativeResponse, headers) == 5 * size_of::<*const u8>());
 
 // NOTE: the server registry carries the handler address plus an opaque user_data word, so
 // no slot pool, trampoline table, or process-global state is needed: the C handler converts
