@@ -580,10 +580,11 @@ fn serve_route(routes: &[H2StaticRoute], request: Request<()>, body: Bytes) -> R
         .iter()
         .any(|value| accepts_gzip_value(value.as_bytes()));
     let Some(found) = select(routes, method, path) else {
+        let accept = header(&request, "accept-encoding");
         let range = header(&request, "range");
         let since = header(&request, "if-modified-since");
         let declared = body.len() as u64;
-        if let Some(response) = file::serve(routes, method, path, declared, range, since) {
+        if let Some(response) = file::serve(routes, method, path, declared, accept, range, since) {
             return response;
         }
         if let Some((allow, len)) = allow_value(routes, path) {

@@ -1205,6 +1205,58 @@ fn file_get_serves_exact_bytes_type_length() {
 }
 
 #[test]
+fn file_get_serves_precompressed_twin() {
+    let (server, fixture) = file_server();
+    std::fs::write(fixture.root.join("hello.txt.br"), b"brotli").expect("br twin");
+    std::fs::write(fixture.root.join("hello.txt.gz"), b"gzip!").expect("gz twin");
+
+    let mut stream = connect(&server);
+    stream
+        .write_all(
+            b"GET /assets/hello.txt HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Accept-Encoding: gzip, br\r\n\
+              Connection: keep-alive\r\n\r\n",
+        )
+        .expect("write br request");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(header(&response, "content-encoding"), "br");
+    assert_eq!(header(&response, "vary"), "Accept-Encoding");
+    assert_eq!(header(&response, "content-length"), "6");
+    assert_eq!(response.body, b"brotli");
+
+    stream
+        .write_all(
+            b"GET /assets/hello.txt HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Accept-Encoding: gzip\r\n\
+              Connection: keep-alive\r\n\r\n",
+        )
+        .expect("write gzip request");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert_eq!(header(&response, "content-encoding"), "gzip");
+    assert_eq!(header(&response, "content-length"), "5");
+    assert_eq!(response.body, b"gzip!");
+
+    get(&mut stream, "/assets/hello.txt");
+    let response = read_response(&mut stream);
+    assert_eq!(response.status, 200);
+    assert!(
+        response
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("content-encoding"))
+    );
+    assert_eq!(header(&response, "vary"), "Accept-Encoding");
+    assert_eq!(response.body, b"hello file");
+
+    server.stop_accepting();
+    let _ = server.join().expect("join server");
+}
+
+#[test]
 fn file_head_returns_headers_only() {
     let (server, _fixture) = file_server();
     let mut stream = connect(&server);

@@ -54,7 +54,7 @@ pub(crate) fn send_file_head(
     } else {
         0
     };
-    let mut fields = [field(b"", b""); 7];
+    let mut fields = [field(b"", b""); 9];
     fields[0] = field(b":status", &status_buf[..status_len]);
     fields[1] = field(b"date", &now_buf[..now_len]);
     let mut count = 2;
@@ -82,6 +82,12 @@ pub(crate) fn send_file_head(
         fields[count] = field(b"content-range", &range_buf[..range_len]);
         count += 1;
     }
+    if let Some(encoding) = head.content_encoding {
+        fields[count] = field(b"content-encoding", encoding.as_bytes());
+        count += 1;
+    }
+    fields[count] = field(b"vary", b"accept-encoding");
+    count += 1;
     let mut block = [0; HPACK_BLOCK_CAP];
     let sent = server
         .send_response(

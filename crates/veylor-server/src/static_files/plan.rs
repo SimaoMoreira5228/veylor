@@ -1,3 +1,4 @@
+use super::ContentCoding;
 use super::http_date::parse_http_date;
 use super::ranges::{FilePlan, RangeApply};
 
@@ -5,6 +6,7 @@ pub struct FileHead {
     pub status: u16,
     pub content_length: u64,
     pub content_type: Option<&'static str>,
+    pub content_encoding: Option<ContentCoding>,
     pub mtime: Option<u64>,
     pub total: u64,
     pub window: Option<(u64, u64)>,
@@ -18,6 +20,7 @@ pub fn plan_file_head(
     range: Option<&[u8]>,
     if_modified_since: Option<&[u8]>,
 ) -> (FilePlan, FileHead, bool) {
+    let content_encoding = plan.content_encoding;
     let fresh = if_modified_since
         .and_then(parse_http_date)
         .is_some_and(|date| plan.mtime <= date);
@@ -26,6 +29,7 @@ pub fn plan_file_head(
             status: 304,
             content_length: 0,
             content_type: None,
+            content_encoding,
             mtime: Some(plan.mtime),
             total: plan.total,
             window: None,
@@ -35,13 +39,20 @@ pub fn plan_file_head(
         return (plan, head, false);
     }
     if plan.head_only {
-        let head = file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, None);
+        let head = file_head_200(
+            plan.size,
+            plan.content_type,
+            content_encoding,
+            plan.mtime,
+            plan.total,
+            None,
+        );
         return (plan, head, false);
     }
     let range = (method == b"GET").then_some(range).flatten();
     match plan.apply_range(range) {
         RangeApply::Multipart => {
-            let head = file_head_206_multipart(plan.size, plan.mtime, plan.total);
+            let head = file_head_206_multipart(plan.size, content_encoding, plan.mtime, plan.total);
             (plan, head, true)
         }
         RangeApply::Unsatisfiable => {
@@ -49,6 +60,7 @@ pub fn plan_file_head(
                 status: 416,
                 content_length: 0,
                 content_type: None,
+                content_encoding: None,
                 mtime: None,
                 total: plan.total,
                 window: None,
@@ -59,11 +71,25 @@ pub fn plan_file_head(
         }
         RangeApply::Ranged => {
             let window = Some((plan.start, plan.start + plan.size - 1));
-            let head = file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, window);
+            let head = file_head_200(
+                plan.size,
+                plan.content_type,
+                content_encoding,
+                plan.mtime,
+                plan.total,
+                window,
+            );
             (plan, head, true)
         }
         RangeApply::Ignored => {
-            let head = file_head_200(plan.size, plan.content_type, plan.mtime, plan.total, None);
+            let head = file_head_200(
+                plan.size,
+                plan.content_type,
+                content_encoding,
+                plan.mtime,
+                plan.total,
+                None,
+            );
             (plan, head, true)
         }
     }
@@ -72,6 +98,7 @@ pub fn plan_file_head(
 fn file_head_200(
     size: u64,
     content_type: &'static str,
+    content_encoding: Option<ContentCoding>,
     mtime: u64,
     total: u64,
     window: Option<(u64, u64)>,
@@ -80,6 +107,7 @@ fn file_head_200(
         status: if window.is_some() { 206 } else { 200 },
         content_length: size,
         content_type: Some(content_type),
+        content_encoding,
         mtime: Some(mtime),
         total,
         window,
@@ -88,11 +116,17 @@ fn file_head_200(
     }
 }
 
-fn file_head_206_multipart(size: u64, mtime: u64, total: u64) -> FileHead {
+fn file_head_206_multipart(
+    size: u64,
+    content_encoding: Option<ContentCoding>,
+    mtime: u64,
+    total: u64,
+) -> FileHead {
     FileHead {
         status: 206,
         content_length: size,
         content_type: None,
+        content_encoding,
         mtime: Some(mtime),
         total,
         window: None,

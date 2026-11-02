@@ -287,6 +287,49 @@ fn aborting_the_task_cancels_the_connection() {
 }
 
 #[test]
+fn connection_limit_pauses_accept() {
+    run(async {
+        let (listener, addr) = listener().await;
+        let config = Config {
+            max_connections: 1,
+            ..Config::default()
+        };
+        smol::spawn(async move {
+            let _ = veylor_runtime_smol::serve(listener, echo, config).await;
+        })
+        .detach();
+
+        let mut first = TcpStream::connect(addr).await.expect("first");
+        first
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("partial");
+        Timer::after(Duration::from_millis(100)).await;
+
+        let mut second = TcpStream::connect(addr).await.expect("second");
+        second
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("request");
+        let mut byte = [0u8; 1];
+        assert!(
+            within(second.read(&mut byte), Duration::from_millis(150))
+                .await
+                .is_none(),
+            "second connection served while the limit was full"
+        );
+
+        drop(first);
+        let mut response = Vec::new();
+        within(second.read_to_end(&mut response), Duration::from_secs(2))
+            .await
+            .expect("served after slot")
+            .expect("read");
+        assert!(!response.is_empty());
+    });
+}
+
+#[test]
 fn idle_connection_closes_cleanly() {
     run(async {
         let (listener, addr) = listener().await;

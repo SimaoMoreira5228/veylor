@@ -1070,7 +1070,8 @@ fn h2_date_file_200_304_416_first_shaped() {
             b"content-length".to_vec(),
             b"content-type".to_vec(),
             b"accept-ranges".to_vec(),
-            b"last-modified".to_vec()
+            b"last-modified".to_vec(),
+            b"vary".to_vec()
         ]
     );
     let since: &[u8] = &got.last_modified;
@@ -1094,7 +1095,8 @@ fn h2_date_file_200_304_416_first_shaped() {
         vec![
             b":status".to_vec(),
             b"date".to_vec(),
-            b"last-modified".to_vec()
+            b"last-modified".to_vec(),
+            b"vary".to_vec()
         ]
     );
     send_headers_extra(
@@ -1117,7 +1119,8 @@ fn h2_date_file_200_304_416_first_shaped() {
             b":status".to_vec(),
             b"date".to_vec(),
             b"content-length".to_vec(),
-            b"content-range".to_vec()
+            b"content-range".to_vec(),
+            b"vary".to_vec()
         ]
     );
     let counts = stop_join(server);
@@ -4776,6 +4779,51 @@ fn file_mount_server(root: &std::path::Path) -> RunningServer {
         .register_file_mount(b"/assets/", root)
         .expect("register mount");
     server.start().expect("start server")
+}
+
+#[test]
+fn h2_file_mount_serves_precompressed_twins() {
+    let root = file_mount_root("encoding");
+    std::fs::write(root.join("hello.txt"), b"file-content").expect("mount file");
+    std::fs::write(root.join("hello.txt.br"), b"brotli").expect("br twin");
+    std::fs::write(root.join("hello.txt.gz"), b"gzip!").expect("gz twin");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut dec_entries = [HpackEntrySlot::EMPTY; 64];
+    let mut dec_scratch = [0; 4096];
+    let mut dec = HpackTable::new(&mut dec_entries, &mut dec_scratch, 4_096);
+
+    send_headers_extra(
+        &mut client,
+        1,
+        b"GET",
+        b"/assets/hello.txt",
+        &[(b"accept-encoding".as_slice(), b"gzip, br".as_slice())],
+        true,
+    );
+    let got = read_response_stateful(&mut client, 1, &mut dec);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.content_encoding, b"br");
+    assert_eq!(got.vary, b"accept-encoding");
+    assert_eq!(got.content_length, 6);
+    assert_eq!(got.body, b"brotli");
+
+    send_headers_extra(
+        &mut client,
+        3,
+        b"GET",
+        b"/assets/hello.txt",
+        &[(b"accept-encoding".as_slice(), b"gzip".as_slice())],
+        true,
+    );
+    let got = read_response_stateful(&mut client, 3, &mut dec);
+    assert_eq!(got.status, 200);
+    assert_eq!(got.content_encoding, b"gzip");
+    assert_eq!(got.content_length, 5);
+    assert_eq!(got.body, b"gzip!");
+
+    stop_join(server);
 }
 
 #[test]

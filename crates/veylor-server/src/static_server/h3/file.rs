@@ -2,7 +2,8 @@ use std::io;
 use std::path::Path;
 
 use veylor_h3::http::header::{
-    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, DATE, LAST_MODIFIED,
+    ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, DATE,
+    LAST_MODIFIED, VARY,
 };
 use veylor_h3::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use veylor_h3::{Body, BodySource, Bytes, StreamBody};
@@ -10,7 +11,7 @@ use veylor_http1::{CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES};
 
 use crate::static_files::{
     FileHead, FileMounts, FilePlan, FileReject, HTTP_DATE_BYTES, plan_file_head, read_chunk,
-    write_content_range, write_http_date,
+    select_encoding, write_content_range, write_http_date,
 };
 use crate::static_routes::MAX_STATIC_BODY_BYTES;
 
@@ -21,6 +22,7 @@ pub(super) fn serve(
     method: &[u8],
     path: &[u8],
     declared: u64,
+    accept: Option<&[u8]>,
     range: Option<&[u8]>,
     since: Option<&[u8]>,
 ) -> Option<Response<Body>> {
@@ -49,6 +51,7 @@ pub(super) fn serve(
             return None;
         }
     };
+    let plan = select_encoding(plan, accept, range);
     let (plan, head, send_body) = plan_file_head(plan, method, range, since);
     Some(file_response(plan, head, send_body))
 }
@@ -110,6 +113,10 @@ fn file_response(plan: FilePlan, head: FileHead, send_body: bool) -> Response<Bo
         let len = write_content_range(&mut range, head.window, head.total);
         insert(headers, CONTENT_RANGE, &range[..len]);
     }
+    if let Some(encoding) = head.content_encoding {
+        insert(headers, CONTENT_ENCODING, encoding.as_bytes());
+    }
+    insert(headers, VARY, b"accept-encoding");
 
     if send_body && plan.size > 0 {
         let length = plan.size;
@@ -239,8 +246,8 @@ mod tests {
     fn serves_full_file_as_stream() {
         let fixture = Fixture::new();
         let routes = fixture.routes();
-        let response =
-            serve(&routes, b"GET", b"/assets/hello.txt", 0, None, None).expect("file response");
+        let response = serve(&routes, b"GET", b"/assets/hello.txt", 0, None, None, None)
+            .expect("file response");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(header(&response, "content-length"), Some("21"));
@@ -250,11 +257,34 @@ mod tests {
     }
 
     #[test]
+    fn serves_precompressed_twin() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("hello.txt.br"), b"brotli").expect("br twin");
+        let routes = fixture.routes();
+        let response = serve(
+            &routes,
+            b"GET",
+            b"/assets/hello.txt",
+            0,
+            Some(b"br"),
+            None,
+            None,
+        )
+        .expect("file response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, "content-encoding"), Some("br"));
+        assert_eq!(header(&response, "vary"), Some("accept-encoding"));
+        assert_eq!(header(&response, "content-length"), Some("6"));
+        assert_eq!(drain(response.into_body()), b"brotli");
+    }
+
+    #[test]
     fn serves_head_without_body() {
         let fixture = Fixture::new();
         let routes = fixture.routes();
-        let response =
-            serve(&routes, b"HEAD", b"/assets/hello.txt", 0, None, None).expect("head response");
+        let response = serve(&routes, b"HEAD", b"/assets/hello.txt", 0, None, None, None)
+            .expect("head response");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(header(&response, "content-length"), Some("21"));
@@ -270,6 +300,7 @@ mod tests {
             b"GET",
             b"/assets/hello.txt",
             0,
+            None,
             Some(b"bytes=5-9"),
             None,
         )
@@ -289,6 +320,7 @@ mod tests {
             b"GET",
             b"/assets/hello.txt",
             0,
+            None,
             Some(b"bytes=0-1,4-5"),
             None,
         )
@@ -321,6 +353,7 @@ mod tests {
             b"/assets/hello.txt",
             0,
             None,
+            None,
             Some(&date[..len]),
         )
         .expect("not modified");
@@ -334,8 +367,8 @@ mod tests {
     fn rejects_methods_over_existing_files() {
         let fixture = Fixture::new();
         let routes = fixture.routes();
-        let response =
-            serve(&routes, b"POST", b"/assets/hello.txt", 0, None, None).expect("method response");
+        let response = serve(&routes, b"POST", b"/assets/hello.txt", 0, None, None, None)
+            .expect("method response");
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(header(&response, "allow"), Some("GET, HEAD"));
@@ -345,14 +378,26 @@ mod tests {
     fn misses_unknown_files_and_forbids_large_bodies() {
         let fixture = Fixture::new();
         let routes = fixture.routes();
-        assert!(serve(&routes, b"GET", b"/assets/missing.txt", 0, None, None).is_none());
-        assert!(serve(&routes, b"GET", b"/assets/../hello.txt", 0, None, None).is_none());
+        assert!(serve(&routes, b"GET", b"/assets/missing.txt", 0, None, None, None).is_none());
+        assert!(
+            serve(
+                &routes,
+                b"GET",
+                b"/assets/../hello.txt",
+                0,
+                None,
+                None,
+                None
+            )
+            .is_none()
+        );
 
         let response = serve(
             &routes,
             b"GET",
             b"/assets/hello.txt",
             MAX_STATIC_BODY_BYTES + 1,
+            None,
             None,
             None,
         )

@@ -19,6 +19,7 @@ pub struct FilePlan {
     pub total: u64,
     pub start: u64,
     pub content_type: &'static str,
+    pub content_encoding: Option<super::ContentCoding>,
     pub head_only: bool,
     pub partial: bool,
     pub multipart: bool,

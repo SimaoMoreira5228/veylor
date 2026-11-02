@@ -5,7 +5,8 @@ use veylor_http1::{
 };
 
 use crate::static_files::{
-    FileReject, HTTP_DATE_BYTES, plan_file_head, write_content_range, write_http_date,
+    FileReject, HTTP_DATE_BYTES, plan_file_head, select_encoding, write_content_range,
+    write_http_date,
 };
 
 use super::respond::{
@@ -72,6 +73,11 @@ pub(crate) fn respond_file(
     };
     let since = header_value(headers, head, input, b"if-modified-since");
     let range = header_value(headers, head, input, b"range");
+    let plan = select_encoding(
+        plan,
+        header_value(headers, head, input, b"accept-encoding"),
+        range,
+    );
     let (plan, file_head, send_body) = plan_file_head(plan, method, range, since);
     let (status, reason) = match file_head.status {
         304 => (304, b"Not Modified".as_slice()),
@@ -96,7 +102,7 @@ pub(crate) fn respond_file(
     let mut fields = [Field {
         name: b"",
         value: &[],
-    }; 5];
+    }; 7];
     let mut field_len = 0;
     fields[field_len] = Field {
         name: b"Date",
@@ -140,6 +146,18 @@ pub(crate) fn respond_file(
         };
         field_len += 1;
     }
+    if let Some(encoding) = file_head.content_encoding {
+        fields[field_len] = Field {
+            name: b"Content-Encoding",
+            value: encoding.as_bytes(),
+        };
+        field_len += 1;
+    }
+    fields[field_len] = Field {
+        name: b"Vary",
+        value: b"Accept-Encoding",
+    };
+    field_len += 1;
 
     let content_length = file_head.content_length;
     let response = ResponseToWrite {

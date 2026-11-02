@@ -4,10 +4,12 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+mod encoding;
 mod http_date;
 mod plan;
 mod ranges;
 
+pub use encoding::{ContentCoding, select_encoding};
 pub(crate) use http_date::system_time_secs;
 pub use http_date::{HTTP_DATE_BYTES, parse_http_date, write_http_date};
 pub use plan::{FileHead, plan_file_head, write_content_range};
@@ -191,6 +193,7 @@ impl FileMounts {
             total: size,
             start: 0,
             content_type: content_type_for_name(segments[last].as_slice()),
+            content_encoding: None,
             head_only: method == b"HEAD",
             partial: false,
             multipart: false,

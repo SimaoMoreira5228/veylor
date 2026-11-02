@@ -251,6 +251,45 @@ async fn aborting_the_task_cancels_the_connection() {
 }
 
 #[tokio::test]
+async fn connection_limit_pauses_accept() {
+    let (listener, addr) = listener().await;
+    let config = Config {
+        max_connections: 1,
+        ..Config::default()
+    };
+    tokio::spawn(async move {
+        let _ = veylor_runtime_tokio::serve(listener, echo, config).await;
+    });
+
+    let mut first = TcpStream::connect(addr).await.expect("first");
+    first
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .expect("partial");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut second = TcpStream::connect(addr).await.expect("second");
+    second
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("request");
+    let mut byte = [0u8; 1];
+    let early = tokio::time::timeout(Duration::from_millis(150), second.read(&mut byte)).await;
+    assert!(
+        early.is_err(),
+        "second connection served while the limit was full"
+    );
+
+    drop(first);
+    let mut response = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), second.read_to_end(&mut response))
+        .await
+        .expect("served after slot")
+        .expect("read");
+    assert!(read > 0);
+}
+
+#[tokio::test]
 async fn idle_connection_closes_cleanly() {
     let (listener, addr) = listener().await;
     let task = tokio::spawn(spawn_one(listener));

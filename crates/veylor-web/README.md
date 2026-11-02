@@ -17,7 +17,8 @@ Server::bind(addr, config)?.serve(app)?;
 Handlers are plain functions. Borrowing extractors (`Query<'_>`, `Headers<'_>`) and owned
 ones (`Path<i64>`, `State<Store>`, `QueryOwned<T>`, `HeadersOwned`, `Bytes`, `Form<T>`,
 `Multipart<'_>`, `Json<T>`) both work, or take a `Request` when you want the raw bytes. `files(dir)` registers
-the engine's file mount at the route's prefix, so ranges, gzip twins and ETags keep working.
+the engine's file mount at the route's prefix, so ranges and precompressed `.br`/`.gz` twins
+keep working.
 
 Two paths, picked per route:
 

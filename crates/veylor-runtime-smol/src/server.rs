@@ -32,6 +32,7 @@ pub struct Config {
     pub body_timeout: Duration,
     pub write_timeout: Duration,
     pub drain_timeout: Duration,
+    pub max_connections: usize,
 }
 
 impl Default for Config {
@@ -44,6 +45,7 @@ impl Default for Config {
             body_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             drain_timeout: Duration::from_secs(5),
+            max_connections: 1024,
         }
     }
 }
@@ -159,8 +161,18 @@ where
     let (finished_tx, finished_rx) = smol::channel::unbounded();
     let mut next_id = 0u64;
     smol::pin!(shutdown);
+    let limit = config.max_connections.max(1);
 
     loop {
+        while tasks.len() >= limit {
+            match finished_rx.recv().await {
+                Ok(id) => {
+                    tasks.remove(&id);
+                }
+                Err(_) => break,
+            }
+        }
+
         let wake = future::or(
             async {
                 (&mut shutdown).await;
@@ -233,6 +245,7 @@ pub async fn serve_connection<H: Handler>(
     handler: H,
     config: Config,
 ) -> io::Result<()> {
+    socket.set_nodelay(true)?;
     let mut head = vec![0u8; INITIAL_HEAD.min(config.max_head)];
     let mut staging = vec![0u8; STAGING];
     let mut output = vec![0u8; INITIAL_OUTPUT.min(config.max_output)];
@@ -484,48 +497,69 @@ async fn write_response(
             Err(error) => return Err(protocol(&format!("response head: {error:?}"))),
         }
     };
-    write_bytes(socket, &output[..head.written], config.write_timeout).await?;
     connection
         .advance_response_write(head.written)
         .map_err(|error| protocol(&format!("advance head: {error:?}")))?;
+    let mut used = head.written;
 
     if head.body_allowed {
         let mut offset = 0usize;
         while offset < response.body.len() {
-            let written = loop {
-                match connection.encode_response_body(&response.body[offset..], output) {
-                    Ok(encoded) => break encoded.written,
-                    Err(ServerError::BufferTooSmall { required }) => {
+            match connection.encode_response_body(&response.body[offset..], &mut output[used..]) {
+                Ok(encoded) => {
+                    if encoded.written == 0 {
+                        return Err(protocol("response body made no progress"));
+                    }
+                    used += encoded.written;
+                    offset += encoded.written;
+                    connection
+                        .advance_response_write(encoded.written)
+                        .map_err(|error| protocol(&format!("advance body: {error:?}")))?;
+                    if used == output.len() {
+                        write_bytes(socket, &output[..used], config.write_timeout).await?;
+                        used = 0;
+                    }
+                }
+                Err(ServerError::BufferTooSmall { required }) => {
+                    if used > 0 {
+                        write_bytes(socket, &output[..used], config.write_timeout).await?;
+                        used = 0;
+                    }
+                    if required > output.len() {
                         grow(output, required, config.max_output)?;
                     }
-                    Err(error) => return Err(protocol(&format!("response body: {error:?}"))),
                 }
-            };
-            if written == 0 {
-                return Err(protocol("response body made no progress"));
+                Err(error) => return Err(protocol(&format!("response body: {error:?}"))),
             }
-            write_bytes(socket, &output[..written], config.write_timeout).await?;
-            connection
-                .advance_response_write(written)
-                .map_err(|error| protocol(&format!("advance body: {error:?}")))?;
-            offset += written;
         }
     }
 
-    let tail = loop {
-        match connection.finish_response_body(&[], output) {
-            Ok(tail) => break tail,
+    loop {
+        match connection.finish_response_body(&[], &mut output[used..]) {
+            Ok(tail) => {
+                used += tail.written;
+                if tail.written > 0 {
+                    connection
+                        .advance_response_write(tail.written)
+                        .map_err(|error| protocol(&format!("advance tail: {error:?}")))?;
+                }
+                break;
+            }
             Err(ServerError::BufferTooSmall { required }) => {
-                grow(output, required, config.max_output)?
+                if used > 0 {
+                    write_bytes(socket, &output[..used], config.write_timeout).await?;
+                    used = 0;
+                }
+                if required > output.len() {
+                    grow(output, required, config.max_output)?;
+                }
             }
             Err(error) => return Err(protocol(&format!("finish response: {error:?}"))),
         }
-    };
-    if tail.written > 0 {
-        write_bytes(socket, &output[..tail.written], config.write_timeout).await?;
-        connection
-            .advance_response_write(tail.written)
-            .map_err(|error| protocol(&format!("advance tail: {error:?}")))?;
+    }
+
+    if used > 0 {
+        write_bytes(socket, &output[..used], config.write_timeout).await?;
     }
 
     Ok(connection.can_reuse())

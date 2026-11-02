@@ -9,7 +9,9 @@ use veylor_http2::{
     DataWriteError, ErrorCode, H2ServerDriver, HpackHeader, ServerError, StreamState,
 };
 
-use crate::static_files::{FileHead, FilePlan, FileReject, plan_file_head, read_chunk};
+use crate::static_files::{
+    FileHead, FilePlan, FileReject, plan_file_head, read_chunk, select_encoding,
+};
 use crate::static_routes::MAX_STATIC_BODY_BYTES;
 
 use super::STREAM_SLOTS;
@@ -149,8 +151,10 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             Err(FileReject::TooLarge) => return FileDecision::TooLarge,
             Err(_) => return FileDecision::Miss,
         };
+        let accept = self.request_header(fields, b"accept-encoding");
         let since = self.request_header(fields, b"if-modified-since");
         let range = self.request_header(fields, b"range");
+        let plan = select_encoding(plan, accept, range);
         let (plan, head, send_body) = plan_file_head(plan, method, range, since);
         FileDecision::Serve(plan, head, send_body)
     }

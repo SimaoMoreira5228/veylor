@@ -25,7 +25,7 @@ pub use host::{
     RequestSpan, RespondOutcome,
 };
 pub use static_files::{
-    FileMounts, FilePlan, FileReject, MountError, RangeApply, content_type_for_name,
+    ContentCoding, FileMounts, FilePlan, FileReject, MountError, RangeApply, content_type_for_name,
     parse_http_date, read_chunk, write_http_date,
 };
 pub use static_files::{MAX_FILE_SIZE, MAX_MOUNTS};
