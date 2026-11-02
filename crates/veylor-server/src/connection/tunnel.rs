@@ -206,27 +206,34 @@ fn echo_frames(
     let mut close_after = false;
 
     loop {
+        if staged > 0 && staged + conn.len + FRAME_OVERHEAD > capacity {
+            if !flush_staged(conn, staged, budget, progress)? {
+                return Ok(());
+            }
+            staged = 0;
+        }
+        if conn.len == 0 {
+            break;
+        }
+
         let len = conn.len;
-        if len == 0 {
-            break;
-        }
-
-        let Some(ws) = conn.tunnel_echo.as_mut() else {
-            return Err(ConnClose::TransportError);
-        };
-        let Some(input) = conn.input.as_mut() else {
-            break;
-        };
-        let feed = ws
-            .feed(&mut input[..len])
-            .map_err(|_| ConnClose::ProtocolError)?;
-        if feed.need_more {
-            break;
-        }
-
-        let consumed = feed.consumed;
-        let mut frame = [0u8; super::OUTPUT_CAP];
-        let frame_len = if let Some(event) = feed.event {
+        let (consumed, frame_len) = {
+            let Some(ws) = conn.tunnel_echo.as_mut() else {
+                return Err(ConnClose::TransportError);
+            };
+            let Some(input) = conn.input.as_mut() else {
+                break;
+            };
+            let feed = ws
+                .feed(&mut input[..len])
+                .map_err(|_| ConnClose::ProtocolError)?;
+            if feed.need_more {
+                break;
+            }
+            let consumed = feed.consumed;
+            let Some(event) = feed.event else {
+                break;
+            };
             let (fin, opcode, payload) = match event {
                 WsEvent::Text { payload, fin } => (fin, OpCode::Text, payload),
                 WsEvent::Binary { payload, fin } => (fin, OpCode::Binary, payload),
@@ -235,13 +242,15 @@ fn echo_frames(
                 WsEvent::Pong(_) => (true, OpCode::Pong, &[][..]),
                 WsEvent::Close(_) => {
                     close_after = true;
+                    conn.tunnel_close = true;
                     (true, OpCode::Close, &[][..])
                 }
             };
-            ws.encode(fin, opcode, None, payload, &mut frame)
-                .map_err(|_| ConnClose::ProtocolError)?
-        } else {
-            0
+            let output = ConnState::materialize_output(&mut conn.output);
+            let frame_len = ws
+                .encode(fin, opcode, None, payload, &mut output[staged..])
+                .map_err(|_| ConnClose::ProtocolError)?;
+            (consumed, frame_len)
         };
 
         if consumed > 0 {
@@ -250,62 +259,42 @@ fn echo_frames(
             }
             conn.len -= consumed;
         }
-        if frame_len == 0 {
-            if close_after {
-                break;
-            }
-            continue;
-        }
-        if close_after {
-            conn.tunnel_close = true;
-        }
-
-        if staged + frame_len > capacity {
-            stage_len(conn, staged);
-            if conn.defer_write {
-                conn.write_deferred = true;
-                return Ok(());
-            }
-            match write_pending(conn, budget) {
-                Ok((wrote, flushed)) => {
-                    progress.bytes_written += wrote;
-                    if !flushed {
-                        return Ok(());
-                    }
-                }
-                Err(reason) => return Err(reason),
-            }
-            staged = 0;
-        }
-        let output = ConnState::materialize_output(&mut conn.output);
-        output[staged..staged + frame_len].copy_from_slice(&frame[..frame_len]);
         staged += frame_len;
         if close_after {
             break;
         }
     }
 
-    if staged > 0 {
-        stage_len(conn, staged);
-        if conn.defer_write {
-            conn.write_deferred = true;
-            return Ok(());
-        }
-        match write_pending(conn, budget) {
-            Ok((wrote, flushed)) => {
-                progress.bytes_written += wrote;
-                if !flushed {
-                    return Ok(());
-                }
-            }
-            Err(reason) => return Err(reason),
-        }
+    if staged > 0 && !flush_staged(conn, staged, budget, progress)? {
+        return Ok(());
     }
     if close_after {
         return Err(ConnClose::Completed);
     }
     Ok(())
 }
+
+fn flush_staged(
+    conn: &mut ConnState,
+    staged: usize,
+    budget: u64,
+    progress: &mut PumpProgress,
+) -> Result<bool, ConnClose> {
+    stage_len(conn, staged);
+    if conn.defer_write {
+        conn.write_deferred = true;
+        return Ok(false);
+    }
+    match write_pending(conn, budget) {
+        Ok((wrote, flushed)) => {
+            progress.bytes_written += wrote;
+            Ok(flushed)
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+const FRAME_OVERHEAD: usize = 14;
 
 fn stage_len(conn: &mut ConnState, len: usize) {
     conn.out_len = len;

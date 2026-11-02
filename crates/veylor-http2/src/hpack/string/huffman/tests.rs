@@ -1,6 +1,6 @@
 use super::{
-    EOS_SYMBOL, HUFFMAN_CODES, HuffmanError, decode_huffman, decoded_bound, encode_huffman,
-    encoded_length,
+    EOS_SYMBOL, HUFFMAN_CODES, HuffmanError, contains_eos, contains_eos_scalar, decode_huffman,
+    decode_huffman_inner, decoded_bound, encode_huffman, encoded_length,
 };
 
 #[test]
@@ -129,5 +129,137 @@ fn one_pass_matches_tight_buffer_for_every_symbol() {
         let written = decode_huffman(&encoded[..encoded_length], &mut bound[..capacity]).unwrap();
         assert_eq!(written, required, "symbol {symbol}");
         assert_eq!(&bound[..written], &plain, "symbol {symbol}");
+    }
+}
+
+#[test]
+fn eos_scan_separates_valid_streams_from_the_eos_code() {
+    let mut encoded = [0u8; 4096];
+    for symbol in 0..=255u8 {
+        let plain = [symbol; 9];
+        let encoded_length = encode_huffman(&plain, &mut encoded).unwrap();
+        assert!(
+            !contains_eos_scalar(&encoded[..encoded_length]),
+            "symbol {symbol}"
+        );
+        if contains_eos_scalar(&encoded[..encoded_length]) {
+            assert!(contains_eos(&encoded[..encoded_length]), "symbol {symbol}");
+        }
+    }
+    for eos in [&[0xff, 0xff, 0xff, 0xfc][..], &[0xff, 0xff, 0xff, 0xfe][..]] {
+        assert!(contains_eos_scalar(eos));
+        assert!(contains_eos(eos));
+    }
+    for plain in [
+        &[0xff, 0xff, 0xff][..],
+        &[0xff, 0xff, 0xff, 0x80][..],
+        &[0x00, 0xff, 0x00][..],
+    ] {
+        assert!(!contains_eos_scalar(plain));
+        assert!(!contains_eos(plain));
+    }
+}
+
+#[test]
+fn fast_path_agrees_with_the_tree_walk() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let mut encoded = [0u8; 512];
+    let mut fast = [0u8; 2048];
+    let mut slow = [0u8; 2048];
+    let mut plain = [0u8; 64];
+
+    let check = |bytes: &[u8], fast: &mut [u8; 2048], slow: &mut [u8; 2048]| {
+        let quick = decode_huffman(bytes, fast).map(|length| &fast[..length]);
+        let walked = decode_huffman_inner(bytes, Some(slow)).map(|length| &slow[..length]);
+        assert_eq!(quick, walked, "bytes {bytes:02x?}");
+    };
+
+    for _ in 0..2000 {
+        let length = (next() % 64) as usize + 1;
+        for slot in plain.iter_mut().take(length) {
+            *slot = (next() % 251) as u8;
+        }
+        let encoded_length = encode_huffman(&plain[..length], &mut encoded).unwrap();
+        check(&encoded[..encoded_length], &mut fast, &mut slow);
+    }
+    for _ in 0..2000 {
+        let length = (next() % 96) as usize + 1;
+        for slot in encoded.iter_mut().take(length) {
+            *slot = (next() % 256) as u8;
+        }
+        check(&encoded[..length], &mut fast, &mut slow);
+    }
+}
+
+#[test]
+fn fast_path_handles_typical_header_values() {
+    use super::decode_huffman_fast;
+
+    let values: [&[u8]; 8] = [
+        b"h2load nghttp2/1.70.0",
+        b"127.0.0.1:8443",
+        b"gzip, deflate",
+        b"*/*",
+        b"application/json",
+        b"Tue, 03 Nov 2026 10:00:00 GMT",
+        b"no-cache",
+        b"www.example.com",
+    ];
+    let mut encoded = [0u8; 256];
+    let mut decoded = [0u8; 256];
+    for value in values {
+        let length = encode_huffman(value, &mut encoded).unwrap();
+        let fast = decode_huffman_fast(&encoded[..length], &mut decoded);
+        assert_eq!(
+            fast.map(|written| &decoded[..written]),
+            Some(value),
+            "value {}",
+            String::from_utf8_lossy(value)
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn eos_scan_kernel_rate() {
+    use std::time::Instant;
+
+    let short = b"h2load nghttp2/1.70.0".as_slice();
+    let long: Vec<u8> = std::iter::repeat_n(
+        b"session=8f14e45fceea167a5a36dedd4bea2543; Path=/; HttpOnly; ",
+        6,
+    )
+    .flatten()
+    .copied()
+    .collect();
+
+    for (name, input) in [("short", short), ("long", long.as_slice())] {
+        let iterations = 2_000_000u32;
+        let start = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..iterations {
+            hits += usize::from(super::contains_eos_scalar(input));
+        }
+        let scalar = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            hits += usize::from(super::contains_eos(input));
+        }
+        let vector = start.elapsed();
+
+        println!(
+            "{name} {}B: scalar {:.2} ns/scan, vector {:.2} ns/scan, hits {hits}",
+            input.len(),
+            scalar.as_nanos() as f64 / f64::from(iterations),
+            vector.as_nanos() as f64 / f64::from(iterations)
+        );
     }
 }
