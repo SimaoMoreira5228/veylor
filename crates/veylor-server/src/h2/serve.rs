@@ -4,6 +4,7 @@ use veylor_http1::ALLOW_BYTES;
 use veylor_http2::{
     ErrorCode, H2ServerDriver, HeaderRange, HpackHeader, ServerError, ValidatedServerRequest,
 };
+use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture};
 use veylor_runtime::ConnectionToken;
 
 use crate::connection::parked::{MAX_STAGED_TRAILER_BYTES, TRAILER_SLOTS};
@@ -12,9 +13,9 @@ use crate::connection::trailers::{trailer_allowed, valid_trailer_field};
 use crate::host::{HOST_MAX_REASON_BYTES, HOST_TUNNEL_CAP, HostEventKind, stage_tunnel_signal};
 use crate::static_files::FileReject;
 use crate::static_routes::{
-    CONTENT_ENCODING_GZIP, MAX_NATIVE_HEADERS, MAX_STATIC_BODY_BYTES, NativeHandler, NativeHeader,
-    NativeRequestView, compress_route_body, engine_owned_request_header,
-    engine_owned_response_header, raw_bytes, valid_field_value,
+    CONTENT_ENCODING_GZIP, MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, MAX_STATIC_BODY_BYTES,
+    NativeHandler, NativeHeader, NativeParam, NativeRequestView, compress_route_body,
+    engine_owned_request_header, engine_owned_response_header, raw_bytes, valid_field_value,
 };
 
 use super::file::FileDecision;
@@ -499,7 +500,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         return self.deny(stream, ErrorCode::RefusedStream, false);
                     }
                 }
-                if let Some((handler, user_data, gzip)) =
+                if let Some((handler, user_data, gzip, pattern)) =
                     self.routes.lookup_native(request.method, path)
                 {
                     let declared = request.content_length.unwrap_or(0);
@@ -523,6 +524,25 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         };
                         native_header_count += 1;
                     }
+                    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+                    let capture_count =
+                        veylor_router::capture_route(pattern, path, &mut captures).unwrap_or(0);
+                    let mut native_params = [NativeParam::EMPTY; MAX_NATIVE_PARAMS];
+                    let mut native_param_count = 0usize;
+                    for capture in captures.iter().take(capture_count.min(MAX_NATIVE_PARAMS)) {
+                        let (Some(name), Some(value)) =
+                            (capture.name(pattern), capture.value(path))
+                        else {
+                            continue;
+                        };
+                        native_params[native_param_count] = NativeParam {
+                            name: name.as_ptr(),
+                            name_len: name.len(),
+                            value: value.as_ptr(),
+                            value_len: value.len(),
+                        };
+                        native_param_count += 1;
+                    }
                     let view = NativeRequestView {
                         method: request.method.as_ptr(),
                         method_len: request.method.len(),
@@ -533,6 +553,8 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                         body: std::ptr::null(),
                         headers: native_headers.as_ptr(),
                         header_count: native_header_count,
+                        params: native_params.as_ptr(),
+                        param_count: native_param_count,
                     };
                     let encode = gzip && FrozenRoutesView::accepts_gzip(fields, self.server);
                     return self.serve_native(

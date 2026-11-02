@@ -30,8 +30,9 @@ pub use static_files::{
 };
 pub use static_files::{MAX_FILE_SIZE, MAX_MOUNTS};
 pub use static_routes::{
-    MAX_NATIVE_HEADERS, MAX_RESPONSE_BODY, MAX_ROUTES, MAX_STATIC_BODY_BYTES, NativeHandler,
-    NativeHeader, NativeRequestView, NativeResponseOut, RouteBuildError, in_native_handler,
+    MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, MAX_RESPONSE_BODY, MAX_ROUTES, MAX_STATIC_BODY_BYTES,
+    NativeHandler, NativeHeader, NativeParam, NativeRequestView, NativeResponseOut,
+    RouteBuildError, in_native_handler,
 };
 pub use static_server::{
     CloseCounts, MAX_WORKERS, RunningServer, Server, ServerConfig, ServerError, TlsConfig,

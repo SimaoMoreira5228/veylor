@@ -6,13 +6,16 @@ A router and handler layer over `veylor-server`. One app serves H1, H2 and H3.
 let app = Router::with_state(store)
     .get("/accounts/:account/statement", statement)
     .post("/accounts/:account/transactions", transaction)
-    .mount("/static/", "./public");
+    .route("/static/*path", files("./public"))
+    .ws_echo("/ws");
 
 Server::bind(addr, config)?.serve(app)?;
 ```
 
-Handlers are plain functions. They can take extractors (`Path<i64>`, `Query<QueryValues>`,
-`State<Store>`, `Headers`, `Body`, `Json<T>`) or a `Request` when you want the raw bytes.
+Handlers are plain functions. Borrowing extractors (`Query<'_>`, `Headers<'_>`) and owned
+ones (`Path<i64>`, `State<Store>`, `QueryOwned<T>`, `HeadersOwned`, `Bytes`, `Form<T>`,
+`Json<T>`) both work, or take a `Request` when you want the raw bytes. `files(dir)` registers the engine's file mount at the
+route's prefix, and `ws_echo(path)` upgrades to the engine's echo tunnel.
 
 Two paths, picked per route:
 
@@ -21,8 +24,8 @@ Two paths, picked per route:
   slab. Keep hot routes here.
 - **Managed.** Anything with a body, or anything marked `managed()` or `*_async`, parks on
   the host and runs on one dispatcher thread that buffers the body first. Async handlers run
-  there too, on a tiny thread-parking executor. Fine for database work, wrong for the hot
-  path. You don't write the dispatch loop.
+  there too, one dispatcher per worker, on a thread-parking executor. Fine for database
+  work, wrong for the hot path. You don't write the dispatch loop.
 
 State is one `&'static` reference handed out through `State<T>`. It is never cloned per
 request.

@@ -12,10 +12,11 @@ use crate::host::HOST_MAX_REASON_BYTES;
 use crate::static_files::HTTP_DATE_BYTES;
 
 use super::{
-    CONTENT_ENCODING_GZIP, IN_NATIVE, MAX_NATIVE_HEADERS, MAX_RESPONSE_BODY, MAX_STATIC_BODY_BYTES,
-    NativeHandler, NativeHeader, NativeRequestView, NativeResponseOut, RouteBuildError,
-    accepts_gzip_value, compress_route_body, engine_owned_request_header,
-    engine_owned_response_header, header_value, raw_bytes, valid_field_value, valid_reason,
+    CONTENT_ENCODING_GZIP, IN_NATIVE, MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, MAX_RESPONSE_BODY,
+    MAX_STATIC_BODY_BYTES, NativeHandler, NativeHeader, NativeParam, NativeRequestView,
+    NativeResponseOut, RouteBuildError, accepts_gzip_value, compress_route_body,
+    engine_owned_request_header, engine_owned_response_header, header_value, raw_bytes,
+    valid_field_value, valid_reason,
 };
 use super::{EncodedStaticResponse, encode_continue, now_http_date, reject_payload};
 
@@ -39,6 +40,8 @@ pub(super) fn respond_native(
     path: &[u8],
     input: &[u8],
     headers: &[Header],
+    captures: &[veylor_router::RouteCapture],
+    pattern: &[u8],
     gzip: bool,
     output: &mut [u8],
 ) -> Result<EncodedStaticResponse, RouteBuildError> {
@@ -88,6 +91,20 @@ pub(super) fn respond_native(
         };
         native_header_count += 1;
     }
+    let mut native_params = [NativeParam::EMPTY; MAX_NATIVE_PARAMS];
+    let mut native_param_count = 0usize;
+    for capture in captures.iter().take(MAX_NATIVE_PARAMS) {
+        let (Some(name), Some(value)) = (capture.name(pattern), capture.value(input)) else {
+            continue;
+        };
+        native_params[native_param_count] = NativeParam {
+            name: name.as_ptr(),
+            name_len: name.len(),
+            value: value.as_ptr(),
+            value_len: value.len(),
+        };
+        native_param_count += 1;
+    }
     let request = NativeRequestView {
         method: method.as_ptr(),
         method_len: method.len(),
@@ -98,6 +115,8 @@ pub(super) fn respond_native(
         body,
         headers: native_headers.as_ptr(),
         header_count: native_header_count,
+        params: native_params.as_ptr(),
+        param_count: native_param_count,
     };
     let mut reason_buf = [0u8; HOST_MAX_REASON_BYTES];
     let invoked = request.invoke(handler, user_data, &mut reason_buf)?;

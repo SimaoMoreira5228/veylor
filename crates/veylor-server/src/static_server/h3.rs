@@ -17,7 +17,9 @@ use veylor_h3::{
     RunningServer, Server, Tls,
 };
 use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, join_allow_value};
-use veylor_router::{compare_route_patterns, matches_route};
+use veylor_router::{
+    MAX_ROUTE_CAPTURES, RouteCapture, capture_route, compare_route_patterns, matches_route,
+};
 use veylor_runtime::ConnectionToken;
 
 use crate::connection::streams::StreamCmd;
@@ -25,8 +27,9 @@ use crate::host::{H3_PARK_SLOTS, HOST_MAX_REASON_BYTES, HostShared, RespondOutco
 use crate::static_files::HTTP_DATE_BYTES;
 use crate::static_routes::now_http_date;
 use crate::static_routes::{
-    MAX_NATIVE_HEADERS, NativeHeader, NativeRequestView, accepts_gzip_value, compress_route_body,
-    engine_owned_request_header, engine_owned_response_header, raw_bytes, valid_field_value,
+    MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, NativeHeader, NativeParam, NativeRequestView,
+    accepts_gzip_value, compress_route_body, engine_owned_request_header,
+    engine_owned_response_header, raw_bytes, valid_field_value,
 };
 
 use super::{H2StaticRoute, ServerConfig, ServerError};
@@ -625,6 +628,22 @@ fn serve_native(
         };
         native_header_count += 1;
     }
+    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
+    let capture_count = capture_route(&route.path, path, &mut captures).unwrap_or(0);
+    let mut native_params = [NativeParam::EMPTY; MAX_NATIVE_PARAMS];
+    let mut native_param_count = 0usize;
+    for capture in captures.iter().take(capture_count.min(MAX_NATIVE_PARAMS)) {
+        let (Some(name), Some(value)) = (capture.name(&route.path), capture.value(path)) else {
+            continue;
+        };
+        native_params[native_param_count] = NativeParam {
+            name: name.as_ptr(),
+            name_len: name.len(),
+            value: value.as_ptr(),
+            value_len: value.len(),
+        };
+        native_param_count += 1;
+    }
     let view = NativeRequestView {
         method: method.as_ptr(),
         method_len: method.len(),
@@ -639,6 +658,8 @@ fn serve_native(
         },
         headers: native_headers.as_ptr(),
         header_count: native_header_count,
+        params: native_params.as_ptr(),
+        param_count: native_param_count,
     };
     let mut reason = [0u8; HOST_MAX_REASON_BYTES];
     match view.invoke(handler, user_data, &mut reason) {

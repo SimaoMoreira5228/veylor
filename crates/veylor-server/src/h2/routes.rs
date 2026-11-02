@@ -266,7 +266,7 @@ impl<'a> FrozenRoutesView<'a> {
         &self,
         method: &[u8],
         path: &[u8],
-    ) -> Option<(NativeHandler, usize, bool)> {
+    ) -> Option<(NativeHandler, usize, bool, &[u8])> {
         let selected = match self.select(method, path)? {
             RouteSelection::Static(index) => self.routes[index].path,
             RouteSelection::Native(index) => self.natives[index].path,
@@ -285,7 +285,7 @@ impl<'a> FrozenRoutesView<'a> {
                     .flatten()
             })?;
 
-        Some((native.handler, native.user_data, native.gzip))
+        Some((native.handler, native.user_data, native.gzip, selected))
     }
 
     // NOTE: miss-only path scan, so hits return with no extra work: one bounded pass

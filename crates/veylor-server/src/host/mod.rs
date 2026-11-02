@@ -353,7 +353,7 @@ impl HostShared {
             return PollReport::default();
         };
         loop {
-            let report = drain_pending(&mut guard, events, methods, paths);
+            let report = drain_pending(&mut guard, None, events, methods, paths);
             if report.copied > 0 || report.events_required > 0 || report.method_required > 0 {
                 return report;
             }
@@ -381,7 +381,60 @@ impl HostShared {
                 None => true,
             };
             if timed_out {
-                return drain_pending(&mut guard, events, methods, paths);
+                return drain_pending(&mut guard, None, events, methods, paths);
+            }
+        }
+    }
+
+    // NOTE: per-worker entry for dispatchers that own one worker's queue; the wait rides
+    // the shared wake, so a spurious wakeup only re-checks this worker.
+    pub fn poll_worker(
+        &self,
+        worker: usize,
+        timeout_ns: u64,
+        events: &mut [EventSlot],
+        methods: &mut [u8],
+        paths: &mut [u8],
+    ) -> PollReport {
+        if events.is_empty() {
+            return PollReport::default();
+        }
+        let deadline = (timeout_ns != 0 && timeout_ns != u64::MAX)
+            .then(|| Instant::now() + Duration::from_nanos(timeout_ns));
+        let unbounded = timeout_ns == u64::MAX;
+        let Ok(mut guard) = self.inner.lock() else {
+            return PollReport::default();
+        };
+        loop {
+            let report = drain_pending(&mut guard, Some(worker), events, methods, paths);
+            if report.copied > 0 || report.events_required > 0 || report.method_required > 0 {
+                return report;
+            }
+            let timed_out = match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        true
+                    } else {
+                        let wait = deadline - now;
+                        guard = match self.wake.wait_timeout(guard, wait) {
+                            Ok((guard, _)) => guard,
+                            Err(_) => return PollReport::default(),
+                        };
+                        false
+                    }
+                }
+                None if unbounded => {
+                    guard = match self.wake.wait(guard) {
+                        Ok(guard) => guard,
+                        Err(_) => return PollReport::default(),
+                    };
+                    false
+                }
+                None => true,
+            };
+            if timed_out {
+                return drain_pending(&mut guard, Some(worker), events, methods, paths);
             }
         }
     }
@@ -485,6 +538,18 @@ impl HostHandle {
         self.shared.poll(timeout_ns, events, methods, paths)
     }
 
+    pub fn poll_worker(
+        &self,
+        worker: usize,
+        timeout_ns: u64,
+        events: &mut [EventSlot],
+        methods: &mut [u8],
+        paths: &mut [u8],
+    ) -> PollReport {
+        self.shared
+            .poll_worker(worker, timeout_ns, events, methods, paths)
+    }
+
     pub fn respond(
         &self,
         token: ConnectionToken,
@@ -562,6 +627,7 @@ fn pending_total(inner: &HostInner) -> usize {
 
 fn drain_pending(
     inner: &mut HostInner,
+    worker: Option<usize>,
     events: &mut [EventSlot],
     methods: &mut [u8],
     paths: &mut [u8],
@@ -574,10 +640,17 @@ fn drain_pending(
     let mut path_used = 0usize;
     let workers = inner.events.len();
     let mut empty_workers = 0;
-    let mut cursor = inner.next_poll % workers;
+    let mut cursor = match worker {
+        Some(worker) if worker < workers => worker,
+        Some(_) => return report,
+        None => inner.next_poll % workers,
+    };
     while report.copied < events.len() && empty_workers < workers {
         let front = inner.events[cursor].front();
         let Some(event) = front else {
+            if worker.is_some() {
+                break;
+            }
             empty_workers += 1;
             cursor = (cursor + 1) % workers;
             continue;
@@ -632,7 +705,9 @@ fn drain_pending(
             path_used += path_len;
         }
         report.copied += 1;
-        cursor = (cursor + 1) % workers;
+        if worker.is_none() {
+            cursor = (cursor + 1) % workers;
+        }
     }
     inner.next_poll = cursor;
     if report.method_required == 0 && report.copied == events.len() {

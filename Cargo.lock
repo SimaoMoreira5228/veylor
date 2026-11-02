@@ -1401,9 +1401,12 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "veylor-h3",
+ "veylor-http2",
  "veylor-router",
  "veylor-runtime",
  "veylor-server",
+ "veylor-tls",
 ]
 
 [[package]]

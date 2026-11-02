@@ -57,12 +57,12 @@ pub struct ManagedRoute {
 
 // NOTE: C-ABI native handlers run on the owner worker inside the pump (never on a host
 // thread) with borrowed request views; the engine copies reason/body into caller buffers
-// before returning and never retains handler memory. No headers in v1: method+path plus
-// framing presence/length keeps the call FFI-trivial, with fixed-length bodies borrowed
-// when fully buffered (see body). user_data crosses as an address-sized value next to the
-// handler pointer (see below).
+// before returning and never retains handler memory. Request headers, response headers and
+// the engine's matched path parameters all cross as bounded borrowed spans. user_data
+// crosses as an address-sized value next to the handler pointer (see below).
 // NOTE: every pointer below borrows worker input bytes for the call only; a handler
-// retaining method/path/body past return is UB, same as the out-param scratch rule.
+// retaining method/path/body/header/param spans past return is UB, same as the out-param
+// scratch rule.
 #[repr(C)]
 pub struct NativeRequestView {
     pub method: *const u8,
@@ -74,6 +74,8 @@ pub struct NativeRequestView {
     pub body: *const u8,
     pub headers: *const NativeHeader,
     pub header_count: usize,
+    pub params: *const NativeParam,
+    pub param_count: usize,
 }
 
 #[repr(C)]
@@ -95,6 +97,26 @@ impl NativeHeader {
 }
 
 pub const MAX_NATIVE_HEADERS: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NativeParam {
+    pub name: *const u8,
+    pub name_len: usize,
+    pub value: *const u8,
+    pub value_len: usize,
+}
+
+impl NativeParam {
+    pub const EMPTY: Self = Self {
+        name: std::ptr::null(),
+        name_len: 0,
+        value: std::ptr::null(),
+        value_len: 0,
+    };
+}
+
+pub const MAX_NATIVE_PARAMS: usize = 8;
 
 #[repr(C)]
 pub struct NativeResponseOut {

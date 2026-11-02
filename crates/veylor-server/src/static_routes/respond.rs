@@ -93,6 +93,8 @@ pub(crate) fn respond_to_head_matched(
                     path,
                     input,
                     headers,
+                    matched.captures,
+                    matched.pattern,
                     native.gzip,
                     output,
                 );

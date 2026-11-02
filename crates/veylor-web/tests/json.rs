@@ -5,7 +5,7 @@ use std::net::{SocketAddr, TcpStream};
 
 use serde::{Deserialize, Serialize};
 use veylor_server::{Server, ServerConfig};
-use veylor_web::{Json, Query, QueryValues, Router, ServeExt};
+use veylor_web::{Json, Query, Router, ServeExt};
 
 #[derive(Deserialize)]
 struct Echo {
@@ -23,7 +23,7 @@ fn double(Json(body): Json<Echo>) -> Json<Reply> {
     })
 }
 
-fn answer(Query(query): Query<QueryValues>) -> Json<Reply> {
+fn answer(Query(query): Query<'_>) -> Json<Reply> {
     Json(Reply {
         doubled: query.parse::<i64>("value").unwrap_or(0),
     })

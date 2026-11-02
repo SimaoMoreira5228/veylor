@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use veylor_server::{CloseCounts, RunningServer, Server, ServerError};
 
 use crate::native::{App, Route, dispatch};
-use crate::router::Router;
+use crate::router::{RouteTarget, Router};
 
 pub trait ServeExt: Sized {
     fn serve<S: Send + Sync + 'static>(self, app: Router<S>) -> Result<RunningApp, ServeError>;
@@ -16,10 +16,12 @@ impl ServeExt for Server {
         let Router {
             state,
             routes,
-            mounts,
+            mut mounts,
             fallback,
             body_cap,
+            layers,
         } = app;
+        let layers: Arc<[Arc<dyn crate::middleware::Middleware<S>>]> = Arc::from(layers);
 
         let state: &'static S = Box::leak(Box::new(state));
         let mut registered = Vec::new();
@@ -32,8 +34,24 @@ impl ServeExt for Server {
                 ));
             }
 
-            for entry in spec.methods.entries {
+            let methods = match spec.target {
+                RouteTarget::Methods(methods) => methods,
+                RouteTarget::Files(files) => {
+                    let prefix = mount_prefix(&spec.path);
+                    if prefix.is_empty() {
+                        return Err(ServeError::InvalidRoute(
+                            String::from_utf8_lossy(&spec.path).into_owned(),
+                        ));
+                    }
+                    mounts.push((prefix.to_vec(), files.0));
+                    continue;
+                }
+            };
+
+            for entry in methods.entries {
                 let route = Arc::new(Route {
+                    layers: Arc::clone(&layers),
+                    kind: entry.kind,
                     method: entry.method,
                     pattern: spec.path.clone(),
                     state,
@@ -67,20 +85,37 @@ impl ServeExt for Server {
             body_cap,
         }));
 
+        let workers = self.worker_count();
         let server = self.start().map_err(ServeError::Server)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let dispatcher = if app.managed.is_empty() {
-            None
-        } else {
-            Some(crate::managed::spawn(server.host(), app, Arc::clone(&stop)))
-        };
+        let mut pool = Vec::new();
+        if !app.managed.is_empty() {
+            for worker in 0..workers {
+                pool.push(crate::managed::spawn(
+                    worker,
+                    server.host(),
+                    app,
+                    Arc::clone(&stop),
+                ));
+            }
+        }
 
         Ok(RunningApp {
             server: Some(server),
-            dispatcher,
+            dispatchers: pool,
             stop,
         })
     }
+}
+
+// NOTE: "/static/*path" mounts at "/static/": the wildcard segment names the mount, it
+// does not become part of the prefix.
+fn mount_prefix(pattern: &[u8]) -> &[u8] {
+    let last = pattern.rsplit(|byte| *byte == b'/').next().unwrap_or(&[]);
+    if last.first() == Some(&b'*') || last.first() == Some(&b':') {
+        return &pattern[..pattern.len() - last.len()];
+    }
+    pattern
 }
 
 // NOTE: a body-bearing method parks on the host dispatcher unless the route already asked
@@ -91,7 +126,7 @@ fn needs_managed(method: &[u8]) -> bool {
 
 pub struct RunningApp {
     server: Option<RunningServer>,
-    dispatcher: Option<JoinHandle<()>>,
+    dispatchers: Vec<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -106,6 +141,10 @@ impl RunningApp {
 
     pub fn h2c_addr(&self) -> Option<std::net::SocketAddr> {
         self.server().h2c_addr()
+    }
+
+    pub fn h3_addr(&self) -> Option<std::net::SocketAddr> {
+        self.server().h3_addr()
     }
 
     pub fn host(&self) -> veylor_server::HostHandle {
@@ -128,7 +167,7 @@ impl RunningApp {
         let joined = server.join().map_err(ServeError::Server);
 
         self.stop.store(true, Ordering::Release);
-        if let Some(dispatcher) = self.dispatcher.take() {
+        for dispatcher in self.dispatchers.drain(..) {
             let _ = dispatcher.join();
         }
 

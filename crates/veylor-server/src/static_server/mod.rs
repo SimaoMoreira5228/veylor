@@ -492,6 +492,10 @@ impl Server {
         Ok(())
     }
 
+    pub fn worker_count(&self) -> usize {
+        self.config.worker_count.clamp(1, MAX_WORKERS)
+    }
+
     pub fn start(self) -> Result<RunningServer, ServerError> {
         freeze_check(&self.routes)?;
         if self.config.worker_count > 1 {

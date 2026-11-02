@@ -1,7 +1,9 @@
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 
-use veylor_server::{NativeHandler, NativeHeader, NativeRequestView, NativeResponseOut};
+use veylor_server::{
+    NativeHandler, NativeHeader, NativeParam, NativeRequestView, NativeResponseOut,
+};
 
 use super::api::read_bytes;
 use super::{ManagedStaticState, ReadyRouteOp, VylManagedStaticServer, server_error_to_result};
@@ -19,6 +21,8 @@ pub struct VylManagedStaticNativeRequest {
     pub body: *const u8,
     pub headers: *const NativeHeader,
     pub header_count: usize,
+    pub params: *const NativeParam,
+    pub param_count: usize,
 }
 
 #[repr(C)]
@@ -44,7 +48,7 @@ pub type VylManagedStaticNativeHandler = Option<VylManagedStaticNativeHandlerFn>
 const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == size_of::<NativeRequestView>());
 const _: () =
     assert!(size_of::<VylManagedStaticNativeResponse>() == size_of::<NativeResponseOut>());
-const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == 72);
+const _: () = assert!(size_of::<VylManagedStaticNativeRequest>() == 88);
 const _: () = assert!(size_of::<VylManagedStaticNativeResponse>() == 56);
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeRequest, has_body) == 4 * size_of::<*const u8>());
@@ -57,6 +61,8 @@ const _: () =
     assert!(offset_of!(VylManagedStaticNativeResponse, body_len) == 4 * size_of::<*const u8>());
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeRequest, headers) == 7 * size_of::<*const u8>());
+const _: () =
+    assert!(offset_of!(VylManagedStaticNativeRequest, params) == 9 * size_of::<*const u8>());
 const _: () =
     assert!(offset_of!(VylManagedStaticNativeResponse, headers) == 5 * size_of::<*const u8>());
 

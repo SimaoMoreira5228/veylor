@@ -27,7 +27,7 @@ impl<S: 'static> Clone for Request<'_, S> {
 }
 
 impl<'a, S: 'static> Request<'a, S> {
-    pub(crate) fn new(
+    pub fn new(
         method: &'a [u8],
         target: &'a [u8],
         headers: &'a [(&'a [u8], &'a [u8])],
@@ -162,9 +162,20 @@ impl<S: 'static> FromRequest<S> for State<S> {
     }
 }
 
-pub struct Headers(pub Vec<(Vec<u8>, Vec<u8>)>);
+pub struct Headers<'a>(pub &'a [(&'a [u8], &'a [u8])]);
 
-impl Headers {
+impl Headers<'_> {
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        self.0
+            .iter()
+            .find(|(found, _)| found.eq_ignore_ascii_case(name.as_bytes()))
+            .map(|(_, value)| *value)
+    }
+}
+
+pub struct HeadersOwned(pub Vec<(Vec<u8>, Vec<u8>)>);
+
+impl HeadersOwned {
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         self.0
             .iter()
@@ -173,9 +184,9 @@ impl Headers {
     }
 }
 
-impl<S: 'static> FromRequest<S> for Headers {
+impl<S: 'static> FromRequest<S> for HeadersOwned {
     fn from_request(request: &Request<'_, S>, _state: &'static S) -> Result<Self, Reject> {
-        Ok(Headers(
+        Ok(HeadersOwned(
             request
                 .headers()
                 .iter()
@@ -185,19 +196,115 @@ impl<S: 'static> FromRequest<S> for Headers {
     }
 }
 
-pub struct Body(pub Vec<u8>);
+pub struct Bytes(pub Vec<u8>);
 
-impl<S: 'static> FromRequest<S> for Body {
+impl<S: 'static> FromRequest<S> for Bytes {
     fn from_request(request: &Request<'_, S>, _state: &'static S) -> Result<Self, Reject> {
-        Ok(Body(request.body().to_vec()))
+        Ok(Bytes(request.body().to_vec()))
     }
 }
 
-pub struct Query<T>(pub T);
+pub struct Query<'a>(pub QueryParams<'a>);
 
-impl<S: 'static, T: FromQuery> FromRequest<S> for Query<T> {
+pub struct QueryOwned<T>(pub T);
+
+impl<S: 'static, T: FromQuery> FromRequest<S> for QueryOwned<T> {
     fn from_request(request: &Request<'_, S>, _state: &'static S) -> Result<Self, Reject> {
-        T::from_query(request.query()).map(Query)
+        T::from_query(request.query()).map(QueryOwned)
+    }
+}
+
+pub struct Form<T>(pub T);
+
+impl<S: 'static, T: FromForm> FromRequest<S> for Form<T> {
+    fn from_request(request: &Request<'_, S>, _state: &'static S) -> Result<Self, Reject> {
+        T::from_form(&FormValues::decode(request.body())?).map(Form)
+    }
+}
+
+pub trait FromForm: Sized {
+    fn from_form(values: &FormValues) -> Result<Self, Reject>;
+}
+
+#[derive(Default, Debug)]
+pub struct FormValues(Vec<(Vec<u8>, Vec<u8>)>);
+
+impl FormValues {
+    pub fn decode(body: &[u8]) -> Result<Self, Reject> {
+        let mut values = Vec::new();
+        for pair in body.split(|byte| *byte == b'&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (name, value) = match pair.iter().position(|byte| *byte == b'=') {
+                Some(split) => (&pair[..split], &pair[split + 1..]),
+                None => (pair, &b""[..]),
+            };
+            values.push((decode_form_component(name), decode_form_component(value)));
+        }
+        Ok(FormValues(values))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        self.0
+            .iter()
+            .find(|(found, _)| found == name.as_bytes())
+            .map(|(_, value)| value.as_slice())
+    }
+
+    pub fn parse<T: FromStr>(&self, name: &str) -> Option<T> {
+        from_utf8(self.get(name)?).ok()?.parse().ok()
+    }
+}
+
+impl FromForm for FormValues {
+    fn from_form(values: &FormValues) -> Result<Self, Reject> {
+        Ok(FormValues(values.0.clone()))
+    }
+}
+
+impl FromForm for () {
+    fn from_form(_values: &FormValues) -> Result<Self, Reject> {
+        Ok(())
+    }
+}
+
+fn decode_form_component(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < raw.len() => {
+                match (hex_digit(raw[index + 1]), hex_digit(raw[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        out.push(high * 16 + low);
+                        index += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

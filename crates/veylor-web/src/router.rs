@@ -1,6 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::handler::{AsyncHandler, Handler, RouteHandler, erase, erase_async};
+use crate::middleware::Middleware;
+use crate::native::Kind;
+use crate::response::Response;
 
 pub struct MethodRouter<S: 'static> {
     pub(crate) entries: Vec<MethodEntry<S>>,
@@ -10,6 +14,7 @@ pub(crate) struct MethodEntry<S: 'static> {
     pub(crate) method: &'static [u8],
     pub(crate) handler: RouteHandler<S>,
     pub(crate) managed: bool,
+    pub(crate) kind: Kind,
 }
 
 impl<S: 'static> Default for MethodRouter<S> {
@@ -33,6 +38,21 @@ impl<S: 'static> MethodRouter<S> {
             method,
             handler: erase(handler),
             managed: false,
+            kind: Kind::Handler,
+        });
+        self
+    }
+
+    pub fn ws_echo(self) -> Self {
+        self.on_echo(b"GET")
+    }
+
+    pub fn on_echo(mut self, method: &'static [u8]) -> Self {
+        self.entries.push(MethodEntry {
+            method,
+            handler: Box::new(|_, _| Response::new(500, &b"not a handler"[..])),
+            managed: true,
+            kind: Kind::Echo,
         });
         self
     }
@@ -122,6 +142,7 @@ impl<S: 'static> MethodRouter<S> {
             method,
             handler: erase_async(handler),
             managed: true,
+            kind: Kind::Handler,
         });
         self
     }
@@ -134,20 +155,44 @@ impl<S: 'static> MethodRouter<S> {
     }
 }
 
+pub struct Files(pub PathBuf);
+
+pub fn files(dir: impl Into<PathBuf>) -> Files {
+    Files(dir.into())
+}
+
+pub enum RouteTarget<S: 'static> {
+    Methods(MethodRouter<S>),
+    Files(Files),
+}
+
+impl<S: 'static> From<MethodRouter<S>> for RouteTarget<S> {
+    fn from(methods: MethodRouter<S>) -> Self {
+        RouteTarget::Methods(methods)
+    }
+}
+
+impl<S: 'static> From<Files> for RouteTarget<S> {
+    fn from(files: Files) -> Self {
+        RouteTarget::Files(files)
+    }
+}
+
 pub struct Router<S: 'static = ()> {
     pub(crate) state: S,
     pub(crate) routes: Vec<RouteSpec<S>>,
     pub(crate) mounts: Vec<(Vec<u8>, PathBuf)>,
     pub(crate) fallback: Option<RouteHandler<S>>,
     pub(crate) body_cap: usize,
+    pub(crate) layers: Vec<Arc<dyn Middleware<S>>>,
 }
 
 pub(crate) struct RouteSpec<S: 'static> {
     pub(crate) path: Vec<u8>,
-    pub(crate) methods: MethodRouter<S>,
+    pub(crate) target: RouteTarget<S>,
 }
 
-const DEFAULT_BODY_CAP: usize = 64 * 1024;
+const DEFAULT_BODY_CAP: usize = veylor_server::MAX_STATIC_BODY_BYTES as usize;
 
 impl Router<()> {
     pub fn new() -> Self {
@@ -169,13 +214,14 @@ impl<S: 'static> Router<S> {
             mounts: Vec::new(),
             fallback: None,
             body_cap: DEFAULT_BODY_CAP,
+            layers: Vec::new(),
         }
     }
 
-    pub fn route(mut self, path: &str, methods: MethodRouter<S>) -> Self {
+    pub fn route(mut self, path: &str, target: impl Into<RouteTarget<S>>) -> Self {
         self.routes.push(RouteSpec {
             path: path.as_bytes().to_vec(),
-            methods,
+            target: target.into(),
         });
         self
     }
@@ -250,6 +296,10 @@ impl<S: 'static> Router<S> {
         self.route(path, MethodRouter::new().delete_async(handler))
     }
 
+    pub fn ws_echo(self, path: &str) -> Self {
+        self.route(path, MethodRouter::new().ws_echo())
+    }
+
     pub fn mount(mut self, prefix: &str, dir: impl Into<PathBuf>) -> Self {
         self.mounts.push((prefix.as_bytes().to_vec(), dir.into()));
         self
@@ -265,6 +315,11 @@ impl<S: 'static> Router<S> {
 
     pub fn body_limit(mut self, bytes: usize) -> Self {
         self.body_cap = bytes;
+        self
+    }
+
+    pub fn layer<M: Middleware<S>>(mut self, layer: M) -> Self {
+        self.layers.push(Arc::new(layer));
         self
     }
 }

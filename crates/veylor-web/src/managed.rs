@@ -9,7 +9,7 @@ use veylor_server::{
     RequestHeadError, RequestHeader, RespondOutcome,
 };
 
-use crate::native::{App, internal_error};
+use crate::native::{App, Kind, internal_error};
 use crate::request::{Param, Request};
 use crate::response::{Response, reason};
 
@@ -20,17 +20,23 @@ const BODY_CHUNK: usize = 4096;
 const POLL_TIMEOUT_NS: u64 = 50_000_000;
 
 pub(crate) fn spawn<S: Send + Sync + 'static>(
+    worker: usize,
     host: HostHandle,
     app: &'static App<S>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .name("veylor-web-dispatch".to_owned())
-        .spawn(move || run(host, app, stop))
+        .name(format!("veylor-web-dispatch-{worker}"))
+        .spawn(move || run(worker, host, app, stop))
         .expect("spawn web dispatcher")
 }
 
-fn run<S: Send + Sync + 'static>(host: HostHandle, app: &'static App<S>, stop: Arc<AtomicBool>) {
+fn run<S: Send + Sync + 'static>(
+    worker: usize,
+    host: HostHandle,
+    app: &'static App<S>,
+    stop: Arc<AtomicBool>,
+) {
     let empty = EventSlot {
         kind: HostEventKind::Shutdown,
         token: veylor_runtime::ConnectionToken::default(),
@@ -48,7 +54,13 @@ fn run<S: Send + Sync + 'static>(host: HostHandle, app: &'static App<S>, stop: A
     let mut body = Vec::with_capacity(BODY_CHUNK);
 
     while !stop.load(Ordering::Acquire) {
-        let report = host.poll(POLL_TIMEOUT_NS, &mut events, &mut methods, &mut paths);
+        let report = host.poll_worker(
+            worker,
+            POLL_TIMEOUT_NS,
+            &mut events,
+            &mut methods,
+            &mut paths,
+        );
         for event in &events[..report.copied] {
             if event.kind != HostEventKind::Request {
                 continue;
@@ -95,6 +107,14 @@ fn serve<S: Send + Sync + 'static>(
         respond(host, token, Response::not_found());
         return;
     };
+
+    if route.kind == Kind::Echo {
+        if host.upgrade_websocket_echo(token) == RespondOutcome::Ok {
+            return;
+        }
+        respond(host, token, Response::new(400, &b"Bad Request"[..]));
+        return;
+    }
 
     let report = match host.request_head(token, headers, bytes) {
         Ok(report) => report,
@@ -155,8 +175,14 @@ fn serve<S: Send + Sync + 'static>(
     }
 
     let incoming = Request::new(method, target, pairs, body, &params[..count], route.state);
-    let response = catch_unwind(AssertUnwindSafe(|| (route.handler)(&incoming, route.state)))
-        .unwrap_or_else(|_| internal_error());
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        if route.layers.is_empty() {
+            (route.handler)(&incoming, route.state)
+        } else {
+            crate::middleware::run_chain(&route.layers, &route.handler, incoming)
+        }
+    }))
+    .unwrap_or_else(|_| internal_error());
     respond(host, token, response);
 }
 

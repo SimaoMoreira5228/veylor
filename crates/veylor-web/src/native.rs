@@ -3,14 +3,23 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use veylor_router::{MAX_ROUTE_CAPTURES, RouteCapture, capture_route};
-use veylor_server::{MAX_NATIVE_HEADERS, NativeHeader, NativeRequestView, NativeResponseOut};
+use veylor_server::{
+    MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, NativeHeader, NativeRequestView, NativeResponseOut,
+};
 
 use crate::handler::RouteHandler;
 use crate::request::{Param, Request};
 use crate::response::{Response, reason};
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Kind {
+    Handler,
+    Echo,
+}
+
 pub(crate) struct Route<S: 'static> {
+    pub(crate) layers: Arc<[Arc<dyn crate::middleware::Middleware<S>>]>,
+    pub(crate) kind: Kind,
     pub(crate) method: &'static [u8],
     pub(crate) pattern: Vec<u8>,
     pub(crate) state: &'static S,
@@ -76,22 +85,31 @@ pub(crate) unsafe extern "C" fn dispatch<S: Send + Sync + 'static>(
         }
         let headers = &headers[..header_count];
 
-        let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
-        let count = capture_route(&route.pattern, target, &mut captures).unwrap_or(0);
+        let count = view.param_count.min(MAX_NATIVE_PARAMS);
         let mut params = [Param {
             name: &[],
             value: &[],
-        }; MAX_ROUTE_CAPTURES];
-        for (index, capture) in captures.iter().take(count).enumerate() {
-            params[index] = Param {
-                name: capture.name(&route.pattern).unwrap_or(&[]),
-                value: capture.value(target).unwrap_or(&[]),
+        }; MAX_NATIVE_PARAMS];
+        for (slot, index) in params.iter_mut().zip(0..count) {
+            let param = &*view.params.add(index);
+            let (Some(name), Some(value)) = (
+                raw(param.name, param.name_len),
+                raw(param.value, param.value_len),
+            ) else {
+                continue;
             };
+            *slot = Param { name, value };
         }
 
         let incoming = Request::new(method, target, headers, body, &params[..count], route.state);
-        let response = catch_unwind(AssertUnwindSafe(|| (route.handler)(&incoming, route.state)))
-            .unwrap_or_else(|_| internal_error());
+        let response = catch_unwind(AssertUnwindSafe(|| {
+            if route.layers.is_empty() {
+                (route.handler)(&incoming, route.state)
+            } else {
+                crate::middleware::run_chain(&route.layers, &route.handler, incoming)
+            }
+        }))
+        .unwrap_or_else(|_| internal_error());
 
         write_out(response, out);
     }

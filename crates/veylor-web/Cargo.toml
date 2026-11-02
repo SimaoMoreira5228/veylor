@@ -16,6 +16,9 @@ json = ["dep:serde", "dep:serde_json"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+veylor-h3 = { version = "0.1.0", path = "../veylor-h3" }
+veylor-http2 = { version = "0.1.0", path = "../veylor-http2" }
+veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
 
 [dependencies.serde]
 version = "1"

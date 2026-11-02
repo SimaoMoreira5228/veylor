@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use crate::executor::block_on;
-use crate::request::{FromRequest, Reject, Request};
+use crate::request::{FromParams, FromRequest, Headers, Path, Query, Reject, Request, State};
 use crate::response::{IntoResponse, Response};
 
 pub trait Handler<T, S: 'static>: Send + Sync + 'static {
@@ -33,6 +33,64 @@ where
 {
     fn call(&self, request: &Request<'_, S>, _state: &'static S) -> Response {
         (self)(*request).into_response()
+    }
+}
+
+pub struct QueryArg;
+
+impl<S: 'static, F, R> Handler<QueryArg, S> for F
+where
+    F: for<'a> Fn(Query<'a>) -> R + Send + Sync + 'static,
+    R: IntoResponse,
+{
+    fn call(&self, request: &Request<'_, S>, _state: &'static S) -> Response {
+        (self)(Query(request.query())).into_response()
+    }
+}
+
+pub struct HeadersArg;
+
+impl<S: 'static, F, R> Handler<HeadersArg, S> for F
+where
+    F: for<'a> Fn(Headers<'a>) -> R + Send + Sync + 'static,
+    R: IntoResponse,
+{
+    fn call(&self, request: &Request<'_, S>, _state: &'static S) -> Response {
+        (self)(Headers(request.headers())).into_response()
+    }
+}
+
+pub struct PathQueryArg<T>(std::marker::PhantomData<T>);
+
+impl<S: 'static, F, R, T> Handler<PathQueryArg<T>, S> for F
+where
+    F: for<'a> Fn(Path<T>, Query<'a>) -> R + Send + Sync + 'static,
+    T: FromParams,
+    R: IntoResponse,
+{
+    fn call(&self, request: &Request<'_, S>, _state: &'static S) -> Response {
+        let invoked = (|| -> Result<Response, Reject> {
+            let path = Path(T::from_params(request.params())?);
+            Ok((self)(path, Query(request.query())).into_response())
+        })();
+        invoked.unwrap_or_else(rejected)
+    }
+}
+
+pub struct PathStateQueryArg<T>(std::marker::PhantomData<T>);
+
+impl<S: 'static, F, R, T> Handler<PathStateQueryArg<T>, S> for F
+where
+    F: for<'a> Fn(Path<T>, State<S>, Query<'a>) -> R + Send + Sync + 'static,
+    T: FromParams,
+    R: IntoResponse,
+{
+    fn call(&self, request: &Request<'_, S>, state: &'static S) -> Response {
+        let invoked = (|| -> Result<Response, Reject> {
+            let path = Path(T::from_params(request.params())?);
+            Ok((self)(path, State(state), Query(request.query())).into_response())
+        })();
+        invoked.unwrap_or_else(rejected)
     }
 }
 
