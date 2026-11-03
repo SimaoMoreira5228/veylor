@@ -164,10 +164,10 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
     let mut progress = PumpProgress::default();
     if conn.out_sent < conn.out_len || conn.tls_unflushed() > 0 {
         if conn.has_tls() {
-            if conn.out_sent < conn.out_len {
-                if let Err(reason) = tls_encrypt_output(conn) {
-                    return PumpOutcome::Close(reason);
-                }
+            if conn.out_sent < conn.out_len
+                && let Err(reason) = tls_encrypt_output(conn)
+            {
+                return PumpOutcome::Close(reason);
             }
 
             if let Err(reason) = tls_generate_flight(conn) {
@@ -324,15 +324,15 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
                 }
                 conn.len -= feed.consumed;
             }
-            if feed.decoded > 0 {
-                if let ConnPhase::Parked { body_received, .. } = &mut conn.phase {
-                    *body_received += feed.decoded;
-                }
+            if feed.decoded > 0
+                && let ConnPhase::Parked { body_received, .. } = &mut conn.phase
+            {
+                *body_received += feed.decoded;
             }
-            if feed.done {
-                if let ConnPhase::Parked { chunked_done, .. } = &mut conn.phase {
-                    *chunked_done = true;
-                }
+            if feed.done
+                && let ConnPhase::Parked { chunked_done, .. } = &mut conn.phase
+            {
+                *chunked_done = true;
             }
         }
         return PumpOutcome::Keep(progress);

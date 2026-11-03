@@ -35,10 +35,10 @@ fn raw(request: Request<'_, Counter>) -> Response {
         if name != b"a" && name != b"b" {
             continue;
         }
-        if let Ok(text) = std::str::from_utf8(value) {
-            if let Ok(parsed) = text.parse::<i64>() {
-                sum += parsed;
-            }
+        if let Ok(text) = std::str::from_utf8(value)
+            && let Ok(parsed) = text.parse::<i64>()
+        {
+            sum += parsed;
         }
     }
 

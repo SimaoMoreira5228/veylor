@@ -701,10 +701,10 @@ pub(crate) fn reuse_keep_alive(conn: &mut ConnState) {
     // phase; this function only shifts the pipelined tail, resets the parser, and re-arms
     // read_ready for the next exchange.
     let tail = conn.len - conn.head_len;
-    if tail > 0 {
-        if let Some(input) = conn.input.as_mut() {
-            input.copy_within(conn.head_len..conn.len, 0);
-        }
+    if tail > 0
+        && let Some(input) = conn.input.as_mut()
+    {
+        input.copy_within(conn.head_len..conn.len, 0);
     }
     conn.len = tail;
     conn.head_len = 0;

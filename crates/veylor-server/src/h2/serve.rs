@@ -466,39 +466,39 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     }
                     return;
                 }
-                if self.routes.is_managed(request.method, path) {
-                    if let Some(ctx) = self.host {
-                        let declared = request.content_length;
-                        if end && declared.unwrap_or(0) > 0 {
-                            return self.deny(stream, ErrorCode::ProtocolError, false);
-                        }
-                        let Some(body_limit) = self.routes.managed_body_limit(request.method, path)
-                        else {
-                            return self.deny(stream, ErrorCode::RefusedStream, false);
-                        };
-                        let body_limit = body_limit.min(H2_BODY_CAP);
-
-                        if declared.is_some_and(|length| length > body_limit) {
-                            self.serve_managed_body_too_large(stream, is_head);
-                            return;
-                        }
-
-                        if park_stream(
-                            ctx,
-                            self.routes,
-                            stream,
-                            request,
-                            end,
-                            body_limit,
-                            fields,
-                            self.server,
-                            self.outcome,
-                            false,
-                        ) {
-                            return;
-                        }
-                        return self.deny(stream, ErrorCode::RefusedStream, false);
+                if self.routes.is_managed(request.method, path)
+                    && let Some(ctx) = self.host
+                {
+                    let declared = request.content_length;
+                    if end && declared.unwrap_or(0) > 0 {
+                        return self.deny(stream, ErrorCode::ProtocolError, false);
                     }
+                    let Some(body_limit) = self.routes.managed_body_limit(request.method, path)
+                    else {
+                        return self.deny(stream, ErrorCode::RefusedStream, false);
+                    };
+                    let body_limit = body_limit.min(H2_BODY_CAP);
+
+                    if declared.is_some_and(|length| length > body_limit) {
+                        self.serve_managed_body_too_large(stream, is_head);
+                        return;
+                    }
+
+                    if park_stream(
+                        ctx,
+                        self.routes,
+                        stream,
+                        request,
+                        end,
+                        body_limit,
+                        fields,
+                        self.server,
+                        self.outcome,
+                        false,
+                    ) {
+                        return;
+                    }
+                    return self.deny(stream, ErrorCode::RefusedStream, false);
                 }
                 if let Some((handler, user_data, gzip, pattern)) =
                     self.routes.lookup_native(request.method, path)

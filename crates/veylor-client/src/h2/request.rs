@@ -179,10 +179,10 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         error_code: ErrorCode,
         output: &mut [u8],
     ) -> Result<WriteOut, H2ClientError> {
-        if let ErrorCode::Unknown(value) = error_code {
-            if value <= 13 {
-                return Err(H2ClientError::InvalidArgument);
-            }
+        if let ErrorCode::Unknown(value) = error_code
+            && value <= 13
+        {
+            return Err(H2ClientError::InvalidArgument);
         }
         self.ensure_writable()?;
         if stream_id == 0 || stream_id > veylor_http2::MAX_STREAM_ID {

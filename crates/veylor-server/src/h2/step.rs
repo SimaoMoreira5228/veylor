@@ -222,18 +222,18 @@ pub(crate) fn apply_h2_streams(
                 }
                 continue;
             }
-            if entry.staged.is_none() {
-                if let Some(stream) = entry.stream.as_mut() {
-                    if stream.head_sent && !stream.upgraded {
-                        stream.writable = true;
-                        // NOTE: one coalesced WRITABLE per release, staged after unlock below:
-                        // HostShared::stage_writable would deadlock under with_inner and the
-                        // queue fields are private to host/, so releases collect here and emit
-                        // there. A full queue leaves the arm set for the next turn to re-signal.
-                        rearmed[rearmed_len] = Some(entry.token);
-                        rearmed_len += 1;
-                    }
-                }
+            if entry.staged.is_none()
+                && let Some(stream) = entry.stream.as_mut()
+                && stream.head_sent
+                && !stream.upgraded
+            {
+                stream.writable = true;
+                // NOTE: one coalesced WRITABLE per release, staged after unlock below:
+                // HostShared::stage_writable would deadlock under with_inner and the
+                // queue fields are private to host/, so releases collect here and emit
+                // there. A full queue leaves the arm set for the next turn to re-signal.
+                rearmed[rearmed_len] = Some(entry.token);
+                rearmed_len += 1;
             }
         }
         ((found, rearmed, rearmed_len), None)

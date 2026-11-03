@@ -303,10 +303,10 @@ fn decode_huffman_fast(input: &[u8], output: &mut [u8]) -> Option<usize> {
 
 pub fn decode_huffman(input: &[u8], output: &mut [u8]) -> Result<usize, HuffmanError> {
     if output.len() >= decoded_bound(input.len()) {
-        if !contains_eos(input) {
-            if let Some(length) = decode_huffman_fast(input, output) {
-                return Ok(length);
-            }
+        if !contains_eos(input)
+            && let Some(length) = decode_huffman_fast(input, output)
+        {
+            return Ok(length);
         }
         return decode_huffman_inner(input, Some(output));
     }

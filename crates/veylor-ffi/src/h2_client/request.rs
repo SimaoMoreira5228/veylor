@@ -349,10 +349,10 @@ unsafe fn send_reset(
         out_written.write(0);
         out_required.write(veylor_http2::FRAME_HEADER_LEN + veylor_http2::RST_STREAM_PAYLOAD_LEN);
     }
-    if let veylor_http2::ErrorCode::Unknown(value) = error_code {
-        if value <= 13 {
-            return VylResult::InvalidArgument;
-        }
+    if let veylor_http2::ErrorCode::Unknown(value) = error_code
+        && value <= 13
+    {
+        return VylResult::InvalidArgument;
     }
     let handle = unsafe { &mut *handle };
     let Some(connection) = handle.connection.as_mut() else {

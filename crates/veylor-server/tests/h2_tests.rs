@@ -175,7 +175,7 @@ fn handshake_advertised_setting(stream: &mut TcpStream, setting_id: u16) -> u32 
     assert_eq!(header.frame_type, FrameType::Settings);
     assert_eq!(header.stream_id, 0);
     let mut advertised = None;
-    for entry in payload.chunks_exact(SETTINGS_ENTRY_LEN) {
+    for entry in payload.as_chunks::<SETTINGS_ENTRY_LEN>().0 {
         let id = u16::from_be_bytes([entry[0], entry[1]]);
         let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
         if id == setting_id {

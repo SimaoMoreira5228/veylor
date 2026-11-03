@@ -179,10 +179,10 @@ fn encode_static(
             let buffered = (conn.len - conn.head_len) as u64;
             let skip = buffered.min(drain_total) as usize;
             let consumed = conn.head_len + skip;
-            if consumed < conn.len {
-                if let Some(input) = conn.input.as_mut() {
-                    input.copy_within(consumed..conn.len, 0);
-                }
+            if consumed < conn.len
+                && let Some(input) = conn.input.as_mut()
+            {
+                input.copy_within(consumed..conn.len, 0);
             }
             conn.len -= consumed;
             conn.head_len = 0;

@@ -327,13 +327,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             staged_epoch_seen = epoch;
             staged = taken;
         }
-        if host.tls_rotation_epoch() != tls_epoch_seen {
-            if let Some((chain, key, epoch)) = host.take_tls_rotation(tls_epoch_seen) {
-                if let Some(acceptor) = tls_acceptor.as_mut() {
-                    let _ = acceptor.rotate(chain, key);
-                }
-                tls_epoch_seen = epoch;
+        if host.tls_rotation_epoch() != tls_epoch_seen
+            && let Some((chain, key, epoch)) = host.take_tls_rotation(tls_epoch_seen)
+        {
+            if let Some(acceptor) = tls_acceptor.as_mut() {
+                let _ = acceptor.rotate(chain, key);
             }
+            tls_epoch_seen = epoch;
         }
         // NOTE: H1/H2 slot-space boundary rides the const ceiling, not max_conns: H2
         // slots start at MAX_CONNECTIONS in the h2/host slice, and every H1 slot
@@ -453,10 +453,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             && !parked_live;
         h1_quiet = skip_pump;
         #[cfg(target_os = "linux")]
-        if !skip_pump {
-            if let Some(ring) = batch_ring.as_mut() {
-                batch_recv::recv_ready(ring, &mut conns, &read_slots, per_conn_budget);
-            }
+        if !skip_pump && let Some(ring) = batch_ring.as_mut() {
+            batch_recv::recv_ready(ring, &mut conns, &read_slots, per_conn_budget);
         }
         let sweep_steps = if skip_pump { 0 } else { max_conns };
         let h1_live = worker.live_count();
@@ -525,10 +523,10 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                             }
                             (_, tls_opt) => {
                                 drop(stream);
-                                if tls_opt.is_some() {
-                                    if let Some(acceptor) = tls_acceptor.as_mut() {
-                                        acceptor.release();
-                                    }
+                                if tls_opt.is_some()
+                                    && let Some(acceptor) = tls_acceptor.as_mut()
+                                {
+                                    acceptor.release();
                                 }
                                 result.counts.add(ConnClose::TransportError);
                             }
@@ -575,20 +573,20 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         if !skip_pump {
             parked_live = parked_now;
             #[cfg(target_os = "linux")]
-            if let Some(ring) = batch_ring.as_mut() {
-                if !send_slots.is_empty() {
-                    batch_send::send_pending(ring, &mut conns, &send_slots, per_conn_budget);
-                    batch_send::flush_deferred_sends(
-                        &send_slots,
-                        &mut conns,
-                        &mut worker,
-                        &mut stream_poller,
-                        &host,
-                        &mut result.counts,
-                        &mut tls_acceptor,
-                        now_ns,
-                    );
-                }
+            if let Some(ring) = batch_ring.as_mut()
+                && !send_slots.is_empty()
+            {
+                batch_send::send_pending(ring, &mut conns, &send_slots, per_conn_budget);
+                batch_send::flush_deferred_sends(
+                    &send_slots,
+                    &mut conns,
+                    &mut worker,
+                    &mut stream_poller,
+                    &host,
+                    &mut result.counts,
+                    &mut tls_acceptor,
+                    now_ns,
+                );
             }
         }
         let h2_pump_enabled = h2_enabled && h2.occupied() > 0;
@@ -692,10 +690,10 @@ fn drain_admitted(
                 conns[slot] = Some(state);
                 registered = true;
             } else {
-                if pending_tls.is_some() {
-                    if let Some(acceptor) = tls_acceptor.as_mut() {
-                        acceptor.release();
-                    }
+                if pending_tls.is_some()
+                    && let Some(acceptor) = tls_acceptor.as_mut()
+                {
+                    acceptor.release();
                 }
 
                 let _ = worker.close(admitted_conn.token);
@@ -970,18 +968,16 @@ pub(super) fn close_conn(
     let tunnel_token = conn.tunnel_token;
     let tunnel_notified = conn.tunnel_notified;
     let had_tls = conn.has_tls();
-    if had_tls {
-        if let Some(tls) = conn.tls.as_mut() {
-            let mut flight = Vec::with_capacity(64);
-            if veylor_tls::queue_close_notify(tls, &mut flight).is_ok() {
-                let mut sent = 0;
-                while sent < flight.len() {
-                    match conn.stream.write(&flight[sent..]) {
-                        Ok(0) => break,
-                        Ok(wrote) => sent += wrote,
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
+    if had_tls && let Some(tls) = conn.tls.as_mut() {
+        let mut flight = Vec::with_capacity(64);
+        if veylor_tls::queue_close_notify(tls, &mut flight).is_ok() {
+            let mut sent = 0;
+            while sent < flight.len() {
+                match conn.stream.write(&flight[sent..]) {
+                    Ok(0) => break,
+                    Ok(wrote) => sent += wrote,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
         }
@@ -1001,10 +997,8 @@ pub(super) fn close_conn(
     let mut stream = conn.into_stream();
     let _ = stream_poller.deregister(&mut stream);
     let _ = worker.close(token);
-    if had_tls {
-        if let Some(acceptor) = tls_acceptor.as_mut() {
-            acceptor.release();
-        }
+    if had_tls && let Some(acceptor) = tls_acceptor.as_mut() {
+        acceptor.release();
     }
     // NOTE: every parked close unparks exactly once (take_staged already removed staged
     // entries, so this is a no-op for applied responds/cancels): the host tomb records

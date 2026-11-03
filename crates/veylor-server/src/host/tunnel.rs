@@ -306,10 +306,10 @@ impl HostShared {
         }) else {
             return RespondOutcome::Stale;
         };
-        if result == RespondOutcome::Ok {
-            if let Some(waker) = waker {
-                let _ = waker.wake();
-            }
+        if result == RespondOutcome::Ok
+            && let Some(waker) = waker
+        {
+            let _ = waker.wake();
         }
         result
     }
@@ -328,10 +328,10 @@ impl HostShared {
         }) else {
             return RespondOutcome::Stale;
         };
-        if result == RespondOutcome::Ok {
-            if let Some(waker) = waker {
-                let _ = waker.wake();
-            }
+        if result == RespondOutcome::Ok
+            && let Some(waker) = waker
+        {
+            let _ = waker.wake();
         }
         result
     }

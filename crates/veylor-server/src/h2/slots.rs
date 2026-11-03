@@ -243,17 +243,17 @@ impl H2Slots {
             return false;
         }
         let index = event.token - H2_STREAM_TOKEN_BASE;
-        if let Some(meta) = self.meta_mut(index) {
-            if meta.occupied {
-                if event.readable || event.read_closed_hint {
-                    meta.readable = true;
-                }
-                if event.writable {
-                    meta.write_blocked = false;
-                }
-                if event.error_hint {
-                    meta.error = true;
-                }
+        if let Some(meta) = self.meta_mut(index)
+            && meta.occupied
+        {
+            if event.readable || event.read_closed_hint {
+                meta.readable = true;
+            }
+            if event.writable {
+                meta.write_blocked = false;
+            }
+            if event.error_hint {
+                meta.error = true;
             }
         }
         true

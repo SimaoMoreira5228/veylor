@@ -245,10 +245,11 @@ impl<'a> FrozenRoutesView<'a> {
         server: &H2ServerDriver<'b, 't, 'd, 'e>,
     ) -> bool {
         for header in fields {
-            if let Some((name, value)) = server.driver().resolve_header(*header) {
-                if name.eq_ignore_ascii_case(b"accept-encoding") && accepts_gzip_value(value) {
-                    return true;
-                }
+            if let Some((name, value)) = server.driver().resolve_header(*header)
+                && name.eq_ignore_ascii_case(b"accept-encoding")
+                && accepts_gzip_value(value)
+            {
+                return true;
             }
         }
 

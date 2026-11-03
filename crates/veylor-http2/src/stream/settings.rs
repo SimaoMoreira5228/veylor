@@ -162,7 +162,7 @@ impl<'a> StreamTable<'a> {
         if header.flags & SETTINGS_ACK != 0 && !payload.is_empty() {
             return StreamAction::connection_error(ErrorCode::FrameSizeError);
         }
-        if header.flags & SETTINGS_ACK == 0 && payload.len() % SETTINGS_ENTRY_LEN != 0 {
+        if header.flags & SETTINGS_ACK == 0 && !payload.len().is_multiple_of(SETTINGS_ENTRY_LEN) {
             return StreamAction::connection_error(ErrorCode::FrameSizeError);
         }
 
@@ -199,7 +199,9 @@ impl<'a> StreamTable<'a> {
         }
 
         let parameters = payload
-            .chunks_exact(SETTINGS_ENTRY_LEN)
+            .as_chunks::<SETTINGS_ENTRY_LEN>()
+            .0
+            .iter()
             .map(|entry| SettingsParameter {
                 id: u16::from_be_bytes([entry[0], entry[1]]),
                 value: u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]),

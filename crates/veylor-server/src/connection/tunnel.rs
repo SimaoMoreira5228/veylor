@@ -314,10 +314,10 @@ pub(crate) fn pump_tunnel(
 
     if conn.out_sent < conn.out_len || conn.tls_unflushed() > 0 {
         if conn.has_tls() {
-            if conn.out_sent < conn.out_len {
-                if let Err(reason) = tls_encrypt_output(conn) {
-                    return PumpOutcome::Close(reason);
-                }
+            if conn.out_sent < conn.out_len
+                && let Err(reason) = tls_encrypt_output(conn)
+            {
+                return PumpOutcome::Close(reason);
             }
             match tls_flush_pending(conn, byte_budget) {
                 Ok(wrote) => {

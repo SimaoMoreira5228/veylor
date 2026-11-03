@@ -112,8 +112,8 @@ impl<'storage, 'index> TimerQueue<'storage, 'index> {
         }
 
         let remaining_ns = deadline_ns - now_ns;
-        let wait_ms =
-            remaining_ns / NANOS_PER_MILLI + u64::from(remaining_ns % NANOS_PER_MILLI != 0);
+        let wait_ms = remaining_ns / NANOS_PER_MILLI
+            + u64::from(!remaining_ns.is_multiple_of(NANOS_PER_MILLI));
         if max_wait_ms >= 0 && wait_ms > max_wait_ms as u64 {
             return max_wait_ms;
         }

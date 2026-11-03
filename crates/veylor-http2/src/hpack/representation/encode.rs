@@ -344,10 +344,10 @@ fn resolve_field(
             Ok((0, Some(index), HpackRepresentation::Indexed))
         }
         HpackRepresentation::Default => {
-            if !is_sensitive_name(field.name) {
-                if let Some(index) = lookup(Some(field.value)) {
-                    return Ok((0, Some(index), HpackRepresentation::Indexed));
-                }
+            if !is_sensitive_name(field.name)
+                && let Some(index) = lookup(Some(field.value))
+            {
+                return Ok((0, Some(index), HpackRepresentation::Indexed));
             }
             let representation = default_literal_representation(field.name);
             Ok((lookup(None).unwrap_or(0), None, representation))

@@ -140,10 +140,10 @@ impl<'c, 'b> H2ServerConnection<'c, 'b> {
         error_code: ErrorCode,
         output: &mut [u8],
     ) -> Result<WriteOut, H2ServerError> {
-        if let ErrorCode::Unknown(value) = error_code {
-            if value <= 13 {
-                return Err(H2ServerError::InvalidArgument);
-            }
+        if let ErrorCode::Unknown(value) = error_code
+            && value <= 13
+        {
+            return Err(H2ServerError::InvalidArgument);
         }
         self.ensure_writable()?;
         let mut required = 0;

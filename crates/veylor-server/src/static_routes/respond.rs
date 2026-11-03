@@ -81,35 +81,34 @@ pub(crate) fn respond_to_head_matched(
     // NOTE: natives dispatch before statics on the same Static slot (same method+path can
     // never sit in both lists); either hit skips the file fallback below, so natives win
     // over file mounts exactly like statics do.
-    if let Ok(matched) = &found {
-        if matched.kind == RouteKind::Static {
-            if let Some(native) = routes.lookup_native(method, matched.pattern) {
-                let path = head.target(input).unwrap_or(matched.pattern);
-                return respond_native(
-                    native.handler,
-                    native.user_data,
-                    head,
-                    method,
-                    path,
-                    input,
-                    headers,
-                    matched.captures,
-                    matched.pattern,
-                    native.gzip,
-                    output,
-                );
-            }
-        }
+    if let Ok(matched) = &found
+        && matched.kind == RouteKind::Static
+        && let Some(native) = routes.lookup_native(method, matched.pattern)
+    {
+        let path = head.target(input).unwrap_or(matched.pattern);
+        return respond_native(
+            native.handler,
+            native.user_data,
+            head,
+            method,
+            path,
+            input,
+            headers,
+            matched.captures,
+            matched.pattern,
+            native.gzip,
+            output,
+        );
     }
     // NOTE: exact static routes win; file mounts serve only table misses, so existing
     // routes never change behavior when mounts are added.
     if matches!(found, Err(RouteError::MethodNotAllowed)) {
         return respond_method_not_allowed(table, head, input, output);
     }
-    if matches!(found, Err(RouteError::NotFound)) {
-        if let Some(file) = respond_file(routes, head, headers, input, output)? {
-            return Ok(file);
-        }
+    if matches!(found, Err(RouteError::NotFound))
+        && let Some(file) = respond_file(routes, head, headers, input, output)?
+    {
+        return Ok(file);
     }
     // NOTE: unmatched requests have no route cap of their own, so 404s keep the default.
     let (status, reason, body, gzip, cap) = match found {

@@ -216,10 +216,11 @@ impl HostShared {
         let Some((result, waker)) = outcome else {
             return Err(ParkError::Full);
         };
-        if result.is_ok() && tunnel {
-            if let Some(count) = self.h2_tunnels.get(worker_id as usize) {
-                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if result.is_ok()
+            && tunnel
+            && let Some(count) = self.h2_tunnels.get(worker_id as usize)
+        {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if result.is_ok() {
             if let Some(waker) = waker {
@@ -252,10 +253,8 @@ impl HostShared {
         let Some(((closed, tunnel), _)) = done else {
             return false;
         };
-        if tunnel {
-            if let Some(count) = self.h2_tunnels.get(worker_id as usize) {
-                count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if tunnel && let Some(count) = self.h2_tunnels.get(worker_id as usize) {
+            count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         closed
     }

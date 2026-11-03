@@ -73,10 +73,10 @@ impl super::Handler {
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
         };
-        if let Ok(mut waiters) = self.waiters.lock() {
-            if let Some(waiter) = waiters.get_mut(&key) {
-                waiter.token = event_token;
-            }
+        if let Ok(mut waiters) = self.waiters.lock()
+            && let Some(waiter) = waiters.get_mut(&key)
+        {
+            waiter.token = event_token;
         }
 
         let upgraded = match tokio::time::timeout(self.timeout, receiver.recv()).await {

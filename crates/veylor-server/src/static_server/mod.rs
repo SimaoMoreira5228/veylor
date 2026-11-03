@@ -452,22 +452,22 @@ impl Server {
         self.routes
             .register_native(method, path, handler, user_data)
             .map_err(ServerError::from)?;
-        if self.h2_routes.len() < MAX_ROUTES {
-            if let Some(handler) = handler {
-                self.h2_routes.push(H2StaticRoute {
-                    method: method.to_vec(),
-                    path: path.to_vec(),
-                    token: 0,
-                    status: 200,
-                    body: Vec::new(),
-                    gzip_body: None,
-                    managed: false,
-                    max_body_bytes: 0,
-                    native: Some((handler, user_data, false)),
-                    file_root: None,
-                    trailers: Vec::new(),
-                });
-            }
+        if self.h2_routes.len() < MAX_ROUTES
+            && let Some(handler) = handler
+        {
+            self.h2_routes.push(H2StaticRoute {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                token: 0,
+                status: 200,
+                body: Vec::new(),
+                gzip_body: None,
+                managed: false,
+                max_body_bytes: 0,
+                native: Some((handler, user_data, false)),
+                file_root: None,
+                trailers: Vec::new(),
+            });
         }
         Ok(())
     }
@@ -482,22 +482,22 @@ impl Server {
         self.routes
             .register_native_gzip(method, path, handler, user_data)
             .map_err(ServerError::from)?;
-        if self.h2_routes.len() < MAX_ROUTES {
-            if let Some(handler) = handler {
-                self.h2_routes.push(H2StaticRoute {
-                    method: method.to_vec(),
-                    path: path.to_vec(),
-                    token: 0,
-                    status: 200,
-                    body: Vec::new(),
-                    gzip_body: None,
-                    managed: false,
-                    max_body_bytes: 0,
-                    native: Some((handler, user_data, true)),
-                    file_root: None,
-                    trailers: Vec::new(),
-                });
-            }
+        if self.h2_routes.len() < MAX_ROUTES
+            && let Some(handler) = handler
+        {
+            self.h2_routes.push(H2StaticRoute {
+                method: method.to_vec(),
+                path: path.to_vec(),
+                token: 0,
+                status: 200,
+                body: Vec::new(),
+                gzip_body: None,
+                managed: false,
+                max_body_bytes: 0,
+                native: Some((handler, user_data, true)),
+                file_root: None,
+                trailers: Vec::new(),
+            });
         }
         Ok(())
     }

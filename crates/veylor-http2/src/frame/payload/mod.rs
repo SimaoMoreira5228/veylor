@@ -400,7 +400,7 @@ pub fn encode_settings_payload(
 
     for (parameter, entry) in parameters
         .iter()
-        .zip(output.chunks_exact_mut(SETTINGS_ENTRY_LEN))
+        .zip(output.as_chunks_mut::<SETTINGS_ENTRY_LEN>().0)
     {
         entry[0] = (parameter.id >> 8) as u8;
         entry[1] = parameter.id as u8;
@@ -424,7 +424,7 @@ pub fn decode_settings_payload(
         }
         return Ok(0);
     }
-    if payload.len() % SETTINGS_ENTRY_LEN != 0 {
+    if !payload.len().is_multiple_of(SETTINGS_ENTRY_LEN) {
         return Err(FramePayloadError::InvalidPayloadLength);
     }
 
@@ -433,7 +433,7 @@ pub fn decode_settings_payload(
         return Err(FramePayloadError::BufferTooSmall { required: count });
     }
 
-    for entry in payload.chunks_exact(SETTINGS_ENTRY_LEN) {
+    for entry in payload.as_chunks::<SETTINGS_ENTRY_LEN>().0 {
         let id = u16::from(entry[0]) << 8 | u16::from(entry[1]);
         let value = read_u32(&entry[2..]);
         if !settings_parameter_valid(id, value) {
@@ -442,7 +442,7 @@ pub fn decode_settings_payload(
     }
     for (parameter, entry) in parameters_output
         .iter_mut()
-        .zip(payload.chunks_exact(SETTINGS_ENTRY_LEN))
+        .zip(payload.as_chunks::<SETTINGS_ENTRY_LEN>().0)
     {
         *parameter = SettingsParameter {
             id: u16::from(entry[0]) << 8 | u16::from(entry[1]),

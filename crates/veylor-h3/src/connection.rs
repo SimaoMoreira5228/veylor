@@ -441,10 +441,10 @@ async fn write_response(send: &mut SendStream, response: Response<Body>, is_head
 
     let mut fields: Vec<(&[u8], &[u8])> = Vec::with_capacity(parts.headers.len() + 2);
     fields.push((b":status", status_text));
-    if let Some(length) = length {
-        if !sheds_length {
-            fields.push((b"content-length", length));
-        }
+    if let Some(length) = length
+        && !sheds_length
+    {
+        fields.push((b"content-length", length));
     }
     for (name, value) in &parts.headers {
         if matches!(

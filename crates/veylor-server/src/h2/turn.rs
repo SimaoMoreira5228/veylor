@@ -107,10 +107,10 @@ pub(crate) fn abort_tls_slot(
     counts: &mut CloseCounts,
     tls_acceptor: &mut Option<TlsAcceptor>,
 ) {
-    if meta.tls.take().is_some() {
-        if let Some(acceptor) = tls_acceptor.as_mut() {
-            acceptor.release();
-        }
+    if meta.tls.take().is_some()
+        && let Some(acceptor) = tls_acceptor.as_mut()
+    {
+        acceptor.release();
     }
     abort_slot(meta, stream_poller, counts);
 }
@@ -121,10 +121,10 @@ fn shut_slot(meta: &mut H2Meta, poller: &mut Poller, reason: ConnClose, turn: &m
         let _ = poller.deregister(&mut stream);
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
-    if meta.tls.take().is_some() {
-        if let Some(acceptor) = turn.tls_acceptor.as_mut() {
-            acceptor.release();
-        }
+    if meta.tls.take().is_some()
+        && let Some(acceptor) = turn.tls_acceptor.as_mut()
+    {
+        acceptor.release();
     }
     // NOTE: the caller clears the conn visibly; stale tables keep dead borrows only.
     meta.occupied = false;
@@ -343,10 +343,10 @@ pub(crate) fn pump_slot(
     }
     // NOTE: closed means flush-then-close: staged bytes go best-effort before the FIN.
     // Flush failure reports transport truth; a blocked remainder drops with the slot.
-    if meta.pending_unflushed() || meta.tls_unflushed() {
-        if let H2Flush::Closed(fatal) = flush_h2(meta, stream_poller, &mut turn.budget) {
-            close_reason = Some(fatal);
-        }
+    if (meta.pending_unflushed() || meta.tls_unflushed())
+        && let H2Flush::Closed(fatal) = flush_h2(meta, stream_poller, &mut turn.budget)
+    {
+        close_reason = Some(fatal);
     }
     if eof && close_reason.is_none() {
         close_reason = Some(ConnClose::PeerClosed);
@@ -387,10 +387,10 @@ pub(crate) fn abandon_slots(
             unpark_conn(host, worker, &slot.meta);
             slot.meta.occupied = false;
             slot.meta.stream.take();
-            if slot.meta.tls.take().is_some() {
-                if let Some(acceptor) = tls_acceptor.as_mut() {
-                    acceptor.release();
-                }
+            if slot.meta.tls.take().is_some()
+                && let Some(acceptor) = tls_acceptor.as_mut()
+            {
+                acceptor.release();
             }
             counts.add(ConnClose::Shutdown);
         }

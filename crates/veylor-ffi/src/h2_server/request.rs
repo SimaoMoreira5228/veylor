@@ -393,10 +393,10 @@ pub unsafe extern "C" fn vyl_h2_server_send_reset(
 ) -> VylResult {
     catch_ffi(|| unsafe {
         let code = veylor_http2::ErrorCode::from(error_code);
-        if let veylor_http2::ErrorCode::Unknown(value) = code {
-            if value <= 13 {
-                return VylResult::InvalidArgument;
-            }
+        if let veylor_http2::ErrorCode::Unknown(value) = code
+            && value <= 13
+        {
+            return VylResult::InvalidArgument;
         }
         reset_stream(
             handle,

@@ -392,10 +392,10 @@ impl Handler {
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
         };
-        if let Ok(mut waiters) = self.waiters.lock() {
-            if let Some(waiter) = waiters.get_mut(&key) {
-                waiter.token = event_token;
-            }
+        if let Ok(mut waiters) = self.waiters.lock()
+            && let Some(waiter) = waiters.get_mut(&key)
+        {
+            waiter.token = event_token;
         }
         if !body.is_empty() && !self.host.push_body(event_token, &body) {
             self.host.unpark_closed(self.worker, slot);
@@ -598,10 +598,8 @@ fn serve_route(routes: &[H2StaticRoute], request: Request<()>, body: Bytes) -> R
     if found.route.managed {
         return text(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable");
     }
-    if gzip {
-        if let Some(twin) = found.route.gzip_body.as_deref() {
-            return gzip_response(found.route.status, twin);
-        }
+    if gzip && let Some(twin) = found.route.gzip_body.as_deref() {
+        return gzip_response(found.route.status, twin);
     }
     status_response(found.route.status, &found.route.body)
 }
@@ -670,18 +668,19 @@ fn serve_native(
     match view.invoke(handler, user_data, &mut reason) {
         Ok(invoked) => {
             let body = invoked.body();
-            if gzip && native_gzip {
-                if let Ok(Some(twin)) = compress_route_body(body) {
-                    let mut response =
-                        status_response_with_headers(invoked.status, &twin, invoked.headers());
-                    response
-                        .headers_mut()
-                        .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-                    response
-                        .headers_mut()
-                        .insert(VARY, HeaderValue::from_static("accept-encoding"));
-                    return response;
-                }
+            if gzip
+                && native_gzip
+                && let Ok(Some(twin)) = compress_route_body(body)
+            {
+                let mut response =
+                    status_response_with_headers(invoked.status, &twin, invoked.headers());
+                response
+                    .headers_mut()
+                    .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                response
+                    .headers_mut()
+                    .insert(VARY, HeaderValue::from_static("accept-encoding"));
+                return response;
             }
             status_response_with_headers(invoked.status, body, invoked.headers())
         }

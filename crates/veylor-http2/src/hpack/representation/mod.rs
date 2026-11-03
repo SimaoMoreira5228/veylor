@@ -125,10 +125,10 @@ pub fn decode_header_block(
     headers_output: &mut [HpackHeader],
 ) -> Result<(usize, usize), HpackError> {
     let required_size_update = table.required_size_update();
-    if let Some(maximum) = required_size_update {
-        if !input.first().is_some_and(|byte| byte & 0xe0 == 0x20) {
-            return Err(HpackError::RequiredTableSizeUpdate { maximum });
-        }
+    if let Some(maximum) = required_size_update
+        && !input.first().is_some_and(|byte| byte & 0xe0 == 0x20)
+    {
+        return Err(HpackError::RequiredTableSizeUpdate { maximum });
     }
 
     let mut offset = 0;
@@ -143,10 +143,10 @@ pub fn decode_header_block(
             }
             let (max_size, consumed) =
                 decode_hpack_integer(&input[offset..], 5).map_err(HpackError::Integer)?;
-            if let Some(maximum) = required_size_update {
-                if max_size > maximum {
-                    return Err(HpackError::RequiredTableSizeUpdate { maximum });
-                }
+            if let Some(maximum) = required_size_update
+                && max_size > maximum
+            {
+                return Err(HpackError::RequiredTableSizeUpdate { maximum });
             }
             table.set_max_size(max_size).map_err(HpackError::Table)?;
             if required_size_update.is_some() {

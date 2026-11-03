@@ -121,11 +121,10 @@ pub(crate) fn take_stream_cmd(inner: &mut HostInner, token: ConnectionToken) -> 
         if matches!(
             cmd,
             StreamCmd::Begin { .. } | StreamCmd::Upgrade { .. } | StreamCmd::H2Upgrade { .. }
-        ) {
-            if let Some(stream) = entry.stream.as_mut() {
-                stream.head_sent = true;
-                stream.writable = true;
-            }
+        ) && let Some(stream) = entry.stream.as_mut()
+        {
+            stream.head_sent = true;
+            stream.writable = true;
         }
         return Some(cmd);
     }
@@ -134,10 +133,10 @@ pub(crate) fn take_stream_cmd(inner: &mut HostInner, token: ConnectionToken) -> 
         return Some(StreamCmd::Cancel);
     }
     // NOTE: no queued command on an open stream means the last flush completed: re-arm.
-    if entry.stream.as_ref().is_some_and(|stream| stream.head_sent) {
-        if let Some(stream) = entry.stream.as_mut() {
-            stream.writable = true;
-        }
+    if entry.stream.as_ref().is_some_and(|stream| stream.head_sent)
+        && let Some(stream) = entry.stream.as_mut()
+    {
+        stream.writable = true;
     }
     None
 }

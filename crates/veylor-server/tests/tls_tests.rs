@@ -277,10 +277,10 @@ fn parse_content_length(head: &[u8]) -> Option<usize> {
             break;
         }
 
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                return value.trim().parse().ok();
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            return value.trim().parse().ok();
         }
     }
 
