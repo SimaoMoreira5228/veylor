@@ -42,8 +42,8 @@ exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+license = "Apache-2.0"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
