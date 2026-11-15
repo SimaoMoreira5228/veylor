@@ -213,9 +213,7 @@ impl HostShared {
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (Ok(event_token), waker)
         });
-        let Some((result, waker)) = outcome else {
-            return Err(ParkError::Full);
-        };
+        let (result, waker) = outcome;
         if result.is_ok()
             && tunnel
             && let Some(count) = self.h2_tunnels.get(worker_id as usize)
@@ -250,9 +248,7 @@ impl HostShared {
                 None => ((false, false), None),
             }
         });
-        let Some(((closed, tunnel), _)) = done else {
-            return false;
-        };
+        let ((closed, tunnel), _) = done;
         if tunnel && let Some(count) = self.h2_tunnels.get(worker_id as usize) {
             count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -275,7 +271,7 @@ impl HostShared {
             retract_body_append(inner, token, bytes.len());
             (false, None)
         });
-        let staged = done.is_some_and(|(ok, _)| ok);
+        let (staged, _) = done;
         if staged && !bytes.is_empty() {
             self.wake.notify_one();
         }
@@ -298,9 +294,7 @@ impl HostShared {
             retract_body_append(inner, token, bytes.len());
             (BodyPushOutcome::Refused, None)
         });
-        let outcome = done
-            .map(|(outcome, _)| outcome)
-            .unwrap_or(BodyPushOutcome::Refused);
+        let (outcome, _) = done;
         if outcome == BodyPushOutcome::Pushed && !bytes.is_empty() {
             self.wake.notify_one();
         }
@@ -377,9 +371,7 @@ impl HostShared {
             }
             (found, None)
         });
-        let Some((result, waker)) = outcome else {
-            return RespondOutcome::Stale;
-        };
+        let (result, waker) = outcome;
         if result == RespondOutcome::Ok {
             self.note_staged(token.worker_id as usize);
             self.wake.notify_all();
@@ -422,9 +414,7 @@ impl HostShared {
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (CancelOutcome::Ok, waker)
         });
-        let Some((result, waker)) = outcome else {
-            return CancelOutcome::Stale;
-        };
+        let (result, waker) = outcome;
         if result == CancelOutcome::Ok {
             self.note_staged(token.worker_id as usize);
             self.wake.notify_all();
@@ -493,15 +483,12 @@ impl HostShared {
             }
             (RespondOutcome::Ok, None)
         });
-        outcome
-            .map(|(outcome, _)| outcome)
-            .unwrap_or(RespondOutcome::Stale)
+        outcome.0
     }
 
     pub fn pull_body(&self, token: ConnectionToken, out: &mut [u8]) -> BodyPull {
         let done = self.with_inner(|inner| (pull_staged_body(inner, token, out), None));
-        done.map(|(r, _)| r)
-            .unwrap_or((RespondOutcome::Stale, 0, false))
+        done.0
     }
 
     // NOTE: coalesced writable staging for the re-arm call sites (take_stream_cmd in
@@ -517,7 +504,7 @@ impl HostShared {
             }
             (stage_writable_locked(inner, worker, token), None)
         });
-        let staged = done.is_some_and(|(ok, _)| ok);
+        let (staged, _) = done;
         if staged {
             self.wake.notify_one();
         }
@@ -541,13 +528,14 @@ impl HostShared {
         &self,
         token: ConnectionToken,
     ) -> Option<crate::connection::streams::StreamCmd> {
-        self.with_inner(|inner| {
+        let (command, _) = self.with_inner(|inner| {
             (
                 crate::connection::streams::take_stream_cmd(inner, token),
                 None,
             )
-        })
-        .and_then(|(command, _)| command)
+        });
+
+        command
     }
 
     pub(crate) fn wait_staged(&self, worker_id: u32, timeout: Duration) -> Vec<StagedWork> {
@@ -555,9 +543,9 @@ impl HostShared {
         if !staged.is_empty() {
             return staged;
         }
-        if let Ok(guard) = self.inner.lock() {
-            let _ = self.wake.wait_timeout(guard, timeout);
-        }
+        let mut guard = self.inner.lock();
+        self.wake.wait_for(&mut guard, timeout);
+        drop(guard);
         self.take_staged(worker_id).0
     }
 
@@ -612,9 +600,7 @@ impl HostShared {
                 None,
             )
         });
-        taken
-            .map(|((staged, epoch), _)| (staged, epoch))
-            .unwrap_or_default()
+        taken.0
     }
 }
 

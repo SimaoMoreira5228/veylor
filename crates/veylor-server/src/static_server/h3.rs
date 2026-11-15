@@ -4,11 +4,12 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use veylor_h3::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
 use veylor_h3::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
@@ -172,10 +173,7 @@ fn dispatch(host: Arc<HostShared>, worker: u32, waiters: WaiterMap, stop: Arc<At
     let mut keys = Vec::new();
     while !stop.load(AtomicOrdering::Acquire) {
         let staged = host.wait_staged(worker, Duration::from_millis(5));
-        let mut waiters = match waiters.lock() {
-            Ok(waiters) => waiters,
-            Err(_) => return,
-        };
+        let mut waiters = waiters.lock();
         for work in staged {
             let key = (
                 work.token.worker_id,
@@ -342,8 +340,7 @@ impl Handler {
         trailer_allow: &[Vec<u8>],
         writer: &mut ResponseWriter<'_>,
     ) -> ManagedOutcome {
-        let Some((slot, generation)) = self.slots.lock().ok().and_then(|mut slots| slots.acquire())
-        else {
+        let Some((slot, generation)) = self.slots.lock().acquire() else {
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
         };
         let key = (self.worker, slot, generation);
@@ -359,8 +356,8 @@ impl Handler {
         let registered = self
             .waiters
             .lock()
-            .map(|mut waiters| waiters.insert(key, Waiter { token, sender }).is_none())
-            .unwrap_or(false);
+            .insert(key, Waiter { token, sender })
+            .is_none();
         if !registered {
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
@@ -392,9 +389,7 @@ impl Handler {
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
         };
-        if let Ok(mut waiters) = self.waiters.lock()
-            && let Some(waiter) = waiters.get_mut(&key)
-        {
+        if let Some(waiter) = self.waiters.lock().get_mut(&key) {
             waiter.token = event_token;
         }
         if !body.is_empty() && !self.host.push_body(event_token, &body) {
@@ -527,16 +522,12 @@ impl Handler {
     }
 
     fn remove_waiter(&self, key: WaiterKey) {
-        if let Ok(mut waiters) = self.waiters.lock() {
-            waiters.remove(&key);
-        }
+        self.waiters.lock().remove(&key);
     }
 }
 
 fn release(slots: &Mutex<Slots>, slot: u32) {
-    if let Ok(mut slots) = slots.lock() {
-        slots.release(slot);
-    }
+    slots.lock().release(slot);
 }
 
 fn staged_response(work: StagedWork) -> Response<Body> {

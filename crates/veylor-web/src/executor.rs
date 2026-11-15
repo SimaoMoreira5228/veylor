@@ -2,9 +2,10 @@ use std::any::Any;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
+use parking_lot::{Condvar, Mutex};
 use pin_project_lite::pin_project;
 
 pub trait Executor: Send + Sync + 'static {
@@ -75,16 +76,12 @@ impl Inflight {
     }
 
     pub(crate) fn add(self: &Arc<Self>) -> InflightGuard {
-        if let Ok(mut count) = self.count.lock() {
-            *count += 1;
-        }
+        *self.count.lock() += 1;
         InflightGuard(Arc::clone(self))
     }
 
     fn remove(&self) {
-        let Ok(mut count) = self.count.lock() else {
-            return;
-        };
+        let mut count = self.count.lock();
         *count = count.saturating_sub(1);
         if *count == 0 {
             self.done.notify_all();
@@ -92,14 +89,9 @@ impl Inflight {
     }
 
     pub(crate) fn wait(&self) {
-        let Ok(mut count) = self.count.lock() else {
-            return;
-        };
+        let mut count = self.count.lock();
         while *count > 0 {
-            count = match self.done.wait(count) {
-                Ok(count) => count,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            self.done.wait(&mut count);
         }
     }
 }

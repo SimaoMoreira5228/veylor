@@ -11,6 +11,7 @@ allow = [
     "MIT-0",
     "Zlib",
     "Unicode-3.0",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

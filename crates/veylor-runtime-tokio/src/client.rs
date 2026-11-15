@@ -1,17 +1,79 @@
 use std::io;
-use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use veylor_client::{
-    BodyFraming, ClientConnection, ClientError, ClientReadKind, Field, Header, RequestMethod, Span,
-};
+use veylor_client::Field;
+use veylor_tls::TlsConnector;
 
-const INITIAL_BUFFER: usize = 8 * 1024;
-const MAX_HEAD: usize = 64 * 1024;
-const MAX_BODY: usize = 1024 * 1024;
-const HEADER_SLOTS: usize = 64;
-const TRAILER_SLOTS: usize = 16;
+use crate::client_conn::{Deadlines, INITIAL_BUFFER, protocol};
+use crate::client_connect::{ConnectTimeouts, connect};
+use crate::client_pool::{Lease, Pool, PoolConfig, PoolStats};
+use crate::client_url::parse_url;
+
+#[derive(Clone)]
+pub struct ClientConfig {
+    pub connect_timeout: Duration,
+    pub attempt_timeout: Duration,
+    pub handshake_timeout: Duration,
+    pub write_timeout: Duration,
+    pub head_timeout: Duration,
+    pub body_timeout: Duration,
+    pub max_head: usize,
+    pub max_body: usize,
+    pub pool: PoolConfig,
+    pub tls: Option<TlsConnector>,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(10),
+            attempt_timeout: Duration::from_secs(3),
+            handshake_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
+            head_timeout: Duration::from_secs(30),
+            body_timeout: Duration::from_secs(30),
+            max_head: 64 * 1024,
+            max_body: 1024 * 1024,
+            pool: PoolConfig::default(),
+            tls: None,
+        }
+    }
+}
+
+pub struct ClientRequest<'a> {
+    pub method: &'a [u8],
+    pub url: &'a str,
+    pub headers: &'a [Field<'a>],
+    pub body: &'a [u8],
+}
+
+impl<'a> ClientRequest<'a> {
+    pub fn new(method: &'a [u8], url: &'a str) -> Self {
+        Self {
+            method,
+            url,
+            headers: &[],
+            body: &[],
+        }
+    }
+
+    pub fn get(url: &'a str) -> Self {
+        Self::new(b"GET", url)
+    }
+
+    pub fn headers(mut self, headers: &'a [Field<'a>]) -> Self {
+        self.headers = headers;
+
+        self
+    }
+
+    pub fn body(mut self, body: &'a [u8]) -> Self {
+        self.body = body;
+
+        self
+    }
+}
 
 pub struct ClientResponse {
     pub status: u16,
@@ -19,215 +81,153 @@ pub struct ClientResponse {
     pub body: Vec<u8>,
 }
 
+pub struct ResponseStream {
+    lease: Lease,
+    status: u16,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl ResponseStream {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn headers(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.headers
+    }
+
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
+            .map(|(_, v)| v.as_slice())
+    }
+
+    pub fn alpn(&mut self) -> Option<&[u8]> {
+        self.lease.conn().alpn()
+    }
+
+    pub async fn chunk(&mut self) -> io::Result<Option<&[u8]>> {
+        self.lease.conn().next_chunk().await
+    }
+
+    pub async fn collect(mut self, max: usize) -> io::Result<Vec<u8>> {
+        let mut body = Vec::new();
+
+        while let Some(chunk) = self.chunk().await? {
+            if body.len() + chunk.len() > max {
+                return Err(protocol("response body exceeds the limit"));
+            }
+
+            body.extend_from_slice(chunk);
+        }
+
+        Ok(body)
+    }
+}
+
+struct Shared {
+    config: ClientConfig,
+    tls: TlsConnector,
+    pool: Arc<Pool>,
+}
+
+#[derive(Clone)]
 pub struct Client {
-    socket: TcpStream,
-    connection: ClientConnection<'static>,
-    read: Vec<u8>,
-    write: Vec<u8>,
-    headers: [Header; HEADER_SLOTS],
-    trailers: [Header; TRAILER_SLOTS],
-    reusable: bool,
+    shared: Arc<Shared>,
 }
 
 impl Client {
-    pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let socket = TcpStream::connect(addr).await?;
-        socket.set_nodelay(true)?;
+    pub fn new(config: ClientConfig) -> io::Result<Self> {
+        let tls = match config.tls.clone() {
+            Some(tls) => tls,
+            None => TlsConnector::builder()
+                .alpn(&[b"http/1.1"])
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+        };
+        let pool = Pool::new(config.pool.clone());
 
         Ok(Self {
-            socket,
-            connection: ClientConnection::new(RequestMethod::Other, b""),
-            read: vec![0u8; INITIAL_BUFFER],
-            write: vec![0u8; INITIAL_BUFFER],
-            headers: [Header::default(); HEADER_SLOTS],
-            trailers: [Header::default(); TRAILER_SLOTS],
-            reusable: true,
+            shared: Arc::new(Shared { config, tls, pool }),
         })
     }
 
-    pub fn is_reusable(&self) -> bool {
-        self.reusable
+    pub fn pool_stats(&self) -> PoolStats {
+        self.shared.pool.stats()
     }
 
-    pub async fn request(
-        &mut self,
-        method: &[u8],
-        target: &[u8],
-        headers: &[Field<'_>],
-        body: &[u8],
-    ) -> io::Result<ClientResponse> {
-        if !self.reusable {
-            return Err(protocol("client connection is not reusable"));
-        }
-
-        let framing = if body.is_empty() {
-            BodyFraming::None
-        } else {
-            BodyFraming::Fixed(body.len() as u64)
-        };
-
-        loop {
-            match self.connection.encode_request_head(
-                method,
-                target,
-                headers,
-                framing,
-                &mut self.write,
-            ) {
-                Ok(head) => {
-                    self.socket.write_all(&self.write[..head.written]).await?;
-                    self.connection
-                        .advance_request_write(head.written)
-                        .map_err(client_error)?;
-                    break;
-                }
-                Err(ClientError::BufferTooSmall { required }) => {
-                    grow(&mut self.write, required, MAX_HEAD)?;
-                }
-                Err(error) => return Err(client_error(error)),
-            }
-        }
-
-        let mut offset = 0usize;
-        while offset < body.len() {
-            let written = loop {
-                match self
-                    .connection
-                    .encode_request_body(&body[offset..], &mut self.write)
-                {
-                    Ok(encoded) => break encoded.written,
-                    Err(ClientError::BufferTooSmall { required }) => {
-                        grow(&mut self.write, required, MAX_HEAD)?;
-                    }
-                    Err(error) => return Err(client_error(error)),
-                }
-            };
-            if written == 0 {
-                return Err(protocol("request body made no progress"));
-            }
-            self.socket.write_all(&self.write[..written]).await?;
-            self.connection
-                .advance_request_write(written)
-                .map_err(client_error)?;
-            offset += written;
-        }
-
-        if !body.is_empty() {
-            let tail = loop {
-                match self.connection.finish_request_body(&[], &mut self.write) {
-                    Ok(tail) => break tail,
-                    Err(ClientError::BufferTooSmall { required }) => {
-                        grow(&mut self.write, required, MAX_HEAD)?;
-                    }
-                    Err(error) => return Err(client_error(error)),
-                }
-            };
-            if tail.written > 0 {
-                self.socket.write_all(&self.write[..tail.written]).await?;
-                self.connection
-                    .advance_request_write(tail.written)
-                    .map_err(client_error)?;
-            }
-        }
-
-        self.read_response().await
+    pub fn close_idle(&self) {
+        self.shared.pool.close_idle();
     }
 
-    async fn read_response(&mut self) -> io::Result<ClientResponse> {
-        let mut filled = 0usize;
-        let mut cursor = 0usize;
-        let mut status = 0u16;
-        let mut headers = Vec::new();
-        let mut body = Vec::new();
+    pub async fn send(&self, request: &ClientRequest<'_>) -> io::Result<ResponseStream> {
+        let config = &self.shared.config;
+        let url = parse_url(request.url)?;
+        let mut lease = self.shared.pool.acquire(&url.origin).await?;
 
-        loop {
-            let input = &self.read[cursor..filled];
-            let event = self
-                .connection
-                .read_response(input, false, &mut self.headers, &mut self.trailers)
-                .map_err(client_error)?;
-            let base = cursor;
-            cursor += event.consumed;
+        if !lease.has_conn() {
+            let conn = connect(
+                &url.origin,
+                &self.shared.tls,
+                ConnectTimeouts {
+                    connect: config.connect_timeout,
+                    attempt: config.attempt_timeout,
+                    handshake: config.handshake_timeout,
+                },
+                Deadlines {
+                    write: config.write_timeout,
+                    head: config.head_timeout,
+                    body: config.body_timeout,
+                    max_head: config.max_head.max(INITIAL_BUFFER),
+                },
+            )
+            .await?;
 
-            match event.kind {
-                ClientReadKind::Head => {
-                    status = event.head.map(|head| head.status).unwrap_or(0);
-                    let count = event
-                        .head
-                        .map(|head| head.header_count)
-                        .unwrap_or(0)
-                        .min(self.headers.len());
-                    headers.clear();
-                    for header in &self.headers[..count] {
-                        let (Some(name), Some(value)) =
-                            (slice(input, header.name), slice(input, header.value))
-                        else {
-                            return Err(protocol("invalid response header span"));
-                        };
-                        headers.push((name.to_vec(), value.to_vec()));
-                    }
-                }
-                ClientReadKind::BodyData => {
-                    let start = base + event.body_data.offset;
-                    let end = start + event.body_data.length;
-                    body.extend_from_slice(&self.read[start..end]);
-                    if body.len() > MAX_BODY {
-                        return Err(protocol("response body exceeds the limit"));
-                    }
-                }
-                ClientReadKind::Complete => {
-                    self.reusable = event.can_reuse && self.connection.reset().is_ok();
-                    return Ok(ClientResponse {
-                        status,
-                        headers,
-                        body,
-                    });
-                }
-                ClientReadKind::Upgrade => {
-                    return Err(protocol("response upgrade is not supported"));
-                }
-                ClientReadKind::NeedMore
-                | ClientReadKind::Informational
-                | ClientReadKind::Trailers => {}
-            }
-
-            if event.kind == ClientReadKind::NeedMore && (cursor == filled || event.consumed == 0) {
-                if cursor > 0 {
-                    self.read.copy_within(cursor..filled, 0);
-                    filled -= cursor;
-                    cursor = 0;
-                }
-                if filled == self.read.len() {
-                    let next = self.read.len() * 2;
-                    grow(&mut self.read, next, MAX_HEAD)?;
-                }
-
-                let read = self.socket.read(&mut self.read[filled..]).await?;
-                if read == 0 {
-                    return Err(protocol("eof inside response"));
-                }
-                filled += read;
-            }
+            lease.set(conn);
         }
+
+        let host = url.origin.host_header();
+        let fields = fields_with_host(request.headers, &host);
+        let conn = lease.conn();
+
+        conn.send_request(request.method, url.target.as_bytes(), &fields, request.body)
+            .await?;
+
+        let head = conn.read_head().await?;
+
+        Ok(ResponseStream {
+            lease,
+            status: head.status,
+            headers: head.headers,
+        })
+    }
+
+    pub async fn request(&self, request: &ClientRequest<'_>) -> io::Result<ClientResponse> {
+        let stream = self.send(request).await?;
+        let status = stream.status;
+        let headers = stream.headers.clone();
+        let body = stream.collect(self.shared.config.max_body).await?;
+
+        Ok(ClientResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
-fn slice(input: &[u8], span: Span) -> Option<&[u8]> {
-    input.get(span.offset..span.offset.checked_add(span.length)?)
-}
+fn fields_with_host<'a>(headers: &'a [Field<'a>], host: &'a str) -> Vec<Field<'a>> {
+    let mut fields = Vec::with_capacity(headers.len() + 1);
 
-fn grow(buffer: &mut Vec<u8>, required: usize, max: usize) -> io::Result<()> {
-    if required > max {
-        return Err(protocol("message exceeds the buffer limit"));
+    if !headers.iter().any(|f| f.name.eq_ignore_ascii_case(b"host")) {
+        fields.push(Field {
+            name: b"host",
+            value: host.as_bytes(),
+        });
     }
-    buffer.resize(required.max(buffer.len() * 2).min(max), 0);
-    Ok(())
-}
 
-fn client_error(error: ClientError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("client: {error:?}"))
-}
+    fields.extend_from_slice(headers);
 
-fn protocol(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
+    fields
 }

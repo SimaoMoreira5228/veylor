@@ -3114,8 +3114,8 @@ fn file_mount_rejects_registration_after_start() {
 // NOTE: native-route coverage. Each test owns its handler statics so parallel runs never share
 // observations. Handlers never unwind (nounwind contract): they record, answer, and return.
 
+use parking_lot::Mutex;
 use std::ffi::c_void;
-use std::sync::Mutex;
 
 struct NativeObserved {
     user_data: usize,
@@ -3162,7 +3162,7 @@ fn record_native(
     } else {
         unsafe { std::slice::from_raw_parts(request.body, request.body_len as usize) }.to_vec()
     };
-    *observed.lock().expect("observe lock") = NativeObserved {
+    *observed.lock() = NativeObserved {
         user_data: user_data as usize,
         method,
         path,
@@ -3274,7 +3274,7 @@ fn native_get_round_trip_reports_views_and_user_data() {
         "unexpected head: {head:?}"
     );
     assert!(head.ends_with("native-bytes"), "unexpected body: {head:?}");
-    let observed = NATIVE_GET_OBSERVED.lock().expect("observed");
+    let observed = NATIVE_GET_OBSERVED.lock();
     assert_eq!(observed.user_data, tag as usize);
     assert_eq!(observed.method, b"GET");
     assert_eq!(observed.path, b"/native");
@@ -3306,7 +3306,7 @@ fn native_post_borrows_staged_body_bytes() {
     let (status, body) = post_exchange(&mut stream, "/submit", b"hello");
     assert_eq!(status, 200);
     assert_eq!(body, b"submit-ack");
-    let observed = NATIVE_POST_OBSERVED.lock().expect("observed");
+    let observed = NATIVE_POST_OBSERVED.lock();
     assert_eq!(observed.user_data, tag as usize);
     assert_eq!(observed.method, b"POST");
     assert_eq!(observed.path, b"/submit");
@@ -3330,7 +3330,7 @@ unsafe extern "C" fn native_echo_handler(
         return 1;
     }
     record_native(&NATIVE_ECHO_OBSERVED, user_data, request);
-    let observed = NATIVE_ECHO_OBSERVED.lock().expect("observed");
+    let observed = NATIVE_ECHO_OBSERVED.lock();
     unsafe {
         (*response).status = 200;
         (*response).reason = b"OK".as_ptr();
@@ -3356,7 +3356,7 @@ fn native_echo_returns_borrowed_body_through_ffi_twin() {
     let (status, body) = post_exchange(&mut stream, "/echo", b"ffi-echo");
     assert_eq!(status, 200);
     assert_eq!(body, b"ffi-echo");
-    let observed = NATIVE_ECHO_OBSERVED.lock().expect("observed");
+    let observed = NATIVE_ECHO_OBSERVED.lock();
     assert_eq!(observed.body, b"ffi-echo");
     assert_eq!(observed.body_len, 8);
     drop(observed);
@@ -3978,7 +3978,7 @@ fn h2c_native_replays_through_rebind_with_static_alongside() {
     h2_send_get(&mut stream, 1, b"/native");
     assert_eq!(h2_status(&mut stream, &mut decoder, 1, &mut decoded), 200);
     assert_eq!(h2_data(&mut stream, 1), b"h2c-native");
-    let observed = H2C_NATIVE_OBSERVED.lock().expect("observed");
+    let observed = H2C_NATIVE_OBSERVED.lock();
     assert_eq!(observed.user_data, tag as usize);
     assert_eq!(observed.method, b"GET");
     assert_eq!(observed.path, b"/native");
@@ -4044,7 +4044,7 @@ fn h2c_native_served_when_h2c_staged_before_register() {
     h2_send_get(&mut stream, 1, b"/native");
     assert_eq!(h2_status(&mut stream, &mut decoder, 1, &mut decoded), 200);
     assert_eq!(h2_data(&mut stream, 1), b"rebind-native");
-    let observed = H2C_REBIND_OBSERVED.lock().expect("observed");
+    let observed = H2C_REBIND_OBSERVED.lock();
     assert_eq!(observed.user_data, tag as usize);
     assert_eq!(observed.method, b"GET");
     assert_eq!(observed.path, b"/native");
@@ -4103,7 +4103,7 @@ fn h2c_native_served_with_two_workers() {
     h2_send_get(&mut stream, 1, b"/native");
     assert_eq!(h2_status(&mut stream, &mut decoder, 1, &mut decoded), 200);
     assert_eq!(h2_data(&mut stream, 1), b"worker-native");
-    let observed = H2C_WORKER_OBSERVED.lock().expect("observed");
+    let observed = H2C_WORKER_OBSERVED.lock();
     assert_eq!(observed.user_data, tag as usize);
     assert_eq!(observed.path, b"/native");
     drop(observed);

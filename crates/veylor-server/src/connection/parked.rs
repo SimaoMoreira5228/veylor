@@ -225,9 +225,7 @@ pub(crate) fn pump_parked(conn: &mut ConnState, host: &HostShared) -> PumpOutcom
         progress.bytes_written = accepted as u64;
         return PumpOutcome::Keep(progress);
     }
-    let staged = host
-        .with_inner(|inner| (take_stream_cmd(inner, event_token), None))
-        .and_then(|(cmd, _)| cmd);
+    let (staged, _) = host.with_inner(|inner| (take_stream_cmd(inner, event_token), None));
     if let Some(cmd) = staged {
         return apply_stream_cmd(conn, host, event_token, cmd, progress);
     }
@@ -676,7 +674,7 @@ impl crate::host::HostHandle {
         let pulled = self
             .shared
             .with_inner(|inner| (pull_parked_trailers(inner, token, names, values), None));
-        pulled.map(|(report, _)| report).unwrap_or_default()
+        pulled.0
     }
 }
 

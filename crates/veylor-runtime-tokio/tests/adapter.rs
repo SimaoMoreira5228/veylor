@@ -3,7 +3,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use veylor_http1::Field;
-use veylor_runtime_tokio::{Client, Config, Request, Response, serve_connection, serve_until};
+use veylor_runtime_tokio::{
+    Client, ClientConfig, ClientRequest, Config, Request, Response, serve_connection, serve_until,
+};
 
 fn echo(request: Request<'_>) -> Response<'_> {
     match request.target() {
@@ -12,11 +14,6 @@ fn echo(request: Request<'_>) -> Response<'_> {
         _ => Response::text(b"ok"),
     }
 }
-
-const HOST: Field = Field {
-    name: b"host",
-    value: b"localhost",
-};
 
 fn boom(_request: Request<'_>) -> Response<'_> {
     panic!("handler panic")
@@ -40,17 +37,18 @@ async fn client_and_server_exchange_keep_alive() {
     let (listener, addr) = listener().await;
     tokio::spawn(spawn_one(listener));
 
-    let mut client = Client::connect(addr).await.expect("connect");
+    let client = Client::new(ClientConfig::default()).expect("client");
+    let base = format!("http://{addr}");
 
     let get = client
-        .request(b"GET", b"/", &[HOST], b"")
+        .request(&ClientRequest::get(&format!("{base}/")))
         .await
         .expect("get");
     assert_eq!(get.status, 200);
     assert_eq!(get.body, b"ok");
 
     let post = client
-        .request(b"POST", b"/echo", &[HOST], b"hello")
+        .request(&ClientRequest::new(b"POST", &format!("{base}/echo")).body(b"hello"))
         .await
         .expect("post");
     assert_eq!(post.status, 200);
@@ -61,12 +59,13 @@ async fn client_and_server_exchange_keep_alive() {
         value: b"value",
     };
     let header = client
-        .request(b"GET", b"/header", &[HOST, header], b"")
+        .request(&ClientRequest::get(&format!("{base}/header")).headers(&[header]))
         .await
         .expect("header");
     assert_eq!(header.body, b"value");
 
-    assert!(client.is_reusable());
+    assert_eq!(client.pool_stats().idle, 1);
+    assert_eq!(client.pool_stats().open, 1);
 }
 
 #[tokio::test]
@@ -210,12 +209,13 @@ async fn shutdown_stops_accepting() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }));
 
-    let mut client = Client::connect(addr).await.expect("connect");
+    let client = Client::new(ClientConfig::default()).expect("client");
     let response = client
-        .request(b"GET", b"/", &[HOST], b"")
+        .request(&ClientRequest::get(&format!("http://{addr}/")))
         .await
         .expect("request");
     assert_eq!(response.body, b"ok");
+    client.close_idle();
     drop(client);
 
     let _ = tokio::time::timeout(Duration::from_secs(2), server)

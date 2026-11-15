@@ -2,8 +2,8 @@ mod config;
 mod handlers;
 mod store;
 
+use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use veylor_server::{Server, ServerConfig, TlsConfig};

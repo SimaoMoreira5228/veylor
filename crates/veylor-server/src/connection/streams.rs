@@ -147,7 +147,7 @@ impl HostShared {
             return false;
         }
 
-        let Some((queued, waker)) = self.with_inner(|inner| {
+        let (queued, waker) = self.with_inner(|inner| {
             let Some(entry) = stream_entry(inner, token) else {
                 return (false, None);
             };
@@ -165,9 +165,7 @@ impl HostShared {
                 .get(token.worker_id as usize)
                 .and_then(Clone::clone);
             (true, waker)
-        }) else {
-            return false;
-        };
+        });
 
         if queued {
             self.note_staged(token.worker_id as usize);
@@ -324,7 +322,7 @@ impl HostShared {
                 });
             (live, None)
         });
-        done.is_some_and(|(live, _)| live)
+        done.0
     }
 
     fn stage_stream(
@@ -429,9 +427,7 @@ impl HostShared {
             let waker = inner.wakers.get(worker).and_then(|slot| slot.clone());
             (RespondOutcome::Ok, waker)
         });
-        let Some((result, waker)) = outcome else {
-            return RespondOutcome::Stale;
-        };
+        let (result, waker) = outcome;
         if result == RespondOutcome::Ok {
             self.wake.notify_all();
             if let Some(waker) = waker {

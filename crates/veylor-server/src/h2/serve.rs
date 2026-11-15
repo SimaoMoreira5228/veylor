@@ -339,9 +339,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
             }
             (H2Trailer::Staged, None)
         });
-        verdict
-            .map(|(verdict, _)| verdict)
-            .unwrap_or(H2Trailer::Conn)
+        verdict.0
     }
 
     pub(crate) fn serve_one(&mut self, event: StreamEvent) {
@@ -939,9 +937,7 @@ fn push_h2_data(ctx: H2HostCtx<'_>, stream: u32, bytes: &[u8], end: bool) -> H2D
         }
         (H2DataOutcome::Gone, None)
     });
-    let Some((result, _)) = outcome else {
-        return H2DataOutcome::Gone;
-    };
+    let (result, _) = outcome;
     if matches!(result, H2DataOutcome::Stored) && !bytes.is_empty() {
         ctx.host.notify_pollers();
     }

@@ -149,8 +149,7 @@ impl HostHandle {
                 );
                 (result, None)
             })
-            .map(|(result, _)| result)
-            .unwrap_or(Err(RequestHeadError::Unavailable(RespondOutcome::Stale)))
+            .0
     }
 }
 

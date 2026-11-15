@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt", "time", "macros"] }
+parking_lot.workspace = true
+tokio = { version = "1", features = ["net", "io-util", "rt", "time", "macros", "sync"] }
 veylor-client = { version = "0.1.0", path = "../veylor-client" }
 veylor-http1 = { version = "0.1.0", path = "../veylor-http1" }
 veylor-server-conn = { version = "0.1.0", path = "../veylor-server-conn" }
+veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

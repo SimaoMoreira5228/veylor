@@ -169,7 +169,7 @@ impl HostShared {
         {
             return RespondOutcome::Invalid;
         }
-        let Some(((result, signals), waker)) = self.with_inner(|inner| {
+        let ((result, signals), waker) = self.with_inner(|inner| {
             let plan = {
                 let Some(entry) = tunnel_entry(inner, token) else {
                     return ((missing_outcome(inner, token), None), None);
@@ -217,9 +217,7 @@ impl HostShared {
                 .get(token.worker_id as usize)
                 .and_then(Clone::clone);
             ((RespondOutcome::Ok, signals), waker)
-        }) else {
-            return RespondOutcome::Stale;
-        };
+        });
         if result == RespondOutcome::Ok {
             if let Some((buffered, closed)) = signals {
                 if buffered {
@@ -237,7 +235,7 @@ impl HostShared {
     }
 
     pub fn tunnel_read(&self, token: ConnectionToken, out: &mut [u8]) -> (RespondOutcome, usize) {
-        let Some(((outcome, take), waker)) = self.with_inner(|inner| {
+        let ((outcome, take), waker) = self.with_inner(|inner| {
             let (outcome, take) = {
                 let Some(entry) = tunnel_entry(inner, token) else {
                     return ((missing_outcome(inner, token), 0), None);
@@ -269,9 +267,7 @@ impl HostShared {
                 None
             };
             ((outcome, take), waker)
-        }) else {
-            return (RespondOutcome::Stale, 0);
-        };
+        });
         if let Some(waker) = waker {
             let _ = waker.wake();
         }
@@ -282,7 +278,7 @@ impl HostShared {
         if bytes.is_empty() {
             return RespondOutcome::Invalid;
         }
-        let Some((result, waker)) = self.with_inner(|inner| {
+        let (result, waker) = self.with_inner(|inner| {
             let Some(entry) = tunnel_entry(inner, token) else {
                 return (missing_outcome(inner, token), None);
             };
@@ -303,9 +299,7 @@ impl HostShared {
                 .get(token.worker_id as usize)
                 .and_then(Clone::clone);
             (RespondOutcome::Ok, waker)
-        }) else {
-            return RespondOutcome::Stale;
-        };
+        });
         if result == RespondOutcome::Ok
             && let Some(waker) = waker
         {
@@ -315,7 +309,7 @@ impl HostShared {
     }
 
     pub fn tunnel_close(&self, token: ConnectionToken) -> RespondOutcome {
-        let Some((result, waker)) = self.with_inner(|inner| {
+        let (result, waker) = self.with_inner(|inner| {
             let Some(entry) = tunnel_entry(inner, token) else {
                 return (missing_outcome(inner, token), None);
             };
@@ -325,9 +319,7 @@ impl HostShared {
                 .get(token.worker_id as usize)
                 .and_then(Clone::clone);
             (RespondOutcome::Ok, waker)
-        }) else {
-            return RespondOutcome::Stale;
-        };
+        });
         if result == RespondOutcome::Ok
             && let Some(waker) = waker
         {
@@ -355,8 +347,7 @@ impl HostShared {
                 entry.tunnel_in.extend_from_slice(&bytes[..take]);
                 (take, None)
             })
-            .map(|(take, _)| take)
-            .unwrap_or(0);
+            .0;
         if take > 0 {
             self.stage_tunnel_data(token);
         }
@@ -380,8 +371,7 @@ impl HostShared {
             }
             (take, None)
         })
-        .map(|(take, _)| take)
-        .unwrap_or(0)
+        .0
     }
 
     pub(crate) fn mark_tunnel_eof(&self, token: ConnectionToken) {
@@ -400,7 +390,7 @@ impl HostShared {
             });
             (done, None)
         })
-        .is_some_and(|(done, _)| done)
+        .0
     }
 
     pub(crate) fn h2_tunnel_active(&self, worker: u32) -> bool {
@@ -421,8 +411,7 @@ impl HostShared {
             );
             (take, None)
         })
-        .map(|(take, _)| take)
-        .unwrap_or(0)
+        .0
     }
 
     pub(crate) fn consume_tunnel_out(&self, token: ConnectionToken, bytes: usize) {
@@ -446,8 +435,7 @@ impl HostShared {
             let closed = tunnel_entry(inner, token).is_none_or(|entry| entry.tunnel_close);
             (closed, None)
         })
-        .map(|(closed, _)| closed)
-        .unwrap_or(true)
+        .0
     }
 
     pub(crate) fn stage_tunnel_data(&self, token: ConnectionToken) {
@@ -472,7 +460,7 @@ impl HostShared {
             );
             (staged, None)
         })
-        .is_some_and(|(staged, _)| staged)
+        .0
     }
 }
 

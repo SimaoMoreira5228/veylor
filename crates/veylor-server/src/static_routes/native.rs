@@ -381,8 +381,8 @@ fn copy_handler_bytes(src: *const u8, len: usize, dst: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::ffi::c_void;
-    use std::sync::Mutex;
 
     use veylor_http1::{Header, Limits, Parser};
     use veylor_router::RouteSlot;
@@ -417,7 +417,7 @@ mod tests {
         } else {
             unsafe { std::slice::from_raw_parts(view.body, view.body_len as usize) }.to_vec()
         };
-        *OBSERVED.lock().expect("observed lock") = Some(Observed {
+        *OBSERVED.lock() = Some(Observed {
             has_body: view.has_body,
             body_len: view.body_len,
             null_body: view.body.is_null(),
@@ -432,7 +432,7 @@ mod tests {
     }
 
     fn drive(input: &[u8], output: &mut [u8]) -> EncodedStaticResponse {
-        *OBSERVED.lock().expect("observed lock") = None;
+        *OBSERVED.lock() = None;
         let mut routes = StaticRoutes::new();
         routes
             .register_native(b"POST", b"/echo", Some(record_handler), 0)
@@ -449,7 +449,7 @@ mod tests {
     }
 
     fn observed() -> Option<Observed> {
-        OBSERVED.lock().expect("observed lock").take()
+        OBSERVED.lock().take()
     }
 
     fn head_with_length(body: &[u8]) -> Vec<u8> {
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn staged_body_borrows_fully_present_bytes() {
-        let _serial = SERIAL.lock().expect("serial lock");
+        let _serial = SERIAL.lock();
         let input = head_with_length(b"hello");
         let mut output = [0u8; 1024];
         let encoded = drive(&input, &mut output);
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn partial_tail_invokes_framing_only() {
-        let _serial = SERIAL.lock().expect("serial lock");
+        let _serial = SERIAL.lock();
         let mut input = b"POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\n".to_vec();
         input.extend_from_slice(b"he");
         let mut output = [0u8; 1024];
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn zero_length_body_passes_null() {
-        let _serial = SERIAL.lock().expect("serial lock");
+        let _serial = SERIAL.lock();
         let input = head_with_length(b"");
         let mut output = [0u8; 1024];
         let encoded = drive(&input, &mut output);
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn over_cap_rejects_before_invoke() {
-        let _serial = SERIAL.lock().expect("serial lock");
+        let _serial = SERIAL.lock();
         let input = format!(
             "POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n",
             MAX_STATIC_BODY_BYTES + 1
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn chunked_rejects_before_invoke() {
-        let _serial = SERIAL.lock().expect("serial lock");
+        let _serial = SERIAL.lock();
         let input = b"POST /echo HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n";
         let mut output = [0u8; 1024];
         let encoded = drive(input, &mut output);

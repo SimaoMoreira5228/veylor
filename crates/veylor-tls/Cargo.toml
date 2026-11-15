@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+webpki-roots = "1"

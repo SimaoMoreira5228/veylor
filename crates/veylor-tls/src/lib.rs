@@ -1,8 +1,10 @@
+mod client;
 mod pem;
 mod pump;
 
+pub use client::{TlsConnector, TlsConnectorBuilder};
 pub use pem::{load_cert_chain, load_private_key};
-pub use pump::{drain_plaintext, feed_ciphertext, queue_close_notify};
+pub use pump::{drain_plaintext, feed_ciphertext, flush_ciphertext, queue_close_notify};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use std::io;
@@ -85,11 +87,7 @@ impl TlsAcceptor {
 
         self.active += 1;
 
-        Ok(TlsConn {
-            inner,
-            bytes_encrypted: 0,
-            bytes_decrypted: 0,
-        })
+        Ok(TlsConn::new(rustls::Connection::Server(inner)))
     }
 
     pub fn release(&mut self) {
@@ -110,12 +108,20 @@ impl TlsAcceptor {
 }
 
 pub struct TlsConn {
-    inner: rustls::ServerConnection,
+    inner: rustls::Connection,
     bytes_encrypted: u64,
     bytes_decrypted: u64,
 }
 
 impl TlsConn {
+    fn new(inner: rustls::Connection) -> Self {
+        Self {
+            inner,
+            bytes_encrypted: 0,
+            bytes_decrypted: 0,
+        }
+    }
+
     pub fn bytes_encrypted(&self) -> u64 {
         self.bytes_encrypted
     }
@@ -142,6 +148,7 @@ pub enum TlsError {
     SlotsFull,
     InvalidInput,
     Handshake,
+    Certificate,
     Crypto,
     Io(io::Error),
 }
@@ -152,6 +159,7 @@ impl std::fmt::Display for TlsError {
             Self::SlotsFull => write!(f, "handshake slot budget exhausted"),
             Self::InvalidInput => write!(f, "invalid certificate or key input"),
             Self::Handshake => write!(f, "TLS handshake failure"),
+            Self::Certificate => write!(f, "TLS peer certificate rejected"),
             Self::Crypto => write!(f, "TLS cryptographic failure"),
             Self::Io(e) => write!(f, "TLS transport I/O failure: {e}"),
         }
@@ -176,6 +184,9 @@ impl From<io::Error> for TlsError {
 impl From<rustls::Error> for TlsError {
     fn from(e: rustls::Error) -> Self {
         match e {
+            rustls::Error::InvalidCertificate(_) | rustls::Error::InvalidCertRevocationList(_) => {
+                Self::Certificate
+            }
             rustls::Error::DecryptError | rustls::Error::EncryptError => Self::Crypto,
             _ => Self::Handshake,
         }

@@ -66,6 +66,22 @@ pub fn drain_plaintext(
     Ok(())
 }
 
+pub fn flush_ciphertext(conn: &mut TlsConn, out: &mut Vec<u8>) -> Result<(), TlsError> {
+    let base = out.len();
+
+    while conn.inner.wants_write() {
+        let wrote = conn.inner.write_tls(out)?;
+
+        if wrote == 0 {
+            break;
+        }
+    }
+
+    conn.bytes_encrypted += (out.len() - base) as u64;
+
+    Ok(())
+}
+
 fn drain_reader(conn: &mut TlsConn, plain_out: &mut Vec<u8>) -> Result<(), TlsError> {
     let mut chunk = [0u8; DRAIN_CHUNK];
 

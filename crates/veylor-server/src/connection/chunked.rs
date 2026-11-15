@@ -46,7 +46,7 @@ impl HostShared {
                 });
             (done, None)
         });
-        marked.is_some_and(|(done, _)| done)
+        marked.0
     }
 
     pub(crate) fn stage_trailer_field(
@@ -90,7 +90,7 @@ impl HostShared {
                 });
             (true, None)
         });
-        staged.is_some_and(|(done, _)| done)
+        staged.0
     }
 }
 

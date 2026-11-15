@@ -52,7 +52,7 @@ fn is_head_park(host: &HostShared, token: ConnectionToken) -> bool {
         });
         (head, None)
     });
-    gated.is_some_and(|(head, _)| head)
+    gated.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,7 +90,7 @@ fn tunnel_step(
             let out = entry.tunnel_out.len() - entry.tunnel_out_start;
             (Some((entry.token, grant, entry.tunnel_close, out)), None)
         });
-        let Some((token, grant, close, out)) = info.and_then(|(info, _)| info) else {
+        let (Some((token, grant, close, out)), _) = info else {
             continue;
         };
         let stream = token.stream_id;
@@ -238,9 +238,7 @@ pub(crate) fn apply_h2_streams(
         }
         ((found, rearmed, rearmed_len), None)
     });
-    let Some(((found, rearmed, rearmed_len), _)) = peek else {
-        return progressed;
-    };
+    let ((found, rearmed, rearmed_len), _) = peek;
     for token in rearmed[..rearmed_len].iter().flatten() {
         host.stage_writable(*token);
     }
@@ -265,12 +263,10 @@ pub(crate) fn apply_h2_streams(
         }
     }
 
-    let Some((cmd, _)) = host.with_inner(|inner| {
+    let (cmd, _) = host.with_inner(|inner| {
         let command = take_stream_cmd(inner, token);
         (command, None)
-    }) else {
-        return progressed;
-    };
+    });
     let Some(cmd) = cmd else {
         return progressed;
     };

@@ -23,8 +23,7 @@ impl super::Handler {
         path: &[u8],
         trailer_allow: &[Vec<u8>],
     ) -> ManagedOutcome {
-        let Some((slot, generation)) = self.slots.lock().ok().and_then(|mut slots| slots.acquire())
-        else {
+        let Some((slot, generation)) = self.slots.lock().acquire() else {
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
         };
         let key = (self.worker, slot, generation);
@@ -40,8 +39,8 @@ impl super::Handler {
         let registered = self
             .waiters
             .lock()
-            .map(|mut waiters| waiters.insert(key, Waiter { token, sender }).is_none())
-            .unwrap_or(false);
+            .insert(key, Waiter { token, sender })
+            .is_none();
         if !registered {
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
@@ -73,9 +72,7 @@ impl super::Handler {
             release(&self.slots, slot);
             return ManagedOutcome::Handled(text(StatusCode::SERVICE_UNAVAILABLE, b"busy"));
         };
-        if let Ok(mut waiters) = self.waiters.lock()
-            && let Some(waiter) = waiters.get_mut(&key)
-        {
+        if let Some(waiter) = self.waiters.lock().get_mut(&key) {
             waiter.token = event_token;
         }
 

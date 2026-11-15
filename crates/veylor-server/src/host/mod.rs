@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use veylor_http1::{is_token, valid_field_value};
 use veylor_runtime::{ConnectionToken, WakeHandle};
@@ -250,10 +252,7 @@ impl HostShared {
     }
 
     pub fn worker_count(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|inner| inner.events.len())
-            .unwrap_or(0)
+        self.inner.lock().events.len()
     }
 
     pub fn h3_worker_id(&self) -> u32 {
@@ -261,9 +260,7 @@ impl HostShared {
     }
 
     pub fn register_waker(&self, worker_id: u32, waker: WakeHandle) {
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
+        let mut inner = self.inner.lock();
         if let Some(slot) = inner.wakers.get_mut(worker_id as usize) {
             *slot = Some(waker);
         }
@@ -286,15 +283,12 @@ impl HostShared {
     ) -> Result<u64, TlsError> {
         TlsAcceptor::from_chain(chain.clone(), key.clone_key(), 1)?;
 
-        let epoch = self
-            .with_inner(|inner| {
-                inner.tls_rotation_epoch += 1;
-                inner.tls_rotation = Some((chain, key));
+        let (epoch, _) = self.with_inner(|inner| {
+            inner.tls_rotation_epoch += 1;
+            inner.tls_rotation = Some((chain, key));
 
-                (inner.tls_rotation_epoch, None)
-            })
-            .map(|(epoch, _)| epoch)
-            .ok_or(TlsError::InvalidInput)?;
+            (inner.tls_rotation_epoch, None)
+        });
 
         self.tls_rotation_epoch.store(epoch, Ordering::Release);
 
@@ -309,7 +303,7 @@ impl HostShared {
             return None;
         }
 
-        self.with_inner(|inner| {
+        let (rotation, _) = self.with_inner(|inner| {
             let epoch = inner.tls_rotation_epoch;
             let rotation = if epoch > seen_epoch {
                 inner
@@ -321,8 +315,9 @@ impl HostShared {
             };
 
             (rotation, None)
-        })
-        .and_then(|(rotation, _)| rotation)
+        });
+
+        rotation
     }
 
     // NOTE: whole-event dequeue: the first unfitting event reports required capacities
@@ -338,11 +333,7 @@ impl HostShared {
         paths: &mut [u8],
     ) -> PollReport {
         if events.is_empty() {
-            let pending = self
-                .inner
-                .lock()
-                .map(|inner| pending_total(&inner))
-                .unwrap_or(0);
+            let pending = pending_total(&self.inner.lock());
             return PollReport {
                 events_required: pending,
                 ..PollReport::default()
@@ -351,9 +342,7 @@ impl HostShared {
         let deadline = (timeout_ns != 0 && timeout_ns != u64::MAX)
             .then(|| Instant::now() + Duration::from_nanos(timeout_ns));
         let unbounded = timeout_ns == u64::MAX;
-        let Ok(mut guard) = self.inner.lock() else {
-            return PollReport::default();
-        };
+        let mut guard = self.inner.lock();
         loop {
             let report = drain_pending(&mut guard, None, events, methods, paths);
             if report.copied > 0 || report.events_required > 0 || report.method_required > 0 {
@@ -366,18 +355,12 @@ impl HostShared {
                         true
                     } else {
                         let wait = deadline - now;
-                        guard = match self.wake.wait_timeout(guard, wait) {
-                            Ok((guard, _)) => guard,
-                            Err(_) => return PollReport::default(),
-                        };
+                        self.wake.wait_for(&mut guard, wait);
                         false
                     }
                 }
                 None if unbounded => {
-                    guard = match self.wake.wait(guard) {
-                        Ok(guard) => guard,
-                        Err(_) => return PollReport::default(),
-                    };
+                    self.wake.wait(&mut guard);
                     false
                 }
                 None => true,
@@ -404,9 +387,7 @@ impl HostShared {
         let deadline = (timeout_ns != 0 && timeout_ns != u64::MAX)
             .then(|| Instant::now() + Duration::from_nanos(timeout_ns));
         let unbounded = timeout_ns == u64::MAX;
-        let Ok(mut guard) = self.inner.lock() else {
-            return PollReport::default();
-        };
+        let mut guard = self.inner.lock();
         loop {
             let report = drain_pending(&mut guard, Some(worker), events, methods, paths);
             if report.copied > 0 || report.events_required > 0 || report.method_required > 0 {
@@ -419,18 +400,12 @@ impl HostShared {
                         true
                     } else {
                         let wait = deadline - now;
-                        guard = match self.wake.wait_timeout(guard, wait) {
-                            Ok((guard, _)) => guard,
-                            Err(_) => return PollReport::default(),
-                        };
+                        self.wake.wait_for(&mut guard, wait);
                         false
                     }
                 }
                 None if unbounded => {
-                    guard = match self.wake.wait(guard) {
-                        Ok(guard) => guard,
-                        Err(_) => return PollReport::default(),
-                    };
+                    self.wake.wait(&mut guard);
                     false
                 }
                 None => true,
@@ -476,7 +451,7 @@ impl HostShared {
                 inner.counters.shutdowns += 1;
                 (true, None)
             });
-            if pushed.is_some_and(|(done, _)| done) {
+            if pushed.0 {
                 self.wake.notify_all();
                 return;
             }
@@ -491,23 +466,16 @@ impl HostShared {
     }
 
     pub fn counters(&self) -> HostCounters {
-        self.inner
-            .lock()
-            .map(|inner| inner.counters)
-            .unwrap_or_default()
+        self.inner.lock().counters
     }
 
     pub fn parked_count(&self) -> usize {
         self.inner
             .lock()
-            .map(|inner| {
-                inner
-                    .parked
-                    .iter()
-                    .map(|table| table.iter().filter(|entry| entry.is_some()).count())
-                    .sum()
-            })
-            .unwrap_or(0)
+            .parked
+            .iter()
+            .map(|table| table.iter().filter(|entry| entry.is_some()).count())
+            .sum()
     }
 
     // NOTE: the closure runs under the queue lock and must only copy bytes. The waker
@@ -515,9 +483,9 @@ impl HostShared {
     pub(crate) fn with_inner<T>(
         &self,
         op: impl FnOnce(&mut MutexGuard<'_, HostInner>) -> (T, Option<WakeHandle>),
-    ) -> Option<(T, Option<WakeHandle>)> {
-        let mut guard = self.inner.lock().ok()?;
-        Some(op(&mut guard))
+    ) -> (T, Option<WakeHandle>) {
+        let mut guard = self.inner.lock();
+        op(&mut guard)
     }
 }
 

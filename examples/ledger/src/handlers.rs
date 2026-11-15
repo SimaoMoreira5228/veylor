@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use veylor_web::{Request, Response};
 
@@ -101,8 +101,8 @@ fn encode(value: &impl serde::Serialize) -> Response {
     }
 }
 
-fn locked(request: &Request<'_, App>) -> Result<std::sync::MutexGuard<'static, Store>, Response> {
-    request.state().lock().map_err(|_| error(500))
+fn locked(request: &Request<'_, App>) -> parking_lot::MutexGuard<'static, Store> {
+    request.state().lock()
 }
 
 pub fn ready() -> &'static str {
@@ -113,10 +113,7 @@ pub fn statement(request: Request<'_, App>) -> Response {
     let Some(account) = account(&request) else {
         return error(404);
     };
-    let mut store = match locked(&request) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
+    let mut store = locked(&request);
 
     match store.statement(account) {
         Ok(statement) => encode(&statement),
@@ -139,10 +136,7 @@ pub fn transaction(request: Request<'_, App>) -> Response {
         Ok(payment) => payment,
         Err(_) => return error(422),
     };
-    let mut store = match locked(&request) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
+    let mut store = locked(&request);
 
     match store.apply(account, key, &payment) {
         Ok(balance) => encode(&balance),

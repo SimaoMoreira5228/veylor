@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use veylor_http2::{
@@ -4192,7 +4194,7 @@ unsafe extern "C" fn h2n_record(
     let view = unsafe { &*request };
     let method = unsafe { std::slice::from_raw_parts(view.method, view.method_len) }.to_vec();
     let path = unsafe { std::slice::from_raw_parts(view.path, view.path_len) }.to_vec();
-    *H2N_OBSERVED.lock().expect("observed lock") = Some(H2nObserved {
+    *H2N_OBSERVED.lock() = Some(H2nObserved {
         method,
         path,
         has_body: view.has_body,
@@ -4208,7 +4210,7 @@ unsafe extern "C" fn h2n_probe_end(
     _request: *const NativeRequestView,
     response: *mut NativeResponseOut,
 ) -> i32 {
-    *H2N_END_HIT.lock().expect("probe lock") = true;
+    *H2N_END_HIT.lock() = true;
     h2n_respond(response, 200, b"OK", b"")
 }
 
@@ -4218,7 +4220,7 @@ unsafe extern "C" fn h2n_probe_cap(
     _request: *const NativeRequestView,
     response: *mut NativeResponseOut,
 ) -> i32 {
-    *H2N_CAP_HIT.lock().expect("probe lock") = true;
+    *H2N_CAP_HIT.lock() = true;
     h2n_respond(response, 200, b"OK", b"")
 }
 
@@ -4352,15 +4354,11 @@ fn h2_native_open_tail_invokes_framing_only_then_refuses() {
     let view = h2n_view(&H2N_ECHO);
     with_rig(|conn, _shared, client, server| {
         rig_handshake(conn, client, server, &view);
-        *H2N_OBSERVED.lock().expect("observed lock") = None;
+        *H2N_OBSERVED.lock() = None;
         send_headers_len(client, 1, b"POST", b"/echo", Some(5), false);
         let outcome = pump_until(conn, server, &view, None, |outcome| outcome.closed);
         assert_eq!(outcome.refused, 1);
-        let seen = H2N_OBSERVED
-            .lock()
-            .expect("observed lock")
-            .take()
-            .expect("handler invoked");
+        let seen = H2N_OBSERVED.lock().take().expect("handler invoked");
         assert_eq!(seen.method, b"POST");
         assert_eq!(seen.path, b"/echo");
         assert_eq!(seen.has_body, 1);
@@ -4386,10 +4384,10 @@ fn h2_native_end_with_declared_body_is_protocol_error() {
     let view = h2n_view(&H2N_END_PROBE);
     with_rig(|conn, _shared, client, server| {
         rig_handshake(conn, client, server, &view);
-        *H2N_END_HIT.lock().expect("probe lock") = false;
+        *H2N_END_HIT.lock() = false;
         send_headers_len(client, 1, b"POST", b"/echo", Some(5), true);
         pump_until(conn, server, &view, None, |outcome| outcome.refused > 0);
-        assert!(!*H2N_END_HIT.lock().expect("probe lock"));
+        assert!(!*H2N_END_HIT.lock());
         let (id, code) = read_rst(client);
         assert_eq!(id, 1);
         assert_eq!(code, ErrorCode::ProtocolError);
@@ -4401,7 +4399,7 @@ fn h2_native_over_cap_refuses_before_invoke() {
     let view = h2n_view(&H2N_CAP_PROBE);
     with_rig(|conn, _shared, client, server| {
         rig_handshake(conn, client, server, &view);
-        *H2N_CAP_HIT.lock().expect("probe lock") = false;
+        *H2N_CAP_HIT.lock() = false;
         send_headers_len(
             client,
             1,
@@ -4411,7 +4409,7 @@ fn h2_native_over_cap_refuses_before_invoke() {
             false,
         );
         pump_until(conn, server, &view, None, |outcome| outcome.refused > 0);
-        assert!(!*H2N_CAP_HIT.lock().expect("probe lock"));
+        assert!(!*H2N_CAP_HIT.lock());
         let (id, code) = read_rst(client);
         assert_eq!(id, 1);
         assert_eq!(code, ErrorCode::RefusedStream);

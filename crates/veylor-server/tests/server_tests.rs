@@ -2256,7 +2256,7 @@ static NATIVE_LARGE_BODY: [u8; MAX_RESPONSE_BODY] = [b'N'; MAX_RESPONSE_BODY];
 // tests recording through different routes never observe each other. The echo buffer is static
 // storage the engine copies before return; the default single-worker pump invokes handlers
 // sequentially, so no concurrent invoke can realloc it mid-copy.
-static NATIVE_ECHO_BODY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static NATIVE_ECHO_BODY: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
 static NATIVE_RECORD_BODY_NULL: AtomicBool = AtomicBool::new(false);
 static NATIVE_RECORD_HAS_BODY: AtomicBool = AtomicBool::new(false);
 static NATIVE_RECORD_BODY_LEN: AtomicU64 = AtomicU64::new(0);
@@ -2273,7 +2273,7 @@ unsafe extern "C" fn native_echo(
 
     let view = unsafe { &*request };
     let out = unsafe { &mut *response };
-    let mut staged = NATIVE_ECHO_BODY.lock().expect("echo lock");
+    let mut staged = NATIVE_ECHO_BODY.lock();
     staged.clear();
     if !view.body.is_null() && view.body_len > 0 {
         let bytes = unsafe { std::slice::from_raw_parts(view.body, view.body_len as usize) };
