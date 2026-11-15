@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use smol::Timer;
@@ -7,7 +7,7 @@ use smol::future::or;
 use veylor_client_driver::{
     ClientConfig, ClientRequest, ClientResponse, Grant, H2Ticket, Lease, ParsedUrl, Pool,
     PoolStats, Protocol, TlsConnector, WaitGuard, fields_with_host, is_retryable, parse_url,
-    streaming_unsupported, timed_out,
+    run_reaper, timed_out,
 };
 
 use crate::client_conn::Connection;
@@ -19,6 +19,7 @@ struct Shared {
     config: ClientConfig,
     tls: TlsConnector,
     pool: Arc<Pool<Connection>>,
+    reaper: Once,
 }
 
 #[derive(Clone)]
@@ -35,8 +36,24 @@ impl Client {
         let pool = Pool::new(config.pool.clone());
 
         Ok(Self {
-            shared: Arc::new(Shared { config, tls, pool }),
+            shared: Arc::new(Shared {
+                config,
+                tls,
+                pool,
+                reaper: Once::new(),
+            }),
         })
+    }
+
+    fn ensure_reaper(&self) {
+        self.shared.reaper.call_once(|| {
+            let pool = Arc::downgrade(&self.shared.pool);
+
+            smol::spawn(run_reaper(pool, |delay| async move {
+                Timer::after(delay).await;
+            }))
+            .detach();
+        });
     }
 
     pub fn pool_stats(&self) -> PoolStats {
@@ -56,9 +73,7 @@ impl Client {
         let url = parse_url(request.url)?;
         let hint = config.protocol_hint(url.origin.tls);
 
-        if request.streaming.is_some() && hint == Some(Protocol::Http1) {
-            return Err(streaming_unsupported());
-        }
+        self.ensure_reaper();
 
         match self.acquire(&url, hint).await? {
             Grant::Idle(lease) => self.send_h1(lease, &url, request).await,
@@ -132,16 +147,21 @@ impl Client {
         url: &ParsedUrl,
         request: &ClientRequest<'_>,
     ) -> io::Result<ResponseStream> {
-        if request.streaming.is_some() {
-            return Err(streaming_unsupported());
-        }
-
         let host = url.origin.host_header();
         let fields = fields_with_host(request.headers, &host);
         let conn = lease.conn();
+        let target = url.target.as_bytes();
 
-        conn.send_request(request.method, url.target.as_bytes(), &fields, request.body)
-            .await?;
+        match request.streaming {
+            Some(body) => {
+                conn.send_streaming(request.method, target, &fields, body)
+                    .await?
+            }
+            None => {
+                conn.send_request(request.method, target, &fields, request.body)
+                    .await?
+            }
+        }
 
         let head = conn.read_head().await?;
 

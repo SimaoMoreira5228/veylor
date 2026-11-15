@@ -17,5 +17,5 @@ pub use handle::{H2Client, H2Start};
 pub use headers::{HeaderIter, HeaderList};
 pub use request::H2Request;
 pub use response::{H2Body, H2Response};
-pub(crate) use upload::Upload;
 pub use upload::UploadSender;
+pub(crate) use upload::{Upload, UploadState};

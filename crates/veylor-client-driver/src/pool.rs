@@ -104,12 +104,14 @@ struct State<C> {
     origins: HashMap<Origin, Entry<C>>,
     idle_total: usize,
     last_prune: Instant,
+    armed: bool,
 }
 
 pub struct Pool<C> {
     config: PoolConfig,
     epoch: Instant,
     state: Mutex<State<C>>,
+    wake: Event,
 }
 
 pub struct Lease<C: H1Conn> {
@@ -175,8 +177,50 @@ impl<C: H1Conn> Pool<C> {
                 origins: HashMap::new(),
                 idle_total: 0,
                 last_prune: Instant::now(),
+                armed: true,
             }),
+            wake: Event::new(),
         })
+    }
+
+    pub fn listen_wake(&self) -> EventListener {
+        self.wake.listen()
+    }
+
+    pub fn reap(&self, now: Instant) -> Option<Instant> {
+        let mut state = self.lock();
+
+        self.expire(&mut state, now);
+
+        let timeout = self.config.idle_timeout;
+        let mut next: Option<Instant> = None;
+
+        for entry in state.origins.values() {
+            let oldest = entry.idle.first().map(|idle| idle.since + timeout);
+            let slots = entry.h2.iter().map(|slot| {
+                let left = match slot.load.idle_for(now) {
+                    Some(idle) => timeout.saturating_sub(idle),
+                    None => timeout,
+                };
+
+                now + left
+            });
+
+            for at in oldest.into_iter().chain(slots) {
+                next = Some(next.map_or(at, |best| best.min(at)));
+            }
+        }
+
+        state.armed = next.is_none();
+
+        next
+    }
+
+    fn arm(&self, state: &mut State<C>) {
+        if state.armed {
+            state.armed = false;
+            self.wake.notify(1);
+        }
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -368,6 +412,7 @@ impl<C: H1Conn> Pool<C> {
                 entry.idle.push(Idle { conn, since: now });
                 entry.notify.notify(usize::MAX);
                 state.idle_total += 1;
+                self.arm(&mut state);
             }
             _ => {
                 entry.open -= 1;
@@ -391,6 +436,10 @@ impl<C: H1Conn> Pool<C> {
 
         state.last_prune = now;
 
+        self.expire(state, now);
+    }
+
+    fn expire(&self, state: &mut State<C>, now: Instant) {
         let idle_timeout = self.config.idle_timeout;
         let mut removed = 0usize;
 
@@ -425,6 +474,12 @@ impl<C: H1Conn> Pool<C> {
 
     fn lock(&self) -> MutexGuard<'_, State<C>> {
         self.state.lock()
+    }
+}
+
+impl<C> Drop for Pool<C> {
+    fn drop(&mut self) {
+        self.wake.notify(usize::MAX);
     }
 }
 
@@ -519,6 +574,8 @@ impl<C: H1Conn> Dial<C> {
             });
             entry.notify.notify(usize::MAX);
         }
+
+        self.pool.arm(&mut state);
 
         H2Ticket { client, load }
     }

@@ -15,6 +15,7 @@ use crate::url::ParsedUrl;
 pub struct ClientConfig {
     pub connect_timeout: Duration,
     pub attempt_timeout: Duration,
+    pub attempt_stagger: Duration,
     pub handshake_timeout: Duration,
     pub write_timeout: Duration,
     pub head_timeout: Duration,
@@ -32,6 +33,7 @@ impl Default for ClientConfig {
         Self {
             connect_timeout: Duration::from_secs(10),
             attempt_timeout: Duration::from_secs(3),
+            attempt_stagger: Duration::from_millis(250),
             handshake_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
             head_timeout: Duration::from_secs(30),
@@ -61,6 +63,7 @@ impl ClientConfig {
         ConnectTimeouts {
             connect: self.connect_timeout,
             attempt: self.attempt_timeout,
+            stagger: self.attempt_stagger,
             handshake: self.handshake_timeout,
         }
     }
@@ -92,6 +95,10 @@ impl StreamingBody {
         let (upload, sender) = Upload::pair(capacity);
 
         (Self { upload }, sender)
+    }
+
+    pub(crate) fn upload(&self) -> &Upload {
+        &self.upload
     }
 }
 
@@ -162,13 +169,6 @@ pub fn is_retryable(error: &io::Error) -> bool {
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<H2Error>())
         .is_some_and(H2Error::is_retryable)
-}
-
-pub fn streaming_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "streaming request bodies need HTTP/2",
-    )
 }
 
 pub fn fields_with_host<'a>(headers: &'a [Field<'a>], host: &'a str) -> Vec<Field<'a>> {

@@ -1,11 +1,12 @@
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use smol::{Async, Timer};
 use veylor_client_driver::{
     ConnectTimeouts, Deadlines, H2Client, H2Config, Origin, TlsConnector, TlsStream, interleave,
-    timed_out,
+    race_connect, timed_out,
 };
 
 use crate::client_conn::Connection;
@@ -104,22 +105,156 @@ async fn open_socket(origin: &Origin, timeouts: ConnectTimeouts) -> io::Result<A
         }
     };
 
-    let mut last = io::Error::new(io::ErrorKind::NotFound, "host resolved to no addresses");
+    race_addrs(addrs, timeouts, deadline, Async::<TcpStream>::connect).await
+}
 
-    for addr in addrs {
-        let attempt: Duration = timeouts
-            .attempt
-            .min(deadline.saturating_duration_since(Instant::now()));
+async fn race_addrs<F, Fut>(
+    addrs: Vec<SocketAddr>,
+    timeouts: ConnectTimeouts,
+    deadline: Instant,
+    connect: F,
+) -> io::Result<Async<TcpStream>>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<Async<TcpStream>>>,
+{
+    let remaining = deadline.saturating_duration_since(Instant::now());
 
-        if attempt.is_zero() {
-            return Err(timed_out("connect"));
-        }
+    if remaining.is_zero() {
+        return Err(timed_out("connect"));
+    }
 
-        match within(attempt, "connect", Async::<TcpStream>::connect(addr)).await {
-            Ok(socket) => return Ok(socket),
-            Err(error) => last = error,
+    let timeouts = ConnectTimeouts {
+        connect: remaining,
+        ..timeouts
+    };
+
+    race_connect(addrs, timeouts, connect, |delay| async move {
+        Timer::after(delay).await;
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    use smol::{Async, Timer};
+    use veylor_client_driver::ConnectTimeouts;
+
+    use super::race_addrs;
+
+    const STAGGER: Duration = Duration::from_millis(50);
+
+    fn timeouts(connect: Duration) -> ConnectTimeouts {
+        ConnectTimeouts {
+            connect,
+            attempt: Duration::from_secs(5),
+            stagger: STAGGER,
+            handshake: Duration::from_secs(5),
         }
     }
 
-    Err(last)
+    fn listener() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        (listener, addr)
+    }
+
+    async fn race(
+        addrs: Vec<SocketAddr>,
+        connect: Duration,
+        delays: [(u16, Duration); 2],
+    ) -> io::Result<Async<TcpStream>> {
+        let deadline = Instant::now() + connect;
+
+        race_addrs(addrs, timeouts(connect), deadline, move |addr| async move {
+            for (port, delay) in delays {
+                if addr.port() == port {
+                    Timer::after(delay).await;
+                }
+            }
+
+            Async::<TcpStream>::connect(addr).await
+        })
+        .await
+    }
+
+    fn peer(socket: &Async<TcpStream>) -> SocketAddr {
+        socket.get_ref().peer_addr().expect("peer")
+    }
+
+    #[test]
+    fn a_blackholed_first_address_does_not_block_the_second() {
+        smol::block_on(async {
+            let (_one, first) = listener();
+            let (_two, second) = listener();
+            let started = Instant::now();
+            let delays = [
+                (first.port(), Duration::from_secs(3600)),
+                (0, Duration::ZERO),
+            ];
+            let socket = race(vec![first, second], Duration::from_secs(5), delays)
+                .await
+                .expect("connected");
+
+            assert_eq!(peer(&socket), second);
+            assert!(started.elapsed() >= STAGGER);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn an_earlier_attempt_keeps_running_and_can_still_win() {
+        smol::block_on(async {
+            let (_one, first) = listener();
+            let (_two, second) = listener();
+            let delays = [
+                (first.port(), Duration::from_millis(120)),
+                (second.port(), Duration::from_millis(600)),
+            ];
+            let socket = race(vec![first, second], Duration::from_secs(5), delays)
+                .await
+                .expect("connected");
+
+            assert_eq!(peer(&socket), first);
+        });
+    }
+
+    #[test]
+    fn a_failed_attempt_starts_the_next_one_immediately() {
+        smol::block_on(async {
+            let (dead, refused) = listener();
+            let (_live, second) = listener();
+
+            drop(dead);
+
+            let started = Instant::now();
+            let delays = [(0, Duration::ZERO), (0, Duration::ZERO)];
+            let socket = race(vec![refused, second], Duration::from_secs(5), delays)
+                .await
+                .expect("connected");
+
+            assert_eq!(peer(&socket), second);
+            assert!(started.elapsed() < STAGGER);
+        });
+    }
+
+    #[test]
+    fn the_overall_deadline_bounds_a_hopeless_race() {
+        smol::block_on(async {
+            let (_one, first) = listener();
+            let (_two, second) = listener();
+            let hour = Duration::from_secs(3600);
+            let delays = [(first.port(), hour), (second.port(), hour)];
+            let error = race(vec![first, second], Duration::from_millis(300), delays)
+                .await
+                .expect_err("must fail");
+
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        });
+    }
 }

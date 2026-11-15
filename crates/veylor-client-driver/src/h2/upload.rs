@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use event_listener::Event;
+use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
 
 use super::error::H2Error;
@@ -18,6 +18,7 @@ struct UploadBuffer {
 pub(crate) struct Upload {
     buffer: Mutex<UploadBuffer>,
     space: Event,
+    data: Event,
     driver: OnceLock<Arc<DriverShared>>,
     capacity: usize,
 }
@@ -40,6 +41,7 @@ impl Upload {
                 trailers: None,
             }),
             space: Event::new(),
+            data: Event::new(),
             driver: OnceLock::new(),
             capacity,
         }
@@ -56,7 +58,13 @@ impl Upload {
         let _ = self.driver.set(driver.clone());
     }
 
+    pub(crate) fn listen_data(&self) -> EventListener {
+        self.data.listen()
+    }
+
     fn wake_driver(&self) {
+        self.data.notify(usize::MAX);
+
         if let Some(driver) = self.driver.get() {
             driver.notify.notify(1);
         }

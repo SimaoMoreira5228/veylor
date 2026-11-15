@@ -147,14 +147,8 @@ impl H1Exchange {
         method: &[u8],
         target: &[u8],
         headers: &[Field<'_>],
-        body_len: usize,
+        framing: BodyFraming,
     ) -> io::Result<usize> {
-        let framing = if body_len == 0 {
-            BodyFraming::None
-        } else {
-            BodyFraming::Fixed(body_len as u64)
-        };
-
         loop {
             match self.exchange.encode_request_head(
                 method,
@@ -187,9 +181,15 @@ impl H1Exchange {
         }
     }
 
-    pub fn encode_tail(&mut self) -> io::Result<usize> {
+    pub fn encode_tail(&mut self, trailers: Option<&HeaderList>) -> io::Result<usize> {
+        let fields: Vec<Field<'_>> = trailers
+            .into_iter()
+            .flat_map(HeaderList::iter)
+            .map(|(name, value)| Field { name, value })
+            .collect();
+
         loop {
-            match self.exchange.finish_request_body(&[], &mut self.write) {
+            match self.exchange.finish_request_body(&fields, &mut self.write) {
                 Ok(tail) => return Ok(tail.written),
                 Err(ClientError::BufferTooSmall { required }) => {
                     grow(&mut self.write, required, self.max_head)?;

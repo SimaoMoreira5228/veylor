@@ -334,18 +334,22 @@ async fn cancelling_a_dial_frees_the_origin() {
 }
 
 #[tokio::test]
-async fn streaming_bodies_are_refused_over_http11() {
+async fn streaming_bodies_are_chunked_over_http11() {
     let server = spawn_raw_tls(&[b"http/1.1"], true);
     let client = client(&[b"http/1.1"], PoolConfig::default());
     let url = format!("https://localhost:{}/", server.addr.port());
-    let (body, _sender) = StreamingBody::new(1024);
-    let error = client
+    let (body, mut sender) = StreamingBody::new(1024);
+
+    sender.write_all(b"abc").await.expect("write");
+    sender.finish();
+
+    let response = client
         .send(&ClientRequest::new(b"POST", &url).streaming(&body))
         .await
-        .err()
-        .expect("must fail");
+        .expect("send");
 
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.alpn(), Some(b"http/1.1".as_slice()));
 }
 
 #[tokio::test]

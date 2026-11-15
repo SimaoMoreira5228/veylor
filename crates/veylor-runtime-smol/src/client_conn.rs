@@ -3,9 +3,10 @@ use std::net::TcpStream;
 
 use smol::Async;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
-use veylor_client::Field;
+use veylor_client::{BodyFraming, Field};
 use veylor_client_driver::{
-    Deadlines, Event, H1Conn, H1Exchange, ResponseHead, Step, TlsConn, protocol,
+    Deadlines, Event, H1Conn, H1Exchange, Next, ResponseHead, Step, StreamingBody, TlsConn,
+    protocol,
 };
 use veylor_tls::queue_close_notify;
 
@@ -40,9 +41,13 @@ impl Connection {
     ) -> io::Result<()> {
         self.exchange.begin(method)?;
 
+        let framing = match body.len() {
+            0 => BodyFraming::None,
+            len => BodyFraming::Fixed(len as u64),
+        };
         let head = self
             .exchange
-            .encode_head(method, target, headers, body.len())?;
+            .encode_head(method, target, headers, framing)?;
 
         self.write_pending(head).await?;
 
@@ -60,13 +65,56 @@ impl Connection {
             offset += written;
         }
 
-        let tail = self.exchange.encode_tail()?;
+        let tail = self.exchange.encode_tail(None)?;
 
         if tail > 0 {
             self.write_pending(tail).await?;
         }
 
         Ok(())
+    }
+
+    pub async fn send_streaming(
+        &mut self,
+        method: &[u8],
+        target: &[u8],
+        headers: &[Field<'_>],
+        body: &StreamingBody,
+    ) -> io::Result<()> {
+        self.exchange.begin(method)?;
+
+        let head = self
+            .exchange
+            .encode_head(method, target, headers, BodyFraming::Chunked)?;
+
+        self.write_pending(head).await?;
+
+        loop {
+            let pull = body.pull(&mut self.exchange)?;
+
+            if pull.written > 0 {
+                self.write_pending(pull.written).await?;
+            }
+
+            match pull.next {
+                Next::More => {}
+                Next::Wait(listener) => {
+                    let limit = self.deadlines.write;
+
+                    within(limit, "request body producer", async {
+                        listener.await;
+
+                        Ok(())
+                    })
+                    .await?;
+                }
+                Next::Tail(trailers) => {
+                    let tail = self.exchange.encode_tail(trailers.as_ref())?;
+
+                    return self.write_pending(tail).await;
+                }
+            }
+        }
     }
 
     pub async fn read_head(&mut self) -> io::Result<ResponseHead> {
