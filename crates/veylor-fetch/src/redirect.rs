@@ -27,7 +27,7 @@ impl Default for RedirectPolicy {
     }
 }
 
-// RFC 9110 15.4: a 303 turns everything but HEAD into GET, and 301/302 do the same for POST.
+// NOTE: RFC 9110 15.4 turns everything but HEAD into GET on 303, and 301/302 do the same for POST.
 pub(crate) fn rewrites_to_get(status: u16, method: &Method) -> bool {
     match status {
         303 => *method != Method::Head,

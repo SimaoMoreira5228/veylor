@@ -310,6 +310,11 @@ impl Server {
     }
 
     pub fn start<H: Handler>(self, handler: H) -> Result<RunningServer, Error> {
+        // NOTE: the first private-key operation of a process otherwise runs inside the
+        // first handshake. On the arena host that cold signature left the first HTTP/3 run
+        // after a start at 267-290K req/s where every later run reached 640-781K, and
+        // signing once here removed the deficit in five paired trials on the same client.
+        let _ = tls::warm_signing_key(&self.config.tls.key);
         let server_config = server_config(
             &self.config.tls.certs,
             &self.config.tls.key,

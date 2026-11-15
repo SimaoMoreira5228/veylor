@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+#![allow(clippy::missing_safety_doc)]
 
 use std::io;
 use std::os::fd::RawFd;
@@ -15,10 +16,8 @@ pub struct ReadOp {
 }
 
 impl ReadOp {
-    /// # Safety
-    ///
-    /// `buffer` must point to `length` writable bytes that stay valid and are not
-    /// accessed through another reference until the enclosing `recv_many` returns.
+    // SAFETY: `buffer` must point to `length` writable bytes that stay valid and are not
+    // accessed through another reference until the enclosing `recv_many` returns.
     pub unsafe fn new(fd: RawFd, slot: u32, buffer: *mut u8, length: usize) -> Self {
         Self {
             fd,
@@ -39,10 +38,8 @@ pub struct SendOp {
 }
 
 impl SendOp {
-    /// # Safety
-    ///
-    /// `buffer` must point to `length` readable bytes that stay valid and are not
-    /// mutated through another reference until the enclosing `send_many` returns.
+    // SAFETY: `buffer` must point to `length` readable bytes that stay valid and are not
+    // mutated through another reference until the enclosing `send_many` returns.
     pub unsafe fn new(fd: RawFd, slot: u32, buffer: *const u8, length: usize) -> Self {
         Self {
             fd,

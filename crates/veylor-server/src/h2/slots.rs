@@ -105,9 +105,7 @@ struct H2Tables {
 }
 
 impl H2Tables {
-    /// # Safety
-    ///
-    /// `bufs` must be a heap allocation that outlives this value and is never moved.
+    // SAFETY: `bufs` must be a heap allocation that outlives this value and is never moved.
     unsafe fn new(bufs: &'static mut H2Buffers) -> Self {
         Self {
             streams: StreamTable::new(

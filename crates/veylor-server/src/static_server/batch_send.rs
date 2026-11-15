@@ -1,5 +1,3 @@
-//! Turn-level send batching: plain H1 responses stage in the connection output
-//! slab, so one io_uring submission can push every deferred response at once.
 #![allow(unsafe_code)]
 
 use std::io;

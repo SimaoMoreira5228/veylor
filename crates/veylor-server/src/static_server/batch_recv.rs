@@ -1,6 +1,3 @@
-//! Turn-level recv batching: the poller already named the readable sockets,
-//! so one io_uring submission can move every ready connection's bytes with a
-//! single enter instead of one recv syscall per socket.
 #![allow(unsafe_code)]
 
 use std::os::fd::AsRawFd;

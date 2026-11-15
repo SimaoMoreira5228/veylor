@@ -94,7 +94,6 @@ pub trait PollSource {
 
     // NOTE: only listeners answer this; the poller arms their gate on every
     // readiness event so the accept path can skip a syscall with no backlog.
-    #[doc(hidden)]
     fn accept_gate(&self) -> Option<Arc<AcceptGate>> {
         None
     }
