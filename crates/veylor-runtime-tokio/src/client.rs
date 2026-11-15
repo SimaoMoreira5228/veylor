@@ -5,10 +5,12 @@ use std::time::Duration;
 use veylor_client::Field;
 use veylor_tls::TlsConnector;
 
-use crate::client_conn::{Deadlines, INITIAL_BUFFER, protocol};
-use crate::client_connect::{ConnectTimeouts, connect};
-use crate::client_pool::{Lease, Pool, PoolConfig, PoolStats};
-use crate::client_url::parse_url;
+use crate::client_conn::{Deadlines, INITIAL_BUFFER};
+use crate::client_connect::{ConnectPlan, ConnectTimeouts, Connected, connect};
+use crate::client_pool::{Grant, H2Ticket, Lease, Pool, PoolConfig, PoolStats, Protocol};
+use crate::client_response::{ClientResponse, ResponseStream};
+use crate::client_url::{ParsedUrl, parse_url};
+use crate::h2_client::{H2Config, H2Error, H2Request, UploadSender};
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -21,6 +23,8 @@ pub struct ClientConfig {
     pub max_head: usize,
     pub max_body: usize,
     pub pool: PoolConfig,
+    pub h2: H2Config,
+    pub h2c_prior_knowledge: bool,
     pub tls: Option<TlsConnector>,
 }
 
@@ -36,8 +40,22 @@ impl Default for ClientConfig {
             max_head: 64 * 1024,
             max_body: 1024 * 1024,
             pool: PoolConfig::default(),
+            h2: H2Config::default(),
+            h2c_prior_knowledge: false,
             tls: None,
         }
+    }
+}
+
+pub struct StreamingBody {
+    pub(crate) upload: Arc<crate::h2_client::Upload>,
+}
+
+impl StreamingBody {
+    pub fn new(capacity: usize) -> (Self, UploadSender) {
+        let (upload, sender) = crate::h2_client::Upload::pair(capacity);
+
+        (Self { upload }, sender)
     }
 }
 
@@ -46,6 +64,7 @@ pub struct ClientRequest<'a> {
     pub url: &'a str,
     pub headers: &'a [Field<'a>],
     pub body: &'a [u8],
+    pub streaming: Option<&'a StreamingBody>,
 }
 
 impl<'a> ClientRequest<'a> {
@@ -55,6 +74,7 @@ impl<'a> ClientRequest<'a> {
             url,
             headers: &[],
             body: &[],
+            streaming: None,
         }
     }
 
@@ -73,56 +93,11 @@ impl<'a> ClientRequest<'a> {
 
         self
     }
-}
 
-pub struct ClientResponse {
-    pub status: u16,
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    pub body: Vec<u8>,
-}
+    pub fn streaming(mut self, body: &'a StreamingBody) -> Self {
+        self.streaming = Some(body);
 
-pub struct ResponseStream {
-    lease: Lease,
-    status: u16,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-impl ResponseStream {
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
-    pub fn headers(&self) -> &[(Vec<u8>, Vec<u8>)] {
-        &self.headers
-    }
-
-    pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
-            .map(|(_, v)| v.as_slice())
-    }
-
-    pub fn alpn(&mut self) -> Option<&[u8]> {
-        self.lease.conn().alpn()
-    }
-
-    pub async fn chunk(&mut self) -> io::Result<Option<&[u8]>> {
-        self.lease.conn().next_chunk().await
-    }
-
-    pub async fn collect(mut self, max: usize) -> io::Result<Vec<u8>> {
-        let mut body = Vec::new();
-
-        while let Some(chunk) = self.chunk().await? {
-            if body.len() + chunk.len() > max {
-                return Err(protocol("response body exceeds the limit"));
-            }
-
-            body.extend_from_slice(chunk);
-        }
-
-        Ok(body)
+        self
     }
 }
 
@@ -138,14 +113,17 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(config: ClientConfig) -> io::Result<Self> {
+    pub fn new(mut config: ClientConfig) -> io::Result<Self> {
         let tls = match config.tls.clone() {
             Some(tls) => tls,
             None => TlsConnector::builder()
-                .alpn(&[b"http/1.1"])
+                .alpn(&[b"h2", b"http/1.1"])
                 .build()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         };
+
+        config.h2.idle_timeout = Some(config.pool.idle_timeout);
+
         let pool = Pool::new(config.pool.clone());
 
         Ok(Self {
@@ -161,30 +139,77 @@ impl Client {
         self.shared.pool.close_idle();
     }
 
+    pub fn is_retryable(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<H2Error>())
+            .is_some_and(H2Error::is_retryable)
+    }
+
     pub async fn send(&self, request: &ClientRequest<'_>) -> io::Result<ResponseStream> {
         let config = &self.shared.config;
         let url = parse_url(request.url)?;
-        let mut lease = self.shared.pool.acquire(&url.origin).await?;
+        let hint = match (url.origin.tls, config.h2c_prior_knowledge) {
+            (true, _) => None,
+            (false, true) => Some(Protocol::Http2),
+            (false, false) => Some(Protocol::Http1),
+        };
 
-        if !lease.has_conn() {
-            let conn = connect(
-                &url.origin,
-                &self.shared.tls,
-                ConnectTimeouts {
-                    connect: config.connect_timeout,
-                    attempt: config.attempt_timeout,
-                    handshake: config.handshake_timeout,
-                },
-                Deadlines {
-                    write: config.write_timeout,
-                    head: config.head_timeout,
-                    body: config.body_timeout,
-                    max_head: config.max_head.max(INITIAL_BUFFER),
-                },
-            )
-            .await?;
+        if request.streaming.is_some() && hint == Some(Protocol::Http1) {
+            return Err(streaming_unsupported());
+        }
 
-            lease.set(conn);
+        match self.shared.pool.acquire(&url.origin, hint).await? {
+            Grant::Idle(lease) => self.send_h1(lease, &url, request).await,
+            Grant::H2(ticket) => self.send_h2(ticket, &url, request).await,
+            Grant::Dial(dial) => {
+                let plan = ConnectPlan {
+                    tls: &self.shared.tls,
+                    timeouts: ConnectTimeouts {
+                        connect: config.connect_timeout,
+                        attempt: config.attempt_timeout,
+                        handshake: config.handshake_timeout,
+                    },
+                    deadlines: Deadlines {
+                        write: config.write_timeout,
+                        head: config.head_timeout,
+                        body: config.body_timeout,
+                        max_head: config.max_head.max(INITIAL_BUFFER),
+                    },
+                    h2: &config.h2,
+                    prior_knowledge_h2: config.h2c_prior_knowledge,
+                };
+
+                match connect(&url.origin, &plan).await? {
+                    Connected::Http1(conn) => {
+                        let lease = dial.finish_h1(conn);
+
+                        self.send_h1(lease, &url, request).await
+                    }
+                    Connected::Http2(client) => {
+                        let ticket = dial.finish_h2(client);
+
+                        self.send_h2(ticket, &url, request).await
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn request(&self, request: &ClientRequest<'_>) -> io::Result<ClientResponse> {
+        let stream = self.send(request).await?;
+
+        stream.into_buffered(self.shared.config.max_body).await
+    }
+
+    async fn send_h1(
+        &self,
+        mut lease: Lease,
+        url: &ParsedUrl,
+        request: &ClientRequest<'_>,
+    ) -> io::Result<ResponseStream> {
+        if request.streaming.is_some() {
+            return Err(streaming_unsupported());
         }
 
         let host = url.origin.host_header();
@@ -196,25 +221,63 @@ impl Client {
 
         let head = conn.read_head().await?;
 
-        Ok(ResponseStream {
-            lease,
-            status: head.status,
-            headers: head.headers,
-        })
+        Ok(ResponseStream::http1(head.status, head.headers, lease))
     }
 
-    pub async fn request(&self, request: &ClientRequest<'_>) -> io::Result<ClientResponse> {
-        let stream = self.send(request).await?;
-        let status = stream.status;
-        let headers = stream.headers.clone();
-        let body = stream.collect(self.shared.config.max_body).await?;
+    async fn send_h2(
+        &self,
+        ticket: H2Ticket,
+        url: &ParsedUrl,
+        request: &ClientRequest<'_>,
+    ) -> io::Result<ResponseStream> {
+        let authority = url.origin.host_header();
+        let scheme: &[u8] = if url.origin.tls { b"https" } else { b"http" };
+        let mut h2 = H2Request::new(request.method, authority.as_bytes(), url.target.as_bytes())
+            .scheme(scheme);
 
-        Ok(ClientResponse {
-            status,
-            headers,
-            body,
-        })
+        for field in request.headers {
+            if is_connection_specific(field.name) {
+                continue;
+            }
+
+            h2 = h2.header(field.name, field.value);
+        }
+
+        h2 = match request.streaming {
+            Some(streaming) => h2.with_upload(Arc::clone(&streaming.upload)),
+            None => h2.body(request.body.to_vec()),
+        };
+
+        let response = ticket.client().send(h2).await?;
+
+        Ok(ResponseStream::http2(
+            response.status,
+            response.headers,
+            response.body,
+            ticket,
+        ))
     }
+}
+
+fn streaming_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "streaming request bodies need HTTP/2",
+    )
+}
+
+fn is_connection_specific(name: &[u8]) -> bool {
+    [
+        b"host".as_slice(),
+        b"connection",
+        b"keep-alive",
+        b"proxy-connection",
+        b"transfer-encoding",
+        b"upgrade",
+        b"te",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
 fn fields_with_host<'a>(headers: &'a [Field<'a>], host: &'a str) -> Vec<Field<'a>> {

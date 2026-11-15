@@ -28,10 +28,11 @@ pub use server_request::{
 
 use crate::flow_control::{DEFAULT_FLOW_WINDOW_SIZE, FlowWindow, FlowWindowError};
 use crate::frame::{
-    ErrorCode, FRAME_HEADER_LEN, FrameHeaderError, SettingsParameter, decode_frame_header,
+    ErrorCode, FRAME_HEADER_LEN, FrameHeaderError, FrameType, SettingsParameter,
+    decode_frame_header,
 };
 use crate::hpack::{HpackHeader, HpackTable};
-use crate::stream::{ClientPrefaceError, SettingsError, StreamTable};
+use crate::stream::{ClientPrefaceError, H2Role, SettingsError, StreamTable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeaderRange {
@@ -49,6 +50,7 @@ pub enum H2FrameAction<'input> {
     Data {
         stream_id: u32,
         data: &'input [u8],
+        padding: usize,
         end_stream: bool,
     },
     StreamReset {
@@ -324,6 +326,20 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             };
             if remaining.len() < frame_length {
                 result.status = FeedStatus::NeedMoreInput;
+                return result;
+            }
+            // NOTE: a decoded block needs room for its whole field list; a later block
+            // sharing the batch would see a partly used `headers` slice and be refused
+            // for capacity it should have had, so a client batch carries one block's
+            // fields. Server hosts size their slots for their own batching instead.
+            if result.headers > 0
+                && self.streams.role() == H2Role::Client
+                && matches!(
+                    header.frame_type,
+                    FrameType::Headers | FrameType::Continuation
+                )
+            {
+                result.status = FeedStatus::OutputFull;
                 return result;
             }
             let payload = &remaining[FRAME_HEADER_LEN..frame_length];

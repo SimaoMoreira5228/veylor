@@ -111,6 +111,9 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
                 H2FrameAction::Data {
                     stream_id: header.stream_id,
                     data: data.data,
+                    padding: data
+                        .padding_length
+                        .map_or(0, |length| usize::from(length) + 1),
                     end_stream: header.flags & DATA_FLAG_END_STREAM != 0,
                 },
             );

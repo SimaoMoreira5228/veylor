@@ -208,6 +208,7 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
             .driver_mut()
             .streams_mut()
             .close_stream(stream_id);
+        self.remove_response(stream_id);
         let mut writer = ControlFrameWriter::new(output, max_frame_size);
         let written = writer
             .queue_action(

@@ -8,6 +8,8 @@ use veylor_tls::TlsConnector;
 
 use crate::client_conn::{Connection, Deadlines, timed_out};
 use crate::client_url::Origin;
+use crate::h2_client::{H2Client, H2Config};
+use crate::tls_stream::TlsStream;
 
 #[derive(Clone, Copy)]
 pub struct ConnectTimeouts {
@@ -16,38 +18,62 @@ pub struct ConnectTimeouts {
     pub handshake: Duration,
 }
 
-pub async fn connect(
-    origin: &Origin,
-    tls: &TlsConnector,
-    timeouts: ConnectTimeouts,
-    deadlines: Deadlines,
-) -> io::Result<Connection> {
-    let socket = open_socket(origin, timeouts).await?;
+pub enum Connected {
+    Http1(Box<Connection>),
+    Http2(H2Client),
+}
+
+pub struct ConnectPlan<'a> {
+    pub tls: &'a TlsConnector,
+    pub timeouts: ConnectTimeouts,
+    pub deadlines: Deadlines,
+    pub h2: &'a H2Config,
+    pub prior_knowledge_h2: bool,
+}
+
+pub async fn connect(origin: &Origin, plan: &ConnectPlan<'_>) -> io::Result<Connected> {
+    let socket = open_socket(origin, plan.timeouts).await?;
 
     socket.set_nodelay(true)?;
 
     if !origin.tls {
-        return Ok(Connection::new(socket, None, None, deadlines));
+        if plan.prior_knowledge_h2 {
+            return Ok(Connected::Http2(H2Client::with_io(socket, plan.h2.clone())));
+        }
+
+        return Ok(Connected::Http1(Box::new(Connection::new(
+            socket,
+            None,
+            None,
+            plan.deadlines,
+        ))));
     }
 
-    let state = tls
+    let state = plan
+        .tls
         .connect(&origin.host)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut conn = Connection::new(socket, Some(Box::new(state)), None, deadlines);
+    let mut stream = TlsStream::new(socket, state);
 
-    match timeout(timeouts.handshake, conn.handshake()).await {
+    match timeout(plan.timeouts.handshake, stream.handshake()).await {
         Ok(done) => done?,
         Err(_) => return Err(timed_out("tls handshake")),
     }
 
-    if conn.alpn() == Some(b"h2".as_slice()) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "server selected h2 but this client speaks http/1.1",
-        ));
+    let alpn = stream.alpn().map(<[u8]>::to_vec);
+
+    if alpn.as_deref() == Some(b"h2".as_slice()) {
+        return Ok(Connected::Http2(H2Client::with_io(stream, plan.h2.clone())));
     }
 
-    Ok(conn)
+    let (socket, tls) = stream.into_parts();
+
+    Ok(Connected::Http1(Box::new(Connection::new(
+        socket,
+        Some(tls),
+        alpn,
+        plan.deadlines,
+    ))))
 }
 
 async fn open_socket(origin: &Origin, timeouts: ConnectTimeouts) -> io::Result<TcpStream> {

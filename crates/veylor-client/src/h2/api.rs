@@ -14,7 +14,7 @@ pub struct WriteOut {
     pub required: usize,
 }
 
-fn map_control_error(error: FrameWriteError, required: &mut usize) -> H2ClientError {
+pub(super) fn map_control_error(error: FrameWriteError, required: &mut usize) -> H2ClientError {
     match error {
         FrameWriteError::OutputTooSmall { required: need } => {
             *required = need;

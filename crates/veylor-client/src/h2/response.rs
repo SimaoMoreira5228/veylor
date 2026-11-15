@@ -38,13 +38,17 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         let section = response
             .classify(driver, headers, end_stream)
             .map_err(|_| H2ClientError::ProtocolError)?;
-        Ok(ResponseClass {
+        let class = ResponseClass {
             kind: section.kind,
             status: section.status.unwrap_or(0),
             phase: response.phase(),
             content_length: response.content_length(),
             end_stream,
-        })
+        };
+        if class.phase == ClientResponsePhase::Complete {
+            self.remove_response(stream_id);
+        }
+        Ok(class)
     }
 
     pub fn account_data(
@@ -61,6 +65,9 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         let phase = response
             .data_received(data_length, end_stream)
             .map_err(|_| H2ClientError::ProtocolError)?;
+        if phase == ClientResponsePhase::Complete {
+            self.remove_response(stream_id);
+        }
         Ok(AccountPhase { phase })
     }
 }

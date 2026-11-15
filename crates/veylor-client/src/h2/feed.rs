@@ -71,6 +71,7 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         scratch: &'s mut FeedScratch<'i>,
     ) -> Result<FeedBatch<'s, 'i>, H2ClientError> {
         self.ensure_live()?;
+        self.driver.driver_mut().compact_decoder();
         let result =
             self.driver
                 .driver_mut()
@@ -81,6 +82,17 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         self.feed_failed = result.status == FeedStatus::ConnectionFailed;
         self.feed_error = result.error;
         self.feed_pending = result.actions > 0;
+        self.feed_reset_count = 0;
+        for action in scratch.actions[..result.actions].iter().flatten() {
+            match action {
+                H2FrameAction::StreamReset { stream_id, .. }
+                | H2FrameAction::SendReset { stream_id, .. } => {
+                    self.feed_resets[self.feed_reset_count] = *stream_id;
+                    self.feed_reset_count += 1;
+                }
+                _ => {}
+            }
+        }
         Ok(self.batch_from(scratch))
     }
 
@@ -100,6 +112,10 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         // the FFI host translates the batch first and clears it after.
         self.feed_action_count = 0;
         self.feed_pending = false;
+        for index in 0..self.feed_reset_count {
+            self.remove_response(self.feed_resets[index]);
+        }
+        self.feed_reset_count = 0;
     }
 
     pub fn has_pending_batch(&self) -> bool {

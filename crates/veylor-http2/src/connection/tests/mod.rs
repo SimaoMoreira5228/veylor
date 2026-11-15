@@ -148,6 +148,7 @@ fn feed_preserves_partial_frames_and_consumes_read_ahead_as_whole_frames() {
         Some(H2FrameAction::Data {
             stream_id: 1,
             data: b"body",
+            padding: 0,
             end_stream: true,
         })
     );
@@ -309,6 +310,7 @@ fn data_delivery_borrows_payload_and_charges_padding_to_both_windows() {
         Some(H2FrameAction::Data {
             stream_id: 1,
             data: b"ab",
+            padding: 3,
             end_stream: true,
         })
     );

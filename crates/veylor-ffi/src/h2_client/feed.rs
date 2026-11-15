@@ -315,6 +315,7 @@ unsafe fn translate_pending(
                 stream_id,
                 data: payload,
                 end_stream,
+                ..
             } => {
                 let data_offset = data_next;
                 data[data_next..data_next + payload.len()].copy_from_slice(payload);

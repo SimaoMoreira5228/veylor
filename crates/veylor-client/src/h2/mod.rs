@@ -2,6 +2,7 @@ mod api;
 mod feed;
 mod request;
 mod response;
+mod state;
 #[cfg(test)]
 mod tests;
 
@@ -9,10 +10,11 @@ pub use api::WriteOut;
 pub use feed::{BatchStatus, FeedBatch, FeedScratch};
 pub use request::{DataOut, RequestOut};
 pub use response::{AccountPhase, ResponseClass};
+pub use state::GoAwayInfo;
 pub use veylor_http2::{
     CLIENT_CONNECTION_PREFACE, ClientResponsePhase, ErrorCode, H2FrameAction, HpackEntrySlot,
     HpackFieldToEncode, HpackHeader, HpackRepresentation, HpackTable, ResponseSectionKind,
-    SettingsParameter, StreamSlot, StreamTable,
+    SETTINGS_INITIAL_WINDOW_SIZE, SettingsParameter, StreamSlot, StreamTable,
 };
 
 pub const STREAM_SLOTS: usize = 32;
@@ -87,10 +89,12 @@ impl<'a> H2ClientTables<'a> {
     }
 }
 
+type ResponseSlot = Option<(u32, veylor_http2::ClientResponseHeaders)>;
+
 pub struct H2ClientConnection<'c, 'b> {
     driver: veylor_http2::H2ClientDriver<'c, 'b, 'b, 'b>,
     pending: PendingWrite,
-    responses: [Option<(u32, veylor_http2::ClientResponseHeaders)>; MAX_RESPONSES],
+    responses: [ResponseSlot; MAX_RESPONSES],
     response_len: usize,
     block: [u8; HEADER_BLOCK_SCRATCH],
     cancelled: bool,
@@ -100,6 +104,8 @@ pub struct H2ClientConnection<'c, 'b> {
     feed_error: Option<ErrorCode>,
     feed_failed: bool,
     feed_pending: bool,
+    feed_resets: [u32; MAX_ACTIONS],
+    feed_reset_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -146,6 +152,8 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
             feed_error: None,
             feed_failed: false,
             feed_pending: false,
+            feed_resets: [0; MAX_ACTIONS],
+            feed_reset_count: 0,
         }
     }
 

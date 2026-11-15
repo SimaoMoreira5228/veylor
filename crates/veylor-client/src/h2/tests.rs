@@ -333,6 +333,7 @@ fn get_200_data_trailers() {
             stream_id,
             data,
             end_stream,
+            ..
         }) => (stream_id, data.len(), end_stream),
         ref other => panic!("data action, got {other:?}"),
     };

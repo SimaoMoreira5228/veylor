@@ -715,6 +715,7 @@ fn pump_controls(
                 stream_id,
                 data,
                 end_stream,
+                ..
             } => {
                 let start = staged.len();
                 staged.extend_from_slice(data);

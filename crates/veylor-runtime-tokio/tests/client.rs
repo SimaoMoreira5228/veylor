@@ -154,7 +154,7 @@ async fn https_verifies_and_negotiates_http11() {
     let client = tls_client(CERT, &[b"http/1.1"]);
     let url = format!("https://localhost:{}/", server.addr.port());
 
-    let mut stream = client.send(&ClientRequest::get(&url)).await.expect("send");
+    let stream = client.send(&ClientRequest::get(&url)).await.expect("send");
 
     assert_eq!(stream.status(), 200);
     assert_eq!(stream.alpn(), Some(b"http/1.1".as_slice()));
@@ -213,21 +213,6 @@ async fn https_default_roots_reject_the_test_certificate() {
     let url = format!("https://localhost:{}/", server.addr.port());
 
     assert!(client.request(&ClientRequest::get(&url)).await.is_err());
-}
-
-#[tokio::test]
-async fn offering_h2_is_refused_by_the_http1_client() {
-    let server = spawn_tls(Mode::KeepAlive).await;
-    let client = tls_client(CERT, &[b"h2", b"http/1.1"]);
-    let url = format!("https://localhost:{}/", server.addr.port());
-
-    let error = client
-        .request(&ClientRequest::get(&url))
-        .await
-        .err()
-        .expect("must fail");
-
-    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
 #[tokio::test]

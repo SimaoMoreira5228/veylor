@@ -9,7 +9,11 @@ use tokio::time::timeout;
 use veylor_client::{
     BodyFraming, ClientConnection, ClientError, ClientReadKind, Field, Header, RequestMethod, Span,
 };
-use veylor_tls::{TlsConn, TlsError, drain_plaintext, feed_ciphertext, flush_ciphertext};
+use veylor_tls::{
+    TlsConn, TlsError, drain_plaintext, feed_ciphertext, flush_ciphertext, queue_close_notify,
+};
+
+use crate::h2_client::HeaderList;
 
 pub const INITIAL_BUFFER: usize = 8 * 1024;
 const RETAINED_BUFFER: usize = 32 * 1024;
@@ -27,7 +31,7 @@ pub struct Deadlines {
 
 pub struct ResponseHead {
     pub status: u16,
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub headers: HeaderList,
 }
 
 pub enum Event {
@@ -49,6 +53,7 @@ pub struct Connection {
     trailers: Box<[Header]>,
     deadlines: Deadlines,
     alpn: Option<Vec<u8>>,
+    trailer_list: Option<HeaderList>,
     eof: bool,
     busy: bool,
     reusable: bool,
@@ -74,50 +79,19 @@ impl Connection {
             trailers: vec![Header::default(); TRAILER_SLOTS].into_boxed_slice(),
             deadlines,
             alpn,
+            trailer_list: None,
             eof: false,
             busy: false,
             reusable: true,
         }
     }
 
-    pub async fn handshake(&mut self) -> io::Result<()> {
-        let Some(tls) = self.tls.as_deref_mut() else {
-            return Ok(());
-        };
-
-        self.cipher_out.clear();
-        flush_ciphertext(tls, &mut self.cipher_out).map_err(tls_error)?;
-        self.write_cipher().await?;
-
-        while self.tls.as_deref().is_some_and(TlsConn::is_handshaking) {
-            self.cipher_in.clear();
-            self.cipher_in.reserve(READ_CHUNK);
-
-            let read =
-                tokio::io::AsyncReadExt::read_buf(&mut self.socket, &mut self.cipher_in).await?;
-
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "peer closed during tls handshake",
-                ));
-            }
-
-            self.feed_tls().await?;
-        }
-
-        self.alpn = self
-            .tls
-            .as_deref()
-            .and_then(veylor_tls::alpn)
-            .map(<[u8]>::to_vec);
-        self.read.clear();
-
-        Ok(())
-    }
-
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
+    }
+
+    pub fn take_trailers(&mut self) -> Option<HeaderList> {
+        self.trailer_list.take()
     }
 
     pub fn is_idle_reusable(&self) -> bool {
@@ -183,6 +157,7 @@ impl Connection {
     ) -> io::Result<()> {
         self.busy = true;
         self.eof = false;
+        self.trailer_list = None;
         self.read.clear();
         self.cursor = 0;
         self.exchange = ClientConnection::new(request_method(method)?, b"");
@@ -303,7 +278,7 @@ impl Connection {
                         .map(|h| h.header_count)
                         .unwrap_or(0)
                         .min(self.headers.len());
-                    let mut headers = Vec::with_capacity(count);
+                    let mut headers = HeaderList::default();
 
                     for header in &self.headers[..count] {
                         let (Some(name), Some(value)) =
@@ -312,7 +287,7 @@ impl Connection {
                             return Err(protocol("invalid response header span"));
                         };
 
-                        headers.push((name.to_vec(), value.to_vec()));
+                        headers.push(name, value);
                     }
 
                     return Ok(Event::Head(ResponseHead { status, headers }));
@@ -341,7 +316,24 @@ impl Connection {
                     return Err(protocol("response upgrade is not supported"));
                 }
 
-                ClientReadKind::Informational | ClientReadKind::Trailers => {}
+                ClientReadKind::Trailers => {
+                    let count = event.trailer_count.min(self.trailers.len());
+                    let mut list = HeaderList::default();
+
+                    for header in &self.trailers[..count] {
+                        let (Some(name), Some(value)) =
+                            (slice(input, header.name), slice(input, header.value))
+                        else {
+                            return Err(protocol("invalid trailer span"));
+                        };
+
+                        list.push(name, value);
+                    }
+
+                    self.trailer_list = Some(list);
+                }
+
+                ClientReadKind::Informational => {}
 
                 ClientReadKind::NeedMore => {
                     if self.cursor < self.read.len() && event.consumed > 0 {
@@ -498,4 +490,17 @@ pub fn protocol(message: &str) -> io::Error {
 
 pub fn timed_out(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out"))
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let Some(tls) = self.tls.as_deref_mut() else {
+            return;
+        };
+        let mut out = Vec::new();
+
+        if queue_close_notify(tls, &mut out).is_ok() {
+            let _ = self.socket.try_write(&out);
+        }
+    }
 }
