@@ -1,6 +1,5 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::task::{Context, Poll, Waker};
 
 use smol::Async;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,16 +133,9 @@ impl H1Conn for Connection {
             return false;
         }
 
-        let mut cx = Context::from_waker(Waker::noop());
         let mut probe = [0u8; 1024];
 
         loop {
-            match self.socket.poll_readable(&mut cx) {
-                Poll::Pending => return true,
-                Poll::Ready(Err(_)) => return false,
-                Poll::Ready(Ok(())) => {}
-            }
-
             match self.socket.get_ref().read(&mut probe) {
                 Ok(0) => return false,
                 Ok(read) => {

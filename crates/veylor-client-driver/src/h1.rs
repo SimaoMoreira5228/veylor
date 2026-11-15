@@ -226,6 +226,8 @@ impl H1Exchange {
     }
 
     pub fn next_step(&mut self, want_head: bool) -> io::Result<Step> {
+        let mut retried_at = None;
+
         loop {
             let input = &self.read[self.cursor..];
             let event = self
@@ -305,6 +307,14 @@ impl H1Exchange {
 
                 ClientReadKind::NeedMore => {
                     if self.cursor < self.read.len() && event.consumed > 0 {
+                        continue;
+                    }
+
+                    // NOTE: the parser can finish a chunk-size line without consuming
+                    // bytes, so buffered input gets one more pass before reading.
+                    if self.cursor < self.read.len() && retried_at != Some(self.cursor) {
+                        retried_at = Some(self.cursor);
+
                         continue;
                     }
 

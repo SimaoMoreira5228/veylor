@@ -1612,6 +1612,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "veylor-fetch"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "smol",
+ "tokio",
+ "veylor-client",
+ "veylor-client-driver",
+ "veylor-fetch",
+ "veylor-runtime-smol",
+ "veylor-runtime-tokio",
+ "veylor-server",
+ "veylor-tls",
+]
+
+[[package]]
 name = "veylor-ffi"
 version = "0.1.0"
 dependencies = [
