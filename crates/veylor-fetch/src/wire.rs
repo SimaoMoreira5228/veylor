@@ -115,8 +115,30 @@ impl Wire {
         self.tcp.set_write_timeout(budget.write_timeout()?)
     }
 
-    pub(crate) fn probe(&self) -> io::Result<TcpStream> {
+    pub(crate) fn reader(&self) -> io::Result<TcpStream> {
         self.tcp.try_clone()
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(crate) fn absorb(&mut self, cipher: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        let Some(tls) = self.tls.as_deref_mut() else {
+            out.extend_from_slice(cipher);
+
+            return Ok(());
+        };
+
+        feed_all(tls, cipher, out).map_err(into_io)?;
+        self.cipher_out.clear();
+        flush_ciphertext(tls, &mut self.cipher_out).map_err(into_io)?;
+
+        if self.cipher_out.is_empty() {
+            return Ok(());
+        }
+
+        self.tcp.write_all(&self.cipher_out)
     }
 
     pub(crate) fn read_plain(&mut self, out: &mut Vec<u8>, chunk: usize) -> io::Result<usize> {

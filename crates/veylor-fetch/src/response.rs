@@ -1,12 +1,11 @@
 use std::io::{self, Read};
-use std::sync::Arc;
 
 use crate::agent::Agent;
 use crate::budget::Budget;
 use crate::encoding;
 use crate::error::Error;
 use crate::h1::H1Conn;
-use crate::h2::H2Handle;
+use crate::h2::H2Stream;
 use crate::headers::{HeaderBytesIter, HeaderIter, Headers};
 use crate::protocol::Protocol;
 use crate::status;
@@ -22,9 +21,8 @@ pub(crate) struct H1Body {
 }
 
 pub(crate) struct H2Body {
-    pub(crate) handle: Arc<H2Handle>,
+    pub(crate) stream: H2Stream,
     pub(crate) budget: Budget,
-    pub(crate) released: bool,
 }
 
 pub(crate) enum Body {
@@ -97,42 +95,18 @@ impl Drop for H1Body {
 }
 
 impl H2Body {
-    fn release(&mut self) {
-        if !self.released {
-            self.released = true;
-            self.handle.release();
-        }
-    }
-
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.released || buf.is_empty() {
+        if buf.is_empty() {
             return Ok(0);
         }
 
-        match self.handle.read(buf, &self.budget) {
-            Ok(0) => {
-                self.release();
+        let result = self.stream.read(buf, &self.budget);
 
-                Ok(0)
-            }
-            Ok(count) => Ok(count),
-            Err(error) => {
-                self.handle.abandon();
-                self.release();
-
-                Err(error)
-            }
-        }
-    }
-}
-
-impl Drop for H2Body {
-    fn drop(&mut self) {
-        if !self.handle.is_finished() {
-            self.handle.abandon();
+        if result.is_err() {
+            self.stream.cancel();
         }
 
-        self.release();
+        result
     }
 }
 

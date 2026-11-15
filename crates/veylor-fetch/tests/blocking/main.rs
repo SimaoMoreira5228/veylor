@@ -1,7 +1,9 @@
 mod gzip;
 mod h1;
+mod h2_mux;
 mod h2_peer;
 mod json;
+mod mux_peer;
 mod redirects;
 mod support;
 mod tls;

@@ -2,7 +2,8 @@ use std::io;
 
 use veylor_client::h2::{DEFAULT_MAX_FIELDS, HpackFieldToEncode, HpackRepresentation};
 
-use super::{Command, Failure};
+use super::Command;
+use super::shared::Failure;
 
 pub(super) type Fields<'a> = ([HpackFieldToEncode<'a>; DEFAULT_MAX_FIELDS], usize);
 

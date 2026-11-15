@@ -1,31 +1,26 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use veylor_client::h2::{
-    CLIENT_CONNECTION_PREFACE, DEFAULT_MAX_FIELDS, DEFAULT_REQUEST_BLOCK, ErrorCode,
-    H2ClientConnection, H2ClientError, H2ClientLimits, H2ClientTables, HPACK_ENTRIES,
-    HpackEntrySlot, HpackHeader, MIN_STREAM_SLOTS, SETTINGS_ACKS, SETTINGS_INITIAL_WINDOW_SIZE,
-    SettingsParameter, StreamSlot, WriteOut, decoder_scratch_len, encoder_scratch_len,
-    header_block_len,
+    DEFAULT_MAX_FIELDS, DEFAULT_REQUEST_BLOCK, ErrorCode, H2ClientConnection, H2ClientLimits,
+    H2ClientTables, HPACK_ENTRIES, HpackEntrySlot, HpackHeader, SETTINGS_ACKS, StreamSlot,
+    decoder_scratch_len, encoder_scratch_len, header_block_len,
 };
 
-use super::fields;
-use super::{BODY_BUFFER_CAP, Command, Failure, H2Settings, Shared};
-use crate::budget::Budget;
+use super::shared::{
+    DriverShared, Failure, STATE_CLOSED, STATE_DRAINING, STATE_OPEN, StreamShared,
+};
+use super::{H2Settings, MAX_STREAMS};
 use crate::wire::Wire;
 
-const READ_CHUNK: usize = 16 * 1024 + 512;
 const OUT_CAP: usize = 64 * 1024;
 const MAX_INBUF: usize = 512 * 1024;
-const CONTROL_ROOM: usize = 64;
-const DATA_ROOM: usize = 1_024;
-const HEAD_SLACK: usize = 64;
-const MIN_FREE: usize = 4_096;
-const STREAM_WINDOW: u32 = 256 * 1024;
-const CONNECTION_WINDOW: u32 = 1024 * 1024;
-const PROTOCOL_WINDOW: u32 = 65_535;
-const CREDIT_THRESHOLD: usize = 16 * 1024;
-const MAX_QUEUED: usize = 8;
+const ABSORB_CHUNK: usize = 64 * 1024;
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PINGS: usize = 8;
+const RESET_CAP: usize = (MAX_STREAMS + 2) * 2;
 
 #[derive(Default)]
 pub(super) struct Outbox {
@@ -33,53 +28,70 @@ pub(super) struct Outbox {
     pub(super) pings: Vec<[u8; 8]>,
     pub(super) resets: Vec<(u32, ErrorCode)>,
     pub(super) connection_error: Option<ErrorCode>,
+    pub(super) goaway: bool,
 }
 
 impl Outbox {
     pub(super) fn push_ping(&mut self, data: [u8; 8]) {
-        if self.pings.len() < MAX_QUEUED {
+        if self.pings.len() < MAX_PINGS {
             self.pings.push(data);
         }
     }
 
     pub(super) fn push_reset(&mut self, id: u32, code: ErrorCode) {
-        if self.resets.len() < MAX_QUEUED {
+        if self.resets.len() < RESET_CAP {
             self.resets.push((id, code));
         }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.settings_acks == 0
+            && self.pings.is_empty()
+            && self.resets.is_empty()
+            && self.connection_error.is_none()
+            && !self.goaway
     }
 }
 
 pub(super) struct Active {
     pub(super) id: u32,
+    pub(super) shared: Arc<StreamShared>,
     pub(super) body: Vec<u8>,
     pub(super) sent: usize,
     pub(super) local_ended: bool,
+    pub(super) remote_ended: bool,
+    pub(super) deadline: Option<Instant>,
 }
 
 pub(super) struct Driver<'c, 'b> {
     pub(super) conn: H2ClientConnection<'c, 'b>,
     pub(super) wire: Wire,
-    pub(super) shared: Arc<Shared>,
+    pub(super) shared: Arc<DriverShared>,
     pub(super) settings: H2Settings,
+    pub(super) streams: Vec<Active>,
     pub(super) header_buf: Box<[HpackHeader]>,
     pub(super) inbuf: Vec<u8>,
+    pub(super) cipher: Vec<u8>,
     pub(super) out: Vec<u8>,
     pub(super) out_len: usize,
     pub(super) outbox: Outbox,
-    pub(super) active: Option<Active>,
-    pub(super) credit_conn: usize,
-    pub(super) credit_stream: usize,
-    pub(super) draining: bool,
+    pub(super) window_check: bool,
+    pub(super) round_robin: usize,
     pub(super) terminal: Option<Failure>,
+    dirty_scratch: Vec<Arc<StreamShared>>,
+    handshake_deadline: Option<Instant>,
+    idle_since: Option<Instant>,
+    close_deadline: Option<Instant>,
+    closing_seen: bool,
 }
 
-pub(super) fn run(wire: Wire, shared: Arc<Shared>, settings: H2Settings) {
+pub(super) fn run(wire: Wire, shared: Arc<DriverShared>, settings: H2Settings) {
     let limits = H2ClientLimits {
         max_header_list_size: settings.max_head.clamp(4 * 1024, 1024 * 1024) as u32,
         max_fields: DEFAULT_MAX_FIELDS,
         request_block: DEFAULT_REQUEST_BLOCK,
     };
-    let mut slots = vec![StreamSlot::EMPTY; MIN_STREAM_SLOTS + 1];
+    let mut slots = vec![StreamSlot::EMPTY; MAX_STREAMS + 2];
     let mut header_block = vec![0u8; header_block_len(limits.max_header_list_size)];
     let mut decoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
     let mut decoder_scratch = vec![0u8; decoder_scratch_len(limits.max_header_list_size)];
@@ -97,30 +109,42 @@ pub(super) fn run(wire: Wire, shared: Arc<Shared>, settings: H2Settings) {
     )
     .with_limits(limits);
 
-    let failure = match tables.connect() {
-        Ok(conn) => Driver::new(conn, wire, Arc::clone(&shared), settings).serve(),
-        Err(_) => Failure::new(io::ErrorKind::Other, "h2 engine setup failed"),
+    let Ok(conn) = tables.connect() else {
+        let failure = Failure::new(io::ErrorKind::Other, "h2 engine setup failed");
+
+        close_shared(&shared, &failure);
+        wire.shutdown();
+
+        return;
     };
 
-    let mut state = shared.state.lock();
+    let mut driver = Driver::new(conn, wire, shared, settings);
+    let failure = driver.serve();
 
-    state.dead = true;
-    state.idle = false;
-    state.command = None;
+    driver.finish(&failure);
+}
 
-    if !state.ended && state.failure.is_none() {
-        state.failure = Some(failure);
+pub(super) fn close_shared(shared: &DriverShared, failure: &Failure) {
+    let mut core = shared.core.lock();
+
+    shared.state.store(STATE_CLOSED, Ordering::Release);
+
+    for pending in core.queue.drain(..) {
+        pending.stream.fail(failure.clone().unprocessed());
     }
 
-    drop(state);
-    shared.wake.notify_all();
+    core.dirty.clear();
+    core.inbound = Vec::new();
+    drop(core);
+
+    shared.room.notify_all();
 }
 
 impl<'c, 'b> Driver<'c, 'b> {
     fn new(
         conn: H2ClientConnection<'c, 'b>,
         wire: Wire,
-        shared: Arc<Shared>,
+        shared: Arc<DriverShared>,
         settings: H2Settings,
     ) -> Self {
         Self {
@@ -128,20 +152,25 @@ impl<'c, 'b> Driver<'c, 'b> {
             wire,
             shared,
             settings,
+            streams: Vec::with_capacity(MAX_STREAMS),
             header_buf: vec![HpackHeader::EMPTY; DEFAULT_MAX_FIELDS].into_boxed_slice(),
             inbuf: Vec::new(),
+            cipher: Vec::new(),
             out: vec![0; OUT_CAP],
             out_len: 0,
             outbox: Outbox::default(),
-            active: None,
-            credit_conn: 0,
-            credit_stream: 0,
-            draining: false,
+            window_check: false,
+            round_robin: 0,
             terminal: None,
+            dirty_scratch: Vec::new(),
+            handshake_deadline: Some(Instant::now() + settings.handshake_timeout),
+            idle_since: None,
+            close_deadline: None,
+            closing_seen: false,
         }
     }
 
-    fn serve(mut self) -> Failure {
+    fn serve(&mut self) -> Failure {
         match self.main_loop() {
             Err(failure) => failure,
             Ok(()) => Failure::new(io::ErrorKind::ConnectionAborted, "h2 connection closed"),
@@ -149,422 +178,345 @@ impl<'c, 'b> Driver<'c, 'b> {
     }
 
     fn main_loop(&mut self) -> Result<(), Failure> {
-        let handshake = Budget {
-            read: Some(self.settings.handshake_timeout),
-            write: Some(self.settings.handshake_timeout),
-            overall: None,
-        };
-
-        self.write_preface(&handshake)?;
+        self.write_preface()?;
 
         loop {
-            let Some(command) = self.next_command() else {
-                return Ok(());
-            };
+            let eof = self.wait_for_work();
 
-            self.exchange(command)?;
+            self.absorb_input()?;
+            self.housekeeping();
+            self.produce()?;
+            self.flush()?;
 
-            if self.draining {
-                return Ok(());
-            }
-
-            let mut state = self.shared.state.lock();
-
-            state.idle = state.command.is_none();
-        }
-    }
-
-    fn next_command(&self) -> Option<Command> {
-        let mut state = self.shared.state.lock();
-
-        loop {
-            if state.shutdown {
-                return None;
-            }
-
-            if let Some(command) = state.command.take() {
-                return Some(command);
-            }
-
-            let waited = self
-                .shared
-                .wake
-                .wait_for(&mut state, self.settings.idle_timeout);
-
-            if waited.timed_out() && state.command.is_none() {
-                return None;
+            if let Some(failure) = self.exit_reason(eof) {
+                return Err(failure);
             }
         }
     }
 
-    fn exchange(&mut self, command: Command) -> Result<(), Failure> {
-        let budget = command.budget;
-
-        self.ensure_ready(&budget)?;
-
-        if !self.begin(command, &budget)? {
-            return Ok(());
-        }
+    fn wait_for_work(&mut self) -> Option<Failure> {
+        let shared = Arc::clone(&self.shared);
+        let mut core = shared.core.lock();
 
         loop {
-            if self.shared.state.lock().shutdown {
-                return Err(Failure::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "request abandoned",
-                ));
+            let admissible = !core.queue.is_empty() && self.can_admit();
+
+            if !core.inbound.is_empty()
+                || !core.dirty.is_empty()
+                || core.eof.is_some()
+                || admissible
+                || self.note_closing(&core)
+                || self.terminal.is_some()
+            {
+                break;
             }
 
-            self.produce(&budget)?;
-            self.flush(&budget)?;
-
-            if self.active.is_none() {
-                return Ok(());
-            }
-
-            if self.buffered() >= BODY_BUFFER_CAP {
-                self.wait_room();
+            let Some(deadline) = self.next_deadline(&core.queue) else {
+                shared.wake.wait(&mut core);
 
                 continue;
+            };
+
+            if Instant::now() >= deadline || shared.wake.wait_until(&mut core, deadline).timed_out()
+            {
+                break;
             }
-
-            self.read_more(&budget)?;
-        }
-    }
-
-    fn ensure_ready(&mut self, budget: &Budget) -> Result<(), Failure> {
-        while !(self.conn.peer_settings_received() && self.conn.local_settings_acknowledged()) {
-            self.produce(budget)?;
-            self.flush(budget)?;
-            self.read_more(budget)?;
         }
 
-        Ok(())
+        std::mem::swap(&mut core.inbound, &mut self.cipher);
+        std::mem::swap(&mut core.dirty, &mut self.dirty_scratch);
+
+        let eof = core.eof.take();
+
+        drop(core);
+        shared.room.notify_one();
+
+        eof
     }
 
-    fn write_preface(&mut self, budget: &Budget) -> Result<(), Failure> {
-        let preface = CLIENT_CONNECTION_PREFACE;
-
-        self.out[..preface.len()].copy_from_slice(preface);
-        self.out_len = preface.len();
-
-        let parameters = [SettingsParameter {
-            id: SETTINGS_INITIAL_WINDOW_SIZE,
-            value: STREAM_WINDOW,
-        }];
-
-        if !self.emit(|conn, out| conn.send_settings(&parameters, out)) {
-            return Err(Failure::new(io::ErrorKind::Other, "h2 settings failed"));
-        }
-
-        let increment = CONNECTION_WINDOW - PROTOCOL_WINDOW;
-
-        if !self.emit(|conn, out| conn.send_window_update(0, increment, out)) {
-            return Err(Failure::new(
-                io::ErrorKind::Other,
-                "h2 window update failed",
-            ));
-        }
-
-        self.flush(budget)
-    }
-
-    fn begin(&mut self, command: Command, budget: &Budget) -> Result<bool, Failure> {
-        let end_stream = command.body.is_empty();
-        let mut digits = [0u8; 20];
-
-        if self.free() < DEFAULT_REQUEST_BLOCK + HEAD_SLACK {
-            self.flush(budget)?;
-        }
-
-        let started = match fields::build(&command, &mut digits) {
-            Ok((built, used)) => {
-                let output = &mut self.out[self.out_len..];
-
-                self.conn.start_request(&built[..used], output, end_stream)
-            }
-            Err(failure) => {
-                self.publish_failure(failure);
-
-                return Ok(false);
-            }
-        };
-
-        let started = match started {
-            Ok(started) => started,
-            Err(H2ClientError::BadState) => {
-                return Err(Failure::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "h2 connection closing",
-                ));
-            }
-            Err(error) => {
-                let message = format!("h2 request rejected: {error:?}");
-
-                self.publish_failure(Failure::new(io::ErrorKind::InvalidInput, message));
-
-                return Ok(false);
-            }
-        };
-
-        if self.conn.acknowledge(started.written).is_err() {
-            return Err(Failure::new(
-                io::ErrorKind::Other,
-                "h2 write bookkeeping failed",
-            ));
-        }
-
-        self.out_len += started.written;
-        self.credit_stream = 0;
-        self.active = Some(Active {
-            id: started.stream_id,
-            body: command.body,
-            sent: 0,
-            local_ended: end_stream,
-        });
-
-        Ok(true)
-    }
-
-    fn produce(&mut self, budget: &Budget) -> Result<(), Failure> {
-        if self.free() < MIN_FREE {
-            self.flush(budget)?;
-        }
-
-        self.write_control();
-        self.write_window_updates();
-        self.write_data(budget)
-    }
-
-    pub(super) fn buffered(&self) -> usize {
-        let state = self.shared.state.lock();
-
-        state.body.len() - state.body_pos
-    }
-
-    fn wait_room(&self) {
-        let mut state = self.shared.state.lock();
-
-        while !state.shutdown && state.body.len() - state.body_pos >= BODY_BUFFER_CAP {
-            self.shared.wake.wait(&mut state);
-        }
-    }
-
-    pub(super) fn free(&self) -> usize {
-        self.out.len() - self.out_len
-    }
-
-    fn emit(
-        &mut self,
-        write: impl FnOnce(
-            &mut H2ClientConnection<'_, '_>,
-            &mut [u8],
-        ) -> Result<WriteOut, H2ClientError>,
-    ) -> bool {
-        let output = &mut self.out[self.out_len..];
-        let Ok(written) = write(&mut self.conn, output) else {
-            return false;
-        };
-
-        if self.conn.acknowledge(written.written).is_err() {
+    fn note_closing(&mut self, core: &super::shared::Core) -> bool {
+        if !core.closing || self.closing_seen {
             return false;
         }
 
-        self.out_len += written.written;
+        self.closing_seen = true;
 
         true
     }
 
-    fn write_control(&mut self) {
-        while self.outbox.settings_acks > 0 && self.free() > CONTROL_ROOM {
-            if !self.emit(|conn, out| conn.send_settings_ack(out)) {
-                break;
-            }
-
-            self.outbox.settings_acks -= 1;
-        }
-
-        while let Some(data) = self.outbox.pings.last().copied() {
-            if self.free() <= CONTROL_ROOM || !self.emit(|conn, out| conn.send_ping_ack(&data, out))
-            {
-                break;
-            }
-
-            self.outbox.pings.pop();
-        }
-
-        while let Some(&(id, code)) = self.outbox.resets.last() {
-            if self.free() <= CONTROL_ROOM
-                || !self.emit(|conn, out| conn.send_queued_reset(id, code, out))
-            {
-                break;
-            }
-
-            self.outbox.resets.pop();
-        }
-
-        if let Some(code) = self.outbox.connection_error
-            && self.free() > CONTROL_ROOM
-            && self.emit(|conn, out| conn.send_connection_error(code, out))
-        {
-            self.outbox.connection_error = None;
-        }
-    }
-
-    fn write_window_updates(&mut self) {
-        if self.buffered() >= BODY_BUFFER_CAP || self.free() <= CONTROL_ROOM {
-            return;
-        }
-
-        if self.credit_conn >= CREDIT_THRESHOLD {
-            let increment = self.credit_conn as u32;
-
-            if self.emit(|conn, out| conn.send_window_update(0, increment, out)) {
-                self.credit_conn = 0;
-            }
-        }
-
-        let Some(id) = self.active.as_ref().map(|active| active.id) else {
-            return;
-        };
-
-        if self.credit_stream >= CREDIT_THRESHOLD && self.free() > CONTROL_ROOM {
-            let increment = self.credit_stream as u32;
-
-            if self.emit(|conn, out| conn.send_window_update(id, increment, out)) {
-                self.credit_stream = 0;
-            }
-        }
-    }
-
-    fn write_data(&mut self, budget: &Budget) -> Result<(), Failure> {
-        loop {
-            let Some(active) = self.active.as_ref() else {
-                return Ok(());
-            };
-
-            if active.local_ended {
-                return Ok(());
-            }
-
-            let id = active.id;
-            let remaining = active.body.len() - active.sent;
-
-            if self.free() < DATA_ROOM {
-                self.flush(budget)?;
-            }
-
-            if remaining > 0 && self.conn.send_credit(id) == 0 {
-                return Ok(());
-            }
-
-            let Some(active) = self.active.as_mut() else {
-                return Ok(());
-            };
-            let input = &active.body[active.sent..];
-            let output = &mut self.out[self.out_len..];
-            let outcome = self.conn.send_data(id, input, true, output);
-
-            match outcome {
-                Ok(sent) => {
-                    if self.conn.acknowledge(sent.written).is_err() {
-                        return Err(Failure::new(
-                            io::ErrorKind::Other,
-                            "h2 write bookkeeping failed",
-                        ));
-                    }
-
-                    self.out_len += sent.written;
-                    active.sent += sent.consumed;
-                    active.local_ended |= sent.end_stream;
-
-                    if sent.consumed == 0 && sent.written == 0 {
-                        return Ok(());
-                    }
-                }
-                Err(H2ClientError::WouldBlock | H2ClientError::BufferTooSmall { .. }) => {
-                    return Ok(());
-                }
-                Err(_) => {
-                    self.fail_stream(
-                        Failure::new(io::ErrorKind::Other, "h2 request body rejected"),
-                        Some(ErrorCode::Cancel),
-                    );
-
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    fn flush(&mut self, budget: &Budget) -> Result<(), Failure> {
-        if self.out_len == 0 {
+    fn absorb_input(&mut self) -> Result<(), Failure> {
+        if self.cipher.is_empty() {
             return Ok(());
         }
 
-        let armed = self.wire.arm_write(budget);
-        let written = armed.and_then(|()| self.wire.write_plain(&self.out[..self.out_len]));
+        let cipher = std::mem::take(&mut self.cipher);
+        let mut result = Ok(());
 
-        self.out_len = 0;
+        for chunk in cipher.chunks(ABSORB_CHUNK) {
+            if let Err(error) = self.wire.absorb(chunk, &mut self.inbuf) {
+                result = Err(Failure::new(error.kind(), error.to_string()));
 
-        written.map_err(failure_from)
+                break;
+            }
+
+            self.process_input();
+
+            if self.inbuf.len() > MAX_INBUF {
+                result = Err(Failure::new(
+                    io::ErrorKind::InvalidData,
+                    "h2 input exceeds the buffer limit",
+                ));
+
+                break;
+            }
+        }
+
+        self.cipher = cipher;
+        self.cipher.clear();
+
+        result
     }
 
-    fn read_more(&mut self, budget: &Budget) -> Result<(), Failure> {
-        self.wire.arm_read(budget).map_err(failure_from)?;
+    fn exit_reason(&mut self, eof: Option<Failure>) -> Option<Failure> {
+        if self.terminal.is_some() && self.outbox.connection_error.is_none() {
+            return self.terminal.take();
+        }
 
-        let read = self
-            .wire
-            .read_plain(&mut self.inbuf, READ_CHUNK)
-            .map_err(failure_from)?;
+        if eof.is_some() {
+            return eof;
+        }
 
-        if read == 0 {
-            return Err(Failure::new(
-                io::ErrorKind::UnexpectedEof,
+        let flushed = self.out_len == 0 && self.outbox.is_empty();
+
+        if self.shared.state.load(Ordering::Acquire) != STATE_OPEN
+            && flushed
+            && self.streams.is_empty()
+            && self.shared.core.lock().queue.is_empty()
+        {
+            return Some(Failure::new(
+                io::ErrorKind::ConnectionAborted,
                 "h2 connection closed",
             ));
         }
 
-        if self.inbuf.len() > MAX_INBUF {
-            return Err(Failure::new(
-                io::ErrorKind::InvalidData,
-                "h2 input exceeds the buffer limit",
-            ));
+        let deadline = self.close_deadline?;
+
+        if Instant::now() < deadline {
+            return None;
         }
 
-        self.process_input();
-
-        if let Some(failure) = self.terminal.take() {
-            self.write_control();
-
-            let _ = self.flush(budget);
-
-            return Err(failure);
-        }
-
-        Ok(())
+        Some(Failure::new(io::ErrorKind::TimedOut, "h2 close timed out"))
     }
 
-    pub(super) fn publish_failure(&self, failure: Failure) {
-        let mut state = self.shared.state.lock();
+    fn housekeeping(&mut self) {
+        let now = Instant::now();
 
-        state.failure = Some(failure);
-        drop(state);
-        self.shared.wake.notify_all();
-    }
+        self.drain_dirty();
 
-    pub(super) fn fail_stream(&mut self, failure: Failure, reset: Option<ErrorCode>) {
-        if let Some(active) = self.active.take() {
-            self.conn.forget_stream(active.id);
-
-            if let Some(code) = reset {
-                self.outbox.push_reset(active.id, code);
+        if self.handshake_deadline.is_some() {
+            if self.conn.peer_settings_received() && self.conn.local_settings_acknowledged() {
+                self.handshake_deadline = None;
+            } else if self.handshake_deadline.is_some_and(|limit| now >= limit) {
+                self.terminal.get_or_insert(Failure::new(
+                    io::ErrorKind::TimedOut,
+                    "h2 handshake timed out",
+                ));
             }
         }
 
-        self.publish_failure(failure);
-    }
-}
+        let mut index = 0;
 
-fn failure_from(error: io::Error) -> Failure {
-    Failure::new(error.kind(), error.to_string())
+        while index < self.streams.len() {
+            let expired = self.streams[index]
+                .deadline
+                .is_some_and(|limit| now >= limit);
+
+            if expired {
+                let failure = Failure::new(io::ErrorKind::TimedOut, "h2 stream timed out");
+
+                self.kill_stream(index, failure, Some(ErrorCode::Cancel));
+
+                continue;
+            }
+
+            index += 1;
+        }
+
+        self.expire_queue(now);
+        self.check_idle(now);
+    }
+
+    fn check_idle(&mut self, now: Instant) {
+        let (queue_empty, closing) = {
+            let core = self.shared.core.lock();
+
+            (core.queue.is_empty(), core.closing)
+        };
+
+        if !self.streams.is_empty() || !queue_empty {
+            self.idle_since = None;
+
+            return;
+        }
+
+        let since = *self.idle_since.get_or_insert(now);
+        let timed_out = now >= since + self.settings.idle_timeout;
+
+        if closing || timed_out {
+            self.begin_close();
+        }
+    }
+
+    fn drain_dirty(&mut self) {
+        let mut dropped_queued = false;
+
+        for stream in std::mem::take(&mut self.dirty_scratch) {
+            stream.clear_dirty();
+
+            self.window_check = true;
+
+            if !stream.is_cancelled() {
+                continue;
+            }
+
+            let position = self
+                .streams
+                .iter()
+                .position(|active| Arc::ptr_eq(&active.shared, &stream));
+
+            match position {
+                Some(index) => {
+                    let failure = Failure::new(io::ErrorKind::Interrupted, "h2 stream cancelled");
+
+                    self.kill_stream(index, failure, Some(ErrorCode::Cancel));
+                }
+                None => dropped_queued = true,
+            }
+        }
+
+        if dropped_queued {
+            let failure = Failure::new(io::ErrorKind::Interrupted, "h2 stream cancelled");
+
+            self.shared.core.lock().queue.retain(|pending| {
+                if pending.stream.is_cancelled() {
+                    pending.stream.fail(failure.clone());
+
+                    return false;
+                }
+
+                true
+            });
+        }
+    }
+
+    fn expire_queue(&mut self, now: Instant) {
+        let mut core = self.shared.core.lock();
+        let expired = core
+            .queue
+            .iter()
+            .any(|pending| pending.deadline.is_some_and(|limit| now >= limit));
+
+        if !expired {
+            return;
+        }
+
+        let queue = std::mem::take(&mut core.queue);
+
+        for pending in queue {
+            if pending.deadline.is_some_and(|limit| now >= limit) {
+                let failure = Failure::new(io::ErrorKind::TimedOut, "h2 request timed out");
+
+                pending.stream.fail(failure);
+            } else {
+                core.queue.push_back(pending);
+            }
+        }
+    }
+
+    pub(super) fn begin_close(&mut self) {
+        if self.shared.state.load(Ordering::Acquire) == STATE_OPEN {
+            let failure = Failure::new(io::ErrorKind::ConnectionAborted, "h2 connection closing");
+
+            self.drain_queue(&failure);
+            self.close_deadline = Some(Instant::now() + CLOSE_TIMEOUT);
+        }
+
+        if !self.conn.goaway_sent() && self.conn.goaway_received().is_none() {
+            self.outbox.goaway = true;
+        }
+    }
+
+    pub(super) fn mark_draining_from_peer(&mut self) {
+        let failure = Failure::new(io::ErrorKind::ConnectionAborted, "h2 goaway");
+
+        self.drain_queue(&failure);
+    }
+
+    fn drain_queue(&mut self, failure: &Failure) {
+        let mut core = self.shared.core.lock();
+
+        self.shared.state.store(STATE_DRAINING, Ordering::Release);
+
+        for pending in core.queue.drain(..) {
+            pending.stream.fail(failure.clone().unprocessed());
+        }
+    }
+
+    fn next_deadline(
+        &self,
+        queue: &std::collections::VecDeque<super::shared::Pending>,
+    ) -> Option<Instant> {
+        let mut earliest = self.handshake_deadline;
+        let mut consider = |candidate: Option<Instant>| {
+            if let Some(candidate) = candidate {
+                earliest = Some(earliest.map_or(candidate, |current| current.min(candidate)));
+            }
+        };
+
+        for stream in &self.streams {
+            consider(stream.deadline);
+        }
+
+        for pending in queue {
+            consider(pending.deadline);
+        }
+
+        consider(self.close_deadline);
+
+        if let Some(since) = self.idle_since {
+            consider(Some(since + self.settings.idle_timeout));
+        }
+
+        earliest
+    }
+
+    pub(super) fn kill_stream(&mut self, index: usize, failure: Failure, reset: Option<ErrorCode>) {
+        let stream = self.streams.swap_remove(index);
+
+        self.conn.forget_stream(stream.id);
+
+        if let Some(code) = reset {
+            self.outbox.push_reset(stream.id, code);
+        }
+
+        if stream.shared.is_cancelled() {
+            stream.shared.discard_body();
+        }
+
+        stream.shared.fail(failure);
+        self.window_check = true;
+    }
+
+    pub(super) fn find_stream(&self, id: u32) -> Option<usize> {
+        self.streams.iter().position(|stream| stream.id == id)
+    }
+
+    fn finish(&mut self, failure: &Failure) {
+        for stream in self.streams.drain(..) {
+            stream.shared.fail(failure.clone());
+        }
+
+        close_shared(&self.shared, failure);
+        self.wire.shutdown();
+    }
 }

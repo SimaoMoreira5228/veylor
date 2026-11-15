@@ -43,6 +43,7 @@ enum Conn {
 struct Failed {
     error: Error,
     retry: bool,
+    unprocessed: bool,
 }
 
 impl Agent {
@@ -231,7 +232,10 @@ impl Agent {
 
             match self.exchange(conn, &request, url, budget) {
                 Ok(response) => return Ok(response),
-                Err(failed) if reused && failed.retry && request.method.is_idempotent() => {}
+                Err(failed)
+                    if reused
+                        && failed.retry
+                        && (failed.unprocessed || request.method.is_idempotent()) => {}
                 Err(failed) => return Err(failed.error),
             }
         }
@@ -245,19 +249,39 @@ impl Agent {
         budget: &Budget,
         reuse: bool,
     ) -> Result<(Conn, bool), Error> {
-        if reuse {
-            if origin.tls
-                && let Some(handle) = self.inner.pool.take_h2(origin)
-            {
-                return Ok((Conn::H2(handle), true));
-            }
+        if reuse && let Some(conn) = self.reuse(origin) {
+            return Ok((conn, true));
+        }
 
-            if let Some(conn) = self.inner.pool.take_h1(origin) {
-                return Ok((Conn::H1(conn), true));
-            }
+        let pool = &self.inner.pool;
+        let _dial = if origin.tls && !pool.is_h1_only(origin) {
+            let guard = pool.dial(origin, budget.overall);
+
+            Some(guard.ok_or(Error::Timeout(TimeoutKind::Connect))?)
+        } else {
+            None
+        };
+
+        if reuse
+            && _dial.is_some()
+            && let Some(conn) = self.reuse(origin)
+        {
+            return Ok((conn, true));
         }
 
         Ok((self.connect(origin, budget)?, false))
+    }
+
+    fn reuse(&self, origin: &Origin) -> Option<Conn> {
+        let pool = &self.inner.pool;
+
+        if origin.tls
+            && let Some(handle) = pool.take_h2(origin)
+        {
+            return Some(Conn::H2(handle));
+        }
+
+        pool.take_h1(origin).map(Conn::H1)
     }
 
     fn connect(&self, origin: &Origin, budget: &Budget) -> Result<Conn, Error> {
@@ -274,12 +298,18 @@ impl Agent {
                 max_head: config.max_head_size,
                 idle_timeout: config.idle_timeout,
                 handshake_timeout: H2_HANDSHAKE_TIMEOUT,
+                write_timeout: config.write_timeout,
             };
             let handle = H2Handle::spawn(wire, settings)?;
 
+            handle.reserve(true);
             self.inner.pool.add_h2(origin, &handle);
 
             return Ok(Conn::H2(handle));
+        }
+
+        if origin.tls {
+            self.inner.pool.mark_h1_only(origin);
         }
 
         Ok(Conn::H1(Box::new(H1Conn::new(wire, config.max_head_size))))
@@ -351,26 +381,19 @@ impl Agent {
         let authority = url.origin().host_header();
 
         match handle.request(request, &authority, budget) {
-            Ok((status, headers)) => {
+            Ok((status, headers, stream)) => {
                 let body = Body::H2(H2Body {
-                    handle,
+                    stream,
                     budget: *budget,
-                    released: false,
                 });
 
                 Ok(self.response(status, Protocol::Http2, headers, url, request, body))
             }
-            Err(refused) => {
-                handle.abandon();
-                handle.release();
-
-                Err(failed(
-                    refused.error,
-                    TimeoutKind::Read,
-                    budget,
-                    refused.retryable,
-                ))
-            }
+            Err(refused) => Err(Failed {
+                error: Error::from_io(refused.error, TimeoutKind::Read, budget.expired()),
+                retry: refused.retryable,
+                unprocessed: refused.unprocessed,
+            }),
         }
     }
 
@@ -409,6 +432,7 @@ fn failed(error: io::Error, phase: TimeoutKind, budget: &Budget, retry: bool) ->
     Failed {
         error: Error::from_io(error, phase, budget.expired()),
         retry,
+        unprocessed: false,
     }
 }
 

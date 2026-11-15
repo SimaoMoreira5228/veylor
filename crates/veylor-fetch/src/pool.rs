@@ -1,12 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::h1::H1Conn;
 use crate::h2::H2Handle;
 use crate::url::Origin;
+
+const MAX_H2_PER_ORIGIN: usize = 2;
+const MAX_REMEMBERED_H1: usize = 256;
+
+#[derive(Default)]
+struct Gate {
+    dialing: HashSet<Origin>,
+    h1_only: HashSet<Origin>,
+}
+
+pub(crate) struct DialGuard<'a> {
+    pool: &'a Pool,
+    origin: Origin,
+}
+
+impl Drop for DialGuard<'_> {
+    fn drop(&mut self) {
+        self.pool.gate.lock().dialing.remove(&self.origin);
+        self.pool.dialed.notify_all();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolStats {
@@ -28,6 +49,8 @@ struct Inner {
 
 pub(crate) struct Pool {
     inner: Mutex<Inner>,
+    gate: Mutex<Gate>,
+    dialed: Condvar,
     idle_timeout: Duration,
     max_per_host: usize,
     max_total: usize,
@@ -37,6 +60,8 @@ impl Pool {
     pub(crate) fn new(idle_timeout: Duration, max_per_host: usize, max_total: usize) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            gate: Mutex::new(Gate::default()),
+            dialed: Condvar::new(),
             idle_timeout,
             max_per_host,
             max_total,
@@ -120,17 +145,20 @@ impl Pool {
 
         list.retain(|handle| !handle.is_dead());
 
-        let found = list
-            .iter()
-            .rev()
-            .find(|handle| handle.try_acquire())
-            .cloned();
+        let found = list.iter().min_by_key(|handle| handle.load()).cloned();
+        let full = list.len() >= MAX_H2_PER_ORIGIN;
 
         if list.is_empty() {
             inner.h2.remove(origin);
         }
 
-        found
+        let handle = found?;
+
+        if handle.reserve(false) || (full && handle.reserve(true)) {
+            return Some(handle);
+        }
+
+        None
     }
 
     pub(crate) fn add_h2(&self, origin: &Origin, handle: &Arc<H2Handle>) {
@@ -139,8 +167,45 @@ impl Pool {
 
         list.retain(|existing| !existing.is_dead());
 
-        if list.len() < self.max_per_host {
+        if list.len() < MAX_H2_PER_ORIGIN {
             list.push(Arc::clone(handle));
         }
+    }
+
+    pub(crate) fn is_h1_only(&self, origin: &Origin) -> bool {
+        self.gate.lock().h1_only.contains(origin)
+    }
+
+    pub(crate) fn mark_h1_only(&self, origin: &Origin) {
+        let mut gate = self.gate.lock();
+
+        if gate.h1_only.len() < MAX_REMEMBERED_H1 {
+            gate.h1_only.insert(origin.clone());
+        }
+    }
+
+    // NOTE: dials to one origin are serialized so a burst of threads shares the first h2
+    // connection instead of each opening its own. Waiters re-check the pool once they get in.
+    pub(crate) fn dial(&self, origin: &Origin, deadline: Option<Instant>) -> Option<DialGuard<'_>> {
+        let mut gate = self.gate.lock();
+
+        while gate.dialing.contains(origin) {
+            let Some(deadline) = deadline else {
+                self.dialed.wait(&mut gate);
+
+                continue;
+            };
+
+            if self.dialed.wait_until(&mut gate, deadline).timed_out() {
+                return None;
+            }
+        }
+
+        gate.dialing.insert(origin.clone());
+
+        Some(DialGuard {
+            pool: self,
+            origin: origin.clone(),
+        })
     }
 }

@@ -49,12 +49,17 @@ fn managed_server() -> RunningServer {
 }
 
 fn fixture_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("veylor-fetch-{}", std::process::id()));
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-    std::fs::create_dir_all(&dir).expect("dir");
-    std::fs::write(dir.join("big.bin"), vec![b'B'; BIG]).expect("fixture");
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("veylor-fetch-{}", std::process::id()));
 
-    dir
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("big.bin"), vec![b'B'; BIG]).expect("fixture");
+
+        dir
+    })
+    .clone()
 }
 
 fn url(server: &RunningServer, path: &str) -> String {
