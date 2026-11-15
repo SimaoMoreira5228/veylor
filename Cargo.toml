@@ -19,6 +19,7 @@ members = [
     "crates/veylor-server-conn",
     "crates/veylor-tls",
     "crates/veylor-web",
+    "crates/veylor-web-smol",
     "crates/veylor-web-tokio",
     "crates/veylor-websocket",
 ]
@@ -39,6 +40,7 @@ default-members = [
     "crates/veylor-server-conn",
     "crates/veylor-tls",
     "crates/veylor-web",
+    "crates/veylor-web-smol",
     "crates/veylor-web-tokio",
     "crates/veylor-websocket",
 ]

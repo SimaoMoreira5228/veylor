@@ -1790,6 +1790,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "veylor-web-smol"
+version = "0.1.0"
+dependencies = [
+ "smol",
+ "veylor-server",
+ "veylor-web",
+]
+
+[[package]]
 name = "veylor-web-tokio"
 version = "0.1.0"
 dependencies = [

@@ -13,7 +13,8 @@ benchmarks run, but there is no versioning promise yet.
   buffers.
 - `veylor-server`: the managed worker and poller server, with H1, H2C, TLS H2 and H3.
 - `veylor-web`: `Router`, native and managed tiers, borrowed extractors, file mounts,
-  WebSocket echo and SSE. `veylor-web-tokio` runs async handlers on Tokio.
+  WebSocket echo and SSE. `veylor-web-tokio` and `veylor-web-smol` run async handlers on
+  Tokio and smol.
 - `veylor-runtime-tokio`, `veylor-runtime-smol`: host-driven connection adapters.
 - `veylor-ffi`: the `vyl_*` C ABI.
 
