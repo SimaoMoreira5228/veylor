@@ -1,12 +1,14 @@
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use parking_lot::Mutex;
 use veylor_fetch::{Agent, AgentBuilder, Error, Protocol};
 use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig, TlsConfig};
 use veylor_tls::{Certificate, PrivateKey};
 
+use super::mux_peer::{Plan, Script, spawn as spawn_peer};
 use crate::support::{TestServer, respond, serve_loop, spawn};
 
 const CERT: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/leaf_cert.der");
@@ -17,6 +19,9 @@ struct Recorded {
     line: String,
     host: String,
     proxy_authorization: String,
+    chunked: bool,
+    declared: String,
+    body_length: usize,
 }
 
 type Seen = Arc<Mutex<Vec<Recorded>>>;
@@ -40,6 +45,11 @@ where
                     .header("proxy-authorization")
                     .unwrap_or("-")
                     .to_owned(),
+                chunked: request
+                    .header("transfer-encoding")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("chunked")),
+                declared: request.header("content-length").unwrap_or("-").to_owned(),
+                body_length: request.body.len(),
             };
 
             recorder.lock().push(recorded.clone());
@@ -451,4 +461,69 @@ fn the_connect_budget_honours_the_connect_timeout() {
 
     assert!(error.is_timeout(), "{error}");
     assert_eq!(proxy.accepted(), 1);
+}
+
+#[test]
+fn a_streamed_upload_reaches_a_forward_proxy_as_chunked_absolute_form() {
+    let (proxy, seen) = forwarding_proxy();
+    let agent = Agent::builder()
+        .proxy(&format!("http://user:secret@{}", proxy.addr))
+        .build()
+        .expect("agent");
+    let total = 500_000usize;
+    let mut body = io::repeat(b's').take(total as u64);
+    let text = agent
+        .post("http://origin.test/up")
+        .send_stream(&mut body)
+        .expect("upload")
+        .text()
+        .expect("body");
+
+    assert_eq!(text, "POST http://origin.test/up HTTP/1.1");
+    assert_eq!(body.limit(), 0);
+
+    let seen = seen.lock();
+
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].line, "POST http://origin.test/up HTTP/1.1");
+    assert_eq!(seen[0].host, "origin.test");
+    assert_eq!(seen[0].proxy_authorization, "Basic dXNlcjpzZWNyZXQ=");
+    assert!(seen[0].chunked);
+    assert_eq!(seen[0].declared, "-");
+    assert_eq!(seen[0].body_length, total);
+}
+
+#[test]
+fn a_streamed_upload_survives_a_connect_tunnel_to_an_h2_origin() {
+    let peer = spawn_peer(Script::new(|_| Plan::Echo));
+    let (proxy, seen) = proxy_server(|recorded, out| {
+        let authority = recorded.line.split_whitespace().nth(1).unwrap_or("");
+
+        splice(out, authority);
+    });
+    let agent = trusting()
+        .proxy(&format!("http://user:secret@{}", proxy.addr))
+        .build()
+        .expect("agent");
+    let total = 1_500_000usize;
+    let mut body = io::repeat(b't').take(total as u64);
+    let text = agent
+        .post(&format!("https://localhost:{}/up", peer.port))
+        .send_stream(&mut body)
+        .expect("upload")
+        .text()
+        .expect("body");
+
+    assert_eq!(text, format!("got:{total}"));
+    assert_eq!(body.limit(), 0);
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.pool_stats().h2, 1);
+
+    let seen = seen.lock();
+
+    assert_eq!(
+        seen[0].line,
+        format!("CONNECT localhost:{} HTTP/1.1", peer.port)
+    );
+    assert_eq!(seen[0].proxy_authorization, "Basic dXNlcjpzZWNyZXQ=");
 }

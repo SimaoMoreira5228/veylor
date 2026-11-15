@@ -49,6 +49,8 @@ pub(crate) fn describes_body(name: &str) -> bool {
         "content-encoding",
         "content-language",
         "content-location",
+        "content-length",
+        "transfer-encoding",
         "digest",
     ]
     .iter()
@@ -75,6 +77,7 @@ mod tests {
         assert!(is_credential_header("cookie"));
         assert!(!is_credential_header("accept"));
         assert!(describes_body("Content-Type"));
+        assert!(describes_body("content-length"));
         assert!(!describes_body("accept"));
     }
 }

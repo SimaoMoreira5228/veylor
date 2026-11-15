@@ -67,39 +67,101 @@ where
 
 pub fn read_request(stream: &mut TcpStream) -> Option<Raw> {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
 
-    let end = loop {
+    let head_end = loop {
         if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
             break position + 4;
         }
 
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return None,
-            Ok(count) => buf.extend_from_slice(&chunk[..count]),
-        }
+        fill(stream, &mut buf)?;
     };
 
-    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let mut raw = Raw {
         head,
         body: Vec::new(),
     };
+    let mut cursor = head_end;
+
+    if raw
+        .header("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        loop {
+            let line = read_line(stream, &mut buf, &mut cursor)?;
+            let size = usize::from_str_radix(line.trim(), 16).ok()?;
+
+            if size == 0 {
+                while !read_line(stream, &mut buf, &mut cursor)?.is_empty() {}
+
+                break;
+            }
+
+            raw.body
+                .extend_from_slice(read_bytes(stream, &mut buf, &mut cursor, size)?);
+
+            read_line(stream, &mut buf, &mut cursor)?;
+        }
+
+        return Some(raw);
+    }
+
     let length = raw
         .header("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
 
-    raw.body = buf[end..].to_vec();
-
-    while raw.body.len() < length {
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return None,
-            Ok(count) => raw.body.extend_from_slice(&chunk[..count]),
-        }
-    }
+    raw.body = read_bytes(stream, &mut buf, &mut cursor, length)?.to_vec();
 
     Some(raw)
+}
+
+fn fill(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<()> {
+    let mut chunk = [0u8; 4096];
+
+    match stream.read(&mut chunk) {
+        Ok(0) | Err(_) => None,
+        Ok(count) => {
+            buf.extend_from_slice(&chunk[..count]);
+
+            Some(())
+        }
+    }
+}
+
+fn read_line(stream: &mut TcpStream, buf: &mut Vec<u8>, cursor: &mut usize) -> Option<String> {
+    loop {
+        if let Some(position) = buf[*cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        {
+            let end = *cursor + position;
+            let line = String::from_utf8_lossy(&buf[*cursor..end]).into_owned();
+
+            *cursor = end + 2;
+
+            return Some(line);
+        }
+
+        fill(stream, buf)?;
+    }
+}
+
+fn read_bytes<'a>(
+    stream: &mut TcpStream,
+    buf: &'a mut Vec<u8>,
+    cursor: &mut usize,
+    length: usize,
+) -> Option<&'a [u8]> {
+    while buf.len() < *cursor + length {
+        fill(stream, buf)?;
+    }
+
+    let start = *cursor;
+
+    *cursor += length;
+
+    Some(&buf[start..start + length])
 }
 
 pub fn respond(stream: &mut TcpStream, status: &str, headers: &[&str], body: &[u8]) {

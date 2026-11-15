@@ -1,4 +1,5 @@
 use std::io;
+use std::io::Read;
 use std::ops::Range;
 
 use veylor_client::{
@@ -15,6 +16,8 @@ const INITIAL_WRITE: usize = 8 * 1024;
 const BODY_WRITE: usize = 32 * 1024;
 const RETAINED_BUFFER: usize = 64 * 1024;
 const READ_CHUNK: usize = 16 * 1024;
+const UPLOAD_CHUNK: usize = 16 * 1024;
+const CHUNK_SLACK: usize = 16;
 const HEADER_SLOTS: usize = 64;
 const TRAILER_SLOTS: usize = 8;
 const MAX_HEADER_SLOTS: usize = 1024;
@@ -32,6 +35,7 @@ pub(crate) struct H1Conn {
     read: Vec<u8>,
     cursor: usize,
     write: Vec<u8>,
+    upload: Vec<u8>,
     headers: Box<[Header]>,
     trailers: Box<[Header]>,
     max_head: usize,
@@ -49,6 +53,7 @@ impl H1Conn {
             read: Vec::new(),
             cursor: 0,
             write: vec![0; INITIAL_WRITE],
+            upload: Vec::new(),
             headers: vec![Header::default(); HEADER_SLOTS].into_boxed_slice(),
             trailers: vec![Header::default(); TRAILER_SLOTS].into_boxed_slice(),
             max_head,
@@ -82,7 +87,11 @@ impl H1Conn {
         }
     }
 
-    pub(crate) fn send(&mut self, request: &Outgoing<'_>, budget: &Budget) -> io::Result<()> {
+    pub(crate) fn send(
+        &mut self,
+        request: &mut Outgoing<'_, '_>,
+        budget: &Budget,
+    ) -> io::Result<()> {
         self.read.clear();
         self.cursor = 0;
         self.eof = false;
@@ -98,7 +107,13 @@ impl H1Conn {
 
         self.exchange = ClientConnection::new(kind, b"");
 
-        if request.body.len() > INITIAL_WRITE && self.write.len() < BODY_WRITE {
+        let streaming = !request.payload.is_replayable();
+        let framing = Self::framing(request);
+
+        if !streaming
+            && request.payload.bytes().len() > INITIAL_WRITE
+            && self.write.len() < BODY_WRITE
+        {
             self.write.resize(BODY_WRITE, 0);
         }
 
@@ -110,17 +125,16 @@ impl H1Conn {
         });
 
         for (name, value) in request.headers {
+            if Self::is_framing_header(name) {
+                continue;
+            }
+
             fields.push(Field {
                 name: name.as_bytes(),
                 value: value.as_bytes(),
             });
         }
 
-        let framing = if request.expects_body() {
-            BodyFraming::Fixed(request.body.len() as u64)
-        } else {
-            BodyFraming::None
-        };
         let mut used = self.encode_head(request, &fields, framing)?;
 
         self.exchange
@@ -128,9 +142,42 @@ impl H1Conn {
             .map_err(client_error)?;
         self.wire.arm_write(budget)?;
 
+        used = if streaming {
+            self.send_streamed(request, framing, used, budget)?
+        } else {
+            self.send_buffered(request.payload.bytes(), used)?
+        };
+
+        self.wire.write_plain(&self.write[..used])
+    }
+
+    fn framing(request: &Outgoing<'_, '_>) -> BodyFraming {
+        if let Some(declared) = request.payload.declared() {
+            return BodyFraming::Fixed(declared);
+        }
+
+        if !request.payload.is_replayable() {
+            return BodyFraming::Chunked;
+        }
+
+        if request.expects_body() {
+            BodyFraming::Fixed(request.payload.bytes().len() as u64)
+        } else {
+            BodyFraming::None
+        }
+    }
+
+    // NOTE: the serializer derives framing from the body itself and rejects a caller-supplied
+    // content-length or transfer-encoding, so the header list must not carry them.
+    fn is_framing_header(name: &str) -> bool {
+        name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+    }
+
+    fn send_buffered(&mut self, body: &[u8], mut used: usize) -> io::Result<usize> {
         let mut offset = 0;
 
-        while offset < request.body.len() {
+        while offset < body.len() {
             if used == self.write.len() {
                 self.wire.write_plain(&self.write[..used])?;
                 used = 0;
@@ -138,7 +185,7 @@ impl H1Conn {
 
             let encoded = self
                 .exchange
-                .encode_request_body(&request.body[offset..], &mut self.write[used..])
+                .encode_request_body(&body[offset..], &mut self.write[used..])
                 .map_err(client_error)?;
 
             if encoded.written == 0 {
@@ -153,18 +200,118 @@ impl H1Conn {
             offset += encoded.written;
         }
 
-        if !request.body.is_empty() {
+        if !body.is_empty() {
             self.exchange
                 .finish_request_body(&[], &mut self.write[used..])
                 .map_err(client_error)?;
         }
 
-        self.wire.write_plain(&self.write[..used])
+        Ok(used)
+    }
+
+    fn send_streamed(
+        &mut self,
+        request: &mut Outgoing<'_, '_>,
+        framing: BodyFraming,
+        mut used: usize,
+        budget: &Budget,
+    ) -> io::Result<usize> {
+        if self.write.len() < BODY_WRITE {
+            self.write.resize(BODY_WRITE, 0);
+        }
+
+        if self.upload.len() < UPLOAD_CHUNK {
+            self.upload.resize(UPLOAD_CHUNK, 0);
+        }
+
+        let declared = request.payload.declared();
+        let mut remaining = declared;
+        let reader = request
+            .payload
+            .reader()
+            .ok_or_else(|| protocol("missing request body reader"))?;
+
+        loop {
+            let limit = match remaining {
+                Some(0) => break,
+                Some(left) => left.min(UPLOAD_CHUNK as u64) as usize,
+                None => UPLOAD_CHUNK,
+            };
+
+            if self.write.len() - used < UPLOAD_CHUNK + CHUNK_SLACK {
+                self.flush(&mut used, budget)?;
+            }
+
+            let read = read_available(&mut *reader, &mut self.upload[..limit])?;
+
+            if read == 0 {
+                let Some(left) = remaining.filter(|left| *left > 0) else {
+                    break;
+                };
+
+                return Err(protocol_body(format!(
+                    "request body ended {left} bytes before the declared content-length"
+                )));
+            }
+
+            used = encode_chunk(
+                &mut self.exchange,
+                &mut self.write,
+                &self.upload[..read],
+                used,
+            )?;
+
+            if let Some(left) = remaining.as_mut() {
+                *left -= read as u64;
+            }
+        }
+
+        if declared.is_some() {
+            let extra = read_available(&mut *reader, &mut self.upload[..1])?;
+
+            if extra > 0 {
+                return Err(protocol_body(
+                    "request body exceeded the declared content-length".to_owned(),
+                ));
+            }
+        }
+
+        if framing == BodyFraming::Chunked {
+            if self.write.len() - used < CHUNK_SLACK {
+                self.flush(&mut used, budget)?;
+            }
+
+            let finished = self
+                .exchange
+                .finish_request_body(&[], &mut self.write[used..])
+                .map_err(client_error)?;
+
+            self.exchange
+                .advance_request_write(finished.written)
+                .map_err(client_error)?;
+
+            used += finished.written;
+        }
+
+        Ok(used)
+    }
+
+    fn flush(&mut self, used: &mut usize, budget: &Budget) -> io::Result<()> {
+        if *used == 0 {
+            return Ok(());
+        }
+
+        self.wire.arm_write(budget)?;
+        self.wire.write_plain(&self.write[..*used])?;
+
+        *used = 0;
+
+        Ok(())
     }
 
     fn encode_head(
         &mut self,
-        request: &Outgoing<'_>,
+        request: &Outgoing<'_, '_>,
         fields: &[Field<'_>],
         framing: BodyFraming,
     ) -> io::Result<usize> {
@@ -392,10 +539,54 @@ fn slice(input: &[u8], span: Span) -> Option<&[u8]> {
     input.get(span.offset..span.offset.checked_add(span.length)?)
 }
 
+fn encode_chunk(
+    exchange: &mut ClientConnection<'static>,
+    write: &mut Vec<u8>,
+    chunk: &[u8],
+    mut used: usize,
+) -> io::Result<usize> {
+    loop {
+        let encoded = match exchange.encode_request_body(chunk, &mut write[used..]) {
+            Ok(encoded) => encoded,
+            Err(ClientError::BufferTooSmall { required }) => {
+                write.resize(used + required, 0);
+
+                continue;
+            }
+            Err(error) => return Err(client_error(error)),
+        };
+
+        if encoded.written == 0 {
+            return Err(protocol("request body made no progress"));
+        }
+
+        exchange
+            .advance_request_write(encoded.written)
+            .map_err(client_error)?;
+
+        used += encoded.written;
+
+        return Ok(used);
+    }
+}
+
+fn read_available(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
 fn client_error(error: ClientError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("client: {error:?}"))
 }
 
 fn protocol(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
+}
+
+fn protocol_body(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }

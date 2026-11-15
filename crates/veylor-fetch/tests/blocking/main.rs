@@ -6,5 +6,8 @@ mod json;
 mod mux_peer;
 mod proxy;
 mod redirects;
+mod stream_h1;
+mod stream_h2;
+mod stream_redirects;
 mod support;
 mod tls;

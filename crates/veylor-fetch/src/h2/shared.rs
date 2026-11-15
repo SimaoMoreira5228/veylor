@@ -14,8 +14,11 @@ pub(super) const STATE_OPEN: u8 = 0;
 pub(super) const STATE_DRAINING: u8 = 1;
 pub(super) const STATE_CLOSED: u8 = 2;
 
+pub(super) const UPLOAD_CHUNK: usize = 16 * 1024;
+
 const MAX_QUEUED: usize = 1_024;
 const CREDIT_REPORT: usize = 16 * 1024;
+const UPLOAD_CHUNKS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub(super) struct Failure {
@@ -118,7 +121,8 @@ impl DriverShared {
         command: Command,
         deadline: Option<Instant>,
     ) -> Result<Arc<StreamShared>, Refused> {
-        let stream = Arc::new(StreamShared::new(Arc::clone(self)));
+        let streaming = command.body.streaming();
+        let stream = Arc::new(StreamShared::new(Arc::clone(self), streaming));
         let mut core = self.core.lock();
 
         if !self.is_open() || core.closing {
@@ -155,6 +159,54 @@ pub(super) fn refused(failure: Failure) -> Refused {
     }
 }
 
+pub(super) struct Chunk {
+    pub(super) data: Vec<u8>,
+    pub(super) used: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UploadPhase {
+    Open,
+    Ended,
+    Aborted,
+}
+
+pub(super) enum Ticket {
+    Chunk(Chunk),
+    Stop,
+}
+
+struct UploadState {
+    free: Vec<Chunk>,
+    ready: VecDeque<Chunk>,
+    phase: UploadPhase,
+}
+
+impl UploadState {
+    fn new() -> Self {
+        let free = (0..UPLOAD_CHUNKS)
+            .map(|_| Chunk {
+                data: vec![0; UPLOAD_CHUNK],
+                used: 0,
+            })
+            .collect();
+
+        Self {
+            free,
+            ready: VecDeque::with_capacity(UPLOAD_CHUNKS),
+            phase: UploadPhase::Open,
+        }
+    }
+
+    fn requeue(&mut self) {
+        self.phase = UploadPhase::Aborted;
+
+        while let Some(chunk) = self.ready.pop_front() {
+            self.free.push(chunk);
+        }
+    }
+}
+
 enum End {
     Open,
     Complete,
@@ -167,11 +219,40 @@ struct StreamInner {
     start: usize,
     unreported: usize,
     end: End,
+    upload: Option<UploadState>,
+}
+
+enum Next {
+    Chunk(Chunk),
+    Stop,
+    Wait,
+    Failed(Failure),
 }
 
 impl StreamInner {
     fn held(&self) -> usize {
         self.body.len() - self.start
+    }
+
+    fn next_chunk(&mut self) -> Next {
+        let Some(upload) = self.upload.as_mut() else {
+            return Next::Stop;
+        };
+
+        if self.head.is_some() || upload.phase != UploadPhase::Open {
+            return Next::Stop;
+        }
+
+        match &self.end {
+            End::Failed(failure) => return Next::Failed(failure.clone()),
+            End::Complete => return Next::Stop,
+            End::Open => {}
+        }
+
+        match upload.free.pop() {
+            Some(chunk) => Next::Chunk(chunk),
+            None => Next::Wait,
+        }
     }
 }
 
@@ -185,7 +266,7 @@ pub(super) struct StreamShared {
 }
 
 impl StreamShared {
-    fn new(driver: Arc<DriverShared>) -> Self {
+    fn new(driver: Arc<DriverShared>, streaming: bool) -> Self {
         Self {
             inner: Mutex::new(StreamInner {
                 head: None,
@@ -193,6 +274,7 @@ impl StreamShared {
                 start: 0,
                 unreported: 0,
                 end: End::Open,
+                upload: streaming.then(UploadState::new),
             }),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
@@ -200,6 +282,91 @@ impl StreamShared {
             released: AtomicBool::new(false),
             driver,
         }
+    }
+
+    pub(super) fn take_chunk(self: &Arc<Self>, budget: &Budget) -> io::Result<Ticket> {
+        let limit = wait_limit(budget);
+        let mut guard = self.inner.lock();
+
+        loop {
+            match guard.next_chunk() {
+                Next::Chunk(chunk) => return Ok(Ticket::Chunk(chunk)),
+                Next::Stop => return Ok(Ticket::Stop),
+                Next::Failed(failure) => return Err(failure.to_io()),
+                Next::Wait => {}
+            }
+
+            if !self.wait(&mut guard, limit) {
+                drop(guard);
+                self.cancel();
+
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+        }
+    }
+
+    pub(super) fn push_chunk(self: &Arc<Self>, chunk: Chunk) -> bool {
+        let mut guard = self.inner.lock();
+        let open = matches!(guard.end, End::Open) && guard.head.is_none();
+        let Some(upload) = guard.upload.as_mut() else {
+            return false;
+        };
+
+        if !open || upload.phase != UploadPhase::Open {
+            upload.free.push(chunk);
+
+            return false;
+        }
+
+        upload.ready.push_back(chunk);
+        drop(guard);
+        self.mark_dirty();
+
+        true
+    }
+
+    pub(super) fn recycle(&self, chunk: Chunk) {
+        let mut guard = self.inner.lock();
+
+        if let Some(upload) = guard.upload.as_mut() {
+            upload.free.push(chunk);
+        }
+
+        drop(guard);
+        self.ready.notify_all();
+    }
+
+    pub(super) fn end_upload(self: &Arc<Self>) {
+        let mut guard = self.inner.lock();
+
+        if let Some(upload) = guard.upload.as_mut()
+            && upload.phase == UploadPhase::Open
+        {
+            upload.phase = UploadPhase::Ended;
+        }
+
+        drop(guard);
+        self.mark_dirty();
+    }
+
+    pub(super) fn abort_upload(self: &Arc<Self>) {
+        let mut guard = self.inner.lock();
+
+        if let Some(upload) = guard.upload.as_mut() {
+            upload.requeue();
+        }
+
+        drop(guard);
+        self.ready.notify_all();
+        self.mark_dirty();
+    }
+
+    pub(super) fn take_ready(&self) -> Option<Chunk> {
+        self.inner.lock().upload.as_mut()?.ready.pop_front()
+    }
+
+    pub(super) fn upload_phase(&self) -> Option<UploadPhase> {
+        self.inner.lock().upload.as_ref().map(|upload| upload.phase)
     }
 
     fn mark_dirty(self: &Arc<Self>) {

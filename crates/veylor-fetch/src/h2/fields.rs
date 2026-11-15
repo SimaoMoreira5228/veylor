@@ -33,9 +33,16 @@ pub(super) fn lowered(headers: &[(String, String)]) -> Vec<(String, String)> {
             !CONNECTION_SPECIFIC
                 .iter()
                 .any(|reserved| name.eq_ignore_ascii_case(reserved))
+                && !is_framing_header(name)
         })
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
         .collect()
+}
+
+// NOTE: the frame stream is authoritative for the body length, so a caller-supplied framing
+// header would either duplicate or contradict the one emitted from the body itself.
+fn is_framing_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
 pub(super) fn build<'a>(
@@ -67,17 +74,16 @@ pub(super) fn build<'a>(
         push(field(name.as_bytes(), value.as_bytes()))?;
     }
 
-    if command.expects_body {
-        push(field(
-            b"content-length",
-            length_digits(command.body.len(), digits),
-        ))?;
+    if command.expects_body
+        && let Some(length) = command.body.declared_length()
+    {
+        push(field(b"content-length", length_digits(length, digits)))?;
     }
 
     Ok((fields, used))
 }
 
-fn length_digits(mut value: usize, digits: &mut [u8; 20]) -> &[u8] {
+fn length_digits(mut value: u64, digits: &mut [u8; 20]) -> &[u8] {
     let mut start = digits.len();
 
     loop {

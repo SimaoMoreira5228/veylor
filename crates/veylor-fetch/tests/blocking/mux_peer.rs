@@ -35,6 +35,8 @@ pub struct Script {
     pub max_concurrent: Option<u32>,
     pub release_at: usize,
     pub goaway_at: Option<usize>,
+    pub reset_after: Option<usize>,
+    pub respond_at: Option<usize>,
     pub plan: Box<dyn Fn(usize) -> Plan + Send + Sync>,
 }
 
@@ -44,6 +46,8 @@ impl Script {
             max_concurrent: None,
             release_at: 0,
             goaway_at: None,
+            reset_after: None,
+            respond_at: None,
             plan: Box::new(plan),
         }
     }
@@ -244,9 +248,35 @@ impl Session {
             HEADERS => self.opened(id, flags & END_STREAM != 0),
             DATA => {
                 let length = payload.len();
+                let mut reset = false;
 
                 if let Some(stream) = self.streams.get_mut(&id) {
                     stream.got += length;
+                    reset = self
+                        .script
+                        .reset_after
+                        .is_some_and(|limit| stream.got >= limit);
+
+                    let early = stream.out.is_none()
+                        && self
+                            .script
+                            .respond_at
+                            .is_some_and(|limit| stream.got >= limit);
+
+                    if early {
+                        stream.out = Some(Out {
+                            headers_sent: false,
+                            remaining: 5,
+                            fill: 0,
+                            text: Some(b"early".to_vec()),
+                        });
+                    }
+                }
+
+                if reset {
+                    self.forget(id);
+
+                    return self.send(&frame(RST_STREAM, 0, id, &8u32.to_be_bytes()));
                 }
 
                 if length > 0 {

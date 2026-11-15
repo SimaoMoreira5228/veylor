@@ -6,10 +6,11 @@ use veylor_client::h2::{
     SETTINGS_INITIAL_WINDOW_SIZE, SettingsParameter, WriteOut,
 };
 
+use super::Body;
 use super::MAX_STREAMS;
-use super::driver::{Active, Driver};
+use super::driver::{Active, Driver, Uplink};
 use super::fields;
-use super::shared::{Failure, Pending, STATE_OPEN};
+use super::shared::{Failure, Pending, STATE_OPEN, UploadPhase};
 use crate::budget::Budget;
 
 pub(super) const STREAM_WINDOW: u32 = 128 * 1024;
@@ -248,7 +249,7 @@ impl Driver<'_, '_> {
             command,
             deadline,
         } = pending;
-        let end_stream = command.body.is_empty();
+        let end_stream = command.body.ends_at_head();
         let mut digits = [0u8; 20];
         let started = match fields::build(&command, &mut digits) {
             Ok((built, used)) => {
@@ -300,12 +301,19 @@ impl Driver<'_, '_> {
             ));
         }
 
+        let uplink = match command.body {
+            Body::Buffered(data) => Uplink::Buffered { data, sent: 0 },
+            Body::Stream { .. } => Uplink::Stream {
+                chunk: None,
+                sent: 0,
+            },
+        };
+
         self.out_len += started.written;
         self.streams.push(Active {
             id: started.stream_id,
             shared: stream,
-            body: command.body,
-            sent: 0,
+            uplink,
             local_ended: end_stream,
             remote_ended: false,
             deadline,
@@ -344,21 +352,24 @@ impl Driver<'_, '_> {
     }
 
     fn write_stream_data(&mut self, index: usize) -> Result<bool, Failure> {
+        if self.streams[index].local_ended {
+            return Ok(false);
+        }
+
+        if self.streams[index].uplink.streaming() {
+            self.write_upload(index)
+        } else {
+            self.write_buffered(index)
+        }
+    }
+
+    fn write_buffered(&mut self, index: usize) -> Result<bool, Failure> {
         let active = &self.streams[index];
-
-        if active.local_ended {
-            return Ok(false);
-        }
-
         let id = active.id;
-        let remaining = active.body.len() - active.sent;
-
-        if remaining > 0 && self.conn.send_credit(id) == 0 {
+        let Uplink::Buffered { data, sent } = &active.uplink else {
             return Ok(false);
-        }
-
-        let active = &mut self.streams[index];
-        let input = &active.body[active.sent..];
+        };
+        let input = &data[*sent..];
         let output = &mut self.out[self.out_len..];
         let outcome = self.conn.send_data(id, input, true, output);
 
@@ -372,14 +383,129 @@ impl Driver<'_, '_> {
                 }
 
                 self.out_len += sent.written;
-                active.sent += sent.consumed;
-                active.local_ended |= sent.end_stream;
+
+                let Uplink::Buffered { sent: used, .. } = &mut self.streams[index].uplink else {
+                    return Ok(false);
+                };
+
+                *used += sent.consumed;
+                self.streams[index].local_ended |= sent.end_stream;
 
                 Ok(sent.consumed > 0 || sent.written > 0)
             }
             Err(H2ClientError::WouldBlock | H2ClientError::BufferTooSmall { .. }) => Ok(false),
             Err(_) => {
                 let failure = Failure::new(io::ErrorKind::Other, "h2 request body rejected");
+
+                self.kill_stream(index, failure, Some(ErrorCode::Cancel));
+
+                Ok(true)
+            }
+        }
+    }
+
+    // NOTE: the uploader owns the buffers, so the driver only pulls a chunk once there is credit
+    // to send it. Holding at most one chunk plus the uploader's slots bounds the upload memory.
+    fn write_upload(&mut self, index: usize) -> Result<bool, Failure> {
+        let id = self.streams[index].id;
+
+        if self.streams[index].shared.upload_phase() == Some(UploadPhase::Aborted) {
+            if let Some(chunk) = self.streams[index].uplink.drop_chunk() {
+                self.streams[index].shared.recycle(chunk);
+            }
+
+            return self.end_upload(index);
+        }
+
+        if matches!(
+            self.streams[index].uplink,
+            Uplink::Stream { chunk: None, .. }
+        ) {
+            if self.conn.send_credit(id) == 0 {
+                return Ok(false);
+            }
+
+            match self.streams[index].shared.take_ready() {
+                Some(chunk) => self.streams[index].uplink.hold_chunk(chunk),
+                None => return self.end_upload(index),
+            }
+        }
+
+        let outcome = {
+            let active = &mut self.streams[index];
+            let Uplink::Stream {
+                chunk: Some(chunk),
+                sent,
+            } = &mut active.uplink
+            else {
+                return Ok(false);
+            };
+            let output = &mut self.out[self.out_len..];
+            let input = &chunk.data[*sent..chunk.used];
+
+            self.conn.send_data(id, input, false, output)
+        };
+
+        match outcome {
+            Ok(sent) => {
+                if self.conn.acknowledge(sent.written).is_err() {
+                    return Err(Failure::new(
+                        io::ErrorKind::Other,
+                        "h2 write bookkeeping failed",
+                    ));
+                }
+
+                self.out_len += sent.written;
+
+                if let Uplink::Stream { sent: used, .. } = &mut self.streams[index].uplink {
+                    *used += sent.consumed;
+                }
+
+                if let Some(chunk) = self.streams[index].uplink.take_sent_chunk() {
+                    self.streams[index].shared.recycle(chunk);
+                }
+
+                Ok(sent.consumed > 0 || sent.written > 0)
+            }
+            Err(H2ClientError::WouldBlock | H2ClientError::BufferTooSmall { .. }) => Ok(false),
+            Err(_) => {
+                let failure = Failure::new(io::ErrorKind::Other, "h2 request body rejected");
+
+                self.kill_stream(index, failure, Some(ErrorCode::Cancel));
+
+                Ok(true)
+            }
+        }
+    }
+
+    fn end_upload(&mut self, index: usize) -> Result<bool, Failure> {
+        let phase = self.streams[index].shared.upload_phase();
+        let ending = matches!(phase, Some(UploadPhase::Ended) | Some(UploadPhase::Aborted));
+
+        if !ending {
+            return Ok(false);
+        }
+
+        let id = self.streams[index].id;
+        let output = &mut self.out[self.out_len..];
+
+        match self.conn.send_data(id, &[], true, output) {
+            Ok(sent) => {
+                if self.conn.acknowledge(sent.written).is_err() {
+                    return Err(Failure::new(
+                        io::ErrorKind::Other,
+                        "h2 write bookkeeping failed",
+                    ));
+                }
+
+                self.out_len += sent.written;
+                self.streams[index].local_ended = true;
+
+                Ok(true)
+            }
+            Err(H2ClientError::WouldBlock | H2ClientError::BufferTooSmall { .. }) => Ok(false),
+            Err(_) => {
+                let failure = Failure::new(io::ErrorKind::Other, "h2 request body could not end");
 
                 self.kill_stream(index, failure, Some(ErrorCode::Cancel));
 

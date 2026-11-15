@@ -10,7 +10,7 @@ use veylor_client::h2::{
 };
 
 use super::shared::{
-    DriverShared, Failure, STATE_CLOSED, STATE_DRAINING, STATE_OPEN, StreamShared,
+    Chunk, DriverShared, Failure, STATE_CLOSED, STATE_DRAINING, STATE_OPEN, StreamShared,
 };
 use super::{H2Settings, MAX_STREAMS};
 use crate::wire::Wire;
@@ -53,11 +53,52 @@ impl Outbox {
     }
 }
 
+pub(super) enum Uplink {
+    Buffered { data: Vec<u8>, sent: usize },
+    Stream { chunk: Option<Chunk>, sent: usize },
+}
+
+impl Uplink {
+    pub(super) fn streaming(&self) -> bool {
+        matches!(self, Self::Stream { .. })
+    }
+
+    pub(super) fn hold_chunk(&mut self, next: Chunk) {
+        if let Self::Stream { chunk, sent } = self {
+            *chunk = Some(next);
+            *sent = 0;
+        }
+    }
+
+    pub(super) fn drop_chunk(&mut self) -> Option<Chunk> {
+        let Self::Stream { chunk, sent } = self else {
+            return None;
+        };
+
+        *sent = 0;
+
+        chunk.take()
+    }
+
+    pub(super) fn take_sent_chunk(&mut self) -> Option<Chunk> {
+        let Self::Stream { chunk, sent } = self else {
+            return None;
+        };
+
+        if !chunk.as_ref().is_some_and(|chunk| *sent >= chunk.used) {
+            return None;
+        }
+
+        *sent = 0;
+
+        chunk.take()
+    }
+}
+
 pub(super) struct Active {
     pub(super) id: u32,
     pub(super) shared: Arc<StreamShared>,
-    pub(super) body: Vec<u8>,
-    pub(super) sent: usize,
+    pub(super) uplink: Uplink,
     pub(super) local_ended: bool,
     pub(super) remote_ended: bool,
     pub(super) deadline: Option<Instant>,

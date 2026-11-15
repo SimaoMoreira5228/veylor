@@ -11,7 +11,7 @@ use crate::error::{Error, TimeoutKind};
 use crate::h1::H1Conn;
 use crate::h2::{H2Handle, H2Settings};
 use crate::method::Method;
-use crate::outgoing::Outgoing;
+use crate::outgoing::{Outgoing, Payload};
 use crate::pool::{Pool, PoolStats, Route};
 use crate::protocol::Protocol;
 use crate::proxy::{self, Proxy};
@@ -114,7 +114,7 @@ impl Agent {
         method: Method,
         url: Url,
         mut headers: Vec<(String, String)>,
-        body: &[u8],
+        payload: Payload<'_>,
         timeout: Option<Duration>,
     ) -> Result<Response, Error> {
         let config = &self.inner.config;
@@ -129,7 +129,7 @@ impl Agent {
 
         let mut method = method;
         let mut url = url;
-        let mut body = body;
+        let mut payload = payload;
         let mut redirects = 0;
 
         loop {
@@ -137,7 +137,8 @@ impl Agent {
 
             self.apply_proxy_auth(&route, &mut headers);
 
-            let mut response = self.round_trip(&method, &url, &route, &headers, body, &budget)?;
+            let mut response =
+                self.round_trip(&method, &url, &route, &headers, &mut payload, &budget)?;
             let location = redirect_location(&response);
 
             let Some(location) = location.filter(|_| config.redirect.limit() > 0) else {
@@ -155,12 +156,18 @@ impl Agent {
                 .map_err(|message| Error::InvalidUrl(message.to_owned()))?;
             let status = response.status();
 
+            if !redirect::rewrites_to_get(status, &method) && !payload.is_replayable() {
+                return Err(Error::InvalidRequest(
+                    "cannot replay a streamed request body across a redirect".to_owned(),
+                ));
+            }
+
             response.discard();
             drop(response);
 
             if redirect::rewrites_to_get(status, &method) {
                 method = Method::Get;
-                body = &[];
+                payload = Payload::Buffered(&[]);
                 headers.retain(|(name, _)| !redirect::describes_body(name));
             }
 
@@ -263,7 +270,7 @@ impl Agent {
         url: &Url,
         route: &Route,
         headers: &[(String, String)],
-        body: &[u8],
+        payload: &mut Payload<'_>,
         budget: &Budget,
     ) -> Result<Response, Error> {
         let host = url.origin().host_header();
@@ -271,19 +278,24 @@ impl Agent {
             Route::Forward(_) => url.as_str(),
             _ => url.target(),
         };
-        let request = Outgoing {
+        let attempts = if payload.is_replayable() {
+            MAX_ATTEMPTS
+        } else {
+            1
+        };
+        let mut request = Outgoing {
             method,
             host: &host,
             target,
             headers,
-            body,
+            payload,
         };
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..attempts {
             let reuse = attempt + 1 < MAX_ATTEMPTS;
             let (conn, reused) = self.checkout(route, budget, reuse)?;
 
-            match self.exchange(conn, &request, url, route, budget) {
+            match self.exchange(conn, &mut request, url, route, budget) {
                 Ok(response) => return self.proxy_status(route, response),
                 Err(failed)
                     if reused
@@ -419,7 +431,7 @@ impl Agent {
     fn exchange(
         &self,
         conn: Conn,
-        request: &Outgoing<'_>,
+        request: &mut Outgoing<'_, '_>,
         url: &Url,
         route: &Route,
         budget: &Budget,
@@ -433,7 +445,7 @@ impl Agent {
     fn exchange_h1(
         &self,
         mut conn: Box<H1Conn>,
-        request: &Outgoing<'_>,
+        request: &mut Outgoing<'_, '_>,
         url: &Url,
         route: &Route,
         budget: &Budget,
@@ -465,7 +477,7 @@ impl Agent {
     fn exchange_h2(
         &self,
         handle: Arc<H2Handle>,
-        request: &Outgoing<'_>,
+        request: &mut Outgoing<'_, '_>,
         url: &Url,
         budget: &Budget,
     ) -> Result<Response, Failed> {
@@ -494,7 +506,7 @@ impl Agent {
         protocol: Protocol,
         headers: crate::headers::Headers,
         url: &Url,
-        request: &Outgoing<'_>,
+        request: &Outgoing<'_, '_>,
         body: Body,
     ) -> Response {
         let max_body = self.inner.config.max_body_size;

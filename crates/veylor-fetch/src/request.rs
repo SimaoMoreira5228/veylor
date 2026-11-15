@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::time::Duration;
 
 use crate::agent::Agent;
@@ -5,6 +6,7 @@ use crate::auth;
 use crate::error::Error;
 use crate::headers::check as check_header;
 use crate::method::Method;
+use crate::outgoing::Payload;
 use crate::percent;
 use crate::response::Response;
 use crate::url::Url;
@@ -84,6 +86,10 @@ impl Request {
         self.dispatch(body)
     }
 
+    pub fn send_stream<R: Read>(self, reader: &mut R) -> Result<Response, Error> {
+        self.dispatch_stream(reader)
+    }
+
     pub fn send_string(self, body: &str) -> Result<Response, Error> {
         self.default_type("text/plain; charset=utf-8")
             .dispatch(body.as_bytes())
@@ -131,6 +137,31 @@ impl Request {
     }
 
     fn dispatch(self, body: &[u8]) -> Result<Response, Error> {
+        let prepared = self.prepare()?;
+
+        prepared.agent.execute(
+            prepared.method,
+            prepared.url,
+            prepared.headers,
+            Payload::Buffered(body),
+            prepared.timeout,
+        )
+    }
+
+    fn dispatch_stream<R: Read>(self, reader: &mut R) -> Result<Response, Error> {
+        let prepared = self.prepare()?;
+        let declared = declared_length(&prepared.headers)?;
+
+        prepared.agent.execute(
+            prepared.method,
+            prepared.url,
+            prepared.headers,
+            Payload::Stream { reader, declared },
+            prepared.timeout,
+        )
+    }
+
+    fn prepare(self) -> Result<Prepared, Error> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -140,7 +171,44 @@ impl Request {
 
         url.append_query(&self.query);
 
-        self.agent
-            .execute(self.method, url, self.headers, body, self.timeout)
+        Ok(Prepared {
+            agent: self.agent,
+            method: self.method,
+            url,
+            headers: self.headers,
+            timeout: self.timeout,
+        })
     }
+}
+
+struct Prepared {
+    agent: Agent,
+    method: Method,
+    url: Url,
+    headers: Vec<(String, String)>,
+    timeout: Option<Duration>,
+}
+
+fn declared_length(headers: &[(String, String)]) -> Result<Option<u64>, Error> {
+    let mut declared = None;
+
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+
+        let length = value.trim().parse::<u64>().map_err(|_| {
+            Error::InvalidRequest("content-length must be a decimal byte count".to_owned())
+        })?;
+
+        if declared.is_some_and(|existing| existing != length) {
+            return Err(Error::InvalidRequest(
+                "conflicting content-length headers".to_owned(),
+            ));
+        }
+
+        declared = Some(length);
+    }
+
+    Ok(declared)
 }
