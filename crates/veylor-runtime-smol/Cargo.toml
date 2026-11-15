@@ -8,8 +8,13 @@ rust-version.workspace = true
 [dependencies]
 smol = "2"
 veylor-client = { version = "0.1.0", path = "../veylor-client" }
+veylor-client-driver = { version = "0.1.0", path = "../veylor-client-driver" }
 veylor-http1 = { version = "0.1.0", path = "../veylor-http1" }
 veylor-server-conn = { version = "0.1.0", path = "../veylor-server-conn" }
+veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
+
+[dev-dependencies]
+veylor-server = { version = "0.1.0", path = "../veylor-server" }
 
 [lints]
 workspace = true

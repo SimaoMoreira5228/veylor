@@ -1,9 +1,5 @@
-use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-
-use tokio::io::{AsyncRead, ReadBuf};
 
 use super::error::H2Error;
 use super::headers::HeaderList;
@@ -57,24 +53,6 @@ impl H2Body {
 
     pub fn trailers(&mut self) -> Option<HeaderList> {
         self.shared.take_trailers()
-    }
-}
-
-impl AsyncRead for H2Body {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let output = buffer.initialize_unfilled();
-        match self.shared.poll_read(context, output) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(count)) => {
-                buffer.advance(count);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
-        }
     }
 }
 

@@ -95,6 +95,7 @@ pub struct Stream {
     pub state: StreamState,
     pub send_window: FlowWindow,
     pub receive_window: FlowWindow,
+    pub locally_reset: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,6 +288,7 @@ impl<'a> StreamTable<'a> {
             self.active_streams -= 1;
         }
         stream.state = StreamState::Closed;
+        stream.locally_reset = true;
         true
     }
 
@@ -396,6 +398,12 @@ impl<'a> StreamTable<'a> {
 
         let action = if let Some(index) = self.find_index(header.stream_id) {
             let current = self.slots[index].stream.unwrap();
+            if current.locally_reset
+                && direction == FrameDirection::Received
+                && !matches!(kind, FrameType::Headers | FrameType::Continuation)
+            {
+                return StreamAction::IGNORE;
+            }
             let transition = stream_state_on_frame(current.state, kind, header.flags, direction);
             if transition.action.kind == StreamActionKind::Accept {
                 if is_active(current.state) != is_active(transition.next_state) {
@@ -648,6 +656,7 @@ impl<'a> StreamTable<'a> {
             state,
             send_window,
             receive_window,
+            locally_reset: false,
         };
 
         if self.used < self.slots.len() {

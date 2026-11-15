@@ -3,7 +3,9 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use veylor_client::h2::ErrorCode;
-use veylor_runtime_tokio::{H2Client, H2Config, H2Error, H2Request, H2Response, TimeoutKind};
+use veylor_runtime_tokio::{
+    H2Client, H2Config, H2Error, H2Request, H2Response, TimeoutKind, connect_h2,
+};
 
 use super::peer::{
     ACK, DATA, GOAWAY, HEADERS, PING, Peer, RST_STREAM, SETTING_INITIAL_WINDOW_SIZE,
@@ -12,7 +14,7 @@ use super::peer::{
 
 async fn setup(config: H2Config, settings: &[(u16, u32)]) -> (H2Client, Peer) {
     let (listener, addr) = listen().await;
-    let (client, accepted) = tokio::join!(H2Client::connect(addr, config), Peer::accept(&listener));
+    let (client, accepted) = tokio::join!(connect_h2(addr, config), Peer::accept(&listener));
     let mut peer = accepted;
     peer.handshake(settings).await;
     (client.expect("connect"), peer)
@@ -398,7 +400,7 @@ async fn silent_peer_fails_the_handshake_deadline() {
         handshake_timeout: Duration::from_millis(150),
         ..H2Config::default()
     };
-    let (client, _peer) = tokio::join!(H2Client::connect(addr, config), Peer::accept(&listener));
+    let (client, _peer) = tokio::join!(connect_h2(addr, config), Peer::accept(&listener));
     let client = client.expect("connect");
 
     let error = client

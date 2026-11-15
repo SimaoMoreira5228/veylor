@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use veylor_client::h2::ErrorCode;
-use veylor_runtime_tokio::{H2Client, H2Config, H2Error, H2Request, H2Response};
+use veylor_runtime_tokio::{H2Client, H2Config, H2Error, H2Request, H2Response, connect_h2};
 
 use super::peer::{DATA, END_HEADERS, END_STREAM, HEADERS, Peer, RST_STREAM, listen};
 
@@ -11,7 +11,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 async fn setup(config: H2Config, settings: &[(u16, u32)]) -> (H2Client, Peer) {
     let (listener, addr) = listen().await;
-    let (client, accepted) = tokio::join!(H2Client::connect(addr, config), Peer::accept(&listener));
+    let (client, accepted) = tokio::join!(connect_h2(addr, config), Peer::accept(&listener));
     let mut peer = accepted;
     peer.handshake(settings).await;
     (client.expect("connect"), peer)

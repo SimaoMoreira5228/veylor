@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
+use event_listener::Event;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
 
 use super::error::H2Error;
 use super::headers::HeaderList;
@@ -17,7 +17,7 @@ struct UploadBuffer {
 
 pub(crate) struct Upload {
     buffer: Mutex<UploadBuffer>,
-    space: Notify,
+    space: Event,
     driver: OnceLock<Arc<DriverShared>>,
     capacity: usize,
 }
@@ -39,7 +39,7 @@ impl Upload {
                 aborted: false,
                 trailers: None,
             }),
-            space: Notify::new(),
+            space: Event::new(),
             driver: OnceLock::new(),
             capacity,
         }
@@ -58,7 +58,7 @@ impl Upload {
 
     fn wake_driver(&self) {
         if let Some(driver) = self.driver.get() {
-            driver.notify.notify_one();
+            driver.notify.notify(1);
         }
     }
 
@@ -76,7 +76,7 @@ impl Upload {
                 buffer.data.clear();
                 buffer.start = 0;
             }
-            self.space.notify_one();
+            self.space.notify(1);
         }
         if finished && buffer.start == buffer.data.len() {
             return match buffer.trailers.take() {
@@ -94,7 +94,7 @@ impl Upload {
 
     pub(crate) fn abort(&self) {
         self.buffer.lock().aborted = true;
-        self.space.notify_one();
+        self.space.notify(1);
     }
 }
 
@@ -114,7 +114,7 @@ impl UploadSender {
             return Err(H2Error::Closed);
         };
         while !data.is_empty() {
-            let waiting = upload.space.notified();
+            let waiting = upload.space.listen();
             let taken = {
                 let mut buffer = upload.buffer.lock();
                 if buffer.aborted {

@@ -2,19 +2,18 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use veylor_tls::{
     TlsConn, alpn, drain_plaintext, feed_ciphertext, flush_ciphertext, queue_close_notify,
 };
 
-use crate::client_conn::{protocol, tls_error};
+use crate::h1::{protocol, tls_error};
 
 const READ_CHUNK: usize = 16 * 1024 + 512;
 const WRITE_CHUNK: usize = 16 * 1024;
 
-pub struct TlsStream {
-    socket: TcpStream,
+pub struct TlsStream<S> {
+    socket: S,
     tls: Box<TlsConn>,
     cipher_in: Vec<u8>,
     plain: Vec<u8>,
@@ -25,8 +24,8 @@ pub struct TlsStream {
     closing: bool,
 }
 
-impl TlsStream {
-    pub fn new(socket: TcpStream, tls: TlsConn) -> Self {
+impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream<S> {
+    pub fn new(socket: S, tls: TlsConn) -> Self {
         Self {
             socket,
             tls: Box::new(tls),
@@ -65,7 +64,7 @@ impl TlsStream {
         alpn(&self.tls)
     }
 
-    pub fn into_parts(self) -> (TcpStream, Box<TlsConn>) {
+    pub fn into_parts(self) -> (S, Box<TlsConn>) {
         (self.socket, self.tls)
     }
 
@@ -119,33 +118,29 @@ impl TlsStream {
     }
 }
 
-impl AsyncRead for TlsStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
         loop {
             if this.plain_pos < this.plain.len() {
-                let take = (this.plain.len() - this.plain_pos).min(buf.remaining());
+                let take = (this.plain.len() - this.plain_pos).min(buf.len());
 
-                buf.put_slice(&this.plain[this.plain_pos..this.plain_pos + take]);
+                buf[..take].copy_from_slice(&this.plain[this.plain_pos..this.plain_pos + take]);
                 this.plain_pos += take;
 
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(take));
             }
 
             if this.eof {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(0));
             }
 
-            let mut raw = ReadBuf::new(&mut this.cipher_in);
-
-            ready!(Pin::new(&mut this.socket).poll_read(cx, &mut raw))?;
-
-            let read = raw.filled().len();
+            let read = ready!(Pin::new(&mut this.socket).poll_read(cx, &mut this.cipher_in))?;
 
             if read == 0 {
                 this.eof = true;
@@ -162,7 +157,7 @@ impl AsyncRead for TlsStream {
     }
 }
 
-impl AsyncWrite for TlsStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -191,7 +186,7 @@ impl AsyncWrite for TlsStream {
         Pin::new(&mut this.socket).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         if !this.closing {
@@ -201,6 +196,6 @@ impl AsyncWrite for TlsStream {
 
         ready!(this.poll_flush_out(cx))?;
 
-        Pin::new(&mut this.socket).poll_shutdown(cx)
+        Pin::new(&mut this.socket).poll_close(cx)
     }
 }

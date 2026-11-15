@@ -1,13 +1,13 @@
 use std::io;
 
-use crate::client_conn::protocol as protocol_error;
-use crate::client_pool::{H2Ticket, Lease, Protocol};
-use crate::h2_client::{H2Body, H2Error, HeaderIter, HeaderList};
+use crate::h1::{H1Conn, protocol as protocol_error};
+use crate::h2::{H2Body, H2Error, HeaderIter, HeaderList};
+use crate::pool::{H2Ticket, Lease, Protocol};
 
 const CHUNK: usize = 16 * 1024;
 
-enum Body {
-    Http1(Lease),
+enum Body<C: H1Conn> {
+    Http1(Lease<C>),
     Http2 {
         body: H2Body,
         scratch: Vec<u8>,
@@ -15,10 +15,10 @@ enum Body {
     },
 }
 
-pub struct ResponseStream {
+pub struct ResponseStream<C: H1Conn> {
     status: u16,
     headers: HeaderList,
-    body: Body,
+    body: Body<C>,
 }
 
 pub struct ClientResponse {
@@ -29,8 +29,8 @@ pub struct ClientResponse {
     pub body: Vec<u8>,
 }
 
-impl ResponseStream {
-    pub(crate) fn http1(status: u16, headers: HeaderList, lease: Lease) -> Self {
+impl<C: H1Conn> ResponseStream<C> {
+    pub fn http1(status: u16, headers: HeaderList, lease: Lease<C>) -> Self {
         Self {
             status,
             headers,
@@ -38,7 +38,7 @@ impl ResponseStream {
         }
     }
 
-    pub(crate) fn http2(status: u16, headers: HeaderList, body: H2Body, ticket: H2Ticket) -> Self {
+    pub fn http2(status: u16, headers: HeaderList, body: H2Body, ticket: H2Ticket) -> Self {
         Self {
             status,
             headers,
@@ -71,7 +71,7 @@ impl ResponseStream {
 
     pub fn alpn(&self) -> Option<&[u8]> {
         match &self.body {
-            Body::Http1(lease) => lease.conn_ref().alpn(),
+            Body::Http1(lease) => lease.conn_ref().exchange().alpn(),
             Body::Http2 { .. } => Some(b"h2"),
         }
     }
@@ -97,7 +97,7 @@ impl ResponseStream {
 
     pub fn trailers(&mut self) -> Option<HeaderList> {
         match &mut self.body {
-            Body::Http1(lease) => lease.conn().take_trailers(),
+            Body::Http1(lease) => lease.conn().exchange_mut().take_trailers(),
             Body::Http2 { body, .. } => body.trailers(),
         }
     }

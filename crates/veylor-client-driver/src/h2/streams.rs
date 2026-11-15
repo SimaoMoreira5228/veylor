@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::time::Instant;
+use std::time::Instant;
 use veylor_client::h2::ErrorCode;
 
 use super::headers::HeaderList;

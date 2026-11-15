@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use veylor_runtime_tokio::{H2Client, H2Config, H2Error, H2Request};
+use veylor_runtime_tokio::{H2Client, H2Config, H2Error, H2Request, connect_h2};
 use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig};
 
 #[path = "h2_client/limits.rs"]
@@ -19,7 +19,8 @@ fn pattern(length: usize) -> Vec<u8> {
 }
 
 fn fixture_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let dir =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("fixture dir");
     std::fs::write(dir.join("big.bin"), pattern(BIG_FILE_BYTES)).expect("big file");
@@ -51,7 +52,7 @@ fn managed_server(name: &str) -> RunningServer {
 
 async fn connect(server: &RunningServer, config: H2Config) -> H2Client {
     let addr = server.h2c_addr().expect("h2c");
-    H2Client::connect(addr, config).await.expect("connect")
+    connect_h2(addr, config).await.expect("connect")
 }
 
 async fn shutdown(client: H2Client, server: RunningServer) {

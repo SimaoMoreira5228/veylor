@@ -1,12 +1,7 @@
-use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, ToSocketAddrs};
-
 use super::config::H2Config;
-use super::driver;
 use super::error::H2Error;
 use super::request::H2Request;
 use super::response::{H2Body, H2Response};
@@ -16,25 +11,24 @@ pub struct H2Client {
     shared: Arc<DriverShared>,
 }
 
-impl H2Client {
-    pub async fn connect(addr: impl ToSocketAddrs, config: H2Config) -> io::Result<Self> {
-        let socket = TcpStream::connect(addr).await?;
-        socket.set_nodelay(true)?;
-        Ok(Self::with_io(socket, config))
-    }
+pub struct H2Start {
+    pub(super) config: H2Config,
+    pub(super) shared: Arc<DriverShared>,
+}
 
-    pub fn with_io<S>(io: S, config: H2Config) -> Self
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
+impl H2Client {
+    pub fn new(config: H2Config) -> (Self, H2Start) {
         let config = config.normalized();
         let shared = DriverShared::new(
             config.max_pending_requests,
             config.stream_timeout,
             config.max_concurrent_streams,
         );
-        tokio::spawn(driver::run(io, config, shared.clone()));
-        Self { shared }
+        let client = Self {
+            shared: shared.clone(),
+        };
+
+        (client, H2Start { config, shared })
     }
 
     pub async fn send(&self, request: H2Request) -> Result<H2Response, H2Error> {
@@ -58,9 +52,9 @@ impl H2Client {
 
     pub async fn close(&self) {
         self.shared.close_requested.store(true, Ordering::Release);
-        self.shared.notify.notify_one();
+        self.shared.notify.notify(1);
         loop {
-            let exited = self.shared.exited.notified();
+            let exited = self.shared.exited.listen();
             if self.shared.state.load(Ordering::Acquire) == STATE_CLOSED {
                 return;
             }
@@ -81,7 +75,7 @@ impl Clone for H2Client {
 impl Drop for H2Client {
     fn drop(&mut self) {
         if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.notify.notify_one();
+            self.shared.notify.notify(1);
         }
     }
 }

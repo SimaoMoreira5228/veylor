@@ -2,11 +2,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use event_listener::Event;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
-use tokio::time::Instant;
 
 use super::error::H2Error;
 use super::headers::HeaderList;
@@ -23,8 +22,8 @@ pub(crate) struct Pending {
 }
 
 pub(crate) struct DriverShared {
-    pub(crate) notify: Notify,
-    pub(crate) exited: Notify,
+    pub(crate) notify: Event,
+    pub(crate) exited: Event,
     pub(crate) queue: Mutex<VecDeque<Pending>>,
     pub(crate) dirty: Mutex<Vec<Arc<StreamShared>>>,
     pub(crate) held_total: AtomicUsize,
@@ -43,8 +42,8 @@ impl DriverShared {
         stream_limit: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
-            notify: Notify::new(),
-            exited: Notify::new(),
+            notify: Event::new(),
+            exited: Event::new(),
             queue: Mutex::new(VecDeque::with_capacity(queue_cap)),
             dirty: Mutex::new(Vec::new()),
             held_total: AtomicUsize::new(0),
@@ -86,7 +85,7 @@ impl DriverShared {
             deadline,
         });
         drop(queue);
-        self.notify.notify_one();
+        self.notify.notify(1);
         Ok(stream)
     }
 }
@@ -146,7 +145,7 @@ impl StreamShared {
         if !self.dirty.swap(true, Ordering::AcqRel) {
             self.driver.dirty.lock().push(self.clone());
         }
-        self.driver.notify.notify_one();
+        self.driver.notify.notify(1);
     }
 
     pub(crate) fn clear_dirty(&self) {

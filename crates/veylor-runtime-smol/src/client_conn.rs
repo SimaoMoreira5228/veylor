@@ -1,0 +1,183 @@
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::task::{Context, Poll, Waker};
+
+use smol::Async;
+use smol::io::{AsyncReadExt, AsyncWriteExt};
+use veylor_client::Field;
+use veylor_client_driver::{
+    Deadlines, Event, H1Conn, H1Exchange, ResponseHead, Step, TlsConn, protocol,
+};
+use veylor_tls::queue_close_notify;
+
+use crate::deadline::within;
+
+pub struct Connection {
+    socket: Async<TcpStream>,
+    exchange: H1Exchange,
+    deadlines: Deadlines,
+}
+
+impl Connection {
+    pub fn new(
+        socket: Async<TcpStream>,
+        tls: Option<Box<TlsConn>>,
+        alpn: Option<Vec<u8>>,
+        deadlines: Deadlines,
+    ) -> Self {
+        Self {
+            socket,
+            exchange: H1Exchange::new(tls, alpn, deadlines.max_head),
+            deadlines,
+        }
+    }
+
+    pub async fn send_request(
+        &mut self,
+        method: &[u8],
+        target: &[u8],
+        headers: &[Field<'_>],
+        body: &[u8],
+    ) -> io::Result<()> {
+        self.exchange.begin(method)?;
+
+        let head = self
+            .exchange
+            .encode_head(method, target, headers, body.len())?;
+
+        self.write_pending(head).await?;
+
+        if body.is_empty() {
+            return Ok(());
+        }
+
+        let mut offset = 0usize;
+
+        while offset < body.len() {
+            let written = self.exchange.encode_body(&body[offset..])?;
+
+            self.write_pending(written).await?;
+
+            offset += written;
+        }
+
+        let tail = self.exchange.encode_tail()?;
+
+        if tail > 0 {
+            self.write_pending(tail).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn read_head(&mut self) -> io::Result<ResponseHead> {
+        let limit = self.deadlines.head;
+
+        match within(limit, "response head", self.next_event(true)).await? {
+            Event::Head(head) => Ok(head),
+            _ => Err(protocol("response ended before its head")),
+        }
+    }
+
+    async fn next_event(&mut self, want_head: bool) -> io::Result<Event> {
+        loop {
+            match self.exchange.next_step(want_head)? {
+                Step::Event(event) => return Ok(event),
+                Step::NeedRead => self.fill().await?,
+            }
+        }
+    }
+
+    async fn fill(&mut self) -> io::Result<()> {
+        let slot = self.exchange.read_slot()?;
+        let read = self.socket.read(slot).await?;
+
+        if self.exchange.filled(read)? {
+            self.write_cipher().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn write_pending(&mut self, len: usize) -> io::Result<()> {
+        let limit = self.deadlines.write;
+        let wire = self.exchange.wire_out(len)?;
+
+        within(limit, "request write", self.socket.write_all(wire)).await?;
+
+        self.exchange.wrote(len)
+    }
+
+    async fn write_cipher(&mut self) -> io::Result<()> {
+        let limit = self.deadlines.write;
+
+        within(
+            limit,
+            "tls write",
+            self.socket.write_all(self.exchange.cipher_out()),
+        )
+        .await
+    }
+}
+
+impl H1Conn for Connection {
+    fn exchange(&self) -> &H1Exchange {
+        &self.exchange
+    }
+
+    fn exchange_mut(&mut self) -> &mut H1Exchange {
+        &mut self.exchange
+    }
+
+    fn is_alive(&mut self) -> bool {
+        if !self.exchange.is_idle_reusable() {
+            return false;
+        }
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut probe = [0u8; 1024];
+
+        loop {
+            match self.socket.poll_readable(&mut cx) {
+                Poll::Pending => return true,
+                Poll::Ready(Err(_)) => return false,
+                Poll::Ready(Ok(())) => {}
+            }
+
+            match self.socket.get_ref().read(&mut probe) {
+                Ok(0) => return false,
+                Ok(read) => {
+                    if !self.exchange.probe_fed(&probe[..read]) {
+                        return false;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    async fn next_chunk(&mut self) -> io::Result<Option<&[u8]>> {
+        let limit = self.deadlines.body;
+        let event = within(limit, "response body", self.next_event(false)).await?;
+
+        match event {
+            Event::Body(range) => Ok(Some(self.exchange.chunk(range))),
+            Event::Done => Ok(None),
+            Event::Head(_) => Err(protocol("unexpected second response head")),
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let Some(tls) = self.exchange.tls_mut() else {
+            return;
+        };
+        let mut out = Vec::new();
+
+        if queue_close_notify(tls, &mut out).is_ok() {
+            let _ = self.socket.get_ref().write(&out);
+        }
+    }
+}

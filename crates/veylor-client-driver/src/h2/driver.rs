@@ -1,10 +1,13 @@
+use std::future::{Future, pending, poll_fn};
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::time::{Instant, sleep_until, timeout};
+use futures_lite::future::or;
+use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use veylor_client::h2::{
     ErrorCode, H2ClientConnection, H2ClientLimits, H2ClientTables, HPACK_ENTRIES, HpackEntrySlot,
     HpackHeader, SETTINGS_ACKS, StreamSlot, decoder_scratch_len, encoder_scratch_len,
@@ -13,10 +16,17 @@ use veylor_client::h2::{
 
 use super::config::H2Config;
 use super::error::{H2Error, TimeoutKind};
+use super::handle::H2Start;
 use super::shared::{DriverShared, Pending, STATE_CLOSED, STATE_DRAINING, STATE_OPEN};
 use super::streams::{ActiveStream, Outbox, Source};
 
 const FLUSH_GRACE: Duration = Duration::from_secs(1);
+
+enum Wake {
+    Read(io::Result<usize>),
+    Write(io::Result<usize>),
+    Other,
+}
 
 pub(super) struct Driver<'c, 'b> {
     pub(super) conn: H2ClientConnection<'c, 'b>,
@@ -40,42 +50,47 @@ pub(super) struct Driver<'c, 'b> {
     close_deadline: Option<Instant>,
 }
 
-pub(super) async fn run<S>(io: S, config: H2Config, shared: Arc<DriverShared>)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let limits = H2ClientLimits {
-        max_header_list_size: config.max_header_list_size,
-        max_fields: config.max_header_fields,
-        request_block: config.max_request_header_bytes,
-    };
-    let mut slots = vec![StreamSlot::EMPTY; config.stream_slots()];
-    let mut header_block = vec![0u8; header_block_len(limits.max_header_list_size)];
-    let mut decoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
-    let mut decoder_scratch = vec![0u8; decoder_scratch_len(limits.max_header_list_size)];
-    let mut encoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
-    let mut encoder_scratch = vec![0u8; encoder_scratch_len(limits.request_block)];
-    let mut ack_limits = [0u32; SETTINGS_ACKS];
-    let mut tables = H2ClientTables::new(
-        &mut slots,
-        &mut header_block,
-        &mut decoder_entries,
-        &mut decoder_scratch,
-        &mut encoder_entries,
-        &mut encoder_scratch,
-        &mut ack_limits,
-    )
-    .with_limits(limits);
-    let Ok(conn) = tables.connect() else {
-        Driver::fail_queue(&shared, H2Error::Closed);
-        shared.state.store(STATE_CLOSED, Ordering::Release);
-        shared.exited.notify_waiters();
-        return;
-    };
+impl H2Start {
+    pub async fn run<S, T, F>(self, io: S, sleep: T)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        T: Fn(Duration) -> F,
+        F: Future<Output = ()>,
+    {
+        let Self { config, shared } = self;
+        let limits = H2ClientLimits {
+            max_header_list_size: config.max_header_list_size,
+            max_fields: config.max_header_fields,
+            request_block: config.max_request_header_bytes,
+        };
+        let mut slots = vec![StreamSlot::EMPTY; config.stream_slots()];
+        let mut header_block = vec![0u8; header_block_len(limits.max_header_list_size)];
+        let mut decoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
+        let mut decoder_scratch = vec![0u8; decoder_scratch_len(limits.max_header_list_size)];
+        let mut encoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
+        let mut encoder_scratch = vec![0u8; encoder_scratch_len(limits.request_block)];
+        let mut ack_limits = [0u32; SETTINGS_ACKS];
+        let mut tables = H2ClientTables::new(
+            &mut slots,
+            &mut header_block,
+            &mut decoder_entries,
+            &mut decoder_scratch,
+            &mut encoder_entries,
+            &mut encoder_scratch,
+            &mut ack_limits,
+        )
+        .with_limits(limits);
+        let Ok(conn) = tables.connect() else {
+            Driver::fail_queue(&shared, H2Error::Closed);
+            shared.state.store(STATE_CLOSED, Ordering::Release);
+            shared.exited.notify(usize::MAX);
+            return;
+        };
 
-    let mut driver = Driver::new(conn, config, shared);
-    let reason = driver.serve(io).await;
-    driver.finish(reason);
+        let mut driver = Driver::new(conn, config, shared);
+        let reason = driver.serve(io, &sleep).await;
+        driver.finish(reason);
+    }
 }
 
 impl<'c, 'b> Driver<'c, 'b> {
@@ -105,14 +120,20 @@ impl<'c, 'b> Driver<'c, 'b> {
         }
     }
 
-    async fn serve<S>(&mut self, io: S) -> H2Error
+    async fn serve<S, T, F>(&mut self, io: S, sleep: &T) -> H2Error
     where
         S: AsyncRead + AsyncWrite + Unpin,
+        T: Fn(Duration) -> F,
+        F: Future<Output = ()>,
     {
-        let (mut reader, mut writer) = tokio::io::split(io);
+        let (mut reader, mut writer) = futures_lite::io::split(io);
+        let shared = self.shared.clone();
         let mut eof = false;
+        let mut turn = 0usize;
 
         let reason = loop {
+            let notified = shared.notify.listen();
+
             self.housekeeping();
             if self.out_pos == self.out_len {
                 self.out_len = 0;
@@ -125,41 +146,78 @@ impl<'c, 'b> Driver<'c, 'b> {
 
             let reading = !eof && self.in_len < self.inbuf.len();
             let writing = self.out_pos < self.out_len;
-            let deadline = self.next_deadline();
-            let timer = async {
-                match deadline {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
+            let delay = self
+                .next_deadline()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let wake = {
+                let mut read = pin!(async {
+                    if reading {
+                        reader.read(&mut self.inbuf[self.in_len..]).await
+                    } else {
+                        pending().await
+                    }
+                });
+                let mut write = pin!(async {
+                    if writing {
+                        writer.write(&self.out[self.out_pos..self.out_len]).await
+                    } else {
+                        pending().await
+                    }
+                });
+                let mut notified = pin!(notified);
+                let mut timer = pin!(async {
+                    match delay {
+                        Some(delay) => sleep(delay).await,
+                        None => pending().await,
+                    }
+                });
+
+                turn = turn.wrapping_add(1);
+
+                poll_fn(|cx| {
+                    for step in 0..4 {
+                        let ready = match (turn + step) % 4 {
+                            0 => read.as_mut().poll(cx).map(Wake::Read),
+                            1 => write.as_mut().poll(cx).map(Wake::Write),
+                            2 => notified.as_mut().poll(cx).map(|()| Wake::Other),
+                            _ => timer.as_mut().poll(cx).map(|()| Wake::Other),
+                        };
+
+                        if let Poll::Ready(wake) = ready {
+                            return Poll::Ready(wake);
+                        }
+                    }
+
+                    Poll::Pending
+                })
+                .await
             };
 
-            tokio::select! {
-                read = reader.read(&mut self.inbuf[self.in_len..]), if reading => match read {
-                    Ok(0) => eof = true,
-                    Ok(count) => {
-                        self.in_len += count;
-                        self.process_input();
-                    }
-                    Err(error) => break H2Error::Io(error.kind()),
-                },
-                written = writer.write(&self.out[self.out_pos..self.out_len]), if writing => {
-                    match written {
-                        Ok(0) => break H2Error::Io(io::ErrorKind::WriteZero),
-                        Ok(count) => self.out_pos += count,
-                        Err(error) => break H2Error::Io(error.kind()),
-                    }
+            match wake {
+                Wake::Read(Ok(0)) => eof = true,
+                Wake::Read(Ok(count)) => {
+                    self.in_len += count;
+                    self.process_input();
                 }
-                _ = self.shared.notify.notified() => {}
-                _ = timer => {}
+                Wake::Read(Err(error)) => break H2Error::Io(error.kind()),
+                Wake::Write(Ok(0)) => break H2Error::Io(io::ErrorKind::WriteZero),
+                Wake::Write(Ok(count)) => self.out_pos += count,
+                Wake::Write(Err(error)) => break H2Error::Io(error.kind()),
+                Wake::Other => {}
             }
         };
 
         let pending = &self.out[self.out_pos..self.out_len];
-        let _ = timeout(FLUSH_GRACE, async {
+        let flush = async {
             writer.write_all(pending).await?;
-            writer.shutdown().await
+            writer.close().await
+        };
+        let _ = or(flush, async {
+            sleep(FLUSH_GRACE).await;
+            Err(io::ErrorKind::TimedOut.into())
         })
         .await;
+
         reason
     }
 
@@ -375,7 +433,7 @@ impl<'c, 'b> Driver<'c, 'b> {
                 Self::reject(pending, stream_error);
             }
         }
-        self.shared.exited.notify_waiters();
+        self.shared.exited.notify(usize::MAX);
     }
 
     pub(super) fn mark_draining_from_peer(&mut self) {

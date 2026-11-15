@@ -4,6 +4,7 @@ members = [
     "examples/conformance",
     "examples/ledger",
     "crates/veylor-client",
+    "crates/veylor-client-driver",
     "crates/veylor-ffi",
     "crates/veylor-h3",
     "crates/veylor-http1",
@@ -22,6 +23,7 @@ members = [
 ]
 default-members = [
     "crates/veylor-client",
+    "crates/veylor-client-driver",
     "crates/veylor-ffi",
     "crates/veylor-h3",
     "crates/veylor-http1",

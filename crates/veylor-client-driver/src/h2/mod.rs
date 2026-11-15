@@ -13,7 +13,7 @@ mod upload;
 
 pub use config::H2Config;
 pub use error::{H2Error, TimeoutKind};
-pub use handle::H2Client;
+pub use handle::{H2Client, H2Start};
 pub use headers::{HeaderIter, HeaderList};
 pub use request::H2Request;
 pub use response::{H2Body, H2Response};

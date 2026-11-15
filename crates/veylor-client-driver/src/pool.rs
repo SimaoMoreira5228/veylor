@@ -4,13 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use event_listener::{Event, EventListener};
 use parking_lot::{Mutex, MutexGuard};
-use tokio::sync::Notify;
-use tokio::time::timeout_at;
 
-use crate::client_conn::{Connection, timed_out};
-use crate::client_url::Origin;
-use crate::h2_client::H2Client;
+use crate::h1::H1Conn;
+use crate::h2::H2Client;
+use crate::url::Origin;
 
 const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -53,8 +52,8 @@ pub struct PoolStats {
     pub h2: usize,
 }
 
-struct Idle {
-    conn: Box<Connection>,
+struct Idle<C> {
+    conn: Box<C>,
     since: Instant,
 }
 
@@ -69,17 +68,17 @@ struct H2Slot {
     load: Arc<H2Load>,
 }
 
-struct Entry {
-    idle: Vec<Idle>,
+struct Entry<C> {
+    idle: Vec<Idle<C>>,
     open: usize,
     h2: Vec<H2Slot>,
     gated: bool,
     known: Option<Protocol>,
     waiters: Arc<AtomicUsize>,
-    notify: Arc<Notify>,
+    notify: Arc<Event>,
 }
 
-impl Entry {
+impl<C> Entry<C> {
     fn new() -> Self {
         Self {
             idle: Vec::new(),
@@ -88,7 +87,7 @@ impl Entry {
             gated: false,
             known: None,
             waiters: Arc::new(AtomicUsize::new(0)),
-            notify: Arc::new(Notify::new()),
+            notify: Arc::new(Event::new()),
         }
     }
 
@@ -101,22 +100,22 @@ impl Entry {
     }
 }
 
-struct State {
-    origins: HashMap<Origin, Entry>,
+struct State<C> {
+    origins: HashMap<Origin, Entry<C>>,
     idle_total: usize,
     last_prune: Instant,
 }
 
-pub struct Pool {
+pub struct Pool<C> {
     config: PoolConfig,
     epoch: Instant,
-    state: Mutex<State>,
+    state: Mutex<State<C>>,
 }
 
-pub struct Lease {
-    pool: Arc<Pool>,
+pub struct Lease<C: H1Conn> {
+    pool: Arc<Pool<C>>,
     origin: Origin,
-    conn: Option<Box<Connection>>,
+    conn: Option<Box<C>>,
 }
 
 pub struct H2Ticket {
@@ -124,21 +123,21 @@ pub struct H2Ticket {
     load: Arc<H2Load>,
 }
 
-pub struct Dial {
-    pool: Arc<Pool>,
+pub struct Dial<C: H1Conn> {
+    pool: Arc<Pool<C>>,
     origin: Origin,
     gated: bool,
     counted: bool,
     done: bool,
 }
 
-pub enum Grant {
-    Idle(Lease),
+pub enum Grant<C: H1Conn> {
+    Idle(Lease<C>),
     H2(H2Ticket),
-    Dial(Dial),
+    Dial(Dial<C>),
 }
 
-struct WaitGuard(Arc<AtomicUsize>);
+pub struct WaitGuard(Arc<AtomicUsize>);
 
 impl Drop for WaitGuard {
     fn drop(&mut self) {
@@ -164,7 +163,7 @@ impl H2Load {
     }
 }
 
-impl Pool {
+impl<C: H1Conn> Pool<C> {
     pub fn new(mut config: PoolConfig) -> Arc<Self> {
         config.max_per_origin = config.max_per_origin.max(1);
         config.max_h2_per_origin = config.max_h2_per_origin.max(1);
@@ -201,50 +200,44 @@ impl Pool {
             entry
                 .h2
                 .retain(|slot| slot.load.inflight.load(Ordering::Acquire) > 0);
-            entry.notify.notify_waiters();
+            entry.notify.notify(usize::MAX);
         }
 
         state.idle_total -= before;
         state.origins.retain(|_, entry| !entry.is_empty());
     }
 
-    pub async fn acquire(
+    pub fn acquire_timeout(&self) -> Duration {
+        self.config.acquire_timeout
+    }
+
+    pub fn poll_acquire(
         self: &Arc<Self>,
         origin: &Origin,
         hint: Option<Protocol>,
-    ) -> io::Result<Grant> {
-        let deadline = tokio::time::Instant::now() + self.config.acquire_timeout;
-        let mut guard: Option<WaitGuard> = None;
+        guard: &mut Option<WaitGuard>,
+    ) -> io::Result<Result<Grant<C>, EventListener>> {
+        let mut state = self.lock();
 
-        loop {
-            let notified = {
-                let mut state = self.lock();
-
-                match self.try_acquire(&mut state, origin, hint, guard.is_none())? {
-                    Step::Ready(grant) => return Ok(grant),
-                    Step::Wait(notify, waiters) => {
-                        if guard.is_none() {
-                            guard = Some(WaitGuard(waiters));
-                        }
-
-                        notify.notified_owned()
-                    }
+        match self.try_acquire(&mut state, origin, hint, guard.is_none())? {
+            Step::Ready(grant) => Ok(Ok(grant)),
+            Step::Wait(notify, waiters) => {
+                if guard.is_none() {
+                    *guard = Some(WaitGuard(waiters));
                 }
-            };
 
-            if timeout_at(deadline, notified).await.is_err() {
-                return Err(timed_out("waiting for a pooled connection"));
+                Ok(Err(notify.listen()))
             }
         }
     }
 
     fn try_acquire(
         self: &Arc<Self>,
-        state: &mut State,
+        state: &mut State<C>,
         origin: &Origin,
         hint: Option<Protocol>,
         first_wait: bool,
-    ) -> io::Result<Step> {
+    ) -> io::Result<Step<C>> {
         let now = Instant::now();
 
         self.prune(state, now);
@@ -338,7 +331,7 @@ impl Pool {
         ))
     }
 
-    fn lease(self: &Arc<Self>, origin: &Origin, conn: Box<Connection>) -> Lease {
+    fn lease(self: &Arc<Self>, origin: &Origin, conn: Box<C>) -> Lease<C> {
         Lease {
             pool: Arc::clone(self),
             origin: origin.clone(),
@@ -346,7 +339,7 @@ impl Pool {
         }
     }
 
-    fn dial(self: &Arc<Self>, origin: &Origin, gated: bool, counted: bool) -> Dial {
+    fn dial(self: &Arc<Self>, origin: &Origin, gated: bool, counted: bool) -> Dial<C> {
         Dial {
             pool: Arc::clone(self),
             origin: origin.clone(),
@@ -356,12 +349,14 @@ impl Pool {
         }
     }
 
-    fn release(&self, origin: &Origin, conn: Option<Box<Connection>>) {
+    fn release(&self, origin: &Origin, conn: Option<Box<C>>) {
         let mut state = self.lock();
         let now = Instant::now();
-        let keep = conn.filter(|c| c.is_idle_reusable()).filter(|_| {
-            self.config.max_idle_per_origin > 0 && state.idle_total < self.config.max_idle_total
-        });
+        let keep = conn
+            .filter(|c| c.exchange().is_idle_reusable())
+            .filter(|_| {
+                self.config.max_idle_per_origin > 0 && state.idle_total < self.config.max_idle_total
+            });
 
         let Some(entry) = state.origins.get_mut(origin) else {
             return;
@@ -369,14 +364,14 @@ impl Pool {
 
         match keep {
             Some(mut conn) if entry.idle.len() < self.config.max_idle_per_origin => {
-                conn.trim();
+                conn.exchange_mut().trim();
                 entry.idle.push(Idle { conn, since: now });
-                entry.notify.notify_waiters();
+                entry.notify.notify(usize::MAX);
                 state.idle_total += 1;
             }
             _ => {
                 entry.open -= 1;
-                entry.notify.notify_waiters();
+                entry.notify.notify(usize::MAX);
 
                 if entry.is_empty() {
                     state.origins.remove(origin);
@@ -387,7 +382,7 @@ impl Pool {
         self.prune(&mut state, now);
     }
 
-    fn prune(&self, state: &mut State, now: Instant) {
+    fn prune(&self, state: &mut State<C>, now: Instant) {
         let interval = (self.config.idle_timeout / 4).min(PRUNE_INTERVAL);
 
         if now.duration_since(state.last_prune) < interval {
@@ -420,7 +415,7 @@ impl Pool {
             });
 
             if gone > 0 {
-                entry.notify.notify_waiters();
+                entry.notify.notify(usize::MAX);
             }
         }
 
@@ -428,14 +423,14 @@ impl Pool {
         state.origins.retain(|_, entry| !entry.is_empty());
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State<C>> {
         self.state.lock()
     }
 }
 
-enum Step {
-    Ready(Grant),
-    Wait(Arc<Notify>, Arc<AtomicUsize>),
+enum Step<C: H1Conn> {
+    Ready(Grant<C>),
+    Wait(Arc<Event>, Arc<AtomicUsize>),
 }
 
 fn ticket(slot: &H2Slot) -> H2Ticket {
@@ -448,17 +443,17 @@ fn ticket(slot: &H2Slot) -> H2Ticket {
     }
 }
 
-impl Lease {
-    pub fn conn_ref(&self) -> &Connection {
+impl<C: H1Conn> Lease<C> {
+    pub fn conn_ref(&self) -> &C {
         self.conn.as_ref().expect("lease holds a connection")
     }
 
-    pub fn conn(&mut self) -> &mut Connection {
+    pub fn conn(&mut self) -> &mut C {
         self.conn.as_mut().expect("lease holds a connection")
     }
 }
 
-impl Drop for Lease {
+impl<C: H1Conn> Drop for Lease<C> {
     fn drop(&mut self) {
         self.pool.release(&self.origin, self.conn.take());
     }
@@ -477,8 +472,8 @@ impl Drop for H2Ticket {
     }
 }
 
-impl Dial {
-    pub fn finish_h1(mut self, conn: Box<Connection>) -> Lease {
+impl<C: H1Conn> Dial<C> {
+    pub fn finish_h1(mut self, conn: Box<C>) -> Lease<C> {
         self.done = true;
 
         let mut state = self.pool.lock();
@@ -490,7 +485,7 @@ impl Dial {
 
             entry.gated = false;
             entry.known = Some(Protocol::Http1);
-            entry.notify.notify_waiters();
+            entry.notify.notify(usize::MAX);
         }
 
         drop(state);
@@ -522,14 +517,14 @@ impl Dial {
                 client: client.clone(),
                 load: Arc::clone(&load),
             });
-            entry.notify.notify_waiters();
+            entry.notify.notify(usize::MAX);
         }
 
         H2Ticket { client, load }
     }
 }
 
-impl Drop for Dial {
+impl<C: H1Conn> Drop for Dial<C> {
     fn drop(&mut self) {
         if self.done {
             return;
@@ -549,7 +544,7 @@ impl Drop for Dial {
             entry.gated = false;
         }
 
-        entry.notify.notify_waiters();
+        entry.notify.notify(usize::MAX);
 
         if entry.is_empty() {
             state.origins.remove(&self.origin);

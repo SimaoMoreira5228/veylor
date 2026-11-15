@@ -1593,6 +1593,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "veylor-client-driver"
+version = "0.1.0"
+dependencies = [
+ "event-listener",
+ "futures-lite",
+ "parking_lot",
+ "veylor-client",
+ "veylor-tls",
+]
+
+[[package]]
 name = "veylor-conformance"
 version = "0.1.0"
 dependencies = [
@@ -1687,17 +1698,21 @@ version = "0.1.0"
 dependencies = [
  "smol",
  "veylor-client",
+ "veylor-client-driver",
  "veylor-http1",
+ "veylor-server",
  "veylor-server-conn",
+ "veylor-tls",
 ]
 
 [[package]]
 name = "veylor-runtime-tokio"
 version = "0.1.0"
 dependencies = [
- "parking_lot",
+ "futures-lite",
  "tokio",
  "veylor-client",
+ "veylor-client-driver",
  "veylor-http1",
  "veylor-server",
  "veylor-server-conn",
