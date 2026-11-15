@@ -1,6 +1,8 @@
 mod config;
 mod handlers;
+mod pool;
 mod store;
+mod writer;
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -11,7 +13,9 @@ use veylor_web::{MethodRouter, Router, ServeExt};
 
 use crate::config::Config;
 use crate::handlers::App;
+use crate::pool::HandlerPool;
 use crate::store::Store;
+use crate::writer::Writer;
 
 fn main() -> Result<(), String> {
     let options = Config::parse(std::env::args_os().skip(1))?;
@@ -32,14 +36,22 @@ fn main() -> Result<(), String> {
         tls,
         ..ServerConfig::default()
     };
-    let store = Store::open(&options.database).map_err(|error| format!("database: {error:?}"))?;
-    let app: Router<App> = Router::with_state(Mutex::new(store))
+    let store = Store::open(&options.database, writer::BUSY_WAIT)
+        .map_err(|error| format!("database: {error:?}"))?;
+    let reader = Store::open_reader(&options.database)
+        .map_err(|error| format!("database reader: {error:?}"))?;
+    let state = App {
+        writer: Writer::start(store, options.commit_delay),
+        reader: Mutex::new(reader),
+    };
+    let app: Router<App> = Router::with_state(state)
+        .executor(Arc::new(HandlerPool::new()))
         .get("/ready", handlers::ready)
         .route(
             "/accounts/:account/statement",
             MethodRouter::new().get(handlers::statement).managed(),
         )
-        .post("/accounts/:account/transactions", handlers::transaction)
+        .post_async("/accounts/:account/transactions", handlers::transaction)
         .body_limit(handlers::BODY_CAP);
 
     let server =

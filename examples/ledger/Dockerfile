@@ -1,4 +1,4 @@
-FROM rust:1.85-bookworm AS build
+FROM rust:1.89-bookworm AS build
 
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./

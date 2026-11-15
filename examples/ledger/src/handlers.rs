@@ -1,27 +1,23 @@
 use parking_lot::Mutex;
+use veylor_web::{Bytes, HeadersOwned, Path, Request, Response, State};
 
-use veylor_web::{Request, Response};
-
-use crate::store::{Payment, Store, StoreError};
+use crate::store::{Payment, Store, StoreError, Write};
+use crate::writer::Writer;
 
 pub const BODY_CAP: usize = 512;
 
-pub type App = Mutex<Store>;
-
-fn account(request: &Request<'_, App>) -> Option<i64> {
-    let [param] = request.params() else {
-        return None;
-    };
-    std::str::from_utf8(param.value)
-        .ok()?
-        .parse::<i64>()
-        .ok()
-        .filter(|account| *account > 0)
+pub struct App {
+    pub writer: Writer,
+    pub reader: Mutex<Store>,
 }
 
-fn idempotency_key<'a>(request: &'a Request<'_, App>) -> Result<&'a [u8], u16> {
+fn account(param: &str) -> Option<i64> {
+    param.parse::<i64>().ok().filter(|account| *account > 0)
+}
+
+fn idempotency_key(headers: &HeadersOwned) -> Result<String, u16> {
     let mut found = None;
-    for (name, value) in request.headers() {
+    for (name, value) in &headers.0 {
         if !name.eq_ignore_ascii_case(b"idempotency-key") {
             continue;
         }
@@ -37,12 +33,16 @@ fn idempotency_key<'a>(request: &'a Request<'_, App>) -> Result<&'a [u8], u16> {
         && value
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    valid.then_some(value).ok_or(422)
+    if !valid {
+        return Err(422);
+    }
+
+    String::from_utf8(value.to_vec()).map_err(|_| 422)
 }
 
-fn json_content_type(request: &Request<'_, App>) -> bool {
+fn json_content_type(headers: &HeadersOwned) -> bool {
     let mut found = None;
-    for (name, value) in request.headers() {
+    for (name, value) in &headers.0 {
         if !name.eq_ignore_ascii_case(b"content-type") {
             continue;
         }
@@ -64,7 +64,12 @@ fn json(status: u16, body: Vec<u8>) -> Response {
 }
 
 fn error(status: u16) -> Response {
-    json(status, error_body(status).to_vec())
+    let response = json(status, error_body(status).to_vec());
+    if status == 503 {
+        return response.header("retry-after", "1");
+    }
+
+    response
 }
 
 fn error_body(status: u16) -> &'static [u8] {
@@ -85,7 +90,7 @@ fn error_status(error: &StoreError) -> u16 {
         StoreError::Rejected => 422,
         StoreError::KeyConflict => 409,
         StoreError::Corrupt => 500,
-        StoreError::Busy => 503,
+        StoreError::Busy | StoreError::Timeout => 503,
         StoreError::Database(error) => {
             eprintln!("database operation failed: {error}");
             500
@@ -101,44 +106,57 @@ fn encode(value: &impl serde::Serialize) -> Response {
     }
 }
 
-fn locked(request: &Request<'_, App>) -> parking_lot::MutexGuard<'static, Store> {
-    request.state().lock()
-}
-
 pub fn ready() -> &'static str {
     "ready\n"
 }
 
 pub fn statement(request: Request<'_, App>) -> Response {
-    let Some(account) = account(&request) else {
+    let Some(account) = request
+        .param("account")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(account)
+    else {
         return error(404);
     };
-    let mut store = locked(&request);
 
-    match store.statement(account) {
+    match request.state().reader.lock().statement(account) {
         Ok(statement) => encode(&statement),
         Err(failure) => error(error_status(&failure)),
     }
 }
 
-pub fn transaction(request: Request<'_, App>) -> Response {
-    let Some(account) = account(&request) else {
+pub async fn transaction(
+    Path(account_param): Path<String>,
+    State(app): State<App>,
+    headers: HeadersOwned,
+    Bytes(body): Bytes,
+) -> Response {
+    let Some(account) = account(&account_param) else {
         return error(404);
     };
-    let key = match idempotency_key(&request) {
+    let key = match idempotency_key(&headers) {
         Ok(key) => key,
         Err(status) => return error(status),
     };
-    if !json_content_type(&request) {
+    if !json_content_type(&headers) {
         return error(415);
     }
-    let payment = match serde_json::from_slice::<Payment>(request.body()) {
-        Ok(payment) => payment,
+    let payment = match serde_json::from_slice::<Payment>(&body) {
+        Ok(payment) => payment.into_owned(),
         Err(_) => return error(422),
     };
-    let mut store = locked(&request);
+    let write = Write {
+        account,
+        key,
+        payment,
+    };
 
-    match store.apply(account, key, &payment) {
+    let ticket = match app.writer.submit(write) {
+        Ok(ticket) => ticket,
+        Err(failure) => return error(error_status(&failure)),
+    };
+
+    match ticket.await {
         Ok(balance) => encode(&balance),
         Err(failure) => error(error_status(&failure)),
     }

@@ -437,3 +437,73 @@ fn configured_tls_serves_verified_https_readiness() {
 
     assert!(response.starts_with(b"HTTP/1.1 200 "));
 }
+
+#[test]
+fn concurrent_writes_share_commits_instead_of_paying_one_each() {
+    let database = Database::new();
+    let service = Service::start_with_options(&database.file(), &["--commit-delay-ms", "100"]);
+    let started = std::time::Instant::now();
+    let address = service.address;
+
+    std::thread::scope(|scope| {
+        for index in 0..64 {
+            scope.spawn(move || {
+                let key = format!("group-{index}");
+                let (status, _) = request_with_idempotency_key(
+                    address,
+                    "POST",
+                    "/accounts/5/transactions",
+                    br#"{"amount":1,"kind":"credit","description":"group"}"#,
+                    false,
+                    &key,
+                );
+                assert_eq!(status, 200);
+            });
+        }
+    });
+
+    assert!(
+        started.elapsed() < Duration::from_millis(3000),
+        "64 writes took {:?}; commits were not shared",
+        started.elapsed()
+    );
+    let (_, statement) = request(address, "GET", "/accounts/5/statement", b"", false);
+    assert_eq!(statement["balance"], 64);
+}
+
+#[test]
+fn flooded_writer_keeps_acknowledged_writes_durable() {
+    let database = Database::new();
+    let service = Service::start_with_options(&database.file(), &["--commit-delay-ms", "50"]);
+    let address = service.address;
+    let acknowledged = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for index in 0..256 {
+            let acknowledged = &acknowledged;
+            scope.spawn(move || {
+                let key = format!("flood-{index}");
+                let (status, _) = request_with_idempotency_key(
+                    address,
+                    "POST",
+                    "/accounts/5/transactions",
+                    br#"{"amount":1,"kind":"credit","description":"flood"}"#,
+                    false,
+                    &key,
+                );
+                match status {
+                    200 => {
+                        acknowledged.fetch_add(1, Ordering::Relaxed);
+                    }
+                    503 => {}
+                    status => panic!("unexpected status {status}"),
+                }
+            });
+        }
+    });
+
+    let (_, statement) = request(address, "GET", "/accounts/5/statement", b"", false);
+    let acknowledged = acknowledged.load(Ordering::Relaxed) as i64;
+    assert!(acknowledged > 0);
+    assert!(statement["balance"].as_i64().unwrap() >= acknowledged);
+}

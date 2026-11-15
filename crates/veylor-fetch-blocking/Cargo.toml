@@ -10,6 +10,7 @@ default = []
 json = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
+base64 = "0.22"
 parking_lot = { workspace = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }

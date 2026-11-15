@@ -1,11 +1,16 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
+// NOTE: --commit-delay-ms sleeps inside every write transaction just before COMMIT. It
+// exists so qualification on tmpfs or SSD can model a slow disk fsync; leave it at 0 in
+// production.
 pub struct Config {
     pub address: SocketAddr,
     pub database: PathBuf,
     pub workers: usize,
+    pub commit_delay: Duration,
     pub h2c_port: Option<u16>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
@@ -17,6 +22,7 @@ impl Config {
             address: SocketAddr::from(([127, 0, 0, 1], 9999)),
             database: PathBuf::from("ledger.sqlite3"),
             workers: 1,
+            commit_delay: Duration::ZERO,
             h2c_port: None,
             tls_cert: None,
             tls_key: None,
@@ -40,6 +46,9 @@ impl Config {
                 }
                 "--workers" => {
                     config.workers = parse_text(&value, flag)?;
+                }
+                "--commit-delay-ms" => {
+                    config.commit_delay = Duration::from_millis(parse_text(&value, flag)?);
                 }
                 "--h2c-port" => {
                     config.h2c_port = Some(parse_text(&value, flag)?);

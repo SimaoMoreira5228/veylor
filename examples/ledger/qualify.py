@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 
 class Service:
-    def __init__(self, binary, database, output, name):
+    def __init__(self, binary, database, output, name, commit_delay_ms=0):
         self.stdout = (output / f"{name}-stdout.txt").open("w")
         self.stderr = (output / f"{name}-stderr.txt").open("w")
         self.process = subprocess.Popen(
@@ -29,6 +29,8 @@ class Service:
                 "2",
                 "--h2c-port",
                 "0",
+                "--commit-delay-ms",
+                str(commit_delay_ms),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -206,7 +208,11 @@ def qualify(args):
     try:
         for index in range(2):
             service = Service(
-                args.binary.resolve(), database, output, f"service-{index}"
+                args.binary.resolve(),
+                database,
+                output,
+                f"service-{index}",
+                args.commit_delay_ms,
             )
             services.append(service)
 
@@ -306,7 +312,11 @@ def qualify(args):
             raise RuntimeError("surviving instance stopped serving")
 
         restarted = Service(
-            args.binary.resolve(), database, output, "service-restarted"
+            args.binary.resolve(),
+            database,
+            output,
+            "service-restarted",
+            args.commit_delay_ms,
         )
         services[0] = restarted
         urls[0] = restarted.url
@@ -391,6 +401,7 @@ def main():
     parser.add_argument("--rates", type=int, nargs="+", default=[100, 500, 2000])
     parser.add_argument("--recovery-rate", type=int, default=100)
     parser.add_argument("--http2", action="store_true")
+    parser.add_argument("--commit-delay-ms", type=int, default=0)
     args = parser.parse_args()
 
     if not 1 <= args.duration <= 3600:

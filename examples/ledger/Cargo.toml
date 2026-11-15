@@ -3,13 +3,13 @@ name = "veylor-ledger"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.89"
 publish = false
 
 [dependencies]
 parking_lot.workspace = true
 ctrlc = { version = "3", features = ["termination"] }
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled", "cache"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 veylor-server = { version = "0.1.0", path = "../../crates/veylor-server" }

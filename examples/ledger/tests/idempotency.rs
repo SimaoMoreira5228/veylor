@@ -242,3 +242,37 @@ fn simultaneous_first_start_serializes_schema_migration() {
     );
     assert_eq!(statement["balance"], 0);
 }
+
+#[test]
+fn unacknowledged_commit_is_replayed_from_the_idempotency_key() {
+    let database = Database::new();
+    let service = Service::start_with_options(&database.file(), &["--commit-delay-ms", "2000"]);
+    let body = br#"{"amount":40,"kind":"credit","description":"slow"}"#;
+
+    let first = request_with_idempotency_key(
+        service.address,
+        "POST",
+        "/accounts/4/transactions",
+        body,
+        false,
+        "slow-commit",
+    );
+    assert_eq!(first.0, 503);
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let replay = request_with_idempotency_key(
+        service.address,
+        "POST",
+        "/accounts/4/transactions",
+        body,
+        false,
+        "slow-commit",
+    );
+    assert_eq!(replay.0, 200);
+    assert_eq!(replay.1["balance"], 40);
+
+    let (_, statement) = request(service.address, "GET", "/accounts/4/statement", b"", false);
+    assert_eq!(statement["balance"], 40);
+    assert_eq!(statement["transactions"].as_array().unwrap().len(), 1);
+}

@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
 use crate::agent::Agent;
 use crate::encode;
 use crate::error::Error;
@@ -58,9 +61,8 @@ impl Request {
     }
 
     pub fn basic_auth(self, user: &str, password: &str) -> Self {
-        let mut value = String::from("Basic ");
-
-        encode::base64(format!("{user}:{password}").as_bytes(), &mut value);
+        let credentials = format!("{user}:{password}");
+        let value = format!("Basic {}", STANDARD.encode(credentials.as_bytes()));
 
         self.set("authorization", &value)
     }

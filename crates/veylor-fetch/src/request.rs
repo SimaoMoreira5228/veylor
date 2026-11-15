@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use crate::body::Body;
 use crate::client::Client;
-use crate::encode::{base64, push_pair};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+use crate::encode::push_pair;
 use crate::error::{Error, Result};
 use crate::headers::Headers;
 use crate::method::Method;
@@ -89,7 +92,7 @@ impl RequestBuilder {
             credentials.push_str(password.as_ref());
         }
 
-        let value = format!("Basic {}", base64(credentials.as_bytes()));
+        let value = format!("Basic {}", STANDARD.encode(credentials.as_bytes()));
 
         self.add_header("authorization", value.as_bytes());
 
