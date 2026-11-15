@@ -1,4 +1,4 @@
-use super::tests::{
+use super::tests::endpoint_io::{
     ack_client, ack_server, answer_settings_ack_client, answer_settings_ack_server,
     client_settings, destroy_client, destroy_server, drain_ack_client, drain_ack_server,
     encode_field, field_text, new_client, new_server, poll_client, poll_server,
