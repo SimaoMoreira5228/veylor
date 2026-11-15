@@ -285,8 +285,8 @@ unsafe fn start_server(server: *mut VylManagedStaticServer) -> VylResult {
     staged.h3_port = h3_port;
     if let Some((cert_der, key_der, max_handshakes)) = tls {
         staged.tls = Some(veylor_server::TlsConfig {
-            cert_chain: vec![veylor_server::CertificateDer::from(cert_der)],
-            key: veylor_server::PrivateKeyDer::Pkcs8(key_der.into()),
+            cert_chain: vec![veylor_server::Certificate::from(cert_der)],
+            key: veylor_server::PrivateKey::Pkcs8(key_der),
             max_handshakes,
         });
     }

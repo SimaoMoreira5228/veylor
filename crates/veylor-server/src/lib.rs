@@ -40,4 +40,4 @@ pub use static_server::{
 };
 pub use static_server::{LISTENER_TOKEN, MAX_CONNECTIONS, SHUTDOWN_TIMER_ID};
 pub use veylor_runtime::PollBackend;
-pub use veylor_tls::{CertificateDer, PrivateKeyDer};
+pub use veylor_tls::{Certificate, PrivateKey};

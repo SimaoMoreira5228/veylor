@@ -1,27 +1,37 @@
+// NOTE: this is the only crate allowed to name the TLS library for the TCP stack; no backend type
+// may appear in a public signature. veylor-h3 is the one exception (quinn needs the backend config).
+
 mod client;
 mod pem;
+mod pin;
 mod pump;
+mod stream;
+mod types;
 
 pub use client::{TlsConnector, TlsConnectorBuilder};
 pub use pem::{load_cert_chain, load_private_key};
 pub use pump::{drain_plaintext, feed_ciphertext, flush_ciphertext, queue_close_notify};
-pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+pub use stream::TlsStream;
+pub use types::{Certificate, PrivateKey, ProtocolVersion};
 
 use std::io;
 use std::sync::Arc;
+
+const DEFAULT_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 pub const MAX_TLS_CONN_BYTES: usize = 2048;
 
 pub struct TlsAcceptor {
     config: Arc<rustls::ServerConfig>,
+    alpn: Vec<Vec<u8>>,
     max_handshakes: usize,
     active: usize,
 }
 
 impl TlsAcceptor {
     pub fn new(cert_der: &[u8], key_der: &[u8], max_handshakes: usize) -> Result<Self, TlsError> {
-        let cert = CertificateDer::from(cert_der.to_vec());
-        let key = PrivateKeyDer::Pkcs8(key_der.to_vec().into());
+        let cert = Certificate::from_der(cert_der.to_vec());
+        let key = PrivateKey::Pkcs8(key_der.to_vec());
 
         Self::from_chain(vec![cert], key, max_handshakes)
     }
@@ -39,38 +49,49 @@ impl TlsAcceptor {
     }
 
     pub fn from_chain(
-        chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
+        chain: Vec<Certificate>,
+        key: PrivateKey,
         max_handshakes: usize,
     ) -> Result<Self, TlsError> {
+        let alpn = DEFAULT_ALPN.iter().map(|p| p.to_vec()).collect::<Vec<_>>();
+
         Ok(Self {
-            config: Arc::new(Self::build_config(chain, key)?),
+            config: Arc::new(Self::build_config(&chain, &key, &alpn)?),
+            alpn,
             max_handshakes,
             active: 0,
         })
     }
 
-    pub fn rotate(
-        &mut self,
-        chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
-    ) -> Result<(), TlsError> {
-        self.config = Arc::new(Self::build_config(chain, key)?);
+    pub fn rotate(&mut self, chain: Vec<Certificate>, key: PrivateKey) -> Result<(), TlsError> {
+        self.config = Arc::new(Self::build_config(&chain, &key, &self.alpn)?);
 
         Ok(())
     }
 
+    pub fn with_alpn(mut self, protocols: &[&[u8]]) -> Self {
+        self.alpn = protocols.iter().map(|p| p.to_vec()).collect();
+
+        Arc::make_mut(&mut self.config).alpn_protocols = self.alpn.clone();
+
+        self
+    }
+
     fn build_config(
-        chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
+        chain: &[Certificate],
+        key: &PrivateKey,
+        alpn: &[Vec<u8>],
     ) -> Result<rustls::ServerConfig, TlsError> {
         let mut config =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_no_client_auth()
-                .with_single_cert(chain, key)
+                .with_single_cert(
+                    chain.iter().map(Certificate::to_backend).collect(),
+                    key.to_backend(),
+                )
                 .map_err(|_| TlsError::InvalidInput)?;
 
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn.to_vec();
 
         debug_assert_eq!(config.max_early_data_size, 0);
 
@@ -111,6 +132,7 @@ pub struct TlsConn {
     inner: rustls::Connection,
     bytes_encrypted: u64,
     bytes_decrypted: u64,
+    peer_closed: bool,
 }
 
 impl TlsConn {
@@ -119,6 +141,7 @@ impl TlsConn {
             inner,
             bytes_encrypted: 0,
             bytes_decrypted: 0,
+            peer_closed: false,
         }
     }
 
@@ -130,6 +153,10 @@ impl TlsConn {
         self.bytes_decrypted
     }
 
+    pub fn peer_closed(&self) -> bool {
+        self.peer_closed
+    }
+
     pub fn is_handshaking(&self) -> bool {
         self.inner.is_handshaking()
     }
@@ -139,8 +166,10 @@ pub fn alpn(conn: &TlsConn) -> Option<&[u8]> {
     conn.inner.alpn_protocol()
 }
 
-pub fn negotiated_version(conn: &TlsConn) -> Option<rustls::ProtocolVersion> {
-    conn.inner.protocol_version()
+pub fn negotiated_version(conn: &TlsConn) -> Option<ProtocolVersion> {
+    conn.inner
+        .protocol_version()
+        .and_then(ProtocolVersion::from_backend)
 }
 
 #[derive(Debug)]

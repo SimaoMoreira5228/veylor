@@ -583,6 +583,44 @@ fn retry_replays_pending_batch() {
 }
 
 #[test]
+fn data_flood_on_reset_stream_is_credited_back_to_the_connection() {
+    fixture!(tables, conn);
+    let _ = tables;
+    handshake(&mut conn);
+    assert_eq!(start_get(&mut conn), 1);
+    let mut scratch = FeedScratch::new();
+    let mut reset = peer_header(4, 3, 0, 1).to_vec();
+    reset.extend_from_slice(&8u32.to_be_bytes());
+    let batch = poll(&mut conn, &reset, &mut scratch);
+    assert_eq!(batch.status, BatchStatus::Ready);
+    conn.finish_batch();
+
+    let chunk = [b'x'; 1_000];
+    let late = peer_data(1, false, &chunk);
+    let mut credited = 0u32;
+    for _ in 0..100 {
+        let batch = poll(&mut conn, &late, &mut scratch);
+        assert_eq!(batch.status, BatchStatus::Ready);
+        for action in batch.actions.iter().flatten() {
+            if let H2FrameAction::ConnectionCredit { amount } = action {
+                credited += amount;
+            }
+        }
+        conn.finish_batch();
+        if credited >= 32_000 {
+            let mut output = [0; 32];
+            conn.send_window_update(0, credited, &mut output)
+                .expect("window update");
+            let written = 13;
+            assert_eq!(conn.acknowledge(written).expect("ack"), 0);
+            credited = 0;
+        }
+    }
+    assert!(conn.driver.driver().connection_receive_window().value() > 0);
+    assert_eq!(start_get(&mut conn), 3);
+}
+
+#[test]
 fn scratch_capacity_matches_abi_limits() {
     assert_eq!(MAX_ACTIONS, 16);
     assert_eq!(DEFAULT_MAX_FIELDS, 128);

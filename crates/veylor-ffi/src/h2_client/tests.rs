@@ -951,10 +951,12 @@ fn scripted_204_no_body() {
     let out = poll_peer(client, &stray);
     assert_eq!(out.result, VylResult::Ok);
     assert_eq!(out.consumed, stray.len());
-    assert_eq!(out.actions.len(), 1);
+    assert_eq!(out.actions.len(), 2);
     assert_eq!(out.actions[0].kind, VylH2ActionKind::SendReset);
     assert_eq!(out.actions[0].stream_id, 1);
     assert_eq!(out.actions[0].error_code, 5);
+    assert_eq!(out.actions[1].kind, VylH2ActionKind::ConnectionCredit);
+    assert_eq!(out.actions[1].data_length, 1);
     destroy_client(client);
 }
 
@@ -1071,10 +1073,12 @@ fn scripted_rst_mid_body_keeps_connection() {
     let out = poll_peer(client, &late);
     assert_eq!(out.result, VylResult::Ok);
     assert_eq!(out.consumed, late.len());
-    assert_eq!(out.actions.len(), 1);
+    assert_eq!(out.actions.len(), 2);
     assert_eq!(out.actions[0].kind, VylH2ActionKind::SendReset);
     assert_eq!(out.actions[0].stream_id, 1);
     assert_eq!(out.actions[0].error_code, 5);
+    assert_eq!(out.actions[1].kind, VylH2ActionKind::ConnectionCredit);
+    assert_eq!(out.actions[1].data_length, 1);
     let second = scripted_request(client, b"GET", b"/again", 1);
     assert_eq!(second, 3);
     let headers = peer_headers(3, true, &[(b":status".as_slice(), b"200".as_slice())]);

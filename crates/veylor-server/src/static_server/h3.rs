@@ -65,8 +65,8 @@ impl H3Server {
 
     pub(crate) fn rotate_tls(
         &self,
-        certs: Vec<veylor_tls::CertificateDer<'static>>,
-        key: veylor_tls::PrivateKeyDer<'static>,
+        certs: Vec<veylor_tls::Certificate>,
+        key: veylor_tls::PrivateKey,
     ) -> Result<(), ServerError> {
         self.running
             .as_ref()
@@ -114,7 +114,7 @@ pub(crate) fn start(
         return Ok(None);
     };
     let tls = config.tls.as_ref().ok_or(ServerError::InvalidConfig)?;
-    let tls = Tls::new(tls.cert_chain.clone(), tls.key.clone_key());
+    let tls = Tls::new(tls.cert_chain.clone(), tls.key.clone());
     let worker = host.h3_worker_id();
     let waiters: WaiterMap = Arc::new(Mutex::new(HashMap::new()));
     let stop = Arc::new(AtomicBool::new(false));

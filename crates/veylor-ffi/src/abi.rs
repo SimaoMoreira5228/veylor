@@ -54,6 +54,7 @@ pub enum VylH2ActionKind {
     PingAck = 5,
     SendReset = 6,
     ConnectionError = 7,
+    ConnectionCredit = 8,
 }
 
 #[repr(C)]

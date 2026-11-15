@@ -1,4 +1,5 @@
 mod control;
+mod credit;
 mod header_block;
 mod settings;
 
@@ -430,10 +431,10 @@ fn stream_flow_error_still_charges_connection_credit_without_partial_stream_cred
         3,
         &[0x82, 0x86, 0x84],
     );
-    let mut next_actions = [None; 1];
+    let mut next_actions = [None; 3];
     let next = driver.feed(&next_input[..next_length], &mut next_actions, &mut headers);
     assert_eq!(next.status, FeedStatus::NeedMoreInput);
-    assert_eq!(next.actions, 1);
+    assert_eq!(next.actions, 2);
     assert_eq!(driver.streams().find(1), None);
     assert_eq!(
         driver.streams().find(3).unwrap().state,

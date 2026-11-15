@@ -95,6 +95,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
                     actions,
                     result,
                 );
+                self.queue_credit(amount, actions, result);
                 return Ok(());
             }
             self.connection_receive_window
@@ -135,7 +136,27 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             StreamActionKind::Ignore | StreamActionKind::Accept => {}
             StreamActionKind::ConnectionError => return Err(action.code),
         }
+        self.queue_credit(amount, actions, result);
         Ok(())
+    }
+
+    fn queue_credit<'input>(
+        &mut self,
+        amount: i64,
+        actions: &mut [Option<H2FrameAction<'input>>],
+        result: &mut FeedResult,
+    ) {
+        let Ok(amount) = u32::try_from(amount) else {
+            return;
+        };
+        if amount == 0 {
+            return;
+        }
+        if result.actions == actions.len() {
+            self.owed_credit = self.owed_credit.saturating_add(amount);
+            return;
+        }
+        Self::push_action(actions, result, H2FrameAction::ConnectionCredit { amount });
     }
 
     fn process_headers<'input>(

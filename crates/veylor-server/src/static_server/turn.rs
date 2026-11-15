@@ -98,7 +98,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         Some(tls) => {
             match veylor_tls::TlsAcceptor::from_chain(
                 tls.cert_chain.clone(),
-                tls.key.clone_key(),
+                tls.key.clone(),
                 tls.max_handshakes,
             ) {
                 Ok(acceptor) => Some(acceptor),

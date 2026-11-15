@@ -356,7 +356,10 @@ typedef enum {
     VYL_H2_ACTION_SETTINGS_ACK_REQUIRED = 4,
     VYL_H2_ACTION_PING_ACK = 5,
     VYL_H2_ACTION_SEND_RESET = 6,
-    VYL_H2_ACTION_CONNECTION_ERROR = 7
+    VYL_H2_ACTION_CONNECTION_ERROR = 7,
+    /* NOTE: data_length is the flow-controlled byte count of DATA that was dropped (closed or
+       reset stream). Hand it back with send_window_update(stream 0) or the connection stalls. */
+    VYL_H2_ACTION_CONNECTION_CREDIT = 8
 } vyl_h2_action_kind;
 
 typedef enum {

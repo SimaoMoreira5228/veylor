@@ -13,7 +13,7 @@ use std::time::Duration;
 use http::header::CONTENT_LENGTH;
 use http::{Request, Response, StatusCode};
 use quinn::VarInt;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use veylor_tls::{Certificate, PrivateKey};
 
 pub use bytes;
 pub use bytes::Bytes;
@@ -25,6 +25,7 @@ mod client;
 mod connection;
 mod frame_io;
 mod response_writer;
+mod tls;
 
 const MAX_UNI_STREAMS: u64 = 8;
 
@@ -64,12 +65,12 @@ impl From<veylor_tls::TlsError> for Error {
 }
 
 pub struct Tls {
-    certs: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
+    certs: Vec<Certificate>,
+    key: PrivateKey,
 }
 
 impl Tls {
-    pub fn new(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Self {
+    pub fn new(certs: Vec<Certificate>, key: PrivateKey) -> Self {
         Self { certs, key }
     }
 
@@ -310,8 +311,8 @@ impl Server {
 
     pub fn start<H: Handler>(self, handler: H) -> Result<RunningServer, Error> {
         let server_config = server_config(
-            self.config.tls.certs.clone(),
-            self.config.tls.key.clone_key(),
+            &self.config.tls.certs,
+            &self.config.tls.key,
             self.config.limits,
         )?;
         let limits = self.config.limits;
@@ -352,12 +353,8 @@ impl RunningServer {
         self.address
     }
 
-    pub fn rotate_tls(
-        &self,
-        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-        key: rustls::pki_types::PrivateKeyDer<'static>,
-    ) -> Result<(), Error> {
-        let config = server_config(certs, key, self.limits)?;
+    pub fn rotate_tls(&self, certs: Vec<Certificate>, key: PrivateKey) -> Result<(), Error> {
+        let config = server_config(&certs, &key, self.limits)?;
         self.endpoint.set_server_config(Some(config));
         Ok(())
     }
@@ -382,25 +379,12 @@ impl Drop for RunningServer {
 }
 
 fn server_config(
-    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: rustls::pki_types::PrivateKeyDer<'static>,
+    certs: &[Certificate],
+    key: &PrivateKey,
     limits: Limits,
 ) -> Result<quinn::ServerConfig, Error> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| Error::Config("tls 1.3 unsupported"))?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|_| Error::Config("invalid certificate or key"))?;
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    tls.max_early_data_size = 0;
-    tls.send_half_rtt_data = false;
-
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-        .map_err(|_| Error::Config("no quic cipher suite"))?;
-    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let crypto = tls::server_crypto(certs, key).map_err(Error::Config)?;
+    let mut server = quinn::ServerConfig::with_crypto(crypto);
     let mut transport = quinn::TransportConfig::default();
     let streams =
         VarInt::from_u64(limits.max_streams).map_err(|_| Error::Config("invalid stream limit"))?;

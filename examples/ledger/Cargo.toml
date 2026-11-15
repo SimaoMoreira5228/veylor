@@ -16,7 +16,7 @@ veylor-server = { version = "0.1.0", path = "../../crates/veylor-server" }
 veylor-web = { version = "0.1.0", path = "../../crates/veylor-web" }
 
 [dev-dependencies]
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+veylor-tls = { version = "0.1.0", path = "../../crates/veylor-tls" }
 
 [lints]
 workspace = true

@@ -79,6 +79,7 @@ impl Driver<'_, '_> {
                     None => self.outbox.resets.push((stream_id, error_code)),
                 },
                 H2FrameAction::GoAway { last_stream_id, .. } => self.on_goaway(last_stream_id),
+                H2FrameAction::ConnectionCredit { .. } => {}
                 H2FrameAction::SettingsAckRequired => self.outbox.settings_acks += 1,
                 H2FrameAction::PingAck { opaque_data } => self.outbox.push_ping(opaque_data),
                 H2FrameAction::ConnectionError { error_code } => {

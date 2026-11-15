@@ -1,14 +1,16 @@
 use rustls::pki_types::pem::SliceIter;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::TlsError;
+use crate::{Certificate, PrivateKey, TlsError};
 
-pub fn load_cert_chain(input: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+pub fn load_cert_chain(input: &[u8]) -> Result<Vec<Certificate>, TlsError> {
     if is_pem(input) {
         let mut chain = Vec::new();
 
         for entry in SliceIter::<CertificateDer<'static>>::new(input) {
-            chain.push(entry.map_err(|_| TlsError::InvalidInput)?);
+            let der = entry.map_err(|_| TlsError::InvalidInput)?;
+
+            chain.push(Certificate::from_backend(&der));
         }
 
         if chain.is_empty() {
@@ -22,13 +24,13 @@ pub fn load_cert_chain(input: &[u8]) -> Result<Vec<CertificateDer<'static>>, Tls
         return Err(TlsError::InvalidInput);
     }
 
-    Ok(vec![CertificateDer::from(input.to_vec())])
+    Ok(vec![Certificate::from_der(input.to_vec())])
 }
 
-pub fn load_private_key(input: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
+pub fn load_private_key(input: &[u8]) -> Result<PrivateKey, TlsError> {
     if is_pem(input) {
         return match SliceIter::<PrivateKeyDer<'static>>::new(input).next() {
-            Some(Ok(key)) => Ok(key),
+            Some(Ok(key)) => PrivateKey::from_backend(&key).ok_or(TlsError::InvalidInput),
             _ => Err(TlsError::InvalidInput),
         };
     }
@@ -37,7 +39,7 @@ pub fn load_private_key(input: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError
         return Err(TlsError::InvalidInput);
     }
 
-    Ok(PrivateKeyDer::Pkcs8(input.to_vec().into()))
+    Ok(PrivateKey::Pkcs8(input.to_vec()))
 }
 
 fn is_pem(input: &[u8]) -> bool {
@@ -65,7 +67,7 @@ fn is_pem(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{load_cert_chain, load_private_key};
-    use rustls::pki_types::PrivateKeyDer;
+    use crate::PrivateKey;
 
     const CERT_DER: &[u8] = include_bytes!("../tests/testdata/server_cert.der");
     const KEY_DER: &[u8] = include_bytes!("../tests/testdata/server_key.der");
@@ -85,11 +87,11 @@ mod tests {
     #[test]
     fn pem_key_decodes_to_pinned_der() {
         let key = load_private_key(KEY_PEM).expect("parse key pem");
-        let PrivateKeyDer::Pkcs8(inner) = key else {
+        let PrivateKey::Pkcs8(inner) = key else {
             panic!("pkcs8 key expected");
         };
 
-        assert_eq!(inner.secret_pkcs8_der(), KEY_DER);
+        assert_eq!(inner, KEY_DER);
     }
 
     #[test]
@@ -100,22 +102,22 @@ mod tests {
         assert_eq!(chain[0].as_ref(), CERT_DER);
 
         let key = load_private_key(KEY_DER).expect("parse key der");
-        let PrivateKeyDer::Pkcs8(inner) = key else {
+        let PrivateKey::Pkcs8(inner) = key else {
             panic!("pkcs8 key expected");
         };
 
-        assert_eq!(inner.secret_pkcs8_der(), KEY_DER);
+        assert_eq!(inner, KEY_DER);
     }
 
     #[test]
     fn rsa_and_ec_pem_keys_map_to_formats() {
         let rsa = load_private_key(RSA_KEY_PEM).expect("parse rsa pem");
 
-        assert!(matches!(rsa, PrivateKeyDer::Pkcs1(_)));
+        assert!(matches!(rsa, PrivateKey::Pkcs1(_)));
 
         let ec = load_private_key(EC_KEY_PEM).expect("parse ec pem");
 
-        assert!(matches!(ec, PrivateKeyDer::Sec1(_)));
+        assert!(matches!(ec, PrivateKey::Sec1(_)));
     }
 
     #[test]

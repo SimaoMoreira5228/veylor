@@ -223,7 +223,7 @@ fn handshake_negotiates_tls13_and_http11() {
 
     assert_eq!(
         negotiated_version(&server),
-        Some(rustls::ProtocolVersion::TLSv1_3)
+        Some(veylor_tls::ProtocolVersion::Tls13)
     );
 
     assert_eq!(
@@ -328,7 +328,7 @@ fn slots_reject_second_hello_and_release_recovers() {
 
     assert_eq!(
         negotiated_version(&first),
-        Some(rustls::ProtocolVersion::TLSv1_3)
+        Some(veylor_tls::ProtocolVersion::Tls13)
     );
 
     acceptor.release();

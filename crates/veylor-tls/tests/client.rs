@@ -87,7 +87,7 @@ fn default_connector_offers_h2_and_http11_over_tls13() {
     assert_eq!(alpn(&client), Some(b"h2".as_slice()));
     assert_eq!(
         negotiated_version(&client),
-        Some(rustls::ProtocolVersion::TLSv1_3)
+        Some(veylor_tls::ProtocolVersion::Tls13)
     );
     assert!(!connector.early_data_enabled());
 }

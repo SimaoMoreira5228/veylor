@@ -86,8 +86,8 @@ impl CloseCounts {
 
 #[derive(Debug)]
 pub struct TlsConfig {
-    pub cert_chain: Vec<veylor_tls::CertificateDer<'static>>,
-    pub key: veylor_tls::PrivateKeyDer<'static>,
+    pub cert_chain: Vec<veylor_tls::Certificate>,
+    pub key: veylor_tls::PrivateKey,
     pub max_handshakes: usize,
 }
 
@@ -95,7 +95,7 @@ impl Clone for TlsConfig {
     fn clone(&self) -> Self {
         Self {
             cert_chain: self.cert_chain.clone(),
-            key: self.key.clone_key(),
+            key: self.key.clone(),
             max_handshakes: self.max_handshakes,
         }
     }
@@ -124,7 +124,7 @@ impl TlsConfig {
             return Err(TlsConfigError::InvalidInput);
         }
 
-        veylor_tls::TlsAcceptor::from_chain(chain.clone(), key.clone_key(), max_handshakes)
+        veylor_tls::TlsAcceptor::from_chain(chain.clone(), key.clone(), max_handshakes)
             .map_err(|_| TlsConfigError::InvalidInput)?;
 
         Ok(Self {
@@ -239,7 +239,7 @@ impl Server {
             }
             veylor_tls::TlsAcceptor::from_chain(
                 tls.cert_chain.clone(),
-                tls.key.clone_key(),
+                tls.key.clone(),
                 tls.max_handshakes,
             )
             .map_err(|_| ServerError::InvalidConfig)?;
@@ -622,7 +622,7 @@ impl RunningServer {
         let key = veylor_tls::load_private_key(key)?;
 
         if let Some(h3) = &self.h3 {
-            h3.rotate_tls(chain.clone(), key.clone_key())
+            h3.rotate_tls(chain.clone(), key.clone())
                 .map_err(|_| veylor_tls::TlsError::InvalidInput)?;
         }
         self.host.shared.stage_tls_rotation(chain, key)?;

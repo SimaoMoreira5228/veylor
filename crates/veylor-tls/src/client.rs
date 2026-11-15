@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::ServerName;
 
-use crate::{TlsConn, TlsError, load_cert_chain};
+use crate::pin::PinVerifier;
+use crate::{Certificate, TlsConn, TlsError, load_cert_chain};
 
 const DEFAULT_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 pub struct TlsConnectorBuilder {
     default_roots: bool,
-    extra_roots: Vec<CertificateDer<'static>>,
+    extra_roots: Vec<Certificate>,
+    pinned: Option<Certificate>,
     alpn: Vec<Vec<u8>>,
     tls13_only: bool,
 }
@@ -23,6 +25,20 @@ impl TlsConnectorBuilder {
 
     pub fn add_root(mut self, pem_or_der: &[u8]) -> Result<Self, TlsError> {
         self.extra_roots.extend(load_cert_chain(pem_or_der)?);
+
+        Ok(self)
+    }
+
+    // SECURITY: a pinned certificate skips name and validity checks and accepts only that exact
+    // end-entity certificate; the handshake signature is still verified against its key.
+    pub fn pin_certificate(mut self, pem_or_der: &[u8]) -> Result<Self, TlsError> {
+        let mut chain = load_cert_chain(pem_or_der)?;
+
+        if chain.len() != 1 {
+            return Err(TlsError::InvalidInput);
+        }
+
+        self.pinned = chain.pop();
 
         Ok(self)
     }
@@ -46,11 +62,13 @@ impl TlsConnectorBuilder {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
 
-        for cert in self.extra_roots {
-            roots.add(cert).map_err(|_| TlsError::InvalidInput)?;
+        for cert in &self.extra_roots {
+            roots
+                .add(cert.to_backend())
+                .map_err(|_| TlsError::InvalidInput)?;
         }
 
-        if roots.is_empty() {
+        if roots.is_empty() && self.pinned.is_none() {
             return Err(TlsError::InvalidInput);
         }
 
@@ -60,9 +78,15 @@ impl TlsConnectorBuilder {
             rustls::ALL_VERSIONS
         };
 
-        let mut config = rustls::ClientConfig::builder_with_protocol_versions(versions)
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let builder = rustls::ClientConfig::builder_with_protocol_versions(versions);
+
+        let mut config = match &self.pinned {
+            Some(pinned) => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinVerifier::new(pinned)?))
+                .with_no_client_auth(),
+            None => builder.with_root_certificates(roots).with_no_client_auth(),
+        };
 
         config.alpn_protocols = self.alpn;
         config.enable_early_data = false;
@@ -83,6 +107,7 @@ impl TlsConnector {
         TlsConnectorBuilder {
             default_roots: true,
             extra_roots: Vec::new(),
+            pinned: None,
             alpn: DEFAULT_ALPN.iter().map(|p| p.to_vec()).collect(),
             tls13_only: false,
         }

@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -405,18 +404,15 @@ fn configured_tls_serves_verified_https_readiness() {
         ],
     );
     let certificate = include_bytes!("testdata/server_cert.der");
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(rustls::pki_types::CertificateDer::from(
-            certificate.to_vec(),
-        ))
+    let connection = veylor_tls::TlsConnector::builder()
+        .default_roots(false)
+        .add_root(certificate)
+        .unwrap()
+        .alpn(&[b"http/1.1"])
+        .build()
+        .unwrap()
+        .connect("localhost")
         .unwrap();
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
     let stream = TcpStream::connect(service.address).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -424,7 +420,7 @@ fn configured_tls_serves_verified_https_readiness() {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut tls = rustls::StreamOwned::new(connection, stream);
+    let mut tls = veylor_tls::TlsStream::new(stream, connection);
 
     tls.write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();

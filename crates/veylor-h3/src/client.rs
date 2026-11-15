@@ -8,23 +8,22 @@ use std::thread::{self, JoinHandle};
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, HOST};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
-use quinn::crypto::rustls::QuicClientConfig;
-use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use veylor_http3::{
     CONTROL_STREAM, QPACK_DECODER_STREAM, QPACK_ENCODER_STREAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
     SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
 };
+use veylor_tls::Certificate;
 
 use crate::frame_io::{discard, read_byte, read_varint};
 use crate::{Error, Limits};
 
 pub struct ClientTls {
-    roots: Vec<CertificateDer<'static>>,
+    roots: Vec<Certificate>,
 }
 
 impl ClientTls {
-    pub fn new(roots: Vec<CertificateDer<'static>>) -> Self {
+    pub fn new(roots: Vec<Certificate>) -> Self {
         Self { roots }
     }
 
@@ -293,20 +292,7 @@ fn run(
 fn build_client(
     config: &ClientConfig,
 ) -> Result<(quinn::Endpoint, quinn::ClientConfig), ClientError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for root in &config.tls.roots {
-        roots
-            .add(root.clone())
-            .map_err(|_| ClientError::Config("invalid root certificate"))?;
-    }
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ClientError::Config("tls 1.3"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    let crypto = QuicClientConfig::try_from(tls).map_err(|_| ClientError::Config("quic"))?;
+    let crypto = crate::tls::client_crypto(&config.tls.roots).map_err(ClientError::Config)?;
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
         config
@@ -315,7 +301,7 @@ fn build_client(
             .try_into()
             .map_err(|_| ClientError::Config("idle timeout"))?,
     ));
-    let mut client = quinn::ClientConfig::new(Arc::new(crypto));
+    let mut client = quinn::ClientConfig::new(crypto);
     client.transport_config(Arc::new(transport));
     let bind = if config.server.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))

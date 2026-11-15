@@ -36,6 +36,8 @@ use crate::frame::{
 use crate::hpack::{HpackHeader, HpackTable};
 use crate::stream::{ClientPrefaceError, H2Role, SettingsError, StreamTable};
 
+const MAX_ACTIONS_PER_FRAME: usize = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeaderRange {
     pub start: usize,
@@ -74,6 +76,9 @@ pub enum H2FrameAction<'input> {
     },
     ConnectionError {
         error_code: ErrorCode,
+    },
+    ConnectionCredit {
+        amount: u32,
     },
 }
 
@@ -115,6 +120,7 @@ pub struct H2FrameDriver<'stream, 'streams, 'decoder, 'encoder> {
     settings_ack_head: usize,
     settings_ack_len: usize,
     connection_receive_window: FlowWindow,
+    owed_credit: u32,
     connection_send_window: FlowWindow,
     pending_headers: Option<PendingHeaders>,
     failed: Option<ErrorCode>,
@@ -142,6 +148,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             settings_ack_head: 0,
             settings_ack_len: 0,
             connection_receive_window,
+            owed_credit: 0,
             connection_send_window,
             pending_headers: None,
             failed: None,
@@ -270,6 +277,15 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
             return result;
         }
 
+        if self.owed_credit > 0 && !actions.is_empty() {
+            let amount = core::mem::take(&mut self.owed_credit);
+            Self::push_action(
+                actions,
+                &mut result,
+                H2FrameAction::ConnectionCredit { amount },
+            );
+        }
+
         if !self.streams.client_preface_complete() {
             let preface_progress = self.streams.client_preface_progress();
             match self.streams.receive_client_preface_fragment(input) {
@@ -294,7 +310,7 @@ impl<'stream, 'streams, 'decoder, 'encoder> H2FrameDriver<'stream, 'streams, 'de
         }
 
         while result.consumed < input.len() {
-            if result.actions == actions.len() {
+            if result.actions + MAX_ACTIONS_PER_FRAME.min(actions.len()) > actions.len() {
                 result.status = FeedStatus::OutputFull;
                 return result;
             }

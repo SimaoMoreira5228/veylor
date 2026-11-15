@@ -763,6 +763,13 @@ fn pump_controls(
                 staged.extend_from_slice(data);
                 stage(StreamEvent::Data(stream_id, start, data.len(), end_stream));
             }
+            H2FrameAction::ConnectionCredit { amount } => {
+                let written = grant_window(server, 0, amount, &mut output[*used..]);
+                if written == 0 {
+                    return false;
+                }
+                *used += written;
+            }
             H2FrameAction::StreamReset { .. } => stage(StreamEvent::PeerReset),
             H2FrameAction::ConnectionError { error_code } => {
                 let mut writer = ControlFrameWriter::new(&mut output[*used..], max);

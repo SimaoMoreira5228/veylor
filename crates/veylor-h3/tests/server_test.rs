@@ -2,22 +2,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Buf;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::CertificateDer;
 use veylor_h3::{Config, Limits, Server, Tls, http, text_response};
+use veylor_tls::{Certificate, PrivateKey};
 
-fn identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+fn identity() -> (Certificate, PrivateKey) {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
         .expect("generate certificate");
-    let cert = generated.cert.der().clone();
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        generated.signing_key.serialize_der(),
-    ));
+    let cert = Certificate::from_der(generated.cert.der().to_vec());
+    let key = PrivateKey::Pkcs8(generated.signing_key.serialize_der());
     (cert, key)
 }
 
-fn client_endpoint(cert: CertificateDer<'static>) -> (quinn::Endpoint, quinn::ClientConfig) {
+fn client_endpoint(cert: Certificate) -> (quinn::Endpoint, quinn::ClientConfig) {
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert).expect("trust fixture");
+    roots
+        .add(CertificateDer::from(cert.as_der().to_vec()))
+        .expect("trust fixture");
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])

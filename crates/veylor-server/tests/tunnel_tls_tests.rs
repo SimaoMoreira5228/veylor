@@ -1,14 +1,13 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustls::pki_types::{CertificateDer, ServerName};
 use veylor_runtime::ConnectionToken;
 use veylor_server::{
     EventSlot, HostEventKind, HostHandle, RespondOutcome, RunningServer, Server, ServerConfig,
     TlsConfig,
 };
+use veylor_tls::{TlsConnector, TlsStream};
 use veylor_websocket::{OpCode, encode_frame};
 
 const CERT_DER: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_cert.der");
@@ -16,86 +15,22 @@ const KEY_DER: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/server_ke
 const DEADLINE: Duration = Duration::from_secs(5);
 const MASK: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
 
-#[derive(Debug)]
-struct PinVerifier {
-    expected: Vec<u8>,
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
-}
-
-impl PinVerifier {
-    fn new(cert_der: &[u8]) -> Self {
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(cert_der.to_vec()))
-            .expect("fixture anchor");
-        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("verifier builds");
-        Self {
-            expected: cert_der.to_vec(),
-            inner,
-        }
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if end_entity.as_ref() == self.expected.as_slice() {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General("TLS 1.2 disabled".into()))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
-}
-
-fn client_config() -> Arc<rustls::ClientConfig> {
-    let verifier = Arc::new(PinVerifier::new(CERT_DER));
-    let mut config =
-        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
+fn connector() -> TlsConnector {
+    TlsConnector::builder()
+        .tls13_only(true)
+        .pin_certificate(CERT_DER)
+        .expect("pin fixture")
+        .alpn(&[b"http/1.1"])
+        .build()
+        .expect("connector")
 }
 
 fn tls_server() -> RunningServer {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let config = ServerConfig {
         tls: Some(TlsConfig {
-            cert_chain: vec![veylor_server::CertificateDer::from(CERT_DER.to_vec())],
-            key: veylor_server::PrivateKeyDer::Pkcs8(KEY_DER.to_vec().into()),
+            cert_chain: vec![veylor_server::Certificate::from(CERT_DER.to_vec())],
+            key: veylor_server::PrivateKey::Pkcs8(KEY_DER.to_vec()),
             max_handshakes: 16,
         }),
         ..ServerConfig::default()
@@ -107,7 +42,7 @@ fn tls_server() -> RunningServer {
     server.start().expect("start server")
 }
 
-fn connect(server: &RunningServer) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+fn connect(server: &RunningServer) -> TlsStream<TcpStream> {
     let socket = TcpStream::connect(server.addr()).expect("connect loopback");
     socket
         .set_read_timeout(Some(DEADLINE))
@@ -115,9 +50,8 @@ fn connect(server: &RunningServer) -> rustls::StreamOwned<rustls::ClientConnecti
     socket
         .set_write_timeout(Some(DEADLINE))
         .expect("write timeout");
-    let name = ServerName::try_from("localhost").expect("server name");
-    let connection = rustls::ClientConnection::new(client_config(), name).expect("client hello");
-    rustls::StreamOwned::new(connection, socket)
+    let conn = connector().connect("localhost").expect("client hello");
+    TlsStream::new(socket, conn)
 }
 
 fn event_slot() -> EventSlot {

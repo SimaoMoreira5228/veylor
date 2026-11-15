@@ -9,7 +9,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use veylor_http1::{is_token, valid_field_value};
 use veylor_runtime::{ConnectionToken, WakeHandle};
-use veylor_tls::{CertificateDer, PrivateKeyDer, TlsAcceptor, TlsError};
+use veylor_tls::{Certificate, PrivateKey, TlsAcceptor, TlsError};
 
 mod request;
 mod signals;
@@ -199,7 +199,7 @@ pub(crate) struct HostInner {
     pub(crate) wakers: Vec<Option<WakeHandle>>,
     next_poll: usize,
     pub(crate) counters: HostCounters,
-    tls_rotation: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    tls_rotation: Option<(Vec<Certificate>, PrivateKey)>,
     tls_rotation_epoch: u64,
     staged_epoch: Vec<u64>,
 }
@@ -278,10 +278,10 @@ impl HostShared {
 
     pub(crate) fn stage_tls_rotation(
         &self,
-        chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
+        chain: Vec<Certificate>,
+        key: PrivateKey,
     ) -> Result<u64, TlsError> {
-        TlsAcceptor::from_chain(chain.clone(), key.clone_key(), 1)?;
+        TlsAcceptor::from_chain(chain.clone(), key.clone(), 1)?;
 
         let (epoch, _) = self.with_inner(|inner| {
             inner.tls_rotation_epoch += 1;
@@ -298,7 +298,7 @@ impl HostShared {
     pub(crate) fn take_tls_rotation(
         &self,
         seen_epoch: u64,
-    ) -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, u64)> {
+    ) -> Option<(Vec<Certificate>, PrivateKey, u64)> {
         if self.tls_rotation_epoch() <= seen_epoch {
             return None;
         }
@@ -309,7 +309,7 @@ impl HostShared {
                 inner
                     .tls_rotation
                     .as_ref()
-                    .map(|(chain, key)| (chain.clone(), key.clone_key(), epoch))
+                    .map(|(chain, key)| (chain.clone(), key.clone(), epoch))
             } else {
                 None
             };

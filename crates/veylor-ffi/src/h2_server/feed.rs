@@ -379,6 +379,11 @@ unsafe fn translate_pending(
                 error_code: error_code.value(),
                 ..VylH2Action::default()
             },
+            veylor_http2::H2FrameAction::ConnectionCredit { amount } => VylH2Action {
+                kind: VylH2ActionKind::ConnectionCredit,
+                data_length: *amount as usize,
+                ..VylH2Action::default()
+            },
         };
         actions[action_next] = translated;
         action_next += 1;

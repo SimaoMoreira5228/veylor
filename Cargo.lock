@@ -1656,10 +1656,10 @@ dependencies = [
  "ctrlc",
  "parking_lot",
  "rusqlite",
- "rustls",
  "serde",
  "serde_json",
  "veylor-server",
+ "veylor-tls",
  "veylor-web",
 ]
 
@@ -1696,7 +1696,6 @@ name = "veylor-runtime-tokio"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
- "rustls",
  "tokio",
  "veylor-client",
  "veylor-http1",
@@ -1712,7 +1711,6 @@ dependencies = [
  "flate2",
  "parking_lot",
  "rustix 0.38.44",
- "rustls",
  "tokio",
  "veylor-h3",
  "veylor-http1",

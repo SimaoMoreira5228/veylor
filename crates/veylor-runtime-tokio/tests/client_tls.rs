@@ -9,7 +9,7 @@ use veylor_runtime_tokio::{
     TlsConnector,
 };
 use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig, TlsConfig};
-use veylor_tls::{CertificateDer, PrivateKeyDer};
+use veylor_tls::{Certificate, PrivateKey, TlsAcceptor, TlsStream};
 
 const CERT: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/leaf_cert.der");
 const KEY: &[u8] = include_bytes!("../../veylor-tls/tests/testdata/leaf_key.der");
@@ -38,8 +38,8 @@ fn client(alpn: &[&[u8]], pool: PoolConfig) -> Client {
 fn managed_tls_server() -> RunningServer {
     let config = ServerConfig {
         tls: Some(TlsConfig {
-            cert_chain: vec![CertificateDer::from(CERT.to_vec())],
-            key: PrivateKeyDer::Pkcs8(KEY.to_vec().into()),
+            cert_chain: vec![Certificate::from(CERT.to_vec())],
+            key: PrivateKey::Pkcs8(KEY.to_vec()),
             max_handshakes: 64,
         }),
         ..ServerConfig::default()
@@ -72,18 +72,10 @@ fn spawn_raw_tls(alpn: &[&[u8]], answers: bool) -> RawTls {
     let addr = listener.local_addr().expect("addr");
     let accepted = Arc::new(AtomicUsize::new(0));
     let clean_closes = Arc::new(AtomicUsize::new(0));
-    let mut config =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from(CERT.to_vec())],
-                PrivateKeyDer::Pkcs8(KEY.to_vec().into()),
-            )
-            .expect("server config");
+    let mut acceptor = TlsAcceptor::new(CERT, KEY, usize::MAX)
+        .expect("acceptor")
+        .with_alpn(alpn);
 
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-
-    let config = Arc::new(config);
     let count = Arc::clone(&accepted);
     let clean = Arc::clone(&clean_closes);
 
@@ -92,13 +84,11 @@ fn spawn_raw_tls(alpn: &[&[u8]], answers: bool) -> RawTls {
             let Ok(socket) = socket else {
                 return;
             };
-            let conn = rustls::ServerConnection::new(Arc::clone(&config)).expect("conn");
+            let conn = acceptor.admit().expect("conn");
             let clean = Arc::clone(&clean);
 
             count.fetch_add(1, Ordering::SeqCst);
-            std::thread::spawn(move || {
-                serve_raw(rustls::StreamOwned::new(conn, socket), answers, clean)
-            });
+            std::thread::spawn(move || serve_raw(TlsStream::new(socket, conn), answers, clean));
         }
     });
 
@@ -110,11 +100,7 @@ fn spawn_raw_tls(alpn: &[&[u8]], answers: bool) -> RawTls {
     }
 }
 
-fn serve_raw(
-    mut stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
-    answers: bool,
-    clean: Arc<AtomicUsize>,
-) {
+fn serve_raw(mut stream: TlsStream<std::net::TcpStream>, answers: bool, clean: Arc<AtomicUsize>) {
     let mut buf = [0u8; 4096];
     let mut seen = Vec::new();
 

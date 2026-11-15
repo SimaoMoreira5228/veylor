@@ -28,6 +28,8 @@ use veylor_server::{
     h2::{FrozenNativeRoute, HEADER_BLOCK_CAP, HEADER_SLOTS, STREAM_SLOTS},
 };
 
+#[path = "h2_tests/closed_data.rs"]
+mod h2_closed_data;
 #[path = "h2_tests/managed_requests.rs"]
 mod h2_managed_requests;
 #[path = "h2_tests/padding.rs"]

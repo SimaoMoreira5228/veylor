@@ -87,7 +87,11 @@ fn drain_reader(conn: &mut TlsConn, plain_out: &mut Vec<u8>) -> Result<(), TlsEr
 
     loop {
         match conn.inner.reader().read(&mut chunk) {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                conn.peer_closed = true;
+
+                return Ok(());
+            }
 
             Ok(n) => {
                 plain_out.extend_from_slice(&chunk[..n]);
