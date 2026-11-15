@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 pub(crate) type Invalid = &'static str;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Origin {
     pub(crate) tls: bool,
-    pub(crate) host: String,
+    pub(crate) host: Arc<str>,
     pub(crate) port: u16,
 }
 
@@ -14,16 +16,25 @@ impl Origin {
 
     pub(crate) fn host_header(&self) -> String {
         let default = if self.tls { 443 } else { 80 };
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
 
         if self.port == default {
-            host
+            return self.bracketed_host();
+        }
+
+        self.authority()
+    }
+
+    pub(crate) fn authority(&self) -> String {
+        let host = self.bracketed_host();
+
+        format!("{host}:{}", self.port)
+    }
+
+    fn bracketed_host(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]", self.host)
         } else {
-            format!("{host}:{}", self.port)
+            self.host.as_ref().to_owned()
         }
     }
 }
@@ -137,7 +148,7 @@ impl Url {
         };
         let origin = Origin {
             tls,
-            host: host.to_ascii_lowercase(),
+            host: host.to_ascii_lowercase().into(),
             port,
         };
 
@@ -207,7 +218,7 @@ fn normalize(path_and_query: &str) -> String {
     out
 }
 
-fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+pub(crate) fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     let head = url.get(..scheme.len())?;
 
     if head.eq_ignore_ascii_case(scheme) {
@@ -217,7 +228,7 @@ fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     None
 }
 
-fn split_authority(authority: &str, default: u16) -> Result<(&str, u16), Invalid> {
+pub(crate) fn split_authority(authority: &str, default: u16) -> Result<(&str, u16), Invalid> {
     if let Some(inner) = authority.strip_prefix('[') {
         let (host, after) = inner.split_once(']').ok_or("bad ipv6 host")?;
 
@@ -242,6 +253,8 @@ fn parse_port(port: Option<&str>) -> Result<u16, Invalid> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::Url;
 
     #[test]
@@ -249,7 +262,7 @@ mod tests {
         let url = Url::parse("HTTPS://Example.COM/a?b=1#frag").expect("url");
 
         assert!(url.origin().tls);
-        assert_eq!(url.origin().host, "example.com");
+        assert_eq!(url.origin().host.as_ref(), "example.com");
         assert_eq!(url.origin().port, 443);
         assert_eq!(url.target(), "/a?b=1");
         assert_eq!(url.as_str(), "https://example.com/a?b=1");
@@ -257,7 +270,7 @@ mod tests {
 
         let url = Url::parse("http://[::1]:81?x").expect("url");
 
-        assert_eq!(url.origin().host, "::1");
+        assert_eq!(url.origin().host.as_ref(), "::1");
         assert_eq!(url.target(), "/?x");
         assert_eq!(url.path(), "/");
         assert_eq!(url.origin().host_header(), "[::1]:81");
@@ -325,5 +338,18 @@ mod tests {
             a.origin(),
             Url::parse("http://h:81/x").expect("url").origin()
         );
+    }
+
+    #[test]
+    fn cloning_an_origin_shares_the_host_allocation() {
+        let origin = Url::parse("http://example.com/x")
+            .expect("url")
+            .origin()
+            .clone();
+        let clone = origin.clone();
+
+        assert!(Arc::ptr_eq(&origin.host, &clone.host));
+        assert_eq!(origin, clone);
+        assert_eq!(clone.host.as_ref(), "example.com");
     }
 }

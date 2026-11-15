@@ -14,6 +14,7 @@ mod outgoing;
 mod percent;
 mod pool;
 mod protocol;
+mod proxy;
 mod redirect;
 mod request;
 mod response;

@@ -12,8 +12,9 @@ use crate::h1::H1Conn;
 use crate::h2::{H2Handle, H2Settings};
 use crate::method::Method;
 use crate::outgoing::Outgoing;
-use crate::pool::{Pool, PoolStats};
+use crate::pool::{Pool, PoolStats, Route};
 use crate::protocol::Protocol;
+use crate::proxy::{self, Proxy};
 use crate::redirect;
 use crate::request::Request;
 use crate::response::{Body, H1Body, H2Body, Response};
@@ -23,6 +24,7 @@ use crate::wire::Wire;
 
 const H2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ATTEMPTS: usize = 3;
+const PROXY_AUTH_REQUIRED: u16 = 407;
 
 struct Inner {
     config: Config,
@@ -131,7 +133,11 @@ impl Agent {
         let mut redirects = 0;
 
         loop {
-            let mut response = self.round_trip(&method, &url, &headers, body, &budget)?;
+            let route = self.route(url.origin());
+
+            self.apply_proxy_auth(&route, &mut headers);
+
+            let mut response = self.round_trip(&method, &url, &route, &headers, body, &budget)?;
             let location = redirect_location(&response);
 
             let Some(location) = location.filter(|_| config.redirect.limit() > 0) else {
@@ -209,29 +215,76 @@ impl Agent {
         }
     }
 
+    fn route(&self, origin: &Origin) -> Route {
+        let config = &self.inner.config;
+        let proxy = if origin.tls {
+            &config.https_proxy
+        } else {
+            &config.http_proxy
+        };
+
+        let Some(proxy) = proxy else {
+            return Route::Direct(origin.clone());
+        };
+
+        if config.no_proxy.matches(&origin.host, origin.port) {
+            return Route::Direct(origin.clone());
+        }
+
+        proxy.route(origin)
+    }
+
+    fn apply_proxy_auth(&self, route: &Route, headers: &mut Vec<(String, String)>) {
+        let Route::Forward(_) = route else {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("proxy-authorization"));
+
+            return;
+        };
+
+        let Some(configured) = self.proxy(route).and_then(Proxy::authorization) else {
+            return;
+        };
+
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("proxy-authorization"));
+        headers.push(("proxy-authorization".to_owned(), configured.to_owned()));
+    }
+
+    fn proxy(&self, route: &Route) -> Option<&Proxy> {
+        match route {
+            Route::Direct(_) => None,
+            Route::Forward(_) => self.inner.config.http_proxy.as_ref(),
+            Route::Tunnel { .. } => self.inner.config.https_proxy.as_ref(),
+        }
+    }
+
     fn round_trip(
         &self,
         method: &Method,
         url: &Url,
+        route: &Route,
         headers: &[(String, String)],
         body: &[u8],
         budget: &Budget,
     ) -> Result<Response, Error> {
         let host = url.origin().host_header();
+        let target = match route {
+            Route::Forward(_) => url.as_str(),
+            _ => url.target(),
+        };
         let request = Outgoing {
             method,
             host: &host,
-            target: url.target(),
+            target,
             headers,
             body,
         };
 
         for attempt in 0..MAX_ATTEMPTS {
             let reuse = attempt + 1 < MAX_ATTEMPTS;
-            let (conn, reused) = self.checkout(url.origin(), budget, reuse)?;
+            let (conn, reused) = self.checkout(route, budget, reuse)?;
 
-            match self.exchange(conn, &request, url, budget) {
-                Ok(response) => return Ok(response),
+            match self.exchange(conn, &request, url, route, budget) {
+                Ok(response) => return self.proxy_status(route, response),
                 Err(failed)
                     if reused
                         && failed.retry
@@ -243,19 +296,28 @@ impl Agent {
         Err(Error::Protocol("no usable connection".to_owned()))
     }
 
-    fn checkout(
-        &self,
-        origin: &Origin,
-        budget: &Budget,
-        reuse: bool,
-    ) -> Result<(Conn, bool), Error> {
-        if reuse && let Some(conn) = self.reuse(origin) {
+    fn proxy_status(&self, route: &Route, mut response: Response) -> Result<Response, Error> {
+        let Route::Forward(endpoint) = route else {
+            return Ok(response);
+        };
+
+        if response.status() != PROXY_AUTH_REQUIRED {
+            return Ok(response);
+        }
+
+        response.discard();
+
+        Err(proxy::auth_required(endpoint))
+    }
+
+    fn checkout(&self, route: &Route, budget: &Budget, reuse: bool) -> Result<(Conn, bool), Error> {
+        if reuse && let Some(conn) = self.reuse(route) {
             return Ok((conn, true));
         }
 
         let pool = &self.inner.pool;
-        let _dial = if origin.tls && !pool.is_h1_only(origin) {
-            let guard = pool.dial(origin, budget.overall);
+        let _dial = if route.uses_tls() && !pool.is_h1_only(route) {
+            let guard = pool.dial(route, budget.overall);
 
             Some(guard.ok_or(Error::Timeout(TimeoutKind::Connect))?)
         } else {
@@ -264,34 +326,29 @@ impl Agent {
 
         if reuse
             && _dial.is_some()
-            && let Some(conn) = self.reuse(origin)
+            && let Some(conn) = self.reuse(route)
         {
             return Ok((conn, true));
         }
 
-        Ok((self.connect(origin, budget)?, false))
+        Ok((self.connect(route, budget)?, false))
     }
 
-    fn reuse(&self, origin: &Origin) -> Option<Conn> {
+    fn reuse(&self, route: &Route) -> Option<Conn> {
         let pool = &self.inner.pool;
 
-        if origin.tls
-            && let Some(handle) = pool.take_h2(origin)
+        if route.uses_tls()
+            && let Some(handle) = pool.take_h2(route)
         {
             return Some(Conn::H2(handle));
         }
 
-        pool.take_h1(origin).map(Conn::H1)
+        pool.take_h1(route).map(Conn::H1)
     }
 
-    fn connect(&self, origin: &Origin, budget: &Budget) -> Result<Conn, Error> {
+    fn connect(&self, route: &Route, budget: &Budget) -> Result<Conn, Error> {
         let config = &self.inner.config;
-        let connector = if origin.tls {
-            Some(self.connector()?)
-        } else {
-            None
-        };
-        let wire = Wire::connect(origin, connector, config.connect_timeout, budget)?;
+        let wire = self.dial(route, budget)?;
 
         if wire.alpn() == Some(b"h2".as_slice()) {
             let settings = H2Settings {
@@ -303,16 +360,48 @@ impl Agent {
             let handle = H2Handle::spawn(wire, settings)?;
 
             handle.reserve(true);
-            self.inner.pool.add_h2(origin, &handle);
+            self.inner.pool.add_h2(route, &handle);
 
             return Ok(Conn::H2(handle));
         }
 
-        if origin.tls {
-            self.inner.pool.mark_h1_only(origin);
+        if route.uses_tls() {
+            self.inner.pool.mark_h1_only(route);
         }
 
         Ok(Conn::H1(Box::new(H1Conn::new(wire, config.max_head_size))))
+    }
+
+    fn dial(&self, route: &Route, budget: &Budget) -> Result<Wire, Error> {
+        let config = &self.inner.config;
+        let timeout = config.connect_timeout;
+
+        match route {
+            Route::Direct(origin) => {
+                let connector = if origin.tls {
+                    Some(self.connector()?)
+                } else {
+                    None
+                };
+
+                Wire::connect(origin, connector, timeout, budget)
+            }
+            Route::Forward(endpoint) => Wire::connect(endpoint, None, timeout, budget),
+            Route::Tunnel { proxy, target } => {
+                let Some(config_proxy) = self.proxy(route) else {
+                    return Err(Error::Protocol(
+                        "tunnel route without a configured proxy".to_owned(),
+                    ));
+                };
+
+                let mut wire = Wire::connect(proxy, None, timeout, budget)?;
+
+                config_proxy.tunnel(&mut wire, target, config.max_head_size, timeout, budget)?;
+                wire.start_tls(target, Some(self.connector()?), timeout, budget)?;
+
+                Ok(wire)
+            }
+        }
     }
 
     fn connector(&self) -> Result<&TlsConnector, Error> {
@@ -332,10 +421,11 @@ impl Agent {
         conn: Conn,
         request: &Outgoing<'_>,
         url: &Url,
+        route: &Route,
         budget: &Budget,
     ) -> Result<Response, Failed> {
         match conn {
-            Conn::H1(conn) => self.exchange_h1(conn, request, url, budget),
+            Conn::H1(conn) => self.exchange_h1(conn, request, url, route, budget),
             Conn::H2(handle) => self.exchange_h2(handle, request, url, budget),
         }
     }
@@ -345,6 +435,7 @@ impl Agent {
         mut conn: Box<H1Conn>,
         request: &Outgoing<'_>,
         url: &Url,
+        route: &Route,
         budget: &Budget,
     ) -> Result<Response, Failed> {
         if let Err(error) = conn.send(request, budget) {
@@ -364,7 +455,7 @@ impl Agent {
         let body = Body::H1(H1Body {
             conn: Some(conn),
             agent: self.clone(),
-            origin: url.origin().clone(),
+            route: route.clone(),
             budget: *budget,
         });
 

@@ -7,16 +7,16 @@ use crate::error::Error;
 use crate::h1::H1Conn;
 use crate::h2::H2Stream;
 use crate::headers::{HeaderBytesIter, HeaderIter, Headers};
+use crate::pool::Route;
 use crate::protocol::Protocol;
 use crate::status;
-use crate::url::Origin;
 
 const REDIRECT_DRAIN_LIMIT: usize = 64 * 1024;
 
 pub(crate) struct H1Body {
     pub(crate) conn: Option<Box<H1Conn>>,
     pub(crate) agent: Agent,
-    pub(crate) origin: Origin,
+    pub(crate) route: Route,
     pub(crate) budget: Budget,
 }
 
@@ -33,7 +33,7 @@ pub(crate) enum Body {
 impl H1Body {
     fn give_back(&mut self) {
         if let Some(conn) = self.conn.take() {
-            self.agent.pool().put_h1(&self.origin, conn);
+            self.agent.pool().put_h1(&self.route, conn);
         }
     }
 

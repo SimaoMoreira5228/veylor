@@ -37,10 +37,20 @@ impl Wire {
             alpn: None,
         };
 
-        if !origin.tls {
-            return Ok(wire);
+        if origin.tls {
+            wire.start_tls(origin, connector, connect_timeout, budget)?;
         }
 
+        Ok(wire)
+    }
+
+    pub(crate) fn start_tls(
+        &mut self,
+        origin: &Origin,
+        connector: Option<&TlsConnector>,
+        connect_timeout: Option<Duration>,
+        budget: &Budget,
+    ) -> Result<(), Error> {
         let Some(connector) = connector else {
             return Err(Error::Tls("no tls connector".to_owned()));
         };
@@ -48,10 +58,8 @@ impl Wire {
             .connect(&origin.host)
             .map_err(|error| Error::Tls(error.to_string()))?;
 
-        wire.tls = Some(Box::new(conn));
-        wire.handshake(connect_timeout, budget)?;
-
-        Ok(wire)
+        self.tls = Some(Box::new(conn));
+        self.handshake(connect_timeout, budget)
     }
 
     fn handshake(&mut self, limit: Option<Duration>, budget: &Budget) -> Result<(), Error> {
@@ -258,7 +266,7 @@ fn open_tcp(
     budget: &Budget,
 ) -> Result<TcpStream, Error> {
     let overall = |error: io::Error| Error::from_io(error, TimeoutKind::Connect, budget.expired());
-    let addresses = (origin.host.as_str(), origin.port)
+    let addresses = (origin.host.as_ref(), origin.port)
         .to_socket_addrs()
         .map_err(Error::Connect)?;
     let mut last = None;

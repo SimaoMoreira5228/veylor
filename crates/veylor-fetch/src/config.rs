@@ -6,6 +6,7 @@ use crate::agent::Agent;
 use crate::error::Error;
 use crate::headers::check as check_header;
 use crate::limits::DEFAULT_MAX_BODY;
+use crate::proxy::{FromEnv, NoProxy, Proxy};
 use crate::redirect::RedirectPolicy;
 
 #[derive(Clone, Debug)]
@@ -27,6 +28,9 @@ pub(crate) struct Config {
     pub(crate) roots: Vec<Certificate>,
     pub(crate) pinned: Option<Certificate>,
     pub(crate) default_roots: bool,
+    pub(crate) https_proxy: Option<Proxy>,
+    pub(crate) http_proxy: Option<Proxy>,
+    pub(crate) no_proxy: NoProxy,
 }
 
 impl Default for Config {
@@ -49,6 +53,9 @@ impl Default for Config {
             roots: Vec::new(),
             pinned: None,
             default_roots: true,
+            https_proxy: None,
+            http_proxy: None,
+            no_proxy: NoProxy::default(),
         }
     }
 }
@@ -172,6 +179,45 @@ impl AgentBuilder {
 
     pub fn http1_only(mut self, enabled: bool) -> Self {
         self.config.http1_only = enabled;
+        self
+    }
+
+    pub fn proxy(mut self, url: &str) -> Self {
+        match Proxy::parse(url) {
+            Ok(proxy) => {
+                self.config.https_proxy = Some(proxy.clone());
+                self.config.http_proxy = Some(proxy);
+            }
+            Err(error) => self.fail(error),
+        }
+
+        self
+    }
+
+    pub fn no_proxy(mut self, spec: &str) -> Self {
+        self.config.no_proxy = NoProxy::parse(spec);
+
+        self
+    }
+
+    pub fn proxy_from_env(mut self) -> Self {
+        match FromEnv::read() {
+            Ok(env) => {
+                if let Some(proxy) = env.https {
+                    self.config.https_proxy = Some(proxy);
+                }
+
+                if let Some(proxy) = env.http {
+                    self.config.http_proxy = Some(proxy);
+                }
+
+                if let Some(bypass) = env.bypass {
+                    self.config.no_proxy = bypass;
+                }
+            }
+            Err(error) => self.fail(error),
+        }
+
         self
     }
 

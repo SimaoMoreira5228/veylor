@@ -4,6 +4,7 @@ mod h2_mux;
 mod h2_peer;
 mod json;
 mod mux_peer;
+mod proxy;
 mod redirects;
 mod support;
 mod tls;
