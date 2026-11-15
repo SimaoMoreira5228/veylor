@@ -1,4 +1,5 @@
 use super::*;
+use crate::flow_control::MAX_FLOW_WINDOW_SIZE;
 use crate::frame::SETTINGS_ACK;
 
 mod preface;

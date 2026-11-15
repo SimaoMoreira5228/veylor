@@ -9,7 +9,7 @@ use crate::static_routes::{
 };
 
 use super::file::FileTransfer;
-use super::parked::park_request;
+use super::park_request::park_request;
 use super::{ConnClose, ConnPhase, ConnState, INPUT_CAP};
 
 // NOTE: minimal request-line frame around a target (1-byte method + 2 spaces + 8-byte version);
