@@ -1617,6 +1617,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "flate2",
+ "parking_lot",
  "serde",
  "serde_json",
  "smol",
@@ -1626,19 +1627,6 @@ dependencies = [
  "veylor-fetch",
  "veylor-runtime-smol",
  "veylor-runtime-tokio",
- "veylor-server",
- "veylor-tls",
-]
-
-[[package]]
-name = "veylor-fetch-blocking"
-version = "0.1.0"
-dependencies = [
- "base64",
- "parking_lot",
- "serde",
- "serde_json",
- "veylor-client",
  "veylor-server",
  "veylor-tls",
 ]

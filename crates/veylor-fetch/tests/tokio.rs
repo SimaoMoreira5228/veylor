@@ -1,10 +1,11 @@
 #![cfg(feature = "tokio")]
 
+#[path = "asynchronous/support/mod.rs"]
 mod support;
 
 use std::future::Future;
 
-use veylor_fetch::Runtime;
+use veylor_fetch::asynchronous::Runtime;
 
 const RUNTIME: Runtime = Runtime::Tokio;
 
@@ -20,8 +21,8 @@ fn run<F: Future>(work: F) -> F::Output {
 mod scenarios {
     use super::*;
 
-    include!("scenarios/basic.rs");
-    include!("scenarios/redirects.rs");
-    include!("scenarios/streaming.rs");
-    include!("scenarios/tls.rs");
+    include!("asynchronous/scenarios/basic.rs");
+    include!("asynchronous/scenarios/redirects.rs");
+    include!("asynchronous/scenarios/streaming.rs");
+    include!("asynchronous/scenarios/tls.rs");
 }

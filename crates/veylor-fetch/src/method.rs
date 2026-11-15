@@ -1,4 +1,6 @@
-use crate::error::{Error, Result};
+use std::fmt;
+
+use crate::field::is_valid_name;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Method {
@@ -13,7 +15,7 @@ pub enum Method {
 }
 
 impl Method {
-    pub fn parse(name: &str) -> Result<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         let method = match name {
             "GET" => Self::Get,
             "HEAD" => Self::Head,
@@ -22,16 +24,11 @@ impl Method {
             "PATCH" => Self::Patch,
             "DELETE" => Self::Delete,
             "OPTIONS" => Self::Options,
-            other => {
-                if other.is_empty() || !other.bytes().all(is_token) {
-                    return Err(Error::builder("invalid method"));
-                }
-
-                Self::Other(other.to_owned())
-            }
+            other if is_valid_name(other) => Self::Other(other.to_owned()),
+            _ => return None,
         };
 
-        Ok(method)
+        Some(method)
     }
 
     pub fn as_str(&self) -> &str {
@@ -46,8 +43,18 @@ impl Method {
             Self::Other(name) => name,
         }
     }
+
+    pub fn is_idempotent(&self) -> bool {
+        match self {
+            Self::Get | Self::Head | Self::Put | Self::Delete | Self::Options => true,
+            Self::Other(name) => name == "TRACE",
+            _ => false,
+        }
+    }
 }
 
-pub(crate) fn is_token(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+impl fmt::Display for Method {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }

@@ -1,62 +1,50 @@
 use std::time::Duration;
 
-use crate::body::Body;
-use crate::client::Client;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-
-use crate::encode::push_pair;
-use crate::error::{Error, Result};
-use crate::headers::Headers;
+use crate::agent::Agent;
+use crate::auth;
+use crate::error::Error;
+use crate::headers::check as check_header;
 use crate::method::Method;
+use crate::percent;
 use crate::response::Response;
-use crate::send::{Plan, execute};
 use crate::url::Url;
 
-pub struct RequestBuilder {
-    client: Client,
+pub struct Request {
+    agent: Agent,
     method: Method,
-    url: Option<Url>,
-    headers: Headers,
+    url: String,
     query: String,
-    body: Body,
+    headers: Vec<(String, String)>,
     timeout: Option<Duration>,
     error: Option<Error>,
 }
 
-impl RequestBuilder {
-    pub(crate) fn new(client: Client, method: Method, url: Result<Url>) -> Self {
-        let (url, error) = match url {
-            Ok(url) => (Some(url), None),
-            Err(error) => (None, Some(error)),
-        };
-
+impl Request {
+    pub(crate) fn new(agent: Agent, method: Method, url: &str) -> Self {
         Self {
-            client,
+            agent,
             method,
-            url,
-            headers: Headers::default(),
+            url: url.to_owned(),
             query: String::new(),
-            body: Body::Empty,
+            headers: Vec::new(),
             timeout: None,
-            error,
+            error: None,
         }
     }
 
-    pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<[u8]>) -> Self {
-        self.add_header(name.as_ref(), value.as_ref());
+    pub fn set(mut self, name: &str, value: &str) -> Self {
+        if self.check(name, value) {
+            self.headers
+                .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            self.headers.push((name.to_owned(), value.to_owned()));
+        }
 
         self
     }
 
-    pub fn headers<I, K, V>(mut self, headers: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<[u8]>,
-    {
-        for (name, value) in headers {
-            self.add_header(name.as_ref(), value.as_ref());
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        if self.check(name, value) {
+            self.headers.push((name.to_owned(), value.to_owned()));
         }
 
         self
@@ -68,113 +56,91 @@ impl RequestBuilder {
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        for (key, value) in pairs {
-            push_pair(&mut self.query, key, value);
+        for (name, value) in pairs {
+            percent::push_pair(&mut self.query, name.as_ref(), value.as_ref(), false);
         }
 
         self
     }
 
-    pub fn bearer_auth(mut self, token: impl AsRef<str>) -> Self {
-        let value = format!("Bearer {}", token.as_ref());
-
-        self.add_header("authorization", value.as_bytes());
-
-        self
+    pub fn bearer_auth(self, token: impl AsRef<str>) -> Self {
+        self.set("authorization", &auth::bearer(token.as_ref()))
     }
 
-    pub fn basic_auth(mut self, user: impl AsRef<str>, password: Option<&str>) -> Self {
-        let mut credentials = user.as_ref().to_owned();
-
-        credentials.push(':');
-
-        if let Some(password) = password {
-            credentials.push_str(password.as_ref());
-        }
-
-        let value = format!("Basic {}", STANDARD.encode(credentials.as_bytes()));
-
-        self.add_header("authorization", value.as_bytes());
-
-        self
-    }
-
-    pub fn body(mut self, body: impl Into<Body>) -> Self {
-        self.body = body.into();
-
-        self
-    }
-
-    pub fn form<I, K, V>(mut self, pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut encoded = String::new();
-
-        for (key, value) in pairs {
-            push_pair(&mut encoded, key, value);
-        }
-
-        self.body = Body::from(encoded);
-        self.default_content_type("application/x-www-form-urlencoded");
-
-        self
-    }
-
-    #[cfg(feature = "json")]
-    pub fn json<T: serde::Serialize + ?Sized>(mut self, value: &T) -> Self {
-        match serde_json::to_vec(value) {
-            Ok(bytes) => {
-                self.body = Body::from(bytes);
-                self.default_content_type("application/json");
-            }
-            Err(error) => {
-                self.error.get_or_insert(Error::builder(error.to_string()));
-            }
-        }
-
-        self
+    pub fn basic_auth(self, user: impl AsRef<str>, password: Option<&str>) -> Self {
+        self.set("authorization", &auth::basic(user.as_ref(), password))
     }
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
-
         self
     }
 
-    pub async fn send(self) -> Result<Response> {
+    pub fn call(self) -> Result<Response, Error> {
+        self.dispatch(&[])
+    }
+
+    pub fn send(self, body: &[u8]) -> Result<Response, Error> {
+        self.dispatch(body)
+    }
+
+    pub fn send_string(self, body: &str) -> Result<Response, Error> {
+        self.default_type("text/plain; charset=utf-8")
+            .dispatch(body.as_bytes())
+    }
+
+    pub fn send_form(self, fields: &[(&str, &str)]) -> Result<Response, Error> {
+        let mut body = String::new();
+
+        for (name, value) in fields {
+            percent::push_pair(&mut body, name, value, true);
+        }
+
+        self.default_type("application/x-www-form-urlencoded")
+            .dispatch(body.as_bytes())
+    }
+
+    #[cfg(feature = "json")]
+    pub fn send_json<T: serde::Serialize>(self, value: &T) -> Result<Response, Error> {
+        let body = serde_json::to_vec(value).map_err(|error| Error::Json(error.to_string()))?;
+
+        self.default_type("application/json").dispatch(&body)
+    }
+
+    fn default_type(self, content_type: &str) -> Self {
+        if self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
+            return self;
+        }
+
+        self.set("content-type", content_type)
+    }
+
+    fn check(&mut self, name: &str, value: &str) -> bool {
+        match check_header(name, value) {
+            Ok(()) => true,
+            Err(error) => {
+                self.error.get_or_insert(error);
+
+                false
+            }
+        }
+    }
+
+    fn dispatch(self, body: &[u8]) -> Result<Response, Error> {
         if let Some(error) = self.error {
             return Err(error);
         }
 
-        let Some(mut url) = self.url else {
-            return Err(Error::builder("missing url"));
-        };
+        let mut url =
+            Url::parse(&self.url).map_err(|message| Error::InvalidUrl(message.to_owned()))?;
 
         url.append_query(&self.query);
 
-        let plan = Plan {
-            method: self.method,
-            url,
-            headers: self.headers,
-            body: self.body,
-            timeout: self.timeout,
-        };
-
-        execute(&self.client, plan).await
-    }
-
-    fn add_header(&mut self, name: &str, value: &[u8]) {
-        if let Err(error) = self.headers.push(name, value) {
-            self.error.get_or_insert(error);
-        }
-    }
-
-    fn default_content_type(&mut self, value: &str) {
-        if !self.headers.contains("content-type") {
-            self.add_header("content-type", value.as_bytes());
-        }
+        self.agent
+            .execute(self.method, url, self.headers, body, self.timeout)
     }
 }

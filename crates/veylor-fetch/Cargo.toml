@@ -7,22 +7,24 @@ rust-version.workspace = true
 
 [features]
 default = []
-tokio = ["dep:tokio", "dep:veylor-runtime-tokio"]
-smol = ["dep:smol", "dep:veylor-runtime-smol"]
+tokio = ["dep:tokio", "dep:veylor-client-driver", "dep:veylor-runtime-tokio"]
+smol = ["dep:smol", "dep:veylor-client-driver", "dep:veylor-runtime-smol"]
 json = ["dep:serde", "dep:serde_json"]
 gzip = ["dep:flate2"]
 
 [dependencies]
 base64 = "0.22"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+parking_lot = { workspace = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 smol = { version = "2", optional = true }
 tokio = { version = "1", features = ["time"], optional = true }
 veylor-client = { version = "0.1.0", path = "../veylor-client" }
-veylor-client-driver = { version = "0.1.0", path = "../veylor-client-driver" }
+veylor-client-driver = { version = "0.1.0", path = "../veylor-client-driver", optional = true }
 veylor-runtime-smol = { version = "0.1.0", path = "../veylor-runtime-smol", optional = true }
 veylor-runtime-tokio = { version = "0.1.0", path = "../veylor-runtime-tokio", optional = true }
+veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
 
 [dev-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -32,7 +34,6 @@ smol = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 veylor-fetch = { path = ".", features = ["tokio", "smol", "json", "gzip"] }
 veylor-server = { version = "0.1.0", path = "../veylor-server" }
-veylor-tls = { version = "0.1.0", path = "../veylor-tls" }
 
 [lints]
 workspace = true

@@ -1,77 +1,85 @@
-use std::fmt;
+pub(crate) type Invalid = &'static str;
 
-use veylor_client_driver::{Origin, parse_url};
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct Origin {
+    pub(crate) tls: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
 
-use crate::error::{Error, Result};
+impl Origin {
+    pub(crate) fn scheme(&self) -> &'static str {
+        if self.tls { "https" } else { "http" }
+    }
+
+    pub(crate) fn host_header(&self) -> String {
+        let default = if self.tls { 443 } else { 80 };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+
+        if self.port == default {
+            host
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Url {
+pub(crate) struct Url {
     text: String,
     origin: Origin,
     target_start: usize,
 }
 
 impl Url {
-    pub fn parse(input: &str) -> Result<Self> {
-        let parsed = parse_url(input).map_err(|e| Error::builder(e.to_string()))?;
-        let without_fragment = input.split('#').next().unwrap_or("");
-        let scheme_len = if parsed.origin.tls { 8 } else { 7 };
-        let rest = &without_fragment[scheme_len..];
-        let split = rest.find(['/', '?']).unwrap_or(rest.len());
-        let (authority, tail) = rest.split_at(split);
-        let scheme = if parsed.origin.tls { "https" } else { "http" };
-        let mut text = String::with_capacity(input.len() + 2);
+    pub(crate) fn parse(url: &str) -> Result<Self, Invalid> {
+        let (tls, rest) = if let Some(rest) = strip_scheme(url, "https://") {
+            (true, rest)
+        } else if let Some(rest) = strip_scheme(url, "http://") {
+            (false, rest)
+        } else {
+            return Err("scheme must be http or https");
+        };
 
-        text.push_str(scheme);
-        text.push_str("://");
-        text.push_str(authority);
+        Self::from_authority(tls, rest)
+    }
 
-        let target_start = text.len();
+    pub(crate) fn resolve(&self, location: &str) -> Result<Self, Invalid> {
+        let location = location.trim();
 
-        match tail {
-            "" => text.push('/'),
-            t if t.starts_with('?') => {
-                text.push('/');
-                text.push_str(t);
-            }
-            t => text.push_str(t),
+        if let Some(rest) = location.strip_prefix("//") {
+            return Self::from_authority(self.origin.tls, rest);
         }
 
-        Ok(Self {
-            text,
-            origin: parsed.origin,
-            target_start,
-        })
-    }
+        if strip_scheme(location, "http://").is_some()
+            || strip_scheme(location, "https://").is_some()
+        {
+            return Self::parse(location);
+        }
 
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
+        if location.contains("://") {
+            return Err("redirect to an unsupported scheme");
+        }
 
-    pub fn scheme(&self) -> &str {
-        if self.origin.tls { "https" } else { "http" }
-    }
+        let location = location.split('#').next().unwrap_or("");
+        let target = if location.is_empty() {
+            self.target().to_owned()
+        } else if location.starts_with('/') {
+            normalize(location)
+        } else if location.starts_with('?') {
+            format!("{}{location}", self.path())
+        } else {
+            let path = self.path();
+            let directory = &path[..path.rfind('/').map_or(0, |index| index + 1)];
 
-    pub fn host(&self) -> &str {
-        &self.origin.host
-    }
+            normalize(&format!("{directory}{location}"))
+        };
 
-    pub fn port(&self) -> u16 {
-        self.origin.port
-    }
-
-    pub fn path(&self) -> &str {
-        let target = self.target();
-
-        target.split('?').next().unwrap_or(target)
-    }
-
-    pub fn query(&self) -> Option<&str> {
-        self.target().split_once('?').map(|(_, query)| query)
-    }
-
-    pub fn is_same_origin(&self, other: &Url) -> bool {
-        self.origin == other.origin
+        Self::from_parts(self.origin.clone(), &target)
     }
 
     pub(crate) fn append_query(&mut self, encoded: &str) {
@@ -79,109 +87,90 @@ impl Url {
             return;
         }
 
-        let separator = if self.text.contains('?') { '&' } else { '?' };
+        let separator = if self.target().contains('?') {
+            '&'
+        } else {
+            '?'
+        };
 
         self.text.push(separator);
         self.text.push_str(encoded);
     }
 
-    pub(crate) fn join(&self, location: &str) -> Result<Url> {
-        let location = location.trim();
-
-        if has_scheme(location) {
-            return Url::parse(location);
-        }
-
-        let authority = &self.text[self.scheme().len() + 3..self.target_start];
-        let mut next = String::with_capacity(self.text.len() + location.len());
-
-        if let Some(rest) = location.strip_prefix("//") {
-            next.push_str(self.scheme());
-            next.push_str("://");
-            next.push_str(rest);
-
-            return Url::parse(&next);
-        }
-
-        next.push_str(self.scheme());
-        next.push_str("://");
-        next.push_str(authority);
-
-        if location.starts_with('/') {
-            next.push_str(&normalize_path(location));
-        } else if location.starts_with('?') {
-            next.push_str(self.path());
-            next.push_str(location);
-        } else {
-            let path = self.path();
-            let directory = &path[..path.rfind('/').map_or(0, |i| i + 1)];
-            let joined = format!("{directory}{location}");
-
-            next.push_str(&normalize_path(&joined));
-        }
-
-        Url::parse(&next)
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
     }
 
-    fn target(&self) -> &str {
+    pub(crate) fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    pub(crate) fn target(&self) -> &str {
         &self.text[self.target_start..]
     }
-}
 
-impl fmt::Display for Url {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.text)
+    pub(crate) fn path(&self) -> &str {
+        let target = self.target();
+
+        target.split('?').next().unwrap_or(target)
+    }
+
+    fn from_authority(tls: bool, rest: &str) -> Result<Self, Invalid> {
+        let rest = rest.split('#').next().unwrap_or("");
+        let split = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(split);
+
+        if authority.contains('@') {
+            return Err("userinfo is not supported");
+        }
+
+        let (host, port) = split_authority(authority, if tls { 443 } else { 80 })?;
+
+        if host.is_empty() {
+            return Err("no host");
+        }
+
+        let target = match tail {
+            "" => "/".to_owned(),
+            tail if tail.starts_with('?') => format!("/{tail}"),
+            tail => tail.to_owned(),
+        };
+        let origin = Origin {
+            tls,
+            host: host.to_ascii_lowercase(),
+            port,
+        };
+
+        Self::from_parts(origin, &target)
+    }
+
+    fn from_parts(origin: Origin, target: &str) -> Result<Self, Invalid> {
+        if target.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+            return Err("target contains control or space characters");
+        }
+
+        let mut text = String::with_capacity(target.len() + 32);
+
+        text.push_str(origin.scheme());
+        text.push_str("://");
+        text.push_str(&origin.host_header());
+
+        let target_start = text.len();
+
+        text.push_str(target);
+
+        Ok(Self {
+            text,
+            origin,
+            target_start,
+        })
     }
 }
 
-pub trait IntoUrl {
-    fn into_url(self) -> Result<Url>;
-}
-
-impl IntoUrl for Url {
-    fn into_url(self) -> Result<Url> {
-        Ok(self)
-    }
-}
-
-impl IntoUrl for &Url {
-    fn into_url(self) -> Result<Url> {
-        Ok(self.clone())
-    }
-}
-
-impl IntoUrl for &str {
-    fn into_url(self) -> Result<Url> {
-        Url::parse(self)
-    }
-}
-
-impl IntoUrl for &String {
-    fn into_url(self) -> Result<Url> {
-        Url::parse(self)
-    }
-}
-
-impl IntoUrl for String {
-    fn into_url(self) -> Result<Url> {
-        Url::parse(&self)
-    }
-}
-
-fn has_scheme(location: &str) -> bool {
-    let lower = |prefix: &str| {
-        location
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-    };
-
-    lower("http://") || lower("https://")
-}
-
-fn normalize_path(path: &str) -> String {
-    let (path, query) = match path.split_once('?') {
+fn normalize(path_and_query: &str) -> String {
+    let (path, query) = match path_and_query.split_once('?') {
         Some((path, query)) => (path, Some(query)),
-        None => (path, None),
+        None => (path_and_query, None),
     };
     let mut segments: Vec<&str> = Vec::new();
     let mut trailing = false;
@@ -193,14 +182,13 @@ fn normalize_path(path: &str) -> String {
             "." => trailing = true,
             ".." => {
                 segments.pop();
-
                 trailing = true;
             }
-            other => segments.push(other),
+            segment => segments.push(segment),
         }
     }
 
-    let mut out = String::with_capacity(path.len() + 1);
+    let mut out = String::with_capacity(path_and_query.len());
 
     for segment in &segments {
         out.push('/');
@@ -219,46 +207,123 @@ fn normalize_path(path: &str) -> String {
     out
 }
 
+fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+    let head = url.get(..scheme.len())?;
+
+    if head.eq_ignore_ascii_case(scheme) {
+        return url.get(scheme.len()..);
+    }
+
+    None
+}
+
+fn split_authority(authority: &str, default: u16) -> Result<(&str, u16), Invalid> {
+    if let Some(inner) = authority.strip_prefix('[') {
+        let (host, after) = inner.split_once(']').ok_or("bad ipv6 host")?;
+
+        return match after {
+            "" => Ok((host, default)),
+            _ => Ok((host, parse_port(after.strip_prefix(':'))?)),
+        };
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Ok((host, parse_port(Some(port))?)),
+        None => Ok((authority, default)),
+    }
+}
+
+fn parse_port(port: Option<&str>) -> Result<u16, Invalid> {
+    match port.and_then(|port| port.parse::<u16>().ok()) {
+        Some(port) if port != 0 => Ok(port),
+        _ => Err("bad port"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Url;
 
     #[test]
-    fn parse_normalizes_the_target() {
-        let url = Url::parse("HTTP://Example.com?q=1#frag").expect("url");
+    fn parses_defaults_and_ports() {
+        let url = Url::parse("HTTPS://Example.COM/a?b=1#frag").expect("url");
 
-        assert_eq!(url.as_str(), "http://Example.com/?q=1");
-        assert_eq!(url.host(), "example.com");
+        assert!(url.origin().tls);
+        assert_eq!(url.origin().host, "example.com");
+        assert_eq!(url.origin().port, 443);
+        assert_eq!(url.target(), "/a?b=1");
+        assert_eq!(url.as_str(), "https://example.com/a?b=1");
+        assert_eq!(url.origin().host_header(), "example.com");
+
+        let url = Url::parse("http://[::1]:81?x").expect("url");
+
+        assert_eq!(url.origin().host, "::1");
+        assert_eq!(url.target(), "/?x");
         assert_eq!(url.path(), "/");
-        assert_eq!(url.query(), Some("q=1"));
-        assert!(Url::parse("ftp://x/").is_err());
+        assert_eq!(url.origin().host_header(), "[::1]:81");
     }
 
     #[test]
-    fn join_resolves_references() {
-        let base = Url::parse("http://h:8080/a/b/c?x=1").expect("url");
+    fn rejects_bad_urls() {
+        for bad in [
+            "ftp://x/",
+            "http://",
+            "http://u@h/",
+            "http://h:0/",
+            "http://h:99999/",
+            "http://h/a b",
+            "http://[::1/",
+        ] {
+            assert!(Url::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn resolves_locations() {
+        let base = Url::parse("http://h:8080/a/b/c?q=1").expect("url");
         let cases = [
-            ("/z", "http://h:8080/z"),
+            ("/x/y", "http://h:8080/x/y"),
             ("d", "http://h:8080/a/b/d"),
-            ("../d", "http://h:8080/a/d"),
+            ("../d?z=2", "http://h:8080/a/d?z=2"),
+            ("../../../d", "http://h:8080/d"),
+            ("?n=2", "http://h:8080/a/b/c?n=2"),
+            ("./", "http://h:8080/a/b/"),
             ("./d/", "http://h:8080/a/b/d/"),
-            ("?y=2", "http://h:8080/a/b/c?y=2"),
-            ("//other/p", "http://other/p"),
+            ("//cdn.test:9/p", "http://cdn.test:9/p"),
             ("https://s/q#f", "https://s/q"),
             ("../../../../up", "http://h:8080/up"),
         ];
 
         for (location, expected) in cases {
-            assert_eq!(base.join(location).expect(location).as_str(), expected);
+            assert_eq!(base.resolve(location).expect(location).as_str(), expected);
         }
+
+        assert!(base.resolve("ftp://x/").is_err());
+    }
+
+    #[test]
+    fn appends_a_query_string() {
+        let mut url = Url::parse("http://h/p").expect("url");
+
+        url.append_query("a%20b=c%26d");
+        url.append_query("e=f");
+        url.append_query("");
+
+        assert_eq!(url.as_str(), "http://h/p?a%20b=c%26d&e=f");
     }
 
     #[test]
     fn origins_compare_by_scheme_host_and_port() {
         let a = Url::parse("http://h/x").expect("url");
 
-        assert!(a.is_same_origin(&Url::parse("http://H:80/y").expect("url")));
-        assert!(!a.is_same_origin(&Url::parse("https://h/x").expect("url")));
-        assert!(!a.is_same_origin(&Url::parse("http://h:81/x").expect("url")));
+        assert_eq!(
+            a.origin(),
+            Url::parse("http://H:80/y").expect("url").origin()
+        );
+        assert_ne!(a.origin(), Url::parse("https://h/x").expect("url").origin());
+        assert_ne!(
+            a.origin(),
+            Url::parse("http://h:81/x").expect("url").origin()
+        );
     }
 }
