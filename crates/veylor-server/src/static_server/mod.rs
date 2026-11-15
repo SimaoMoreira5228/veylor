@@ -20,9 +20,12 @@ mod batch_recv;
 #[cfg(target_os = "linux")]
 mod batch_send;
 
+mod conn_lifecycle;
 pub(crate) mod h3;
+mod staged;
 pub(crate) mod turn;
 
+pub(crate) use staged::apply_h2_staged;
 pub(crate) use turn::worker_main;
 
 // NOTE: per-worker connection ceiling: 1024 makes the 10k-idle ladder reachable

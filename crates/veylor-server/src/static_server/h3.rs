@@ -1,9 +1,7 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
@@ -11,31 +9,23 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use veylor_h3::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
-use veylor_h3::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use veylor_h3::http::{Request, Response, StatusCode};
 use veylor_h3::{
     Body, Bytes, ConnectProtocol, ManagedOutcome, RequestStream, RequestTrailers, ResponseWriter,
     RunningServer, Server, Tls,
 };
-use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, join_allow_value};
-use veylor_router::{
-    MAX_ROUTE_CAPTURES, RouteCapture, capture_route, compare_route_patterns, matches_route,
-};
 use veylor_runtime::ConnectionToken;
 
 use crate::connection::streams::StreamCmd;
-use crate::host::{H3_PARK_SLOTS, HOST_MAX_REASON_BYTES, HostShared, RespondOutcome, StagedWork};
-use crate::static_files::HTTP_DATE_BYTES;
-use crate::static_routes::now_http_date;
-use crate::static_routes::{
-    MAX_NATIVE_HEADERS, MAX_NATIVE_PARAMS, NativeHeader, NativeParam, NativeRequestView,
-    accepts_gzip_value, compress_route_body, engine_owned_request_header,
-    engine_owned_response_header, raw_bytes, valid_field_value,
-};
+use crate::host::{H3_PARK_SLOTS, HostShared, RespondOutcome, StagedWork};
 
 use super::{H2StaticRoute, ServerConfig, ServerError};
+use response::{staged_response, text, with_date};
+use route::{select, serve_route};
 
 mod file;
+mod response;
+mod route;
 mod tunnel;
 
 type WaiterKey = (u32, u32, u64);
@@ -528,303 +518,4 @@ impl Handler {
 
 fn release(slots: &Mutex<Slots>, slot: u32) {
     slots.lock().release(slot);
-}
-
-fn staged_response(work: StagedWork) -> Response<Body> {
-    if work.cancel {
-        return text(StatusCode::SERVICE_UNAVAILABLE, b"cancelled");
-    }
-    let mut response = Response::new(Body::Bytes(Bytes::from(work.body)));
-    *response.status_mut() =
-        StatusCode::from_u16(work.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let length = response.body().content_length().unwrap_or(0).to_string();
-    response.headers_mut().insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_bytes(length.as_bytes()).expect("length"),
-    );
-    for (name, value) in work.headers {
-        if name.eq_ignore_ascii_case(b"content-length") {
-            continue;
-        }
-        let Ok(name) = HeaderName::from_bytes(&name) else {
-            continue;
-        };
-        let Ok(value) = HeaderValue::from_bytes(&value) else {
-            continue;
-        };
-        response.headers_mut().append(name, value);
-    }
-    response
-}
-
-fn serve_route(routes: &[H2StaticRoute], request: Request<()>, body: Bytes) -> Response<Body> {
-    let method = request.method().as_str().as_bytes();
-    let path = request.uri().path().as_bytes();
-    let target = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str().as_bytes())
-        .unwrap_or(path);
-    let gzip = request
-        .headers()
-        .get_all(ACCEPT_ENCODING)
-        .iter()
-        .any(|value| accepts_gzip_value(value.as_bytes()));
-    let Some(found) = select(routes, method, path) else {
-        let accept = header(&request, "accept-encoding");
-        let range = header(&request, "range");
-        let since = header(&request, "if-modified-since");
-        let declared = body.len() as u64;
-        if let Some(response) = file::serve(routes, method, path, declared, accept, range, since) {
-            return response;
-        }
-        if let Some((allow, len)) = allow_value(routes, path) {
-            return method_not_allowed(&allow[..len]);
-        }
-        return text(StatusCode::NOT_FOUND, b"Not Found");
-    };
-    if found.native {
-        return serve_native(found.route, &body, method, target, request.headers(), gzip);
-    }
-    if found.route.managed {
-        return text(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable");
-    }
-    if gzip && let Some(twin) = found.route.gzip_body.as_deref() {
-        return gzip_response(found.route.status, twin);
-    }
-    status_response(found.route.status, &found.route.body)
-}
-
-fn serve_native(
-    route: &H2StaticRoute,
-    body: &Bytes,
-    method: &[u8],
-    path: &[u8],
-    request_headers: &HeaderMap,
-    gzip: bool,
-) -> Response<Body> {
-    let Some((handler, user_data, native_gzip)) = route.native else {
-        return text(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error");
-    };
-    let mut native_headers = [NativeHeader::EMPTY; MAX_NATIVE_HEADERS];
-    let mut native_header_count = 0usize;
-    for (name, value) in request_headers {
-        if native_header_count == MAX_NATIVE_HEADERS
-            || engine_owned_request_header(name.as_str().as_bytes())
-        {
-            continue;
-        }
-        native_headers[native_header_count] = NativeHeader {
-            name: name.as_str().as_ptr(),
-            name_len: name.as_str().len(),
-            value: value.as_bytes().as_ptr(),
-            value_len: value.as_bytes().len(),
-        };
-        native_header_count += 1;
-    }
-    let mut captures = [RouteCapture::default(); MAX_ROUTE_CAPTURES];
-    let capture_count = capture_route(&route.path, path, &mut captures).unwrap_or(0);
-    let mut native_params = [NativeParam::EMPTY; MAX_NATIVE_PARAMS];
-    let mut native_param_count = 0usize;
-    for capture in captures.iter().take(capture_count.min(MAX_NATIVE_PARAMS)) {
-        let (Some(name), Some(value)) = (capture.name(&route.path), capture.value(path)) else {
-            continue;
-        };
-        native_params[native_param_count] = NativeParam {
-            name: name.as_ptr(),
-            name_len: name.len(),
-            value: value.as_ptr(),
-            value_len: value.len(),
-        };
-        native_param_count += 1;
-    }
-    let view = NativeRequestView {
-        method: method.as_ptr(),
-        method_len: method.len(),
-        path: path.as_ptr(),
-        path_len: path.len(),
-        has_body: u8::from(!body.is_empty()),
-        body_len: body.len() as u64,
-        body: if body.is_empty() {
-            ptr::null()
-        } else {
-            body.as_ptr()
-        },
-        headers: native_headers.as_ptr(),
-        header_count: native_header_count,
-        params: native_params.as_ptr(),
-        param_count: native_param_count,
-    };
-    let mut reason = [0u8; HOST_MAX_REASON_BYTES];
-    match view.invoke(handler, user_data, &mut reason) {
-        Ok(invoked) => {
-            let body = invoked.body();
-            if gzip
-                && native_gzip
-                && let Ok(Some(twin)) = compress_route_body(body)
-            {
-                let mut response =
-                    status_response_with_headers(invoked.status, &twin, invoked.headers());
-                response
-                    .headers_mut()
-                    .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-                response
-                    .headers_mut()
-                    .insert(VARY, HeaderValue::from_static("accept-encoding"));
-                return response;
-            }
-            status_response_with_headers(invoked.status, body, invoked.headers())
-        }
-        Err(_) => text(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error"),
-    }
-}
-
-fn select<'a>(routes: &'a [H2StaticRoute], method: &[u8], path: &[u8]) -> Option<RouteMatch<'a>> {
-    let mut best: Option<(&'a [u8], RouteMatch<'a>)> = None;
-    for (index, route) in routes.iter().enumerate() {
-        if route.file_root.is_some() || route.method != method {
-            continue;
-        }
-        if route_matches(&route.path, path) {
-            select_route(&mut best, route, index);
-        }
-    }
-    if best.is_none() && method == b"HEAD" {
-        for (index, route) in routes.iter().enumerate() {
-            if route.file_root.is_some() || route.method != b"GET" {
-                continue;
-            }
-            if route_matches(&route.path, path) {
-                select_route(&mut best, route, index);
-            }
-        }
-    }
-    best.map(|(_, found)| found)
-}
-
-fn select_route<'a>(
-    best: &mut Option<(&'a [u8], RouteMatch<'a>)>,
-    route: &'a H2StaticRoute,
-    index: usize,
-) {
-    let better = best
-        .as_ref()
-        .is_none_or(|(current, _)| compare_route_patterns(&route.path, current) == Ordering::Less);
-    if better {
-        *best = Some((
-            &route.path,
-            RouteMatch {
-                index,
-                route,
-                native: route.native.is_some(),
-            },
-        ));
-    }
-}
-
-fn route_matches(pattern: &[u8], target: &[u8]) -> bool {
-    matches_route(pattern, target)
-}
-
-fn allow_value(routes: &[H2StaticRoute], path: &[u8]) -> Option<([u8; ALLOW_BYTES], usize)> {
-    let mut methods: [&[u8]; ALLOW_METHODS] = [&[]; ALLOW_METHODS];
-    let mut count = 0;
-    for route in routes {
-        if route.file_root.is_some() || !route_matches(&route.path, path) {
-            continue;
-        }
-        if methods[..count].contains(&route.method.as_slice()) {
-            continue;
-        }
-        let slot = methods.get_mut(count)?;
-        *slot = &route.method;
-        count += 1;
-    }
-    if count == 0 {
-        return None;
-    }
-    let mut out = [0u8; ALLOW_BYTES];
-    let len = join_allow_value(&methods[..count], &mut out)?;
-    Some((out, len))
-}
-
-fn header<'a>(request: &'a Request<()>, name: &str) -> Option<&'a [u8]> {
-    request
-        .headers()
-        .get_all(name)
-        .iter()
-        .next()
-        .map(|value| value.as_bytes())
-}
-
-fn with_date(mut headers: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let has_date = headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(b"date"));
-    if !has_date {
-        let mut date = [0u8; HTTP_DATE_BYTES];
-        let len = now_http_date(&mut date);
-        headers.push((b"date".to_vec(), date[..len].to_vec()));
-    }
-    headers
-}
-
-fn gzip_response(status: u16, body: &[u8]) -> Response<Body> {
-    let mut response = status_response(status, body);
-    response
-        .headers_mut()
-        .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-    response
-        .headers_mut()
-        .insert(VARY, HeaderValue::from_static("accept-encoding"));
-    response
-}
-
-fn method_not_allowed(allow: &[u8]) -> Response<Body> {
-    let mut response = text(StatusCode::METHOD_NOT_ALLOWED, b"Method Not Allowed");
-    if let Ok(value) = HeaderValue::from_bytes(allow) {
-        response.headers_mut().insert("allow", value);
-    }
-    response
-}
-
-fn status_response_with_headers(
-    status: u16,
-    body: &[u8],
-    headers: &[NativeHeader],
-) -> Response<Body> {
-    let mut response = status_response(status, body);
-    for header in headers {
-        let (Some(name), Some(value)) = (
-            raw_bytes(header.name, header.name_len),
-            raw_bytes(header.value, header.value_len),
-        ) else {
-            continue;
-        };
-        if engine_owned_response_header(name) || !valid_field_value(value) {
-            continue;
-        }
-        let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
-        else {
-            continue;
-        };
-        response.headers_mut().append(name, value);
-    }
-    response
-}
-
-fn status_response(status: u16, body: &[u8]) -> Response<Body> {
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    text(status, body)
-}
-
-fn text(status: StatusCode, body: &[u8]) -> Response<Body> {
-    let mut response = Response::new(Body::Bytes(Bytes::copy_from_slice(body)));
-    *response.status_mut() = status;
-    let length = body.len().to_string();
-    response.headers_mut().insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_bytes(length.as_bytes()).expect("length"),
-    );
-    response
 }

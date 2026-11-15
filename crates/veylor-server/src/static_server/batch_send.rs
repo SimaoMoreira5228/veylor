@@ -11,7 +11,8 @@ use crate::connection::{ConnClose, ConnPhase, ConnState, PumpProgress, reuse_kee
 use crate::host::HostShared;
 
 use super::CloseCounts;
-use super::turn::{apply_pump_hooks, close_conn, conn_poll_token};
+use super::conn_lifecycle::{apply_pump_hooks, close_conn};
+use super::turn::conn_poll_token;
 
 pub(crate) fn send_pending(
     ring: &mut BatchRing,

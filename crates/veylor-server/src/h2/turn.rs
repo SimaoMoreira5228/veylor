@@ -12,7 +12,7 @@ use crate::connection::ConnClose;
 use crate::connection::tls::tls_read_decrypted;
 use crate::host::{HostShared, StagedWork};
 use crate::static_routes::MAX_RESPONSE_BODY;
-use crate::static_server::turn::apply_h2_staged;
+use crate::static_server::apply_h2_staged;
 use crate::static_server::{CloseCounts, H2StaticRoute, MAX_CONNECTIONS};
 use veylor_http2::ErrorCode;
 
