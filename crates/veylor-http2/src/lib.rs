@@ -12,8 +12,8 @@ pub use connection::{
     H2FrameDriver, H2ServerDriver, HeaderRange, HeadersFrameWriter, HeadersWriteError,
     OutputProgress, QueuedDataFrame, QueuedHeadersBlock, RequestFieldSectionError,
     ResponseFieldSection, ResponseSectionError, ResponseSectionKind, SentData, SentResponse,
-    SentServerData, ServerError, ServerRequestError, ServerResponseError, StartedRequest,
-    ValidatedServerRequest, encode_request_field_section, status_sheds_length,
+    SentServerData, SentTrailers, ServerError, ServerRequestError, ServerResponseError,
+    StartedRequest, ValidatedServerRequest, encode_request_field_section, status_sheds_length,
     validate_server_request_fields,
 };
 pub use flow_control::{

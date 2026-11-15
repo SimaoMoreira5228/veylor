@@ -65,6 +65,7 @@ pub struct VylH2Action {
     pub error_code: u32,
     pub data_offset: usize,
     pub data_length: usize,
+    pub padding_length: usize,
     pub field_start: usize,
     pub field_count: usize,
     pub ping: [u8; 8],
@@ -97,9 +98,9 @@ pub const VYL_H2_NO_FIELD: usize = usize::MAX;
 // NOTE: single-sourced from the native client (unlike a mirrored literal): the C ABI
 // exposes the same caps the engine enforces, so they cannot drift apart.
 pub const VYL_H2_MAX_ACTIONS: usize = veylor_client::h2::MAX_ACTIONS;
-pub const VYL_H2_MAX_FIELDS: usize = veylor_client::h2::MAX_FIELDS;
+pub const VYL_H2_MAX_FIELDS: usize = 64;
 pub const VYL_H2_MAX_SETTINGS: usize = veylor_client::h2::MAX_SETTINGS;
-pub const VYL_H2_MAX_HEADER_LIST_SIZE: u32 = veylor_client::h2::MAX_HEADER_LIST_SIZE;
+pub const VYL_H2_MAX_HEADER_LIST_SIZE: u32 = 2_112;
 
 pub type VylSpan = Span;
 pub type VylHeader = Header;

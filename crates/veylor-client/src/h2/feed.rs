@@ -1,18 +1,33 @@
 use veylor_http2::{ErrorCode, FeedStatus, H2FrameAction, HpackHeader};
 
-use super::{H2ClientConnection, H2ClientError, MAX_ACTIONS, MAX_FIELDS};
+use super::{DEFAULT_MAX_FIELDS, H2ClientConnection, H2ClientError, MAX_ACTIONS};
 
 pub struct FeedScratch<'i> {
     actions: [Option<H2FrameAction<'i>>; MAX_ACTIONS],
-    headers: [HpackHeader; MAX_FIELDS],
+    headers: Box<[HpackHeader]>,
 }
 
 impl<'i> FeedScratch<'i> {
     pub fn new() -> Self {
+        Self::with_fields(DEFAULT_MAX_FIELDS)
+    }
+
+    pub fn with_fields(max_fields: usize) -> Self {
         Self {
             actions: [None; MAX_ACTIONS],
-            headers: [HpackHeader::EMPTY; MAX_FIELDS],
+            headers: vec![HpackHeader::EMPTY; max_fields].into_boxed_slice(),
         }
+    }
+
+    pub fn from_headers(headers: Box<[HpackHeader]>) -> Self {
+        Self {
+            actions: [None; MAX_ACTIONS],
+            headers,
+        }
+    }
+
+    pub fn into_headers(self) -> Box<[HpackHeader]> {
+        self.headers
     }
 
     pub fn headers(&self) -> &[HpackHeader] {

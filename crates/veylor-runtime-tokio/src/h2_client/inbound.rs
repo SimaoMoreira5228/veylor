@@ -12,7 +12,7 @@ impl Driver<'_, '_> {
         let input = std::mem::take(&mut self.inbuf);
         let length = self.in_len;
         let data = &input[..length];
-        let mut scratch = FeedScratch::new();
+        let mut scratch = FeedScratch::from_headers(std::mem::take(&mut self.header_buf));
         let mut position = 0;
 
         while position < length {
@@ -36,6 +36,7 @@ impl Driver<'_, '_> {
             }
         }
 
+        self.header_buf = scratch.into_headers();
         let mut input = input;
         input.copy_within(position..length, 0);
         self.in_len = length - position;

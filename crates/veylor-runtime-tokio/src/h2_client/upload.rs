@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use super::error::H2Error;
+use super::headers::HeaderList;
 use super::shared::DriverShared;
 
 struct UploadBuffer {
@@ -11,6 +12,7 @@ struct UploadBuffer {
     start: usize,
     finished: bool,
     aborted: bool,
+    trailers: Option<HeaderList>,
 }
 
 pub(crate) struct Upload {
@@ -24,6 +26,7 @@ pub(crate) enum UploadState {
     Aborted,
     Open,
     Finished,
+    Trailers(HeaderList),
 }
 
 impl Upload {
@@ -34,6 +37,7 @@ impl Upload {
                 start: 0,
                 finished: false,
                 aborted: false,
+                trailers: None,
             }),
             space: Notify::new(),
             driver: OnceLock::new(),
@@ -64,7 +68,8 @@ impl Upload {
             return UploadState::Aborted;
         }
         let finished = buffer.finished;
-        let taken = send(&buffer.data[buffer.start..], finished);
+        let ends_stream = finished && buffer.trailers.is_none();
+        let taken = send(&buffer.data[buffer.start..], ends_stream);
         if taken > 0 {
             buffer.start += taken;
             if buffer.start == buffer.data.len() {
@@ -74,7 +79,10 @@ impl Upload {
             self.space.notify_one();
         }
         if finished && buffer.start == buffer.data.len() {
-            return UploadState::Finished;
+            return match buffer.trailers.take() {
+                Some(trailers) => UploadState::Trailers(trailers),
+                None => UploadState::Finished,
+            };
         }
         UploadState::Open
     }
@@ -137,6 +145,24 @@ impl UploadSender {
             return;
         };
         upload.buffer.lock().finished = true;
+        upload.wake_driver();
+    }
+
+    pub fn finish_with_trailers(mut self, trailers: &[(&[u8], &[u8])]) {
+        let Some(upload) = self.upload.take() else {
+            return;
+        };
+        let mut list = HeaderList::default();
+        for (name, value) in trailers {
+            list.push(name, value);
+        }
+        {
+            let mut buffer = upload.buffer.lock();
+            if !list.is_empty() {
+                buffer.trailers = Some(list);
+            }
+            buffer.finished = true;
+        }
         upload.wake_driver();
     }
 }

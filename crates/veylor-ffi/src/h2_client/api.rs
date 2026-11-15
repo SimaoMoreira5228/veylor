@@ -3,11 +3,11 @@ use std::ptr;
 use std::slice;
 
 use veylor_client::h2::{
-    FeedScratch, H2ClientConnection, H2ClientTables, HEADER_BLOCK, HPACK_ENTRIES, HPACK_SCRATCH,
-    HpackEntrySlot, SETTINGS_ACKS, STREAM_SLOTS, StreamSlot, WriteOut,
+    FeedScratch, H2ClientConnection, H2ClientTables, HpackEntrySlot, SETTINGS_ACKS, StreamSlot,
+    WriteOut,
 };
 
-use super::{VylH2Client, split_error};
+use super::{HEADER_BLOCK, HPACK_ENTRIES, HPACK_SCRATCH, STREAM_SLOTS, VylH2Client, split_error};
 use crate::abi::{VylH2Setting, VylResult, catch_ffi, slice_length_valid};
 
 fn write_out(written: usize, required: usize, out_written: *mut usize, out_required: *mut usize) {
@@ -61,7 +61,7 @@ unsafe fn create_handle(out_handle: *mut *mut VylH2Client) -> VylResult {
         settings_ack_limits: [0; SETTINGS_ACKS],
         tables: None,
         connection: None,
-        feed_scratch: FeedScratch::new(),
+        feed_scratch: FeedScratch::with_fields(crate::abi::VYL_H2_MAX_FIELDS),
     });
     let handle_ptr: *mut VylH2Client = &mut *handle;
     let tables = unsafe { build_tables(handle_ptr) };
@@ -123,6 +123,7 @@ unsafe fn build_tables(handle: *mut VylH2Client) -> H2ClientTables<'static> {
         encoder_scratch,
         ack_limits,
     )
+    .with_limits(super::LIMITS)
 }
 
 #[unsafe(no_mangle)]

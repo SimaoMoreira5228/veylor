@@ -17,18 +17,51 @@ pub use veylor_http2::{
     SETTINGS_INITIAL_WINDOW_SIZE, SettingsParameter, StreamSlot, StreamTable,
 };
 
-pub const STREAM_SLOTS: usize = 32;
-pub const HEADER_BLOCK: usize = 4_096;
-pub const HPACK_ENTRIES: usize = 32;
-pub const HPACK_SCRATCH: usize = 4_096;
+pub const MIN_STREAM_SLOTS: usize = 3;
+pub const MAX_STREAM_SLOTS: usize = 1_024;
+pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+pub const DEFAULT_MAX_FIELDS: usize = 128;
+pub const DEFAULT_REQUEST_BLOCK: usize = 16 * 1024;
+pub const HPACK_ENTRIES: usize = 128;
 pub const SETTINGS_ACKS: usize = 8;
-pub const HEADER_BLOCK_SCRATCH: usize = 4_096;
-pub const MAX_RESPONSES: usize = 32;
 pub const MAX_ACTIONS: usize = 16;
-pub const MAX_FIELDS: usize = 64;
 pub const MAX_SETTINGS: usize = 8;
-pub const MAX_HEADER_LIST_SIZE: u32 =
-    (MAX_FIELDS as u32) * (veylor_http2::MIN_HEADER_FIELD_SIZE as u32);
+
+const HPACK_TABLE_SIZE: usize = 4_096;
+
+// NOTE: sizing for the caller-owned tables, derived from one header-list limit so the pieces
+// cannot disagree: the wire block is capped at the list limit (HPACK literals never expand past
+// it), and the decoder scratch holds the block's decoded strings plus the live dynamic table
+// with one more table of headroom for entries inserted before older ones are reclaimed.
+pub const fn header_block_len(max_header_list_size: u32) -> usize {
+    max_header_list_size as usize
+}
+
+pub const fn decoder_scratch_len(max_header_list_size: u32) -> usize {
+    (max_header_list_size as usize) + 2 * HPACK_TABLE_SIZE
+}
+
+pub const fn encoder_scratch_len(request_block: usize) -> usize {
+    request_block / 2 + HPACK_TABLE_SIZE
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct H2ClientLimits {
+    pub max_header_list_size: u32,
+    pub max_fields: usize,
+    pub request_block: usize,
+}
+
+impl Default for H2ClientLimits {
+    fn default() -> Self {
+        Self {
+            max_header_list_size: DEFAULT_MAX_HEADER_LIST_SIZE,
+            max_fields: DEFAULT_MAX_FIELDS,
+            request_block: DEFAULT_REQUEST_BLOCK,
+        }
+    }
+}
+
 pub(crate) const MAX_PENDING_SETTINGS: usize = MAX_SETTINGS + 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +82,8 @@ pub struct H2ClientTables<'a> {
     decoder: HpackTable<'a>,
     encoder: HpackTable<'a>,
     ack_limits: &'a mut [u32],
+    limits: H2ClientLimits,
+    response_slots: usize,
 }
 
 impl<'a> H2ClientTables<'a> {
@@ -61,17 +96,21 @@ impl<'a> H2ClientTables<'a> {
         encoder_scratch: &'a mut [u8],
         ack_limits: &'a mut [u32],
     ) -> Self {
+        let response_slots = slots.len().clamp(MIN_STREAM_SLOTS, MAX_STREAM_SLOTS);
+        let block_cap = u32::try_from(header_block.len()).unwrap_or(u32::MAX);
         Self {
-            streams: StreamTable::new(
-                slots,
-                veylor_http2::H2Role::Client,
-                header_block,
-                HEADER_BLOCK as u32,
-            ),
-            decoder: HpackTable::new(decoder_entries, decoder_scratch, 4_096),
-            encoder: HpackTable::new(encoder_entries, encoder_scratch, 4_096),
+            streams: StreamTable::new(slots, veylor_http2::H2Role::Client, header_block, block_cap),
+            decoder: HpackTable::new(decoder_entries, decoder_scratch, HPACK_TABLE_SIZE as u32),
+            encoder: HpackTable::new(encoder_entries, encoder_scratch, HPACK_TABLE_SIZE as u32),
             ack_limits,
+            limits: H2ClientLimits::default(),
+            response_slots,
         }
+    }
+
+    pub fn with_limits(mut self, limits: H2ClientLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn connect<'c>(&'c mut self) -> Result<H2ClientConnection<'c, 'a>, H2ClientError>
@@ -85,7 +124,11 @@ impl<'a> H2ClientTables<'a> {
             &mut *self.ack_limits,
         )
         .map_err(|_| H2ClientError::InternalError)?;
-        Ok(H2ClientConnection::with_driver(driver))
+        Ok(H2ClientConnection::with_driver(
+            driver,
+            self.limits,
+            self.response_slots,
+        ))
     }
 }
 
@@ -94,9 +137,10 @@ type ResponseSlot = Option<(u32, veylor_http2::ClientResponseHeaders)>;
 pub struct H2ClientConnection<'c, 'b> {
     driver: veylor_http2::H2ClientDriver<'c, 'b, 'b, 'b>,
     pending: PendingWrite,
-    responses: [ResponseSlot; MAX_RESPONSES],
+    limits: H2ClientLimits,
+    responses: Box<[ResponseSlot]>,
     response_len: usize,
-    block: [u8; HEADER_BLOCK_SCRATCH],
+    block: Box<[u8]>,
     cancelled: bool,
     feed_action_count: usize,
     feed_header_count: usize,
@@ -138,13 +182,20 @@ impl Default for PendingWrite {
 }
 
 impl<'c, 'b> H2ClientConnection<'c, 'b> {
-    fn with_driver(driver: veylor_http2::H2ClientDriver<'c, 'b, 'b, 'b>) -> Self {
+    fn with_driver(
+        driver: veylor_http2::H2ClientDriver<'c, 'b, 'b, 'b>,
+        limits: H2ClientLimits,
+        response_slots: usize,
+    ) -> Self {
         Self {
             driver,
             pending: PendingWrite::default(),
-            responses: std::array::from_fn(|_| None),
+            limits,
+            responses: std::iter::repeat_with(|| None)
+                .take(response_slots)
+                .collect(),
             response_len: 0,
-            block: [0; HEADER_BLOCK_SCRATCH],
+            block: vec![0; limits.request_block].into_boxed_slice(),
             cancelled: false,
             feed_action_count: 0,
             feed_header_count: 0,
@@ -155,6 +206,10 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
             feed_resets: [0; MAX_ACTIONS],
             feed_reset_count: 0,
         }
+    }
+
+    pub const fn limits(&self) -> H2ClientLimits {
+        self.limits
     }
 
     pub fn cancel(&mut self) {
@@ -195,7 +250,7 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         stream_id: u32,
         response: veylor_http2::ClientResponseHeaders,
     ) -> Result<(), H2ClientError> {
-        if self.response_len >= MAX_RESPONSES {
+        if self.response_len >= self.responses.len() {
             return Err(H2ClientError::Capacity);
         }
         self.responses[self.response_len] = Some((stream_id, response));

@@ -27,6 +27,9 @@ pub enum RequestFieldSectionError {
     InvalidTe,
     InvalidConnectPseudoHeaders,
     OptionsAsteriskOnly,
+    EmptyTrailers,
+    PseudoHeaderInTrailers,
+    ForbiddenTrailerField,
     WrongRole,
     Hpack(HpackError),
 }
@@ -42,6 +45,58 @@ pub fn encode_request_field_section(
     validate_request_fields(fields)?;
     encode_header_block(fields, driver.hpack_encoder_mut(), output)
         .map_err(RequestFieldSectionError::Hpack)
+}
+
+pub fn encode_request_trailer_section(
+    driver: &mut H2FrameDriver<'_, '_, '_, '_>,
+    fields: &[HpackFieldToEncode<'_>],
+    output: &mut [u8],
+) -> Result<usize, RequestFieldSectionError> {
+    if driver.streams().role() != crate::stream::H2Role::Client {
+        return Err(RequestFieldSectionError::WrongRole);
+    }
+    validate_trailer_fields(fields)?;
+    encode_header_block(fields, driver.hpack_encoder_mut(), output)
+        .map_err(RequestFieldSectionError::Hpack)
+}
+
+fn validate_trailer_fields(
+    fields: &[HpackFieldToEncode<'_>],
+) -> Result<(), RequestFieldSectionError> {
+    if fields.is_empty() {
+        return Err(RequestFieldSectionError::EmptyTrailers);
+    }
+    for field in fields {
+        validate_field_value(field.value)?;
+        if field.name.first() == Some(&b':') {
+            return Err(RequestFieldSectionError::PseudoHeaderInTrailers);
+        }
+        if !valid_field_name(field.name) {
+            return Err(RequestFieldSectionError::InvalidFieldName);
+        }
+        if is_prohibited_connection_field(field.name) || field.name == b"te" {
+            return Err(RequestFieldSectionError::ConnectionSpecificField);
+        }
+        if is_forbidden_trailer_field(field.name) {
+            return Err(RequestFieldSectionError::ForbiddenTrailerField);
+        }
+    }
+    Ok(())
+}
+
+// NOTE: RFC 9110 section 6.5.1: framing, routing, content-processing and trailer-declaring
+// fields are meaningless (or dangerous) once the content has been sent.
+fn is_forbidden_trailer_field(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"host"
+            | b"content-length"
+            | b"content-encoding"
+            | b"content-type"
+            | b"content-range"
+            | b"trailer"
+            | b"expect"
+    )
 }
 
 fn validate_request_fields(

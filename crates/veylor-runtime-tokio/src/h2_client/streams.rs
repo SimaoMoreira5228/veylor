@@ -3,12 +3,18 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use veylor_client::h2::ErrorCode;
 
+use super::headers::HeaderList;
 use super::shared::StreamShared;
 use super::upload::Upload;
 
 pub(super) enum Source {
-    Full { data: Vec<u8>, sent: usize },
+    Full {
+        data: Vec<u8>,
+        sent: usize,
+        trailers: HeaderList,
+    },
     Stream(Arc<Upload>),
+    Trailers(HeaderList),
     Done,
 }
 

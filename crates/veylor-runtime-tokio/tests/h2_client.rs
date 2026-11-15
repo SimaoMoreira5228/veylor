@@ -5,6 +5,8 @@ use std::time::Duration;
 use veylor_runtime_tokio::{H2Client, H2Config, H2Error, H2Request};
 use veylor_server::{MAX_STATIC_BODY_BYTES, RunningServer, Server, ServerConfig};
 
+#[path = "h2_client/limits.rs"]
+mod limits;
 #[path = "h2_client/peer.rs"]
 mod peer;
 #[path = "h2_client/scripted.rs"]

@@ -6,8 +6,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Instant, sleep_until, timeout};
 use veylor_client::h2::{
-    ErrorCode, H2ClientConnection, H2ClientTables, HEADER_BLOCK, HpackEntrySlot, SETTINGS_ACKS,
-    STREAM_SLOTS, StreamSlot,
+    ErrorCode, H2ClientConnection, H2ClientLimits, H2ClientTables, HPACK_ENTRIES, HpackEntrySlot,
+    HpackHeader, SETTINGS_ACKS, StreamSlot, decoder_scratch_len, encoder_scratch_len,
+    header_block_len,
 };
 
 use super::config::H2Config;
@@ -15,9 +16,6 @@ use super::error::{H2Error, TimeoutKind};
 use super::shared::{DriverShared, Pending, STATE_CLOSED, STATE_DRAINING, STATE_OPEN};
 use super::streams::{ActiveStream, Outbox, Source};
 
-const HPACK_ENTRIES: usize = 128;
-const DECODER_SCRATCH: usize = 16 * 1024;
-const ENCODER_SCRATCH: usize = 8 * 1024;
 const FLUSH_GRACE: Duration = Duration::from_secs(1);
 
 pub(super) struct Driver<'c, 'b> {
@@ -25,6 +23,7 @@ pub(super) struct Driver<'c, 'b> {
     pub(super) shared: Arc<DriverShared>,
     pub(super) config: H2Config,
     pub(super) streams: Vec<ActiveStream>,
+    pub(super) header_buf: Box<[HpackHeader]>,
     pub(super) inbuf: Vec<u8>,
     pub(super) in_len: usize,
     pub(super) out: Vec<u8>,
@@ -45,12 +44,17 @@ pub(super) async fn run<S>(io: S, config: H2Config, shared: Arc<DriverShared>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut slots = vec![StreamSlot::EMPTY; STREAM_SLOTS];
-    let mut header_block = vec![0u8; HEADER_BLOCK];
+    let limits = H2ClientLimits {
+        max_header_list_size: config.max_header_list_size,
+        max_fields: config.max_header_fields,
+        request_block: config.max_request_header_bytes,
+    };
+    let mut slots = vec![StreamSlot::EMPTY; config.stream_slots()];
+    let mut header_block = vec![0u8; header_block_len(limits.max_header_list_size)];
     let mut decoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
-    let mut decoder_scratch = vec![0u8; DECODER_SCRATCH];
+    let mut decoder_scratch = vec![0u8; decoder_scratch_len(limits.max_header_list_size)];
     let mut encoder_entries = vec![HpackEntrySlot::EMPTY; HPACK_ENTRIES];
-    let mut encoder_scratch = vec![0u8; ENCODER_SCRATCH];
+    let mut encoder_scratch = vec![0u8; encoder_scratch_len(limits.request_block)];
     let mut ack_limits = [0u32; SETTINGS_ACKS];
     let mut tables = H2ClientTables::new(
         &mut slots,
@@ -60,7 +64,8 @@ where
         &mut encoder_entries,
         &mut encoder_scratch,
         &mut ack_limits,
-    );
+    )
+    .with_limits(limits);
     let Ok(conn) = tables.connect() else {
         Driver::fail_queue(&shared, H2Error::Closed);
         shared.state.store(STATE_CLOSED, Ordering::Release);
@@ -76,20 +81,22 @@ where
 impl<'c, 'b> Driver<'c, 'b> {
     fn new(conn: H2ClientConnection<'c, 'b>, config: H2Config, shared: Arc<DriverShared>) -> Self {
         let handshake_deadline = Instant::now() + config.handshake_timeout;
+        let slots = config.stream_slots();
         Self {
             conn,
+            header_buf: vec![HpackHeader::EMPTY; config.max_header_fields].into_boxed_slice(),
             streams: Vec::with_capacity(config.max_concurrent_streams),
             inbuf: vec![0; config.read_buffer],
             in_len: 0,
             out: vec![0; config.write_buffer],
             out_len: 0,
             out_pos: 0,
-            outbox: Outbox::new(STREAM_SLOTS * 2),
+            outbox: Outbox::new(slots * 2),
             preface_sent: false,
             window_check: false,
             round_robin: 0,
             terminal: None,
-            dirty_scratch: Vec::with_capacity(STREAM_SLOTS),
+            dirty_scratch: Vec::with_capacity(slots),
             handshake_deadline: Some(handshake_deadline),
             idle_since: None,
             close_deadline: None,

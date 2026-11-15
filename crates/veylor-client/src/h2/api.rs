@@ -4,8 +4,8 @@ use veylor_http2::{
 };
 
 use super::{
-    H2ClientConnection, H2ClientError, MAX_HEADER_LIST_SIZE, MAX_PENDING_SETTINGS, MAX_SETTINGS,
-    PendingWrite, PendingWriteKind,
+    H2ClientConnection, H2ClientError, MAX_PENDING_SETTINGS, MAX_SETTINGS, PendingWrite,
+    PendingWriteKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,7 +70,7 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
                 enable_push_seen = true;
             }
             if parameter.id == SETTINGS_MAX_HEADER_LIST_SIZE {
-                if parameter.value > MAX_HEADER_LIST_SIZE {
+                if parameter.value > self.limits.max_header_list_size {
                     return Err(H2ClientError::InvalidArgument);
                 }
                 max_header_list_size_seen = true;
@@ -90,7 +90,7 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         if !max_header_list_size_seen {
             staged[setting_count] = SettingsParameter {
                 id: SETTINGS_MAX_HEADER_LIST_SIZE,
-                value: MAX_HEADER_LIST_SIZE,
+                value: self.limits.max_header_list_size,
             };
             setting_count += 1;
         }

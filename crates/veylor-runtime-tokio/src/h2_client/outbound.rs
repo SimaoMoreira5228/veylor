@@ -1,19 +1,21 @@
 use std::sync::atomic::Ordering;
 
 use veylor_client::h2::{
-    CLIENT_CONNECTION_PREFACE, DataOut, ErrorCode, H2ClientError, HpackFieldToEncode,
-    HpackRepresentation, MAX_FIELDS, SETTINGS_INITIAL_WINDOW_SIZE, SettingsParameter, WriteOut,
+    CLIENT_CONNECTION_PREFACE, DEFAULT_MAX_FIELDS as MAX_FIELDS, DataOut, ErrorCode, H2ClientError,
+    HpackFieldToEncode, HpackRepresentation, SETTINGS_INITIAL_WINDOW_SIZE, SettingsParameter,
+    WriteOut,
 };
 
 use super::driver::Driver;
 use super::error::H2Error;
+use super::headers::HeaderList;
 use super::request::{H2Request, RequestBody};
 use super::shared::{Pending, STATE_OPEN};
 use super::streams::{ActiveStream, Source};
 use super::upload::UploadState;
 
 const CONTROL_ROOM: usize = 64;
-const HEAD_ROOM: usize = 4_096 + 64;
+const HEAD_ROOM_SLACK: usize = 64;
 const DATA_ROOM: usize = 1_024;
 const PROTOCOL_WINDOW: i64 = 65_535;
 
@@ -151,7 +153,7 @@ impl Driver<'_, '_> {
             if self.shared.state.load(Ordering::Acquire) != STATE_OPEN
                 || !self.conn.peer_settings_received()
                 || !self.conn.local_settings_acknowledged()
-                || self.free() < HEAD_ROOM
+                || self.free() < self.config.max_request_header_bytes + HEAD_ROOM_SLACK
             {
                 return;
             }
@@ -199,7 +201,7 @@ impl Driver<'_, '_> {
             }
         };
         let used = fields.1;
-        let end_stream = matches!(request.body, RequestBody::Empty);
+        let end_stream = matches!(request.body, RequestBody::Empty) && request.trailers.is_empty();
         let started = {
             let output = &mut self.out[self.out_len..];
             self.conn
@@ -249,8 +251,13 @@ impl Driver<'_, '_> {
         self.out_len += started.written;
 
         let source = match request.body {
-            RequestBody::Empty => Source::Done,
-            RequestBody::Full(data) => Source::Full { data, sent: 0 },
+            RequestBody::Empty if request.trailers.is_empty() => Source::Done,
+            RequestBody::Empty => Source::Trailers(request.trailers),
+            RequestBody::Full(data) => Source::Full {
+                data,
+                sent: 0,
+                trailers: request.trailers,
+            },
             RequestBody::Stream(upload) => Source::Stream(upload),
         };
         self.streams.push(ActiveStream {
@@ -284,23 +291,36 @@ impl Driver<'_, '_> {
     }
 
     fn write_stream_data(&mut self, index: usize) -> bool {
+        if matches!(self.streams[index].source, Source::Trailers(_)) {
+            return self.write_trailers(index);
+        }
         let id = self.streams[index].id;
         let credit = self.conn.send_credit(id);
         let mut result: Option<Result<DataOut, H2ClientError>> = None;
+        let mut next_trailers: Option<HeaderList> = None;
 
         let output_start = self.out_len;
         let stream = &mut self.streams[index];
         match &mut stream.source {
             Source::Done => return false,
-            Source::Full { data, sent } => {
+            Source::Trailers(_) => return false,
+            Source::Full {
+                data,
+                sent,
+                trailers,
+            } => {
                 let input = &data[*sent..];
                 if !input.is_empty() && credit == 0 {
                     return false;
                 }
                 let output = &mut self.out[output_start..];
-                let outcome = self.conn.send_data(id, input, true, output);
+                let ends_stream = trailers.is_empty();
+                let outcome = self.conn.send_data(id, input, ends_stream, output);
                 if let Ok(out) = &outcome {
                     *sent += out.consumed;
+                    if *sent == data.len() && !ends_stream {
+                        next_trailers = Some(std::mem::take(trailers));
+                    }
                 }
                 result = Some(outcome);
             }
@@ -323,15 +343,19 @@ impl Driver<'_, '_> {
                     result = Some(outcome);
                     consumed
                 });
-                if matches!(state, UploadState::Aborted) {
-                    self.kill_stream(index, H2Error::Cancelled, Some(ErrorCode::Cancel));
-                    return true;
+                match state {
+                    UploadState::Aborted => {
+                        self.kill_stream(index, H2Error::Cancelled, Some(ErrorCode::Cancel));
+                        return true;
+                    }
+                    UploadState::Trailers(trailers) => next_trailers = Some(trailers),
+                    UploadState::Open | UploadState::Finished => {}
                 }
             }
         }
 
         let Some(outcome) = result else {
-            return false;
+            return self.switch_to_trailers(index, next_trailers);
         };
         match outcome {
             Ok(out) => {
@@ -344,6 +368,7 @@ impl Driver<'_, '_> {
                 if out.end_stream {
                     self.streams[index].source = Source::Done;
                 }
+                self.switch_to_trailers(index, next_trailers);
                 true
             }
             Err(H2ClientError::WouldBlock | H2ClientError::BufferTooSmall { .. }) => false,
@@ -353,6 +378,52 @@ impl Driver<'_, '_> {
                     H2Error::Reset(ErrorCode::InternalError),
                     Some(ErrorCode::Cancel),
                 );
+                true
+            }
+        }
+    }
+}
+
+impl Driver<'_, '_> {
+    fn switch_to_trailers(&mut self, index: usize, trailers: Option<HeaderList>) -> bool {
+        let Some(trailers) = trailers else {
+            return false;
+        };
+        self.streams[index].source = Source::Trailers(trailers);
+        true
+    }
+
+    fn write_trailers(&mut self, index: usize) -> bool {
+        let id = self.streams[index].id;
+        let Source::Trailers(list) = &self.streams[index].source else {
+            return false;
+        };
+        let mut fields: [HpackFieldToEncode<'_>; MAX_FIELDS] = [field(b"", b""); MAX_FIELDS];
+        if list.len() > MAX_FIELDS {
+            self.kill_stream(index, H2Error::InvalidRequest, Some(ErrorCode::Cancel));
+            return true;
+        }
+        let mut count = 0;
+        for (name, value) in list.iter() {
+            fields[count] = field(name, value);
+            count += 1;
+        }
+        let output = &mut self.out[self.out_len..];
+        let outcome = self.conn.send_trailers(id, &fields[..count], output);
+        match outcome {
+            Ok(out) => {
+                if self.conn.acknowledge(out.written).is_err() {
+                    self.terminal
+                        .get_or_insert(H2Error::Connection(ErrorCode::InternalError));
+                    return false;
+                }
+                self.out_len += out.written;
+                self.streams[index].source = Source::Done;
+                true
+            }
+            Err(H2ClientError::WouldBlock | H2ClientError::BufferTooSmall { .. }) => false,
+            Err(_) => {
+                self.kill_stream(index, H2Error::InvalidRequest, Some(ErrorCode::Cancel));
                 true
             }
         }

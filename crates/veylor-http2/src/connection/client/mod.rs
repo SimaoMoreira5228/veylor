@@ -13,6 +13,7 @@ use super::QueuedDataFrame;
 use super::QueuedHeadersBlock;
 use super::RequestFieldSectionError;
 use super::encode_request_field_section;
+use super::encode_request_trailer_section;
 use crate::flow_control::FlowWindowError;
 use crate::frame::ErrorCode;
 use crate::frame::FRAME_HEADER_LEN;
@@ -83,6 +84,12 @@ impl From<FlowWindowError> for ClientError {
 
 pub struct StartedRequest<'output> {
     pub stream_id: u32,
+    pub block_length: usize,
+    pub frame: QueuedHeadersBlock,
+    pub writer: HeadersFrameWriter<'output>,
+}
+
+pub struct SentTrailers<'output> {
     pub block_length: usize,
     pub frame: QueuedHeadersBlock,
     pub writer: HeadersFrameWriter<'output>,
@@ -179,6 +186,33 @@ impl<'borrow, 'streams, 'decoder, 'encoder> H2ClientDriver<'borrow, 'streams, 'd
 
         Ok(StartedRequest {
             stream_id,
+            block_length,
+            frame,
+            writer,
+        })
+    }
+
+    pub fn send_trailers<'output>(
+        &mut self,
+        stream_id: u32,
+        fields: &[HpackFieldToEncode<'_>],
+        block: &mut [u8],
+        output: &'output mut [u8],
+    ) -> Result<SentTrailers<'output>, ClientError> {
+        let Some(stream) = self.driver.streams().find(stream_id) else {
+            return Err(ClientError::UnknownStream);
+        };
+        if stream.state != StreamState::Open {
+            return Err(ClientError::StreamClosed);
+        }
+
+        let block_length = encode_request_trailer_section(&mut self.driver, fields, block)?;
+
+        let mut writer = HeadersFrameWriter::new(output);
+        let frame =
+            writer.queue_headers(&mut self.driver, stream_id, &block[..block_length], true)?;
+
+        Ok(SentTrailers {
             block_length,
             frame,
             writer,

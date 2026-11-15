@@ -4,10 +4,12 @@ use veylor_http2::{
 };
 
 use super::{
-    BatchStatus, FeedBatch, FeedScratch, H2ClientConnection, H2ClientError, H2ClientTables,
-    HEADER_BLOCK, HPACK_ENTRIES, HPACK_SCRATCH, MAX_ACTIONS, MAX_FIELDS, SETTINGS_ACKS,
-    STREAM_SLOTS,
+    BatchStatus, DEFAULT_MAX_FIELDS, DEFAULT_MAX_HEADER_LIST_SIZE, FeedBatch, FeedScratch,
+    H2ClientConnection, H2ClientError, H2ClientLimits, H2ClientTables, HPACK_ENTRIES, MAX_ACTIONS,
+    SETTINGS_ACKS, decoder_scratch_len, encoder_scratch_len, header_block_len,
 };
+
+const STREAM_SLOTS: usize = 32;
 
 fn field<'f>(name: &'f [u8], value: &'f [u8]) -> HpackFieldToEncode<'f> {
     HpackFieldToEncode {
@@ -31,11 +33,12 @@ fn get_fields<'f>() -> [HpackFieldToEncode<'f>; 4] {
 macro_rules! fixture {
     ($tables:ident, $conn:ident) => {
         let mut slots = [veylor_http2::StreamSlot::EMPTY; STREAM_SLOTS];
-        let mut header_block = [0; HEADER_BLOCK];
+        let limits = H2ClientLimits::default();
+        let mut header_block = vec![0; header_block_len(limits.max_header_list_size)];
         let mut decoder_entries = [veylor_http2::HpackEntrySlot::EMPTY; HPACK_ENTRIES];
-        let mut decoder_scratch = [0; HPACK_SCRATCH];
+        let mut decoder_scratch = vec![0; decoder_scratch_len(limits.max_header_list_size)];
         let mut encoder_entries = [veylor_http2::HpackEntrySlot::EMPTY; HPACK_ENTRIES];
-        let mut encoder_scratch = [0; HPACK_SCRATCH];
+        let mut encoder_scratch = vec![0; encoder_scratch_len(limits.request_block)];
         let mut ack_limits = [0; SETTINGS_ACKS];
         let mut $tables = H2ClientTables::new(
             &mut slots,
@@ -45,7 +48,8 @@ macro_rules! fixture {
             &mut encoder_entries,
             &mut encoder_scratch,
             &mut ack_limits,
-        );
+        )
+        .with_limits(limits);
         let mut $conn = $tables.connect().expect("connect");
     };
 }
@@ -154,7 +158,7 @@ fn handshake(conn: &mut H2ClientConnection<'_, '_>) {
     assert_eq!(
         &output[..written],
         &[
-            0, 0, 12, 0x04, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 6, 0, 0, 8, 64,
+            0, 0, 12, 0x04, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 6, 0, 0, 64, 0,
         ]
     );
     assert_eq!(conn.acknowledge(written).expect("ack"), 0);
@@ -195,7 +199,7 @@ fn settings_keep_push_disabled_and_header_storage_bounded() {
 
     let excessive_header_limit = [SettingsParameter {
         id: SETTINGS_MAX_HEADER_LIST_SIZE,
-        value: super::MAX_HEADER_LIST_SIZE + 1,
+        value: DEFAULT_MAX_HEADER_LIST_SIZE + 1,
     }];
     assert_eq!(
         conn.send_settings(&excessive_header_limit, &mut output),
@@ -581,10 +585,9 @@ fn retry_replays_pending_batch() {
 #[test]
 fn scratch_capacity_matches_abi_limits() {
     assert_eq!(MAX_ACTIONS, 16);
-    assert_eq!(MAX_FIELDS, 64);
+    assert_eq!(DEFAULT_MAX_FIELDS, 128);
     let scratch = FeedScratch::new();
-    let batch_size = std::mem::size_of_val(&scratch);
-    assert!(batch_size > 0);
-    let headers = [HpackHeader::EMPTY; MAX_FIELDS];
-    assert_eq!(headers.len(), 64);
+    assert_eq!(scratch.headers().len(), DEFAULT_MAX_FIELDS);
+    assert_eq!(FeedScratch::with_fields(7).headers().len(), 7);
+    assert_eq!(HpackHeader::EMPTY, scratch.headers()[0]);
 }

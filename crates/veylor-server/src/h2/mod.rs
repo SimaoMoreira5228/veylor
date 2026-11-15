@@ -567,7 +567,15 @@ impl<'a> H2Conn<'a> {
             return false;
         }
         let full = result.status == FeedStatus::OutputFull;
-        if !pump_controls(&mut actions, output, used, events, event_len, max, staged) {
+        let controls = Controls {
+            max,
+            output: &mut *output,
+            used: &mut *used,
+            events: &mut *events,
+            event_len: &mut *event_len,
+            staged: &mut *staged,
+        };
+        if !pump_controls(handshake.server_mut(), &mut actions, controls) {
             self.fail(ErrorCode::InternalError, output, used, outcome);
             return false;
         }
@@ -619,7 +627,15 @@ impl<'a> H2Conn<'a> {
             return false;
         }
         let full = result.status == FeedStatus::OutputFull;
-        if !pump_controls(&mut actions, output, used, events, event_len, max, staged) {
+        let controls = Controls {
+            max,
+            output: &mut *output,
+            used: &mut *used,
+            events: &mut *events,
+            event_len: &mut *event_len,
+            staged: &mut *staged,
+        };
+        if !pump_controls(server, &mut actions, controls) {
             self.fail(ErrorCode::InternalError, output, used, outcome);
             return false;
         }
@@ -675,15 +691,28 @@ fn consume(staging: &mut [u8], staged: &mut usize, consumed: usize) {
     *staged -= consumed;
 }
 
-fn pump_controls(
-    actions: &mut [Option<H2FrameAction<'_>>; MAX_STREAMS_PER_STEP],
-    output: &mut [u8],
-    used: &mut usize,
-    events: &mut [Option<StreamEvent>; MAX_STREAMS_PER_STEP],
-    event_len: &mut usize,
+struct Controls<'a> {
     max: u32,
-    staged: &mut Vec<u8>,
+    output: &'a mut [u8],
+    used: &'a mut usize,
+    events: &'a mut [Option<StreamEvent>; MAX_STREAMS_PER_STEP],
+    event_len: &'a mut usize,
+    staged: &'a mut Vec<u8>,
+}
+
+fn pump_controls(
+    server: &mut H2ServerDriver<'_, '_, '_, '_>,
+    actions: &mut [Option<H2FrameAction<'_>>; MAX_STREAMS_PER_STEP],
+    controls: Controls<'_>,
 ) -> bool {
+    let Controls {
+        max,
+        output,
+        used,
+        events,
+        event_len,
+        staged,
+    } = controls;
     let mut stage = |event: StreamEvent| {
         if *event_len < MAX_STREAMS_PER_STEP {
             events[*event_len] = Some(event);
@@ -714,9 +743,22 @@ fn pump_controls(
             H2FrameAction::Data {
                 stream_id,
                 data,
+                padding,
                 end_stream,
-                ..
             } => {
+                // SECURITY: padding is charged to both receive windows but never reaches the
+                // body, so it is credited back here or a padded flood starves the connection.
+                if padding > 0 {
+                    let Ok(owed) = u32::try_from(padding) else {
+                        return false;
+                    };
+                    let connection = grant_window(server, 0, owed, &mut output[*used..]);
+                    if connection == 0 {
+                        return false;
+                    }
+                    *used += connection;
+                    *used += grant_window(server, stream_id, owed, &mut output[*used..]);
+                }
                 let start = staged.len();
                 staged.extend_from_slice(data);
                 stage(StreamEvent::Data(stream_id, start, data.len(), end_stream));

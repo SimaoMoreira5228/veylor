@@ -8,8 +8,10 @@ mod server_request;
 #[cfg(test)]
 mod tests;
 
-pub use client::{ClientError, H2ClientDriver, SentData, StartedRequest};
-pub use client_request::{RequestFieldSectionError, encode_request_field_section};
+pub use client::{ClientError, H2ClientDriver, SentData, SentTrailers, StartedRequest};
+pub use client_request::{
+    RequestFieldSectionError, encode_request_field_section, encode_request_trailer_section,
+};
 pub use client_response::{
     ClientResponseHeaders, ClientResponsePhase, ResponseFieldSection, ResponseSectionError,
     ResponseSectionKind,

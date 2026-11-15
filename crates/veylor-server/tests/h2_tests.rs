@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use veylor_http2::{
     CLIENT_CONNECTION_PREFACE, CONTINUATION_FLAG_END_HEADERS, DATA_FLAG_END_STREAM,
-    DEFAULT_MAX_FRAME_SIZE, ErrorCode, FRAME_HEADER_LEN, FrameHeader, FrameType, H2Role,
-    HEADERS_FLAG_END_HEADERS, HEADERS_FLAG_END_STREAM, HpackEntrySlot, HpackFieldToEncode,
+    DATA_FLAG_PADDED, DEFAULT_MAX_FRAME_SIZE, ErrorCode, FRAME_HEADER_LEN, FrameHeader, FrameType,
+    H2Role, HEADERS_FLAG_END_HEADERS, HEADERS_FLAG_END_STREAM, HpackEntrySlot, HpackFieldToEncode,
     HpackHeader, HpackRepresentation, HpackTable, SETTINGS_ACK, SETTINGS_ENTRY_LEN,
     SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_HEADER_LIST_SIZE, StreamSlot, StreamTable,
     decode_frame_header, decode_goaway_payload, decode_header_block, decode_rst_stream_payload,
@@ -30,6 +30,8 @@ use veylor_server::{
 
 #[path = "h2_tests/managed_requests.rs"]
 mod h2_managed_requests;
+#[path = "h2_tests/padding.rs"]
+mod h2_padding;
 #[path = "h2_tests/tunnel.rs"]
 mod h2_tunnel;
 

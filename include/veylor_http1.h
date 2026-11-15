@@ -405,6 +405,9 @@ typedef struct {
     uint32_t error_code;
     size_t data_offset;
     size_t data_length;
+    /* NOTE: DATA only. Pad length byte plus padding; flow control charged it with the
+       payload, so WINDOW_UPDATE must credit data_length + padding_length. */
+    size_t padding_length;
     size_t field_start;
     size_t field_count;
     uint8_t ping[8];

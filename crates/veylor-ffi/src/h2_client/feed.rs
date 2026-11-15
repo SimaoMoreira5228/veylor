@@ -314,8 +314,8 @@ unsafe fn translate_pending(
             veylor_http2::H2FrameAction::Data {
                 stream_id,
                 data: payload,
+                padding,
                 end_stream,
-                ..
             } => {
                 let data_offset = data_next;
                 data[data_next..data_next + payload.len()].copy_from_slice(payload);
@@ -326,6 +326,7 @@ unsafe fn translate_pending(
                     flags: u32::from(*end_stream) & VYL_H2_END_STREAM,
                     data_offset,
                     data_length: payload.len(),
+                    padding_length: *padding,
                     ..VylH2Action::default()
                 }
             }

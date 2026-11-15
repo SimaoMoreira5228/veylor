@@ -4,7 +4,6 @@ use veylor_http2::{
 };
 
 use super::{H2ClientConnection, H2ClientError, PendingWrite, PendingWriteKind, WriteOut};
-use crate::h2::{MAX_FIELDS, MAX_RESPONSES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestOut {
@@ -93,7 +92,7 @@ fn map_data_error(error: DataWriteError, required: &mut usize) -> H2ClientError 
 impl<'c, 'b> H2ClientConnection<'c, 'b> {
     pub fn check_start_request(&self) -> Result<(), H2ClientError> {
         self.ensure_writable()?;
-        if self.response_len >= MAX_RESPONSES {
+        if self.response_len >= self.responses.len() {
             return Err(H2ClientError::Capacity);
         }
         Ok(())
@@ -105,11 +104,11 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
         output: &mut [u8],
         end_stream: bool,
     ) -> Result<RequestOut, H2ClientError> {
-        if fields.len() > MAX_FIELDS {
+        if fields.len() > self.limits.max_fields {
             return Err(H2ClientError::Capacity);
         }
         self.ensure_writable()?;
-        if self.response_len >= MAX_RESPONSES {
+        if self.response_len >= self.responses.len() {
             return Err(H2ClientError::Capacity);
         }
         let mut method: &[u8] = &[];
@@ -162,6 +161,33 @@ impl<'c, 'b> H2ClientConnection<'c, 'b> {
             written: sent.frame.frame_length,
             end_stream: sent.frame.end_stream,
             required: sent.frame.frame_length,
+        })
+    }
+
+    pub fn send_trailers(
+        &mut self,
+        stream_id: u32,
+        fields: &[HpackFieldToEncode<'_>],
+        output: &mut [u8],
+    ) -> Result<WriteOut, H2ClientError> {
+        if fields.len() > self.limits.max_fields {
+            return Err(H2ClientError::Capacity);
+        }
+        self.ensure_writable()?;
+        let mut required = 0;
+        let sent = self
+            .driver
+            .send_trailers(stream_id, fields, &mut self.block, output)
+            .map_err(|error| map_client_error(error, &mut required))?;
+        let written = sent.frame.output_length;
+        self.pending = PendingWrite {
+            kind: PendingWriteKind::Headers,
+            remaining: written,
+            ..PendingWrite::default()
+        };
+        Ok(WriteOut {
+            written,
+            required: written,
         })
     }
 

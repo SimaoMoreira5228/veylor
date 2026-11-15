@@ -1448,3 +1448,26 @@ fn scripted_continuation_over_limit_fails_connection_before_reuse() {
     assert_eq!(closed.connection_error, 9);
     destroy_client(client);
 }
+
+#[test]
+fn scripted_padded_data_reports_padding_to_credit() {
+    let client = new_client();
+    scripted_handshake(client);
+    let stream = scripted_get(client);
+    assert_eq!(stream, 1);
+    let headers = peer_headers(1, false, &[(b":status".as_slice(), b"200".as_slice())]);
+    let out = poll_peer(client, &headers);
+    assert_eq!(out.result, VylResult::Ok);
+    let mut padded = vec![200_u8];
+    padded.extend_from_slice(b"abc");
+    padded.extend_from_slice(&[0_u8; 200]);
+    let mut frame = peer_header(padded.len(), 0x00, 0x08, 1).to_vec();
+    frame.extend_from_slice(&padded);
+    let out = poll_peer(client, &frame);
+    assert_eq!(out.result, VylResult::Ok);
+    assert_eq!(out.actions.len(), 1);
+    assert_eq!(out.actions[0].kind, VylH2ActionKind::Data);
+    assert_eq!(out.actions[0].data_length, 3);
+    assert_eq!(out.actions[0].padding_length, 201);
+    destroy_client(client);
+}

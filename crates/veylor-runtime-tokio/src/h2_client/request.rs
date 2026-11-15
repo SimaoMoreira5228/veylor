@@ -17,6 +17,7 @@ pub struct H2Request {
     pub(crate) authority: Vec<u8>,
     pub(crate) path: Vec<u8>,
     pub(crate) headers: HeaderList,
+    pub(crate) trailers: HeaderList,
     pub(crate) body: RequestBody,
     pub(crate) timeout: Option<Option<Duration>>,
 }
@@ -29,6 +30,7 @@ impl H2Request {
             authority: authority.to_vec(),
             path: path.to_vec(),
             headers: HeaderList::default(),
+            trailers: HeaderList::default(),
             body: RequestBody::Empty,
             timeout: None,
         }
@@ -40,6 +42,11 @@ impl H2Request {
 
     pub fn header(mut self, name: &[u8], value: &[u8]) -> Self {
         self.headers.push(name, value);
+        self
+    }
+
+    pub fn trailer(mut self, name: &[u8], value: &[u8]) -> Self {
+        self.trailers.push(name, value);
         self
     }
 

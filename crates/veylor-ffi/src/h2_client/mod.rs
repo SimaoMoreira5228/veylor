@@ -14,8 +14,21 @@ mod roundtrip;
 mod tests;
 
 use veylor_client::h2::{
-    FeedScratch, H2ClientConnection, H2ClientError, H2ClientTables, HEADER_BLOCK, HPACK_ENTRIES,
-    HPACK_SCRATCH, HpackEntrySlot, SETTINGS_ACKS, STREAM_SLOTS, StreamSlot,
+    FeedScratch, H2ClientConnection, H2ClientError, H2ClientLimits, H2ClientTables, HpackEntrySlot,
+    SETTINGS_ACKS, StreamSlot,
+};
+
+// NOTE: the C ABI keeps the fixed small profile (it shares VYL_H2_MAX_FIELDS and the header-list
+// bound with the server handle); only Rust embedders get the larger configurable limits.
+pub(crate) const STREAM_SLOTS: usize = 32;
+pub(crate) const HEADER_BLOCK: usize = 4_096;
+pub(crate) const HPACK_ENTRIES: usize = 32;
+pub(crate) const HPACK_SCRATCH: usize = 4_096;
+
+pub(crate) const LIMITS: H2ClientLimits = H2ClientLimits {
+    max_header_list_size: crate::abi::VYL_H2_MAX_HEADER_LIST_SIZE,
+    max_fields: crate::abi::VYL_H2_MAX_FIELDS,
+    request_block: HEADER_BLOCK,
 };
 
 pub struct VylH2Client {

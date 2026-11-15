@@ -1,5 +1,6 @@
 use super::ClientError;
 use super::H2ClientDriver;
+use crate::connection::RequestFieldSectionError;
 use crate::frame::DATA_FLAG_END_STREAM;
 use crate::frame::DEFAULT_MAX_FRAME_SIZE;
 use crate::frame::ErrorCode;
@@ -307,6 +308,91 @@ fn received_goaway_blocks_new_streams() {
         assert!(matches!(
             client.start_request(&fields, &mut block, &mut output, true),
             Err(ClientError::NewStreamsClosed)
+        ));
+    });
+}
+
+#[test]
+fn trailers_end_the_request_after_data() {
+    with_client(|client| {
+        let fields = request_fields();
+        let mut block = [0; 256];
+        let mut output = [0; 1_024];
+        let started = client
+            .start_request(&fields, &mut block, &mut output, false)
+            .unwrap();
+        assert_eq!(started.stream_id, 1);
+
+        let mut output = [0; 1_024];
+        client.send_data(1, b"body", false, &mut output).unwrap();
+
+        let trailers = [field(b"x-checksum", b"abc")];
+        let mut block = [0; 256];
+        let mut output = [0; 1_024];
+        let sent = client
+            .send_trailers(1, &trailers, &mut block, &mut output)
+            .unwrap();
+        assert!(sent.frame.end_stream);
+        let length = sent.frame.output_length;
+        let header =
+            decode_frame_header(&output[..FRAME_HEADER_LEN], DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::Headers);
+        assert_eq!(header.stream_id, 1);
+        assert_eq!(
+            header.flags,
+            HEADERS_FLAG_END_HEADERS | HEADERS_FLAG_END_STREAM
+        );
+        assert_eq!(length, FRAME_HEADER_LEN + header.payload_length as usize);
+        assert_eq!(
+            client.driver().streams().find(1).unwrap().state,
+            StreamState::HalfClosedLocal
+        );
+
+        let mut block = [0; 256];
+        let mut output = [0; 1_024];
+        assert!(matches!(
+            client.send_trailers(1, &trailers, &mut block, &mut output),
+            Err(ClientError::StreamClosed)
+        ));
+    });
+}
+
+#[test]
+fn trailers_reject_pseudo_headers_unknown_streams_and_empty_sections() {
+    with_client(|client| {
+        let fields = request_fields();
+        let mut block = [0; 256];
+        let mut output = [0; 1_024];
+        client
+            .start_request(&fields, &mut block, &mut output, false)
+            .unwrap();
+
+        let mut block = [0; 256];
+        let mut output = [0; 1_024];
+        let pseudo = [field(b":path", b"/")];
+        assert!(matches!(
+            client.send_trailers(1, &pseudo, &mut block, &mut output),
+            Err(ClientError::Request(
+                RequestFieldSectionError::PseudoHeaderInTrailers
+            ))
+        ));
+        assert!(matches!(
+            client.send_trailers(1, &[], &mut block, &mut output),
+            Err(ClientError::Request(
+                RequestFieldSectionError::EmptyTrailers
+            ))
+        ));
+        let framing = [field(b"content-length", b"4")];
+        assert!(matches!(
+            client.send_trailers(1, &framing, &mut block, &mut output),
+            Err(ClientError::Request(
+                RequestFieldSectionError::ForbiddenTrailerField
+            ))
+        ));
+        let ok = [field(b"x-a", b"b")];
+        assert!(matches!(
+            client.send_trailers(3, &ok, &mut block, &mut output),
+            Err(ClientError::UnknownStream)
         ));
     });
 }
