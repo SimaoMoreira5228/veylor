@@ -1,7 +1,9 @@
 use std::io;
 use std::net::SocketAddr;
 
-use mio::net::{TcpListener, TcpStream};
+use mio::net::TcpStream;
+
+use super::TcpListener;
 
 #[derive(Debug)]
 pub struct AcceptedConnection {
@@ -48,60 +50,84 @@ pub fn accept_ready(
             outcome: AcceptBatchOutcome::Stopped(AcceptStop::StorageFull),
         });
     }
+    if !listener.gate().consume() {
+        return Ok(AcceptBatch {
+            accepted: 0,
+            attempts: 0,
+            outcome: AcceptBatchOutcome::Stopped(AcceptStop::Drained),
+        });
+    }
 
+    let batch = drain_listener(listener, storage, attempt_budget);
+
+    if !matches!(
+        batch.outcome,
+        AcceptBatchOutcome::Stopped(AcceptStop::Drained)
+    ) {
+        listener.gate().arm();
+    }
+
+    Ok(batch)
+}
+
+fn drain_listener(
+    listener: &mut TcpListener,
+    storage: &mut [Option<AcceptedConnection>],
+    attempt_budget: usize,
+) -> AcceptBatch {
     let mut accepted = 0;
     let mut attempts = 0;
     loop {
         if accepted == storage.len() {
-            return Ok(AcceptBatch {
+            return AcceptBatch {
                 accepted,
                 attempts,
                 outcome: AcceptBatchOutcome::Stopped(AcceptStop::StorageFull),
-            });
+            };
         }
         if attempts == attempt_budget {
-            return Ok(AcceptBatch {
+            return AcceptBatch {
                 accepted,
                 attempts,
                 outcome: AcceptBatchOutcome::Stopped(AcceptStop::BudgetExhausted),
-            });
+            };
         }
         if storage[accepted].is_some() {
-            return Ok(AcceptBatch {
+            return AcceptBatch {
                 accepted,
                 attempts,
                 outcome: AcceptBatchOutcome::InvalidStorage,
-            });
+            };
         }
 
         attempts += 1;
         match listener.accept() {
             Ok((stream, peer)) => {
                 if let Err(error) = stream.set_nodelay(true) {
-                    return Ok(AcceptBatch {
+                    return AcceptBatch {
                         accepted,
                         attempts,
                         outcome: AcceptBatchOutcome::Error(error),
-                    });
+                    };
                 }
 
                 storage[accepted] = Some(AcceptedConnection { stream, peer });
                 accepted += 1;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(AcceptBatch {
+                return AcceptBatch {
                     accepted,
                     attempts,
                     outcome: AcceptBatchOutcome::Stopped(AcceptStop::Drained),
-                });
+                };
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
-                return Ok(AcceptBatch {
+                return AcceptBatch {
                     accepted,
                     attempts,
                     outcome: AcceptBatchOutcome::Error(error),
-                });
+                };
             }
         }
     }

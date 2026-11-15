@@ -1,10 +1,3 @@
-//! Batched socket I/O over one io_uring submission.
-//!
-//! Readiness still comes from the poller; this module only amortises the
-//! syscall that moves bytes. A turn's ready connections submit their recv
-//! SQEs together, one `io_uring_enter` drives them, and completions land back
-//! in the caller's order. The caller owns the buffers and must keep every
-//! submitted operation alive (and unmoved) until `recv_many` returns.
 #![allow(unsafe_code)]
 
 use std::io;
@@ -111,7 +104,7 @@ impl BatchRing {
                 }
             }
         }
-        self.ring.submit_and_wait(ops.len())?;
+        self.drive(ops.len())?;
         let mut queue = self.ring.completion();
         queue.sync();
         for completion in &mut queue {
@@ -150,7 +143,7 @@ impl BatchRing {
                 }
             }
         }
-        self.ring.submit_and_wait(ops.len())?;
+        self.drive(ops.len())?;
         let mut queue = self.ring.completion();
         queue.sync();
         for completion in &mut queue {
@@ -160,5 +153,18 @@ impl BatchRing {
             }
         }
         Ok(())
+    }
+
+    // TODO: callers that ignore a failed batch keep a ring whose entries may already be
+    // submitted. The H1 batching callers still retry such a ring; they must close the
+    // contributing connections instead, as the H2 caller now does.
+    fn drive(&self, want: usize) -> io::Result<()> {
+        loop {
+            match self.ring.submit_and_wait(want) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }

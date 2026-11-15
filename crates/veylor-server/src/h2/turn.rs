@@ -164,6 +164,7 @@ fn goaway_close(
         let staged = active.drain_with_code(pending_spare(meta), code);
         meta.pending_len += staged.written;
     }
+    meta.defer_write = false;
     let fatal = match flush_h2(meta, stream_poller, &mut turn.budget) {
         H2Flush::Closed(fatal) => fatal,
         H2Flush::Done | H2Flush::Blocked | H2Flush::Retry => reason,
@@ -182,6 +183,8 @@ pub(crate) fn pump_slot(
     if !meta.occupied {
         return None;
     }
+    let batched_read = std::mem::take(&mut meta.batched_read);
+    let mut eof = std::mem::take(&mut meta.eof);
     if conn.is_none() {
         shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
         return Some(ConnClose::TransportError);
@@ -225,7 +228,7 @@ pub(crate) fn pump_slot(
         );
     }
     let mut close_reason: Option<ConnClose> = None;
-    let mut eof = false;
+    turn.budget = turn.budget.saturating_sub(batched_read as u64);
     let mut progressed = apply_h2_staged(meta, conn, turn);
     progressed |= super::apply_h2_streams(meta, conn, turn);
     if let H2Flush::Closed(reason) = flush_h2(meta, stream_poller, &mut turn.budget) {
@@ -343,10 +346,13 @@ pub(crate) fn pump_slot(
     }
     // NOTE: closed means flush-then-close: staged bytes go best-effort before the FIN.
     // Flush failure reports transport truth; a blocked remainder drops with the slot.
-    if (meta.pending_unflushed() || meta.tls_unflushed())
-        && let H2Flush::Closed(fatal) = flush_h2(meta, stream_poller, &mut turn.budget)
-    {
-        close_reason = Some(fatal);
+    if meta.pending_unflushed() || meta.tls_unflushed() {
+        if close_reason.is_some() {
+            meta.defer_write = false;
+        }
+        if let H2Flush::Closed(fatal) = flush_h2(meta, stream_poller, &mut turn.budget) {
+            close_reason = Some(fatal);
+        }
     }
     if eof && close_reason.is_none() {
         close_reason = Some(ConnClose::PeerClosed);
@@ -365,6 +371,10 @@ pub(crate) fn pump_slot(
     }
     // NOTE: terminal without a reason is unreachable; fail closed, never wedge the slot.
     if conn.as_ref().is_some_and(|live| live.is_closed()) {
+        if meta.pending_unflushed() || meta.tls_unflushed() {
+            meta.defer_write = false;
+            let _ = flush_h2(meta, stream_poller, &mut turn.budget);
+        }
         shut_slot(meta, stream_poller, ConnClose::Completed, turn);
         return Some(ConnClose::Completed);
     }
@@ -614,6 +624,8 @@ pub(crate) fn drive_pumps(
         return;
     };
     slots.sweep_deadlines(now_ns, timeouts);
+    let batched = slots.batch_available();
+    slots.recv_ready(poller, budget);
     let mut turn = H2Turn {
         routes: view,
         host,
@@ -633,7 +645,9 @@ pub(crate) fn drive_pumps(
         let mut retire = false;
         if let Some(slot) = slots.slot_mut(index) {
             if slot.meta.occupied {
+                slot.meta.defer_write = batched;
                 let _ = pump_slot(&mut slot.meta, &mut slot.conn, &mut turn, poller, index);
+                slot.meta.defer_write = false;
                 if let Some(conn) = slot.conn.as_mut() {
                     conn.compact_decoder();
                 }
@@ -643,6 +657,22 @@ pub(crate) fn drive_pumps(
             }
         }
         if retire {
+            slots.close(index);
+        }
+    }
+    if batched && slots.send_deferred(poller, budget) {
+        // NOTE: a deferred write that failed surfaces here, after the pump already left
+        // the slot; close it on the same account the direct flush would have used.
+        for index in 0..slots.capacity() {
+            let failed = slots
+                .slot_mut(index)
+                .is_some_and(|slot| slot.meta.occupied && slot.meta.error);
+            if !failed {
+                continue;
+            }
+            if let Some(slot) = slots.slot_mut(index) {
+                shut_slot(&mut slot.meta, poller, ConnClose::TransportError, &mut turn);
+            }
             slots.close(index);
         }
     }

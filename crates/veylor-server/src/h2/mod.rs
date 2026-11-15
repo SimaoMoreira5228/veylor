@@ -17,6 +17,7 @@ pub(crate) mod turn;
 // writes), step owns the staged step draining one queued host command, slots owns
 // the per-worker slot table, flush owns socket flush pacing, and file owns
 // file-mount assembly (range planning, HEADERS emit, DATA pump).
+mod batch;
 mod file;
 mod flush;
 mod pending;

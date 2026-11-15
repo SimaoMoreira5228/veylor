@@ -3,8 +3,8 @@ use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::time::{Duration, Instant};
 
 use super::{
-    AcceptBatchOutcome, AcceptStop, AcceptedConnection, PollInterest, Poller, TcpListener,
-    WAKE_TOKEN, accept_ready,
+    AcceptBatchOutcome, AcceptGate, AcceptStop, AcceptedConnection, PollInterest, Poller,
+    TcpListener, WAKE_TOKEN, accept_ready,
 };
 use crate::{TimerExpiration, TimerQueue};
 
@@ -208,6 +208,116 @@ fn empty_storage_and_invalid_batch_inputs_are_distinguished() {
         invalid.outcome,
         AcceptBatchOutcome::InvalidStorage
     ));
+}
+
+#[test]
+fn accept_gate_admits_one_attempt_per_arm_and_fails_open_unattached() {
+    let gate = AcceptGate::new();
+    assert!(gate.consume());
+
+    gate.attach();
+    assert!(gate.consume());
+    assert!(!gate.consume());
+
+    gate.arm();
+    assert!(gate.armed());
+    assert!(gate.consume());
+    assert!(!gate.consume());
+
+    gate.arm();
+    assert!(gate.consume());
+
+    gate.detach();
+    assert!(gate.consume());
+}
+
+#[test]
+fn poller_arms_a_listener_once_per_readiness_edge() {
+    let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut listener = TcpListener::bind(address).unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut poller = Poller::new(4).unwrap();
+    poller
+        .register(&mut listener, 30, PollInterest::Readable)
+        .unwrap();
+
+    let mut storage: [Option<AcceptedConnection>; 2] = [None, None];
+    let probe = accept_ready(&mut listener, &mut storage, 8).unwrap();
+    assert_eq!(probe.accepted, 0);
+    assert_eq!(probe.attempts, 1);
+    assert!(matches!(
+        probe.outcome,
+        AcceptBatchOutcome::Stopped(AcceptStop::Drained)
+    ));
+
+    let idle = accept_ready(&mut listener, &mut storage, 8).unwrap();
+    assert_eq!(idle.accepted, 0);
+    assert_eq!(idle.attempts, 0);
+    assert!(matches!(
+        idle.outcome,
+        AcceptBatchOutcome::Stopped(AcceptStop::Drained)
+    ));
+
+    let _client = StdTcpStream::connect(address).unwrap();
+    assert!(
+        poller
+            .poll(Some(Duration::from_secs(2)))
+            .unwrap()
+            .any(|event| event.token == 30 && event.readable)
+    );
+
+    let batch = accept_ready(&mut listener, &mut storage, 8).unwrap();
+    assert_eq!(batch.accepted, 1);
+    assert!(matches!(
+        batch.outcome,
+        AcceptBatchOutcome::Stopped(AcceptStop::Drained)
+    ));
+    drop(storage[0].take().unwrap());
+
+    let quiet = accept_ready(&mut listener, &mut storage, 8).unwrap();
+    assert_eq!(quiet.accepted, 0);
+    assert_eq!(quiet.attempts, 0);
+    assert!(matches!(
+        quiet.outcome,
+        AcceptBatchOutcome::Stopped(AcceptStop::Drained)
+    ));
+}
+
+#[test]
+fn burst_larger_than_the_batch_budget_drains_without_further_edges() {
+    // NOTE: mio binds through std, whose listen backlog is 128, so the burst stays
+    // under it while still needing many more batches than one readiness edge buys.
+    const CLIENTS: usize = 96;
+
+    let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut listener = TcpListener::bind(address).unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut poller = Poller::new(4).unwrap();
+    poller
+        .register(&mut listener, 40, PollInterest::Readable)
+        .unwrap();
+    let clients: Vec<StdTcpStream> = (0..CLIENTS)
+        .map(|_| StdTcpStream::connect(address).unwrap())
+        .collect();
+    assert!(
+        poller
+            .poll(Some(Duration::from_secs(2)))
+            .unwrap()
+            .any(|event| event.token == 40)
+    );
+
+    let mut storage: [Option<AcceptedConnection>; 8] = [(); 8].map(|()| None);
+    let mut accepted = 0;
+    while accepted < CLIENTS {
+        let batch = accept_ready(&mut listener, &mut storage, 8).unwrap();
+        accepted += batch.accepted;
+        for entry in storage.iter_mut() {
+            entry.take();
+        }
+    }
+
+    assert_eq!(accepted, CLIENTS);
+    assert_eq!(clients.len(), CLIENTS);
 }
 
 #[cfg(not(any(target_os = "wasi", target_os = "horizon")))]

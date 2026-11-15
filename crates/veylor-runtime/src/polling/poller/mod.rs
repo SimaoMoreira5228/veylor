@@ -1,9 +1,12 @@
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mio::{Events, Interest, Poll as MioPoll, Token};
 
 use crate::timers::TimerQueue;
+
+use super::AcceptGate;
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -89,6 +92,13 @@ pub trait PollSource {
 
     fn deregister_mio(&mut self, registry: &mio::Registry) -> io::Result<()>;
 
+    // NOTE: only listeners answer this; the poller arms their gate on every
+    // readiness event so the accept path can skip a syscall with no backlog.
+    #[doc(hidden)]
+    fn accept_gate(&self) -> Option<Arc<AcceptGate>> {
+        None
+    }
+
     #[cfg(target_os = "linux")]
     fn raw_fd(&self) -> std::os::fd::RawFd;
 }
@@ -128,11 +138,11 @@ macro_rules! impl_poll_source {
 }
 
 impl_poll_source!(mio::net::TcpStream);
-impl_poll_source!(mio::net::TcpListener);
 
 pub struct Poller {
     backend: Backend,
     ready: Vec<Readiness>,
+    accept_gates: Vec<(usize, Arc<AcceptGate>)>,
 }
 
 enum Backend {
@@ -178,6 +188,7 @@ impl Poller {
         Ok(Self {
             backend,
             ready: Vec::with_capacity(event_capacity),
+            accept_gates: Vec::new(),
         })
     }
 
@@ -190,11 +201,13 @@ impl Poller {
         validate_token(token)?;
         match &mut self.backend {
             Backend::Mio(backend) => {
-                source.register_mio(backend.poller.registry(), Token(token), interest.mio())
+                source.register_mio(backend.poller.registry(), Token(token), interest.mio())?;
             }
             #[cfg(target_os = "linux")]
-            Backend::Uring(backend) => backend.register(source.raw_fd(), token, interest),
+            Backend::Uring(backend) => backend.register(source.raw_fd(), token, interest)?,
         }
+        self.track_accept_gate(source.accept_gate(), token);
+        Ok(())
     }
 
     pub fn reregister<S: PollSource + ?Sized>(
@@ -206,18 +219,59 @@ impl Poller {
         validate_token(token)?;
         match &mut self.backend {
             Backend::Mio(backend) => {
-                source.reregister_mio(backend.poller.registry(), Token(token), interest.mio())
+                source.reregister_mio(backend.poller.registry(), Token(token), interest.mio())?;
             }
             #[cfg(target_os = "linux")]
-            Backend::Uring(backend) => backend.reregister(source.raw_fd(), token, interest),
+            Backend::Uring(backend) => backend.reregister(source.raw_fd(), token, interest)?,
         }
+        self.track_accept_gate(source.accept_gate(), token);
+        Ok(())
     }
 
     pub fn deregister<S: PollSource + ?Sized>(&mut self, source: &mut S) -> io::Result<()> {
         match &mut self.backend {
-            Backend::Mio(backend) => source.deregister_mio(backend.poller.registry()),
+            Backend::Mio(backend) => source.deregister_mio(backend.poller.registry())?,
             #[cfg(target_os = "linux")]
-            Backend::Uring(backend) => backend.deregister(source.raw_fd()),
+            Backend::Uring(backend) => backend.deregister(source.raw_fd())?,
+        }
+        self.untrack_accept_gate(source.accept_gate());
+        Ok(())
+    }
+
+    // NOTE: re-registering a token onto another source drops the previous gate, and
+    // the dropped listener goes back to unattached: an accept path that lost its
+    // poller must not skip syscalls on the strength of a stale arm.
+    fn track_accept_gate(&mut self, gate: Option<Arc<AcceptGate>>, token: usize) {
+        let Some(gate) = gate else {
+            return;
+        };
+        gate.attach();
+        match self
+            .accept_gates
+            .iter_mut()
+            .find(|(existing, _)| *existing == token)
+        {
+            Some(entry) => {
+                if !Arc::ptr_eq(&entry.1, &gate) {
+                    entry.1.detach();
+                }
+                entry.1 = gate;
+            }
+            None => self.accept_gates.push((token, gate)),
+        }
+    }
+
+    fn untrack_accept_gate(&mut self, gate: Option<Arc<AcceptGate>>) {
+        let Some(gate) = gate else {
+            return;
+        };
+        gate.detach();
+        if let Some(index) = self
+            .accept_gates
+            .iter()
+            .position(|(_, tracked)| Arc::ptr_eq(tracked, &gate))
+        {
+            self.accept_gates.remove(index);
         }
     }
 
@@ -242,7 +296,25 @@ impl Poller {
             #[cfg(target_os = "linux")]
             Backend::Uring(backend) => backend.poll(timeout, &mut self.ready)?,
         }
+        self.arm_ready_listeners();
         Ok(self.ready.iter().copied())
+    }
+
+    // NOTE: every event on a listener token is a readiness edge (the registration
+    // interest filters the rest), so any event arms its accept gate. A level backend
+    // (io_uring PollAdd) re-reports while a backlog exists, which arms it again
+    // without an extra syscall.
+    fn arm_ready_listeners(&mut self) {
+        if self.accept_gates.is_empty() {
+            return;
+        }
+        for event in &self.ready {
+            for (token, gate) in &self.accept_gates {
+                if *token == event.token {
+                    gate.arm();
+                }
+            }
+        }
     }
 
     pub fn poll_with_timers(

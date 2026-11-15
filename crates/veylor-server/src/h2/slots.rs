@@ -59,8 +59,13 @@ pub(crate) struct H2Meta {
     pub(crate) tls_plain: Vec<u8>,
     pub(crate) occupied: bool,
     pub(crate) readable: bool,
+    pub(crate) claimed: bool,
     pub(crate) write_blocked: bool,
     pub(crate) watching_write: bool,
+    pub(crate) defer_write: bool,
+    pub(crate) write_deferred: bool,
+    pub(crate) batched_read: usize,
+    pub(crate) eof: bool,
     pub(crate) error: bool,
     pub(crate) staged: bool,
     pub(crate) serving: bool,
@@ -180,13 +185,31 @@ impl H2Slot {
 
 pub(crate) struct H2Slots {
     slots: Vec<Option<Box<H2Slot>>>,
+    batches: super::batch::Batches,
 }
 
 impl H2Slots {
     pub(crate) fn new() -> Self {
         Self {
             slots: (0..MAX_H2_CONNS).map(|_| None).collect(),
+            batches: super::batch::Batches::new(),
         }
+    }
+
+    pub(crate) fn recv_ready(&mut self, poller: &mut veylor_runtime::Poller, budget: u64) {
+        self.batches.recv_ready(&mut self.slots, poller, budget);
+    }
+
+    pub(crate) fn send_deferred(
+        &mut self,
+        poller: &mut veylor_runtime::Poller,
+        budget: u64,
+    ) -> bool {
+        self.batches.send_deferred(&mut self.slots, poller, budget)
+    }
+
+    pub(crate) fn batch_available(&mut self) -> bool {
+        self.batches.ensure()
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -248,6 +271,9 @@ impl H2Slots {
         {
             if event.readable || event.read_closed_hint {
                 meta.readable = true;
+                // NOTE: only a fresh edge proves bytes are already waiting, which is what
+                // lets a batched recv complete instead of arming io_uring's own poll.
+                meta.claimed = true;
             }
             if event.writable {
                 meta.write_blocked = false;

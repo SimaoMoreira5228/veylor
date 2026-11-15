@@ -80,6 +80,12 @@ fn flush_pending(meta: &mut H2Meta, stream_poller: &mut Poller, budget: &mut u64
     if !meta.pending_unflushed() {
         return H2Flush::Done;
     }
+    if meta.defer_write {
+        // NOTE: set only while the turn's batch send pass will run; the bytes stay
+        // queued and that pass owns the single write for this turn.
+        meta.write_deferred = true;
+        return H2Flush::Done;
+    }
     let Some(stream) = meta.stream.as_mut() else {
         return H2Flush::Closed(ConnClose::TransportError);
     };
