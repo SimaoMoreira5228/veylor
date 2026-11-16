@@ -308,7 +308,9 @@ fn build_client(
     } else {
         SocketAddr::from(([0u16; 8], 0))
     };
-    let endpoint = quinn::Endpoint::client(bind)?;
+    let runtime = quinn::default_runtime().ok_or(ClientError::Config("missing async runtime"))?;
+    let socket = crate::socket::bind_udp(bind).map_err(ClientError::Io)?;
+    let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
     Ok((endpoint, client))
 }
 

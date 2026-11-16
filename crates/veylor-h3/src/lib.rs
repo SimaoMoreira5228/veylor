@@ -25,6 +25,7 @@ mod client;
 mod connection;
 mod frame_io;
 mod response_writer;
+mod socket;
 mod tls;
 
 const MAX_UNI_STREAMS: u64 = 8;
@@ -328,7 +329,15 @@ impl Server {
             .build()
             .map_err(Error::Runtime)?;
         let entered = runtime.enter();
-        let endpoint = quinn::Endpoint::server(server_config, self.address)?;
+        let runtime_handle =
+            quinn::default_runtime().ok_or(Error::Config("missing async runtime"))?;
+        let socket = socket::bind_udp(self.address)?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime_handle,
+        )?;
         let address = endpoint.local_addr()?;
         drop(entered);
         let accept_endpoint = endpoint.clone();

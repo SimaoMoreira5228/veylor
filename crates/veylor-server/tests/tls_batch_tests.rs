@@ -106,6 +106,12 @@ fn open_h2(client: &mut Tls) -> Vec<u8> {
 }
 
 fn write_frame(client: &mut Tls, frame_type: FrameType, flags: u8, id: u32, payload: &[u8]) {
+    let mut wire = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    append_frame(&mut wire, frame_type, flags, id, payload);
+    client.write_all(&wire).expect("write frame");
+}
+
+fn append_frame(out: &mut Vec<u8>, frame_type: FrameType, flags: u8, id: u32, payload: &[u8]) {
     let header = FrameHeader {
         payload_length: payload.len() as u32,
         frame_type,
@@ -114,8 +120,8 @@ fn write_frame(client: &mut Tls, frame_type: FrameType, flags: u8, id: u32, payl
     };
     let mut encoded = [0; FRAME_HEADER_LEN];
     encode_frame_header(header, &mut encoded, DEFAULT_MAX_FRAME_SIZE).expect("encode header");
-    client.write_all(&encoded).expect("write header");
-    client.write_all(payload).expect("write payload");
+    out.extend_from_slice(&encoded);
+    out.extend_from_slice(payload);
 }
 
 fn read_frame(client: &mut Tls, stash: &mut Vec<u8>) -> (FrameHeader, Vec<u8>) {
@@ -152,6 +158,15 @@ fn field<'a>(name: &'a [u8], value: &'a [u8]) -> HpackFieldToEncode<'a> {
 }
 
 fn send_headers(client: &mut Tls, id: u32, method: &[u8], path: &[u8], end_stream: bool) {
+    let block = request_block(method, path);
+    let mut flags = HEADERS_FLAG_END_HEADERS;
+    if end_stream {
+        flags |= HEADERS_FLAG_END_STREAM;
+    }
+    write_frame(client, FrameType::Headers, flags, id, &block);
+}
+
+fn request_block(method: &[u8], path: &[u8]) -> Vec<u8> {
     let fields = vec![
         field(b":method", method),
         field(b":scheme", b"https"),
@@ -163,11 +178,7 @@ fn send_headers(client: &mut Tls, id: u32, method: &[u8], path: &[u8], end_strea
     let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
     let mut block = [0; 2048];
     let len = encode_header_block(&fields, &mut encoder, &mut block).expect("encode block");
-    let mut flags = HEADERS_FLAG_END_HEADERS;
-    if end_stream {
-        flags |= HEADERS_FLAG_END_STREAM;
-    }
-    write_frame(client, FrameType::Headers, flags, id, &block[..len]);
+    block[..len].to_vec()
 }
 
 fn decode_status(block: &[u8]) -> u16 {
@@ -190,14 +201,15 @@ fn decode_status(block: &[u8]) -> u16 {
 }
 
 // NOTE: uploads make the server grant window credit, so WINDOW_UPDATE frames arrive between
-// the response frames; they are skipped here and the response order is still enforced.
+// the response frames; a SETTINGS ACK can land there too. Both are skipped here and the
+// response order is still enforced.
 fn read_response(client: &mut Tls, stash: &mut Vec<u8>, id: u32) -> (u16, Vec<u8>) {
     let mut block = Vec::new();
     let mut headers_ended_stream = false;
     loop {
         let (header, payload) = read_frame(client, stash);
         match header.frame_type {
-            FrameType::WindowUpdate => {}
+            FrameType::WindowUpdate | FrameType::Settings => {}
             FrameType::Headers => {
                 assert_eq!(header.stream_id, id);
                 headers_ended_stream = header.flags & HEADERS_FLAG_END_STREAM != 0;
@@ -222,7 +234,7 @@ fn read_response(client: &mut Tls, stash: &mut Vec<u8>, id: u32) -> (u16, Vec<u8
         loop {
             let (header, payload) = read_frame(client, stash);
             match header.frame_type {
-                FrameType::WindowUpdate => {}
+                FrameType::WindowUpdate | FrameType::Settings => {}
                 FrameType::Data => {
                     assert_eq!(header.stream_id, id);
                     body.extend_from_slice(&payload);
@@ -322,6 +334,42 @@ fn h2_tls_upload_spanning_records_arrives_intact() {
     let (status, response) = read_response(&mut client, &mut stash, 1);
     assert_eq!(status, 200);
     assert_eq!(response, b"stored");
+
+    running.stop_accepting();
+    let counts = running.join().expect("join clean");
+    assert_eq!(counts.h2_served, 1, "counts: {counts:?}");
+    assert_eq!(counts.transport_error, 0, "counts: {counts:?}");
+}
+
+// NOTE: the client sends its preface, SETTINGS and a complete request before it reads
+// anything, so those bytes are already queued when the moved TLS slot gets its first
+// readiness edge. That edge is the only proof the batch needs to read them.
+#[test]
+fn h2_tls_first_flight_is_served_from_the_queued_bytes() {
+    let running = tls_server();
+    let mut client = connect(&running);
+    assert_eq!(client.alpn(), Some(b"h2".as_slice()), "client observes h2");
+
+    let mut flight = Vec::new();
+    flight.extend_from_slice(CLIENT_CONNECTION_PREFACE);
+    append_frame(&mut flight, FrameType::Settings, 0, 0, &[]);
+    let block = request_block(b"GET", b"/hello");
+    append_frame(
+        &mut flight,
+        FrameType::Headers,
+        HEADERS_FLAG_END_HEADERS | HEADERS_FLAG_END_STREAM,
+        1,
+        &block,
+    );
+    client.write_all(&flight).expect("write first flight");
+
+    let mut stash = Vec::new();
+    let (header, _) = read_frame(&mut client, &mut stash);
+    assert_eq!(header.frame_type, FrameType::Settings);
+
+    let (status, response) = read_response(&mut client, &mut stash, 1);
+    assert_eq!(status, 200);
+    assert_eq!(response, b"hello");
 
     running.stop_accepting();
     let counts = running.join().expect("join clean");

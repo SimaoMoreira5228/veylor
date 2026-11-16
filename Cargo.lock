@@ -1657,6 +1657,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "socket2 0.5.10",
  "tokio",
  "veylor-http3",
  "veylor-tls",
