@@ -172,23 +172,34 @@ fn h2_settings_flood_goes_away_with_enhance_your_calm() {
     send_headers(&mut stream, 1, b"GET", b"/hello", true);
     let hello = read_response(&mut stream, 1);
     assert_eq!(hello.status, 200);
+    // NOTE: frames are written one at a time so the guard samples the flood across several
+    // turns. A peer that closes mid-flood turns a later write into a transport error; that is
+    // the interleaving where the verdict already landed. A close may also turn the GOAWAY
+    // into a reset, so the wire code is checked when it survives and the counted reason below
+    // carries the proof either way.
     for _ in 0..60 {
-        write_frame(&mut stream, FrameType::Settings, 0, 0, &[]);
+        if try_write_frame(&mut stream, FrameType::Settings, 0, 0, &[]).is_err() {
+            break;
+        }
     }
+
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if Instant::now() > deadline {
-            panic!("no GOAWAY for settings flood");
-        }
-        match try_read_frame(&mut stream) {
-            Some((header, payload)) if header.frame_type == FrameType::GoAway => {
-                let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
-                assert_eq!(goaway.error_code, ErrorCode::EnhanceYourCalm);
-                return;
-            }
-            Some(_) | None => {}
+    let mut goaway_code = None;
+    while Instant::now() < deadline {
+        let Some((header, payload)) = try_read_frame(&mut stream) else {
+            break;
+        };
+        if header.frame_type == FrameType::GoAway {
+            let goaway = decode_goaway_payload(header, &payload).expect("decode goaway");
+            goaway_code = Some(goaway.error_code);
+            break;
         }
     }
+    if let Some(code) = goaway_code {
+        assert_eq!(code, ErrorCode::EnhanceYourCalm);
+    }
+    let counts = stop_join(server);
+    assert_eq!(counts.abused, 1, "counts: {counts:?}");
 }
 
 #[test]

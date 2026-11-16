@@ -3,7 +3,7 @@ use crate::h2_peer::*;
 use crate::h2_response::*;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use veylor_http2::{
     ErrorCode, H2Role, HpackEntrySlot, HpackHeader, HpackTable, StreamSlot, StreamTable,
 };
@@ -293,16 +293,17 @@ fn route_view_rejects_bad_input() {
 
 #[test]
 fn h2_progressing_conn_after_h1_drain_stays_bound_by_grace() {
-    // NOTE: once the last H1 connection closes mid-shutdown, the cancelled
-    // grace timer must not leave a progressing H2 connection unforced:
-    // per-second GETs defeat body-progress timeouts and the disabled linger
-    // defeats idle closes, so only the grace bound can release the worker.
+    // NOTE: once the last H1 connection closes mid-shutdown, the cancelled grace timer must
+    // not leave a progressing H2 connection unforced. Body progress is stretched past the
+    // join guard and drain linger is disabled, so only the grace bound can release the
+    // worker. The keep-alive round trips synchronize the stop observation without sleeps: a
+    // response is only produced in a turn after the previous response.
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let config = ServerConfig {
         h2c_port: Some(0),
         drain_idle_linger_ns: u64::MAX,
         timeouts: ConnectionTimeouts {
-            body_progress_ns: 2_000_000_000,
+            body_progress_ns: 3_600_000_000_000,
             ..ConnectionTimeouts::production()
         },
         ..ServerConfig::default()
@@ -330,41 +331,33 @@ fn h2_progressing_conn_after_h1_drain_stays_bound_by_grace() {
     let hello = read_response(&mut h2, 1);
     assert_eq!(hello.status, 200);
     server.stop_accepting();
-    // NOTE: let the worker observe stop (Draining + grace armed) before
-    // dropping H1, and keep GETs flowing until the verdict: stopping GETs
-    // would let the trailing body-progress timeout release the worker and
-    // mask a hang. A failed GET is only acceptable if join already completed.
-    std::thread::sleep(Duration::from_millis(500));
+
+    // NOTE: the worker runs two stop observations (a backlog turn, then begin_shutdown), and
+    // each sequential keep-alive response crosses a turn boundary, so these round trips enter
+    // Draining before H1 drops and then prove the drained server still serves.
+    for _ in 0..3 {
+        h1.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+            .expect("write drain h1 request");
+        let (status, body) = read_h1_body(&mut h1);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+    }
+
+    send_headers(&mut h2, 3, b"GET", b"/hello", true);
+    let drained = read_response(&mut h2, 3);
+    assert_eq!(drained.status, 200);
+
     drop(h1);
+
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = done_tx.send(stop_join(server));
     });
-    let deadline = Instant::now() + Duration::from_secs(25);
-    let mut id = 3u32;
-    loop {
-        if let Ok(counts) = done_rx.try_recv() {
-            assert!(counts.h2_served >= 2, "counts: {counts:?}");
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("join hung past grace");
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        let alive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            send_headers(&mut h2, id, b"GET", b"/hello", true);
-            let sibling = read_response(&mut h2, id);
-            assert_eq!(sibling.status, 200);
-        }));
-        if alive.is_err() {
-            break;
-        }
-        id += 2;
-    }
     let counts = done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("h2 died without join completing");
+        .recv_timeout(Duration::from_secs(25))
+        .expect("join hung past grace");
     assert!(counts.h2_served >= 2, "counts: {counts:?}");
+    assert_eq!(counts.shutdown, 1, "counts: {counts:?}");
 }
 
 #[test]

@@ -25,7 +25,8 @@ use crate::multi_worker::{ThreadCtx, ThreadResult};
 use crate::static_routes::MAX_ROUTES;
 
 use super::conn_lifecycle::{
-    apply_pump_hooks, cleanup_all, close_conn, close_idle_for_drain, drain_admitted, drain_expired,
+    apply_pump_hooks, cleanup_all, close_conn, close_idle_for_drain, close_lost_connections,
+    drain_admitted, drain_expired,
 };
 use super::staged::drain_host_staged;
 use super::{CloseCounts, LISTENER_TOKEN, MAX_CONNECTIONS, MAX_EVENTS_PER_TURN, SHUTDOWN_TIMER_ID};
@@ -174,6 +175,8 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
     let base = Instant::now();
     #[cfg(target_os = "linux")]
     let mut batch_ring = BatchRing::new(MAX_EVENTS_PER_TURN as u32).ok();
+    #[cfg(target_os = "linux")]
+    let mut read_batch = batch_recv::ReadBatch::new(MAX_EVENTS_PER_TURN);
     #[cfg(target_os = "linux")]
     let mut read_slots: Vec<usize> = Vec::with_capacity(MAX_EVENTS_PER_TURN);
     #[cfg(target_os = "linux")]
@@ -481,8 +484,24 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             && !parked_live;
         h1_quiet = skip_pump;
         #[cfg(target_os = "linux")]
-        if !skip_pump && let Some(ring) = batch_ring.as_mut() {
-            batch_recv::recv_ready(ring, &mut conns, &read_slots, per_conn_budget);
+        if !skip_pump
+            && let Some(lost) = read_batch.recv_ready(
+                &mut batch_ring,
+                &mut conns,
+                &mut stream_poller,
+                &read_slots,
+                per_conn_budget,
+            )
+        {
+            close_lost_connections(
+                lost,
+                &host,
+                &mut conns,
+                &mut stream_poller,
+                &mut worker,
+                &mut result.counts,
+                &mut tls_acceptor,
+            );
         }
         let sweep_steps = if skip_pump { 0 } else { max_conns };
         let h1_live = worker.live_count();
@@ -619,10 +638,25 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         if !skip_pump {
             parked_live = parked_now;
             #[cfg(target_os = "linux")]
-            if let Some(ring) = batch_ring.as_mut()
-                && !send_slots.is_empty()
-            {
-                batch_send::send_pending(ring, &mut conns, &send_slots, per_conn_budget);
+            if !send_slots.is_empty() {
+                if let Some(lost) = batch_send::send_pending(
+                    &mut batch_ring,
+                    &mut conns,
+                    &send_slots,
+                    per_conn_budget,
+                ) {
+                    // NOTE: same fail-closed rule as the read batch; the deferred flush
+                    // below then skips every slot already taken here.
+                    close_lost_connections(
+                        lost,
+                        &host,
+                        &mut conns,
+                        &mut stream_poller,
+                        &mut worker,
+                        &mut result.counts,
+                        &mut tls_acceptor,
+                    );
+                }
                 batch_send::flush_deferred_sends(
                     &send_slots,
                     &mut conns,

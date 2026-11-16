@@ -174,13 +174,54 @@ pub fn request_with_headers(
     fragmented: bool,
     idempotency_keys: &[&str],
 ) -> (u16, Value) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    try_request_with_headers(
+        address,
+        method,
+        path,
+        content_type,
+        body,
+        fragmented,
+        idempotency_keys,
+    )
+    .expect("service answered with a complete response")
+}
+
+#[allow(dead_code)]
+pub fn try_request_with_idempotency_key(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    fragmented: bool,
+    idempotency_key: &str,
+) -> Option<(u16, Value)> {
+    try_request_with_headers(
+        address,
+        method,
+        path,
+        "application/json",
+        body,
+        fragmented,
+        &[idempotency_key],
+    )
+}
+
+// NOTE: an overloaded server may close a connection without a response (full host queue);
+// that is an unacknowledged attempt, not a test failure, so the flood tests read this None.
+fn try_request_with_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    fragmented: bool,
+    idempotency_keys: &[&str],
+) -> Option<(u16, Value)> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+        .ok()?;
 
     let mut idempotency_headers = String::new();
     for key in idempotency_keys {
@@ -196,26 +237,23 @@ pub fn request_with_headers(
          Connection: close\r\n\r\n",
         body.len(),
     );
-    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(head.as_bytes()).ok()?;
     if fragmented && !body.is_empty() {
         let middle = body.len() / 2;
-        stream.write_all(&body[..middle]).unwrap();
+        stream.write_all(&body[..middle]).ok()?;
         std::thread::sleep(Duration::from_millis(5));
-        stream.write_all(&body[middle..]).unwrap();
+        stream.write_all(&body[middle..]).ok()?;
     } else {
-        stream.write_all(body).unwrap();
+        stream.write_all(body).ok()?;
     }
 
     let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).unwrap();
+    stream.read_to_end(&mut bytes).ok()?;
 
-    let end = bytes
-        .windows(4)
-        .position(|part| part == b"\r\n\r\n")
-        .unwrap();
-    let head = std::str::from_utf8(&bytes[..end]).unwrap();
-    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let end = bytes.windows(4).position(|part| part == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&bytes[..end]).ok()?;
+    let status = head.split_whitespace().nth(1)?.parse().ok()?;
     let value = serde_json::from_slice(&bytes[end + 4..]).unwrap_or(Value::Null);
 
-    (status, value)
+    Some((status, value))
 }

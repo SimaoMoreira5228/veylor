@@ -3,7 +3,7 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-use veylor_runtime::{BatchRing, PollInterest, Poller, SendOp, Worker};
+use veylor_runtime::{BatchFailure, BatchRing, PollInterest, Poller, SendOp, Worker};
 
 use crate::connection::{ConnClose, ConnPhase, ConnState, PumpProgress, reuse_keep_alive};
 use crate::host::HostShared;
@@ -12,18 +12,22 @@ use super::CloseCounts;
 use super::conn_lifecycle::{apply_pump_hooks, close_conn};
 use super::turn::conn_poll_token;
 
+// NOTE: `Some(slots)` means the ring died after an SQE may have reached the kernel, so
+// the batch is not retried and every contributing connection must close.
 pub(crate) fn send_pending(
-    ring: &mut BatchRing,
+    ring: &mut Option<BatchRing>,
     conns: &mut [Option<ConnState>],
     slots: &[usize],
     budget: u64,
-) {
+) -> Option<Vec<usize>> {
     if slots.is_empty() || budget == 0 {
-        return;
+        return None;
     }
-    let mut ops: Vec<SendOp> = Vec::with_capacity(slots.len().min(ring.capacity()));
+    let batch_ring = ring.take()?;
+    let capacity = batch_ring.capacity();
+    let mut ops: Vec<SendOp> = Vec::with_capacity(slots.len().min(capacity));
     for &slot in slots {
-        if ops.len() == ring.capacity() {
+        if ops.len() == capacity {
             break;
         }
         let Some(conn) = conns.get_mut(slot).and_then(|entry| entry.as_mut()) else {
@@ -57,10 +61,32 @@ pub(crate) fn send_pending(
         // completion has been drained.
         ops.push(unsafe { SendOp::new(fd, slot as u32, src.as_ptr(), width) });
     }
-    if ops.is_empty() || ring.send_many(&mut ops).is_err() {
-        return;
+    if ops.is_empty() {
+        *ring = Some(batch_ring);
+        return None;
     }
-    for op in &ops {
+    settle_batch(batch_ring.send_many(&mut ops), ring, conns, &ops)
+}
+
+fn settle_batch(
+    outcome: Result<BatchRing, BatchFailure>,
+    ring: &mut Option<BatchRing>,
+    conns: &mut [Option<ConnState>],
+    ops: &[SendOp],
+) -> Option<Vec<usize>> {
+    match outcome {
+        Ok(batch_ring) => {
+            *ring = Some(batch_ring);
+            settle(conns, ops);
+            None
+        }
+        Err(BatchFailure::NotSubmitted) => None,
+        Err(BatchFailure::Lost(_)) => Some(ops.iter().map(|op| op.slot as usize).collect()),
+    }
+}
+
+fn settle(conns: &mut [Option<ConnState>], ops: &[SendOp]) {
+    for op in ops {
         let Some(conn) = conns
             .get_mut(op.slot as usize)
             .and_then(|entry| entry.as_mut())
@@ -73,6 +99,8 @@ pub(crate) fn send_pending(
             conn.write_blocked = false;
         } else if op.result == 0 {
             conn.error_hint = true;
+        } else if op.canceled() {
+            conn.write_blocked = true;
         } else {
             match io::Error::from_raw_os_error(-op.result).kind() {
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {
@@ -191,5 +219,54 @@ pub(super) fn flush_deferred_sends(
                 let _ = stream_poller.reregister(&mut conn.stream, conn_poll_token(slot), interest);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use veylor_runtime::{BatchFailure, SendOp};
+
+    use super::settle_batch;
+
+    fn ops(buffer: &[u8]) -> [SendOp; 2] {
+        // SAFETY: nothing is submitted; `Lost` and `NotSubmitted` read no bytes through
+        // these pointers, and `buffer` outlives the ops in the caller.
+        unsafe {
+            [
+                SendOp::new(3, 11, buffer.as_ptr(), buffer.len()),
+                SendOp::new(7, 42, buffer.as_ptr(), buffer.len()),
+            ]
+        }
+    }
+
+    #[test]
+    fn lost_batch_names_every_contributor() {
+        let buffer = [0u8; 8];
+        let ops = ops(&buffer);
+        let mut ring = None;
+        let mut conns: [Option<super::ConnState>; 0] = [];
+        let lost = settle_batch(
+            Err(BatchFailure::Lost(io::Error::other("released ring"))),
+            &mut ring,
+            &mut conns,
+            &ops,
+        );
+        assert_eq!(lost, Some(vec![11, 42]));
+        assert!(ring.is_none());
+        assert!(ops.iter().all(|op| op.result == 0));
+    }
+
+    #[test]
+    fn not_submitted_batch_keeps_connections() {
+        let buffer = [0u8; 8];
+        let ops = ops(&buffer);
+        let mut ring = None;
+        let mut conns: [Option<super::ConnState>; 0] = [];
+        let lost = settle_batch(Err(BatchFailure::NotSubmitted), &mut ring, &mut conns, &ops);
+        assert!(lost.is_none());
+        assert!(ring.is_none());
+        assert!(ops.iter().all(|op| op.result == 0));
     }
 }

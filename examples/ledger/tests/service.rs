@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use harness::{
     Database, Service, request, request_with_content_type, request_with_idempotency_key,
+    try_request_with_idempotency_key,
 };
 use serde_json::json;
 
@@ -483,14 +484,16 @@ fn flooded_writer_keeps_acknowledged_writes_durable() {
             let acknowledged = &acknowledged;
             scope.spawn(move || {
                 let key = format!("flood-{index}");
-                let (status, _) = request_with_idempotency_key(
+                let Some((status, _)) = try_request_with_idempotency_key(
                     address,
                     "POST",
                     "/accounts/5/transactions",
                     br#"{"amount":1,"kind":"credit","description":"flood"}"#,
                     false,
                     &key,
-                );
+                ) else {
+                    return;
+                };
                 match status {
                     200 => {
                         acknowledged.fetch_add(1, Ordering::Relaxed);

@@ -662,6 +662,7 @@ impl RunningServer {
             total.response_overflow += worker.response_overflow;
             total.transport_error += worker.transport_error;
             total.shutdown += worker.shutdown;
+            total.abused += worker.abused;
             total.h2_served += worker.h2_served;
             total.h2_refused += worker.h2_refused;
         }

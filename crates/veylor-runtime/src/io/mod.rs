@@ -4,7 +4,7 @@ mod batch;
 use std::io::{self, Read, Write};
 
 #[cfg(target_os = "linux")]
-pub use batch::{BatchRing, ReadOp, SendOp};
+pub use batch::{BatchFailure, BatchRing, ReadOp, SendOp};
 
 use crate::{ConnectionTable, ConnectionToken, DeadlineError, TcpStream, TimerExpiration};
 
@@ -439,5 +439,7 @@ fn refresh_progress_deadline(
     crate::refresh_phase_deadline(table, token, now_ns, timeouts)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod batch_tests;
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,12 @@
 #[path = "server_tests/h1_peer.rs"]
 mod h1_peer;
 
+#[path = "server_tests/batch_stall.rs"]
+mod batch_stall;
+
+#[path = "server_tests/batch_reads.rs"]
+mod batch_reads;
+
 #[path = "server_tests/idle_slabs.rs"]
 mod idle_slabs;
 

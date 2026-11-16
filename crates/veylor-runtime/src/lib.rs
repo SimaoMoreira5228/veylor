@@ -15,7 +15,7 @@ pub use connections::{
     schedule_phase_deadline, start_keep_alive_idle_deadline,
 };
 #[cfg(target_os = "linux")]
-pub use io::{BatchRing, ReadOp, SendOp};
+pub use io::{BatchFailure, BatchRing, ReadOp, SendOp};
 #[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 pub use io::{
     CloseReason, IoBatch, IoOutcome, ReadStatus, WriteStatus, dispatch, note_completion,

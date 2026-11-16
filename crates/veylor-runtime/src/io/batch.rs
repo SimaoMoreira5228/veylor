@@ -7,6 +7,11 @@ use std::os::fd::RawFd;
 use io_uring::types::Fd;
 use io_uring::{IoUring, opcode};
 
+// NOTE: cancel completions share the ring with the batch ops; the top bit keeps their tag
+// out of the op index space, which the ring capacity bounds.
+const CANCEL_TAG: u64 = 1 << 63;
+const WORD_BITS: usize = u64::BITS as usize;
+
 pub struct ReadOp {
     pub fd: RawFd,
     pub slot: u32,
@@ -26,6 +31,12 @@ impl ReadOp {
             buffer,
             length,
         }
+    }
+
+    // NOTE: the ring cancels a recv that would have armed internal polling; the peer sent
+    // nothing to this reader, so the op is a block, not a transport failure.
+    pub fn canceled(&self) -> bool {
+        self.result == -libc::ECANCELED
     }
 }
 
@@ -49,11 +60,30 @@ impl SendOp {
             length,
         }
     }
+
+    // NOTE: the ring cancels a send that would have armed internal polling; no byte
+    // moved, so the caller treats it as a blocked write and retries on writability.
+    pub fn canceled(&self) -> bool {
+        self.result == -libc::ECANCELED
+    }
 }
 
 pub struct BatchRing {
     ring: IoUring,
     capacity: usize,
+    settled: Vec<u64>,
+}
+
+// NOTE: every batch consumes the ring so a failure cannot be retried on state the kernel
+// may already own; the ring comes back only when every op settled. `NotSubmitted` means
+// no SQE was pushed and nothing reached the kernel: the connections keep their byte
+// positions and want the direct read/write path. `Lost` means an SQE may have run: every
+// contributing connection must close, because the peer's offset past the batch is
+// unknowable.
+#[must_use]
+pub enum BatchFailure {
+    NotSubmitted,
+    Lost(io::Error),
 }
 
 impl BatchRing {
@@ -68,100 +98,181 @@ impl BatchRing {
             .build(entries)
             .or_else(|_| IoUring::new(entries))?;
         let capacity = usize::try_from(entries).unwrap_or(0);
-        Ok(Self { ring, capacity })
+        Ok(Self {
+            ring,
+            capacity,
+            settled: vec![0; capacity.div_ceil(WORD_BITS)],
+        })
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    pub fn send_many(&mut self, ops: &mut [SendOp]) -> io::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn ring_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        self.ring.as_raw_fd()
+    }
+
+    pub fn send_many(mut self, ops: &mut [SendOp]) -> Result<BatchRing, BatchFailure> {
         if ops.is_empty() {
+            return Ok(self);
+        }
+        if ops.len() > self.capacity || !self.push_sends(ops) {
+            return Err(BatchFailure::NotSubmitted);
+        }
+        let count = ops.len();
+        let driven = self.drive(count, |index, result| {
+            if let Some(op) = ops.get_mut(index) {
+                op.result = result;
+            }
+        });
+        match driven {
+            Ok(()) => Ok(self),
+            Err(error) => Err(BatchFailure::Lost(error)),
+        }
+    }
+
+    pub fn recv_many(mut self, ops: &mut [ReadOp]) -> Result<BatchRing, BatchFailure> {
+        if ops.is_empty() {
+            return Ok(self);
+        }
+        if ops.len() > self.capacity || !self.push_recvs(ops) {
+            return Err(BatchFailure::NotSubmitted);
+        }
+        let count = ops.len();
+        let driven = self.drive(count, |index, result| {
+            if let Some(op) = ops.get_mut(index) {
+                op.result = result;
+            }
+        });
+        match driven {
+            Ok(()) => Ok(self),
+            Err(error) => Err(BatchFailure::Lost(error)),
+        }
+    }
+
+    fn push_sends(&mut self, ops: &[SendOp]) -> bool {
+        let mut queue = self.ring.submission();
+        for (index, op) in ops.iter().enumerate() {
+            let entry = opcode::Send::new(
+                Fd(op.fd),
+                op.buffer,
+                u32::try_from(op.length).unwrap_or(u32::MAX),
+            )
+            .build()
+            .user_data(index as u64);
+            // SAFETY: the entry copies the staged pointer; the caller keeps those bytes
+            // valid until `drive` has settled every op of this batch.
+            if unsafe { queue.push(&entry) }.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn push_recvs(&mut self, ops: &[ReadOp]) -> bool {
+        let mut queue = self.ring.submission();
+        for (index, op) in ops.iter().enumerate() {
+            let entry = opcode::Recv::new(
+                Fd(op.fd),
+                op.buffer,
+                u32::try_from(op.length).unwrap_or(u32::MAX),
+            )
+            .build()
+            .user_data(index as u64);
+            // SAFETY: the entry copies the staged pointer; the caller keeps those bytes
+            // writable and unreferenced until `drive` has settled every op of this batch.
+            if unsafe { queue.push(&entry) }.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    // NOTE: io_uring arms internal polling for a send or recv that would block, so its
+    // completion arrives only once the peer moves bytes; waiting for every op parks the
+    // whole worker on one full socket buffer. The batch therefore waits for nothing,
+    // settles whatever completed inline, and cancels the remainder, which reports
+    // -ECANCELED without having touched the buffer or the peer's stream position.
+    fn drive<F: FnMut(usize, i32)>(&mut self, count: usize, mut settle: F) -> io::Result<()> {
+        self.settled.fill(0);
+        self.enter(0)?;
+        let mut done = self.collect(count, &mut settle);
+        if done == count {
             return Ok(());
         }
-        if ops.len() > self.capacity {
-            return Err(io::Error::other("batch exceeds ring capacity"));
-        }
-        {
-            let mut queue = self.ring.submission();
-            for (index, op) in ops.iter().enumerate() {
-                let entry = opcode::Send::new(
-                    Fd(op.fd),
-                    op.buffer,
-                    u32::try_from(op.length).unwrap_or(u32::MAX),
-                )
-                .build()
-                .user_data(index as u64);
-                // SAFETY: same contract as recv_many; the caller owns the staged response
-                // bytes and the submit-and-wait below drains each completion first.
-                unsafe {
-                    queue
-                        .push(&entry)
-                        .map_err(|_| io::Error::other("submission queue full"))?;
-                }
-            }
-        }
-        self.drive(ops.len())?;
-        let mut queue = self.ring.completion();
-        queue.sync();
-        for completion in &mut queue {
-            let index = usize::try_from(completion.user_data()).unwrap_or(usize::MAX);
-            if let Some(op) = ops.get_mut(index) {
-                op.result = completion.result();
-            }
+        self.push_cancels(count)?;
+        while done < count {
+            self.enter(1)?;
+            done += self.collect(count, &mut settle);
         }
         Ok(())
     }
 
-    pub fn recv_many(&mut self, ops: &mut [ReadOp]) -> io::Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        if ops.len() > self.capacity {
-            return Err(io::Error::other("batch exceeds ring capacity"));
-        }
-        {
-            let mut queue = self.ring.submission();
-            for (index, op) in ops.iter().enumerate() {
-                let entry = opcode::Recv::new(
-                    Fd(op.fd),
-                    op.buffer,
-                    u32::try_from(op.length).unwrap_or(u32::MAX),
-                )
-                .build()
-                .user_data(index as u64);
-                // SAFETY: the entry is copied into the shared submission ring, which the
-                // kernel owns until submission; the caller keeps every buffer valid and the
-                // submit-and-wait below drains each completion before returning.
-                unsafe {
-                    queue
-                        .push(&entry)
-                        .map_err(|_| io::Error::other("submission queue full"))?;
-                }
-            }
-        }
-        self.drive(ops.len())?;
-        let mut queue = self.ring.completion();
-        queue.sync();
-        for completion in &mut queue {
-            let index = usize::try_from(completion.user_data()).unwrap_or(usize::MAX);
-            if let Some(op) = ops.get_mut(index) {
-                op.result = completion.result();
-            }
-        }
-        Ok(())
-    }
-
-    // TODO: callers that ignore a failed batch keep a ring whose entries may already be
-    // submitted. The H1 batching callers still retry such a ring; they must close the
-    // contributing connections instead, as the H2 caller now does.
-    fn drive(&self, want: usize) -> io::Result<()> {
+    fn enter(&mut self, want: u32) -> io::Result<()> {
         loop {
-            match self.ring.submit_and_wait(want) {
+            match self.ring.submitter().submit_and_wait(want as usize) {
                 Ok(_) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
         }
     }
+
+    fn collect<F: FnMut(usize, i32)>(&mut self, count: usize, settle: &mut F) -> usize {
+        let mut done = 0;
+        let mut queue = self.ring.completion();
+        queue.sync();
+        for completion in &mut queue {
+            let tag = completion.user_data();
+            if tag & CANCEL_TAG != 0 {
+                continue;
+            }
+            let index = usize::try_from(tag).unwrap_or(usize::MAX);
+            if index >= count || !mark(&mut self.settled, index) {
+                continue;
+            }
+            settle(index, completion.result());
+            done += 1;
+        }
+        done
+    }
+
+    fn push_cancels(&mut self, count: usize) -> io::Result<()> {
+        let mut queue = self.ring.submission();
+        for index in 0..count {
+            if marked(&self.settled, index) {
+                continue;
+            }
+            let entry = opcode::AsyncCancel::new(index as u64)
+                .build()
+                .user_data(CANCEL_TAG | index as u64);
+            // SAFETY: a cancel entry carries no buffer and no length.
+            if unsafe { queue.push(&entry) }.is_err() {
+                return Err(io::Error::other("cancel queue full"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn marked(bits: &[u64], index: usize) -> bool {
+    let Some(word) = bits.get(index / WORD_BITS) else {
+        return false;
+    };
+    word & (1u64 << (index % WORD_BITS)) != 0
+}
+
+fn mark(bits: &mut [u64], index: usize) -> bool {
+    let Some(word) = bits.get_mut(index / WORD_BITS) else {
+        return false;
+    };
+    let bit = 1u64 << (index % WORD_BITS);
+    if *word & bit != 0 {
+        return false;
+    }
+    *word |= bit;
+    true
 }

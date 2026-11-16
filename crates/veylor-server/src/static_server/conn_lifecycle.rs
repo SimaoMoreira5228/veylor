@@ -270,6 +270,31 @@ pub(super) fn cleanup_all(
     }
 }
 
+// NOTE: a batch that failed after submission leaves every contributor's peer offset
+// unknowable, so all of them close on the same account a failed transport op uses.
+pub(super) fn close_lost_connections(
+    slots: Vec<usize>,
+    host: &HostShared,
+    conns: &mut [Option<ConnState>],
+    stream_poller: &mut Poller,
+    worker: &mut Worker<'_>,
+    counts: &mut CloseCounts,
+    tls_acceptor: &mut Option<veylor_tls::TlsAcceptor>,
+) {
+    for slot in slots {
+        close_conn(
+            slot,
+            ConnClose::TransportError,
+            host,
+            conns,
+            stream_poller,
+            worker,
+            counts,
+            tls_acceptor,
+        );
+    }
+}
+
 pub(super) fn close_idle_for_drain(
     host: &HostShared,
     conns: &mut [Option<ConnState>],

@@ -1,7 +1,6 @@
 use crate::frame_io::*;
 use crate::h2_peer::*;
 use crate::h2_response::*;
-use std::time::{Duration, Instant};
 use veylor_http2::{
     ErrorCode, FrameType, SETTINGS_MAX_CONCURRENT_STREAMS, decode_rst_stream_payload,
 };
@@ -116,29 +115,19 @@ fn h2_stream_ceiling_refuses_33rd_and_recycles() {
     let expected: Vec<u32> = (0..STREAM_SLOTS).map(|n| (2 * n + 1) as u32).collect();
     assert_eq!(ids, expected);
     client
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .expect("short timeout");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut refused = false;
-    while Instant::now() < deadline && !refused {
-        match try_read_frame(&mut client) {
-            Some((header, _)) if header.frame_type == FrameType::GoAway => {
-                panic!("ceiling never goes away: {header:?}");
-            }
-            Some((header, payload))
-                if header.frame_type == FrameType::RstStream && header.stream_id == last =>
-            {
-                let code = decode_rst_stream_payload(header, &payload).expect("decode rst");
-                assert_eq!(code, ErrorCode::RefusedStream);
-                refused = true;
-            }
-            Some(_) | None => {}
-        }
-    }
-    assert!(refused, "33rd concurrent stream is refused");
-    client
         .set_read_timeout(Some(DEADLINE))
         .expect("read timeout");
+    let code = loop {
+        let (header, payload) = read_frame(&mut client);
+        match header.frame_type {
+            FrameType::GoAway => panic!("ceiling never goes away: {header:?}"),
+            FrameType::RstStream if header.stream_id == last => {
+                break decode_rst_stream_payload(header, &payload).expect("decode rst");
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(code, ErrorCode::RefusedStream);
     let first = parked
         .iter()
         .find(|event| event.token.stream_id == 1)

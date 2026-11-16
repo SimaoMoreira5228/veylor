@@ -161,7 +161,7 @@ fn stream_pacing_rejects_unarmed_then_admits() {
 }
 
 #[test]
-fn stream_end_twice_reports_duplicate() {
+fn stream_end_twice_rejects_the_second_end() {
     let config = test_config(0);
     let server = unsafe { create(&config) };
     unsafe { register_managed(server, b"GET", b"/s", u64::MAX) };
@@ -181,13 +181,13 @@ fn stream_end_twice_reports_duplicate() {
         unsafe { vyl_managed_static_host_end_stream(server, token) },
         VylResult::Ok
     );
-    // NOTE: the queued end applies within microseconds, so the immediate second end wins the race
-    // in practice: a queued end reports duplicate, an applied one gone. The terminal-chunk read
-    // below proves the apply, pinning the later gone assertions either way.
-    assert_eq!(
-        unsafe { vyl_managed_static_host_end_stream(server, token) },
-        VylResult::Duplicate,
-        "queued end reports duplicate"
+    // NOTE: the second end races the worker's apply: a queued end reports Duplicate, an
+    // applied one Gone. Both reject the second end, and the terminal chunk read below proves
+    // exactly one end reached the wire.
+    let second = unsafe { vyl_managed_static_host_end_stream(server, token) };
+    assert!(
+        matches!(second, VylResult::Duplicate | VylResult::Gone),
+        "second end must be rejected, got {second:?}"
     );
     let (status, raw, body) = read_streamed(&mut stream);
     assert_eq!(status, 200);

@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 
 use veylor_runtime::Poller;
 #[cfg(target_os = "linux")]
-use veylor_runtime::{BatchRing, PollInterest, ReadOp, SendOp};
+use veylor_runtime::{BatchFailure, BatchRing, PollInterest, ReadOp, SendOp};
 
 #[cfg(target_os = "linux")]
 use super::MAX_H2_CONNS;
@@ -105,10 +105,9 @@ fn submit_reads(
     if budget == 0 {
         return;
     }
-    let Some(ring) = batches.ring.as_mut() else {
+    let Some(capacity) = batches.ring.as_ref().map(BatchRing::capacity) else {
         return;
     };
-    let capacity = ring.capacity();
     batches.reads.clear();
     batches.widths.clear();
     for (index, entry) in table.iter_mut().enumerate() {
@@ -153,21 +152,28 @@ fn submit_reads(
     if batches.reads.is_empty() {
         return;
     }
-    if ring.recv_many(&mut batches.reads).is_err() {
-        // NOTE: a batch that failed after submission leaves the peer's byte position
-        // unknowable, so every contributing slot closes instead of being retried.
-        for op in &batches.reads {
-            if let Some(slot) = table
-                .get_mut(op.slot as usize)
-                .and_then(|entry| entry.as_mut())
-            {
-                slot.meta.readable = false;
-                slot.meta.claimed = false;
-                slot.meta.error = true;
+    let outcome = match batches.ring.take() {
+        Some(ring) => ring.recv_many(&mut batches.reads),
+        None => return,
+    };
+    match outcome {
+        Ok(ring) => batches.ring = Some(ring),
+        Err(BatchFailure::NotSubmitted) => return,
+        Err(BatchFailure::Lost(_)) => {
+            // NOTE: a batch that failed after submission leaves the peer's byte position
+            // unknowable, so every contributing slot closes instead of being retried.
+            for op in &batches.reads {
+                if let Some(slot) = table
+                    .get_mut(op.slot as usize)
+                    .and_then(|entry| entry.as_mut())
+                {
+                    slot.meta.readable = false;
+                    slot.meta.claimed = false;
+                    slot.meta.error = true;
+                }
             }
+            return;
         }
-        batches.ring = None;
-        return;
     }
     settle_reads(batches, table, poller);
 }
@@ -199,6 +205,13 @@ fn settle_reads(batches: &Batches, table: &mut [Option<Box<H2Slot>>], poller: &m
             meta.claimed = false;
             meta.readable = false;
             meta.eof = true;
+            continue;
+        }
+        // NOTE: the ring cancels a recv that would have armed internal polling, so a
+        // stale claim ends here instead of stalling the worker on an empty socket.
+        if op.canceled() {
+            meta.claimed = false;
+            meta.readable = false;
             continue;
         }
         match io::Error::from_raw_os_error(-op.result).kind() {
@@ -273,23 +286,27 @@ fn submit_writes(
     if batches.writes.is_empty() {
         return false;
     }
-    let Some(ring) = batches.ring.as_mut() else {
-        return false;
+    let outcome = match batches.ring.take() {
+        Some(ring) => ring.send_many(&mut batches.writes),
+        None => return false,
     };
-    if ring.send_many(&mut batches.writes).is_err() {
-        // NOTE: a submitted send that failed leaves the peer's byte position unknowable,
-        // so the contributing connections close instead of retrying the range.
-        for op in &batches.writes {
-            if let Some(slot) = table
-                .get_mut(op.slot as usize)
-                .and_then(|entry| entry.as_mut())
-            {
-                slot.meta.write_deferred = false;
-                slot.meta.error = true;
+    match outcome {
+        Ok(ring) => batches.ring = Some(ring),
+        Err(BatchFailure::NotSubmitted) => return false,
+        Err(BatchFailure::Lost(_)) => {
+            // NOTE: a submitted send that failed leaves the peer's byte position
+            // unknowable, so the contributing connections close instead of retrying.
+            for op in &batches.writes {
+                if let Some(slot) = table
+                    .get_mut(op.slot as usize)
+                    .and_then(|entry| entry.as_mut())
+                {
+                    slot.meta.write_deferred = false;
+                    slot.meta.error = true;
+                }
             }
+            return true;
         }
-        batches.ring = None;
-        return true;
     }
     settle_writes(batches, table, poller)
 }
@@ -325,6 +342,12 @@ fn settle_writes(
         if op.result == 0 {
             meta.error = true;
             failed = true;
+            continue;
+        }
+        // NOTE: the ring cancels a send that would have armed internal polling; no byte
+        // moved, so the range waits for writability exactly like a short write.
+        if op.canceled() {
+            arm_write(meta, poller);
             continue;
         }
         match io::Error::from_raw_os_error(-op.result).kind() {

@@ -30,6 +30,18 @@ pub(crate) fn write_frame(
     id: u32,
     payload: &[u8],
 ) {
+    try_write_frame(stream, frame_type, flags, id, payload).expect("write frame");
+}
+
+// NOTE: a peer that closed early turns a frame write into a transport error; flood tests
+// treat that as the interleaving where the verdict already landed, not as a failure.
+pub(crate) fn try_write_frame(
+    stream: &mut TcpStream,
+    frame_type: FrameType,
+    flags: u8,
+    id: u32,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let header = FrameHeader {
         payload_length: payload.len() as u32,
         frame_type,
@@ -38,8 +50,8 @@ pub(crate) fn write_frame(
     };
     let mut encoded = [0; FRAME_HEADER_LEN];
     encode_frame_header(header, &mut encoded, DEFAULT_MAX_FRAME_SIZE).expect("encode header");
-    stream.write_all(&encoded).expect("write header");
-    stream.write_all(payload).expect("write payload");
+    stream.write_all(&encoded)?;
+    stream.write_all(payload)
 }
 
 pub(crate) fn read_frame(stream: &mut TcpStream) -> (FrameHeader, Vec<u8>) {
