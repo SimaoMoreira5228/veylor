@@ -40,6 +40,44 @@ pub fn decrypt_from_vec<R: Read>(
     })
 }
 
+// NOTE: ciphertext already read off the socket: feed it in order and copy the decrypted
+// chunks into the caller's fixed slice. Returns the ciphertext consumed and the plaintext
+// written; whatever did not fit stays queued in the provider.
+pub fn feed_ciphertext_into(
+    conn: &mut TlsConn,
+    input: &[u8],
+    plain_out: &mut [u8],
+) -> Result<(usize, usize), TlsError> {
+    let mut filled = 0;
+
+    drain_into(conn, plain_out, &mut filled)?;
+
+    let mut cursor: &[u8] = input;
+
+    while !cursor.is_empty() {
+        let read = conn.inner.read_tls(&mut cursor)?;
+
+        if read == 0 {
+            break;
+        }
+
+        conn.inner.process_new_packets()?;
+
+        drain_into(conn, plain_out, &mut filled)?;
+    }
+
+    Ok((input.len() - cursor.len(), filled))
+}
+
+// NOTE: true while the provider still holds decrypted bytes a smaller sink could not take;
+// a caller with no new ciphertext still owes the reader one more pull.
+pub fn plaintext_queued(conn: &mut TlsConn) -> bool {
+    match conn.inner.reader().fill_buf() {
+        Ok(chunk) => !chunk.is_empty(),
+        Err(error) => error.kind() != std::io::ErrorKind::WouldBlock,
+    }
+}
+
 pub fn feed_ciphertext(
     conn: &mut TlsConn,
     input: &[u8],
@@ -173,6 +211,24 @@ fn read_wire<R: Read>(conn: &mut TlsConn, reader: &mut R) -> std::io::Result<usi
 
 // NOTE: the provider hands out decrypted bytes as a borrowed chunk; copying that chunk
 // straight to the destination keeps one plaintext copy per record instead of three.
+fn drain_into(
+    conn: &mut TlsConn,
+    plain_out: &mut [u8],
+    filled: &mut usize,
+) -> Result<(), TlsError> {
+    pump_plain(conn, &mut |chunk| {
+        let take = chunk.len().min(plain_out.len() - *filled);
+
+        plain_out[*filled..*filled + take].copy_from_slice(&chunk[..take]);
+
+        *filled += take;
+
+        take
+    })?;
+
+    Ok(())
+}
+
 fn pump_plain(conn: &mut TlsConn, put: &mut impl FnMut(&[u8]) -> usize) -> Result<usize, TlsError> {
     let mut taken = 0;
 

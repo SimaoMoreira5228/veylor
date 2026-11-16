@@ -8,6 +8,8 @@ use std::os::fd::AsRawFd;
 use veylor_runtime::Poller;
 #[cfg(target_os = "linux")]
 use veylor_runtime::{BatchFailure, BatchRing, PollInterest, ReadOp, SendOp};
+#[cfg(target_os = "linux")]
+use veylor_tls::plaintext_queued;
 
 #[cfg(target_os = "linux")]
 use super::MAX_H2_CONNS;
@@ -95,6 +97,7 @@ impl Batches {
 // submitted recv would block, which would stall the whole worker on an empty socket,
 // so the claim is dropped after every attempt and only a full read re-arms the edge
 // through the poller (mio is edge-triggered; a short read means the socket drained).
+// TLS reads ciphertext into its own slab; the pump decrypts it into the staging spare.
 #[cfg(target_os = "linux")]
 fn submit_reads(
     batches: &mut Batches,
@@ -117,29 +120,59 @@ fn submit_reads(
         let Some(slot) = entry.as_mut() else {
             continue;
         };
-        let meta = &mut slot.meta;
+        let meta = &slot.meta;
         if !meta.occupied
             || !meta.readable
             || !meta.claimed
             || meta.error
             || meta.timed_out
-            || meta.tls.is_some()
+            || meta.tls_cipher_pending()
         {
             continue;
         }
         let Some(fd) = meta.stream.as_ref().map(AsRawFd::as_raw_fd) else {
             continue;
         };
+        let tls = meta.tls.is_some();
+        if slot.conn.as_ref().is_none_or(|conn| conn.is_closed()) {
+            continue;
+        }
+        let room = slot
+            .conn
+            .as_mut()
+            .map_or(0, |conn| conn.spare_mut().len())
+            .min(budget as usize);
+        if room == 0 {
+            continue;
+        }
+        if tls {
+            // NOTE: plaintext still queued in the provider must reach the staging window
+            // before the socket is read again, or it would arrive behind newer records.
+            if slot
+                .meta
+                .tls
+                .as_mut()
+                .is_some_and(|tls| plaintext_queued(tls))
+            {
+                continue;
+            }
+            let Some(cipher) = slot.meta.tls_cipher.as_deref_mut() else {
+                continue;
+            };
+            let width = room.min(cipher.len());
+            // SAFETY: `cipher` points into the slot's retained ciphertext slab, which
+            // outlives the `recv_many` call below; the pump does not touch it until every
+            // completion has been drained.
+            batches
+                .reads
+                .push(unsafe { ReadOp::new(fd, index as u32, cipher.as_mut_ptr(), width) });
+            batches.widths.push(width);
+            continue;
+        }
         let Some(conn) = slot.conn.as_mut() else {
             continue;
         };
-        if conn.is_closed() {
-            continue;
-        }
         let spare = conn.spare_mut();
-        if spare.is_empty() {
-            continue;
-        }
         let width = spare.len().min(budget as usize);
         // SAFETY: `spare` points into the slot's retained staging slab, which outlives
         // the `recv_many` call below; no other reference touches it until every
@@ -190,7 +223,12 @@ fn settle_reads(batches: &Batches, table: &mut [Option<Box<H2Slot>>], poller: &m
         let meta = &mut slot.meta;
         if op.result > 0 {
             let read = op.result as usize;
-            if let Some(conn) = slot.conn.as_mut() {
+            if meta.tls.is_some() {
+                // NOTE: TLS delivered ciphertext, not plaintext; the pump decrypts it into
+                // the staging window, so the staged count moves there and not here.
+                meta.tls_cipher_read = read;
+                meta.tls_cipher_fed = 0;
+            } else if let Some(conn) = slot.conn.as_mut() {
                 conn.commit_staged(read);
             }
             meta.claimed = false;
@@ -204,7 +242,13 @@ fn settle_reads(batches: &Batches, table: &mut [Option<Box<H2Slot>>], poller: &m
         if op.result == 0 {
             meta.claimed = false;
             meta.readable = false;
-            meta.eof = true;
+            // NOTE: TLS closes only after the provider's queued plaintext has been fed and
+            // stepped, so a record that filled the spare is not dropped by the FIN.
+            if meta.tls.is_some() {
+                meta.tls_wire_eof = true;
+            } else {
+                meta.eof = true;
+            }
             continue;
         }
         // NOTE: the ring cancels a recv that would have armed internal polling, so a

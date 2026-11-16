@@ -18,6 +18,8 @@ use super::STREAM_SLOTS;
 use super::send::send_file_head;
 use super::serve::Serve;
 
+pub(crate) type FileTable = [Option<H2FileTransfer>; STREAM_SLOTS];
+
 // NOTE: per-stream file progress: the plan owns its fs path, offset counts plan-relative
 // bytes already framed, and the entry drops on completion, peer reset, or conn close.
 // NOTE: the retained fd opens once per transfer and serves every plain chunk through
@@ -230,8 +232,13 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
 
     // NOTE: a refused insert drops the transfer inline, so its retained fd closes with it;
     // the table-full RST path releases cleanly by construction, never by a separate sweep.
+    // The table itself is allocated on the first file response and stays until the
+    // connection's slabs are released.
     fn file_insert(&mut self, transfer: H2FileTransfer) -> bool {
-        let Some(slot) = self.files.iter_mut().find(|slot| slot.is_none()) else {
+        let files = self
+            .files
+            .get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
+        let Some(slot) = files.iter_mut().find(|slot| slot.is_none()) else {
             return false;
         };
         *slot = Some(transfer);
@@ -264,35 +271,39 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
     }
 
     fn pump_file_slot(&mut self, index: usize) -> FileSlot {
-        let stream = match self.files[index].as_ref() {
+        let Some(files) = self.files.as_deref_mut() else {
+            return FileSlot::Empty;
+        };
+        let stream = match files[index].as_ref() {
             Some(transfer) => transfer.stream,
             None => return FileSlot::Empty,
         };
         let live = self.server.driver().streams().find(stream);
         if live.is_none_or(|found| found.state == StreamState::Closed) {
-            self.files[index] = None;
+            files[index] = None;
             return FileSlot::Dropped;
         }
-        let Some(transfer) = self.files[index].as_mut() else {
+        let Some(transfer) = files[index].as_mut() else {
             return FileSlot::Empty;
         };
         let pump = pump_file_data(self.server, transfer, self.scratch, self.output, self.used);
         match pump {
             FilePump::Done => {
-                self.files[index] = None;
+                files[index] = None;
                 FileSlot::Done
             }
             FilePump::More => FileSlot::More,
             FilePump::Fail(code) => {
-                self.files[index] = None;
+                files[index] = None;
                 FileSlot::Fail(code)
             }
         }
     }
 }
 
-// NOTE: large by construction (FilePlan rides by value so no per-request alloc lands
-// beside the already-boxed transfer table); the allow mirrors the tradeoff explicitly.
+// NOTE: large by construction (FilePlan rides by value so no per-request alloc lands beside
+// the transfer table, which is boxed only after the first file response); the allow mirrors
+// the tradeoff explicitly.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum FileDecision {
     Miss,

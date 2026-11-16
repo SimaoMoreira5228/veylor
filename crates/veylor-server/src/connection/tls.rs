@@ -234,10 +234,7 @@ pub(crate) fn tls_read_decrypted(
     tls: &mut TlsConn,
     spare: &mut [u8],
     budget: u64,
-    _scratch: &mut Vec<u8>,
 ) -> Result<(u64, usize, bool), ConnClose> {
-    // NOTE: h2/turn.rs still passes its tls_plain slot for this call; plaintext lands
-    // straight in the caller's spare, so that slot stays empty until its owner drops it.
     if budget == 0 || spare.is_empty() {
         return Ok((0, 0, false));
     }
@@ -293,7 +290,7 @@ pub(crate) fn tls_write_once(stream: &mut TcpStream, chunk: &[u8]) -> TlsWriteOu
     }
 }
 
-fn close_for(error: &std::io::Error) -> ConnClose {
+pub(crate) fn close_for(error: &std::io::Error) -> ConnClose {
     match error.kind() {
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
             ConnClose::Reset

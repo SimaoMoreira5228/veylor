@@ -95,7 +95,6 @@ pub struct ConnState {
     pub(crate) tunnel_notified: bool,
     pub(crate) tls_pending: Vec<u8>,
     pub(crate) tls_pending_sent: usize,
-    pub(crate) tls_plain: Vec<u8>,
     pub(crate) last_active_ns: u64,
     pub(crate) quiet_turns: u8,
 }
@@ -142,7 +141,6 @@ impl ConnState {
             tunnel_notified: false,
             tls_pending: Vec::new(),
             tls_pending_sent: 0,
-            tls_plain: Vec::new(),
             last_active_ns: 0,
             quiet_turns: 0,
         }
@@ -168,11 +166,6 @@ impl ConnState {
             self.tls_pending
                 .reserve(TLS_PENDING_MIN_BYTES - self.tls_pending.capacity());
         }
-
-        if self.tls_plain.capacity() < INPUT_CAP {
-            self.tls_plain
-                .reserve(INPUT_CAP - self.tls_plain.capacity());
-        }
     }
 
     pub(crate) fn drop_tls_scratch(&mut self) {
@@ -182,7 +175,6 @@ impl ConnState {
 
         self.tls_pending = Vec::new();
         self.tls_pending_sent = 0;
-        self.tls_plain = Vec::new();
     }
 
     pub(crate) fn has_tls(&self) -> bool {

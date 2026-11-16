@@ -237,6 +237,29 @@ impl<'a> StreamTable<'a> {
         self.used
     }
 
+    // NOTE: a worker pool recycles the slot and block storage between connections; this
+    // hand-off is only legal once no stream owns a slot and no header block is in flight,
+    // so the array can be re-filled for its next owner without touching peer-visible state.
+    pub fn take_storage(&mut self) -> Option<(&'a mut [StreamSlot], &'a mut [u8])> {
+        if self.active_streams != 0 || self.assembler.active || self.assembler.complete {
+            return None;
+        }
+        let slots = core::mem::take(&mut self.slots);
+        let header_block = core::mem::take(&mut self.assembler.buffer);
+        self.used = 0;
+        self.assembler.reset();
+        Some((slots, header_block))
+    }
+
+    pub fn install_storage(&mut self, slots: &'a mut [StreamSlot], header_block: &'a mut [u8]) {
+        slots.fill(StreamSlot::EMPTY);
+        self.slots = slots;
+        self.used = 0;
+        self.active_streams = 0;
+        self.assembler.buffer = header_block;
+        self.assembler.reset();
+    }
+
     pub const fn slot_capacity(&self) -> usize {
         self.slots.len()
     }

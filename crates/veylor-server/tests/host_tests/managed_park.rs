@@ -297,7 +297,7 @@ fn managed_parked_timeout_releases_slot() {
 }
 
 #[test]
-fn managed_queue_full_fails_closed_server_healthy() {
+fn managed_queue_full_answers_503_and_server_stays_healthy() {
     let config = ServerConfig {
         shutdown_grace_ns: 300_000_000,
         ..ServerConfig::default()
@@ -330,28 +330,37 @@ fn managed_queue_full_fails_closed_server_healthy() {
     assert_eq!(parked, 64, "queue holds exactly one depth");
     let (_, _, _, empty) = poll_batch(&host, 100_000_000, 8);
     assert_eq!(empty.copied, 0, "no 65th event escapes the full queue");
-    let closed = spin_until(|| {
-        let mut closed = 0;
-        for stream in clients.iter_mut() {
-            if is_closed(stream) {
-                closed += 1;
-            }
-        }
-        closed == 1 && host.counters().queue_full == 1
-    });
-    assert!(closed, "one connection fails closed with queue-full");
-    let mut closed_count = 0;
-    let mut pending_count = 0;
+    // NOTE: the refused connection is answered, not silently dropped: parked heads are
+    // still in the host queue, so the only reader with bytes is the one that overflowed.
+    assert!(
+        spin_until(|| clients
+            .iter_mut()
+            .any(|stream| matches!(stream.peek(&mut [0; 1]), Ok(count) if count > 0))),
+        "the overloaded connection gets an answer"
+    );
+    let refused = clients
+        .iter_mut()
+        .position(|stream| matches!(stream.peek(&mut [0; 1]), Ok(count) if count > 0))
+        .expect("one refused connection");
+    let mut refused = clients.swap_remove(refused);
+    refused
+        .set_nonblocking(false)
+        .expect("refused stream blocking");
+    let response = read_response(&mut refused);
+    assert_eq!(
+        response.status, 503,
+        "overload is answered as not acknowledged"
+    );
+    assert_eq!(header(&response, "connection"), "close");
+    assert_eq!(response.body, b"Service Unavailable");
+    expect_eof(&mut refused);
     for stream in clients.iter_mut() {
-        match stream.read(&mut [0; 1]) {
-            Ok(0) => closed_count += 1,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => pending_count += 1,
-            Err(_) => closed_count += 1,
-            Ok(_) => panic!("parked connection must send no bytes"),
-        }
+        assert!(
+            stream.peek(&mut [0; 1]).is_err(),
+            "a parked connection must send no bytes"
+        );
     }
-    assert_eq!(closed_count, 1, "exactly one connection closed");
-    assert_eq!(pending_count, 64, "the rest stay parked with no bytes");
+    assert_eq!(clients.len(), 64, "the rest stay parked");
     let mut healthy = connect(&server);
     get(&mut healthy, "/hello");
     let response = read_response(&mut healthy);
@@ -360,6 +369,31 @@ fn managed_queue_full_fails_closed_server_healthy() {
     server.stop_accepting();
     let counts = server.join().expect("join server");
     assert_eq!(counts.queue_full, 1, "counts: {counts:?}");
+}
+
+// NOTE: without a final blank line there is no parsed head, so framing is unknown and the
+// server keeps the plain close; only the request-head deadline ends the wait.
+#[test]
+fn incomplete_head_closes_without_inventing_a_response() {
+    let mut config = ServerConfig::default();
+    config.timeouts.request_head_ns = 300_000_000;
+    let server = managed_server(config);
+    let mut stream = connect(&server);
+    stream
+        .write_all(b"GET /work HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .expect("write partial head");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("server closes the partial head");
+    assert!(
+        response.is_empty(),
+        "an incomplete head gets no response, got {} bytes",
+        response.len()
+    );
+    server.stop_accepting();
+    let counts = server.join().expect("join server");
+    assert_eq!(counts.timeout, 1, "counts: {counts:?}");
 }
 
 #[test]

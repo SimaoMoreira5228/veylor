@@ -114,6 +114,58 @@ impl Drop for Database {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct WriterStats {
+    pub commits: u64,
+    pub writes: u64,
+    pub max_batch: u64,
+}
+
+// NOTE: read after the service exits, when SQLite's last close has checkpointed the WAL, so
+// the counters and the transactions describe the same durable state.
+#[allow(dead_code)]
+pub fn writer_stats(database: &Database) -> WriterStats {
+    let connection = rusqlite::Connection::open_with_flags(
+        database.file(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open database for stats");
+    let (commits, writes, max_batch): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT commits, writes, max_batch FROM writer_stats WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("writer stats row");
+
+    WriterStats {
+        commits: u64::try_from(commits).expect("commit count is non-negative"),
+        writes: u64::try_from(writes).expect("write count is non-negative"),
+        max_batch: u64::try_from(max_batch).expect("batch size is non-negative"),
+    }
+}
+
+#[allow(dead_code)]
+pub fn durable_keys(database: &Database, account: i64) -> Vec<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        database.file(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open database for keys");
+    let mut statement = connection
+        .prepare(
+            "SELECT idempotency_key FROM transactions
+             WHERE account_id = ?1 AND idempotency_key IS NOT NULL",
+        )
+        .expect("prepare key query");
+    statement
+        .query_map([account], |row| row.get::<_, String>(0))
+        .expect("query keys")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read keys")
+}
+
 pub fn request(
     address: SocketAddr,
     method: &str,
@@ -206,8 +258,9 @@ pub fn try_request_with_idempotency_key(
     )
 }
 
-// NOTE: an overloaded server may close a connection without a response (full host queue);
-// that is an unacknowledged attempt, not a test failure, so the flood tests read this None.
+// NOTE: an overloaded server answers 503 after a parsed head and only closes silently when
+// it never got a complete head (transport failure, request-head deadline); both are
+// unacknowledged attempts, so the flood tests read this None instead of panicking.
 fn try_request_with_headers(
     address: SocketAddr,
     method: &str,

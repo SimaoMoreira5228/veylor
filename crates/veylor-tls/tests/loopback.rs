@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use veylor_tls::{
     MAX_TLS_CONN_BYTES, TlsAcceptor, TlsConn, TlsError, WireIo, alpn, decrypt_from,
-    drain_plaintext, feed_ciphertext, negotiated_version,
+    drain_plaintext, feed_ciphertext, feed_ciphertext_into, negotiated_version, plaintext_queued,
 };
 
 const CERT_DER: &[u8] = include_bytes!("testdata/server_cert.der");
@@ -345,6 +345,70 @@ fn decrypt_from_delivers_one_record_across_short_slices() {
         server.bytes_decrypted(),
         request.len() as u64,
         "decrypted counter matches the delivered bytes"
+    );
+}
+
+#[test]
+fn feed_ciphertext_into_reports_consumption_and_drains_a_short_sink() {
+    let mut acceptor = TlsAcceptor::new(CERT_DER, KEY_DER, 8).expect("acceptor builds");
+
+    let mut server = acceptor.admit().expect("slot available");
+
+    let config = client_config();
+    let mut client = client_conn(&config);
+
+    let mut c2s = Vec::new();
+    let mut s2c = Vec::new();
+
+    handshake(&mut server, &mut client, &mut c2s, &mut s2c);
+
+    let payload = pattern(9000, 0x21);
+
+    for chunk in payload.chunks(3000) {
+        client
+            .writer()
+            .write_all(chunk)
+            .expect("client queues payload");
+    }
+
+    client.write_tls(&mut c2s).expect("client emits payload");
+
+    let mut got = Vec::new();
+    let mut offset = 0;
+
+    while offset < c2s.len() {
+        let mut slice = [0u8; 512];
+        let (consumed, plain) =
+            feed_ciphertext_into(&mut server, &c2s[offset..], &mut slice).expect("feed succeeds");
+
+        assert!(
+            consumed > 0 || plain > 0,
+            "a feed against input makes progress"
+        );
+
+        offset += consumed;
+        got.extend_from_slice(&slice[..plain]);
+    }
+
+    assert_eq!(offset, c2s.len(), "the feed consumes every ciphertext byte");
+
+    while plaintext_queued(&mut server) {
+        let mut slice = [0u8; 512];
+        let (consumed, plain) =
+            feed_ciphertext_into(&mut server, &[], &mut slice).expect("queued plaintext drains");
+
+        assert_eq!(consumed, 0, "an empty feed consumes no ciphertext");
+        assert!(plain > 0, "an empty feed still delivers queued plaintext");
+
+        got.extend_from_slice(&slice[..plain]);
+    }
+
+    assert_eq!(got, payload, "short sinks reassemble the payload in order");
+
+    assert_eq!(
+        server.bytes_decrypted(),
+        payload.len() as u64,
+        "every delivered byte is counted once"
     );
 }
 

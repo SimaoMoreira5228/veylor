@@ -1,5 +1,5 @@
 use veylor_runtime::{ConnectionTimeouts, ConnectionToken, Poller};
-use veylor_tls::TlsAcceptor;
+use veylor_tls::{TlsAcceptor, TlsError, feed_ciphertext_into, plaintext_queued};
 
 pub(crate) use super::accept::{drive_accepts, move_tls_slot, register_listener};
 use super::flush::{H2Flush, H2Read, flush_h2, read_once};
@@ -7,9 +7,10 @@ use super::flush::{H2Flush, H2Read, flush_h2, read_once};
 use super::slots::{
     H2_STREAM_TOKEN_BASE, H2Meta, H2Slabs, H2Slot, H2Slots, idle_for_drain, pending_spare,
 };
+use super::tables::H2Buffers;
 use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView, H2Conn, STREAM_SLOTS};
 use crate::connection::ConnClose;
-use crate::connection::tls::tls_read_decrypted;
+use crate::connection::tls::{close_for, tls_read_decrypted};
 use crate::host::{HostShared, StagedWork};
 use crate::static_routes::MAX_RESPONSE_BODY;
 use crate::static_server::apply_h2_staged;
@@ -128,9 +129,127 @@ impl H2Turn<'_> {
     }
 }
 
+enum TlsSlot {
+    Idle,
+    Progress,
+    Eof,
+    Closed(ConnClose),
+}
+
+// NOTE: TLS read turn. Ciphertext the batch pass read is fed to the provider in order and
+// decrypted into the staging spare; a slot the batch pass did not serve reads its socket
+// directly, exactly as it did before the ciphertext slab existed. Both paths are one
+// reader: the pump never reads the socket while ciphertext from the ring is undecrypted.
+fn tls_slot_read(meta: &mut H2Meta, live: &mut H2Conn<'_>, budget: &mut u64) -> TlsSlot {
+    let room = live.spare_mut().len().min(*budget as usize);
+
+    if room == 0 {
+        return TlsSlot::Idle;
+    }
+
+    if meta.tls_cipher_pending() || meta.tls_plain_queued {
+        return tls_feed_ciphertext(meta, live, room);
+    }
+
+    if meta.tls_wire_eof {
+        return TlsSlot::Eof;
+    }
+
+    if !meta.readable {
+        return TlsSlot::Idle;
+    }
+
+    tls_read_socket(meta, live, room, budget)
+}
+
+fn tls_feed_ciphertext(meta: &mut H2Meta, live: &mut H2Conn<'_>, room: usize) -> TlsSlot {
+    let fed = meta.tls_cipher_fed;
+    let read = meta.tls_cipher_read;
+
+    let outcome = {
+        let H2Meta {
+            tls, tls_cipher, ..
+        } = meta;
+        let Some(tls) = tls.as_mut() else {
+            return TlsSlot::Closed(ConnClose::TransportError);
+        };
+        let cipher = tls_cipher
+            .as_deref()
+            .map_or(&[][..], |slab| &slab[fed..read]);
+        feed_ciphertext_into(tls, cipher, &mut live.spare_mut()[..room])
+    };
+
+    match outcome {
+        Ok((consumed, plain)) => {
+            meta.tls_cipher_fed = fed + consumed;
+            if meta.tls_cipher_fed >= meta.tls_cipher_read {
+                meta.tls_cipher_read = 0;
+                meta.tls_cipher_fed = 0;
+            }
+            live.commit_staged(plain);
+            let Some(tls) = meta.tls.as_mut() else {
+                return TlsSlot::Closed(ConnClose::TransportError);
+            };
+            meta.tls_plain_queued = plaintext_queued(tls);
+            if meta.tls_plain_queued || meta.tls_cipher_read > meta.tls_cipher_fed {
+                return TlsSlot::Progress;
+            }
+            if tls.peer_closed() {
+                return TlsSlot::Eof;
+            }
+            if plain > 0 {
+                TlsSlot::Progress
+            } else {
+                TlsSlot::Idle
+            }
+        }
+        Err(TlsError::Io(error)) => TlsSlot::Closed(close_for(&error)),
+        Err(_) => TlsSlot::Closed(ConnClose::TransportError),
+    }
+}
+
+fn tls_read_socket(
+    meta: &mut H2Meta,
+    live: &mut H2Conn<'_>,
+    room: usize,
+    budget: &mut u64,
+) -> TlsSlot {
+    let Some(stream) = meta.stream.as_mut() else {
+        return TlsSlot::Closed(ConnClose::TransportError);
+    };
+    let Some(tls) = meta.tls.as_mut() else {
+        return TlsSlot::Closed(ConnClose::TransportError);
+    };
+
+    match tls_read_decrypted(stream, tls, &mut live.spare_mut()[..room], *budget) {
+        Ok((wire, plain, blocked)) => {
+            meta.claimed = false;
+            *budget = (*budget).saturating_sub(wire);
+            live.commit_staged(plain);
+            if blocked {
+                meta.readable = false;
+                return TlsSlot::Idle;
+            }
+            let Some(tls) = meta.tls.as_mut() else {
+                return TlsSlot::Closed(ConnClose::TransportError);
+            };
+            meta.tls_plain_queued = plaintext_queued(tls);
+            if tls.peer_closed() && !meta.tls_plain_queued {
+                meta.readable = false;
+                return TlsSlot::Eof;
+            }
+            // NOTE: a direct read may stop at the provider's input-buffer limit with the
+            // socket still holding bytes, so the next turn reads again until WouldBlock.
+            TlsSlot::Progress
+        }
+        Err(reason) => TlsSlot::Closed(reason),
+    }
+}
+
 pub(crate) fn pump_slot(
     meta: &mut H2Meta,
     conn: &mut Option<H2Conn<'_>>,
+    bufs: &mut H2Buffers,
     slabs: &mut H2Slabs,
     turn: &mut H2Turn<'_>,
     stream_poller: &mut Poller,
@@ -153,9 +272,11 @@ pub(crate) fn pump_slot(
     // the staged application, the flush or the read can write through them.
     let staged_here = turn.staged_for(index);
     let wants = staged_here || meta.wants_pump() || meta.timed_out || turn.draining;
-    let missing = meta.pending.is_none() || conn.as_ref().is_some_and(|live| !live.holds_slabs());
+    let missing = meta.pending.is_none()
+        || (meta.tls.is_some() && meta.tls_cipher.is_none())
+        || conn.as_ref().is_some_and(|live| live.needs_slabs());
     if wants && missing {
-        slabs.adopt(meta, conn, turn.now_ns);
+        slabs.adopt(meta, conn, bufs, turn.now_ns);
     }
     if meta.timed_out {
         return goaway_close(
@@ -201,39 +322,23 @@ pub(crate) fn pump_slot(
     // NOTE: keep reading even while output is pending. A response larger than the
     // connection window makes the peer's WINDOW_UPDATE the only thing that can unblock
     // the flush, so pausing reads here deadlocks any multi-stream file transfer.
-    let wants_read = meta.readable && close_reason.is_none();
+    let wants_tls =
+        meta.readable || meta.tls_cipher_pending() || meta.tls_plain_queued || meta.tls_wire_eof;
+    let wants_read = wants_tls && close_reason.is_none();
     if wants_read {
+        let Some(live) = conn.as_mut() else {
+            shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
+            return Some(ConnClose::TransportError);
+        };
         if meta.tls.is_some() {
-            let Some(live) = conn.as_mut() else {
-                shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
-                return Some(ConnClose::TransportError);
-            };
-            let room = live.spare_mut().len().min(turn.budget as usize);
-            if room > 0 {
-                let spare = &mut live.spare_mut()[..room];
-                let (Some(stream), Some(tls)) = (meta.stream.as_mut(), meta.tls.as_mut()) else {
-                    shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
-                    return Some(ConnClose::TransportError);
-                };
-                match tls_read_decrypted(stream, tls, spare, turn.budget, &mut meta.tls_plain) {
-                    Ok((wire, plain, blocked)) => {
-                        // NOTE: TLS never joins the batch pass, so this is the claim's only
-                        // consumer; leaving it set would keep the slabs from ever releasing.
-                        meta.claimed = false;
-                        live.commit_staged(plain);
-                        turn.budget = turn.budget.saturating_sub(wire);
-                        if blocked {
-                            meta.readable = false;
-                        }
-                        if wire > 0 || plain > 0 {
-                            progressed = true;
-                        }
-                    }
-                    Err(reason) => close_reason = Some(reason),
-                }
+            match tls_slot_read(meta, live, &mut turn.budget) {
+                TlsSlot::Idle => {}
+                TlsSlot::Progress => progressed = true,
+                TlsSlot::Eof => eof = true,
+                TlsSlot::Closed(reason) => close_reason = Some(reason),
             }
         } else {
-            let (Some(live), Some(stream)) = (conn.as_mut(), meta.stream.as_mut()) else {
+            let Some(stream) = meta.stream.as_mut() else {
                 shut_slot(meta, stream_poller, ConnClose::TransportError, turn);
                 return Some(ConnClose::TransportError);
             };
@@ -264,7 +369,15 @@ pub(crate) fn pump_slot(
         ..Default::default()
     };
     let mut steps = 0;
-    while close_reason.is_none() && !eof && steps < MAX_H2_STEPS_PER_TURN && turn.budget > 0 {
+    let attached = conn.as_ref().is_some_and(|live| live.tables_attached());
+    // NOTE: a released connection keeps no engine storage, so a step has nothing to feed or
+    // serve; the adopt above is the only path that puts the tables back.
+    while attached
+        && close_reason.is_none()
+        && !eof
+        && steps < MAX_H2_STEPS_PER_TURN
+        && turn.budget > 0
+    {
         if pending_spare(meta).len() < H2_FLUSH_THRESHOLD && meta.pending_unflushed() {
             if let H2Flush::Closed(reason) = flush_h2(meta, stream_poller, &mut turn.budget) {
                 close_reason = Some(reason);
@@ -492,8 +605,10 @@ pub(crate) fn drive_pumps(
             {
                 if slot.meta.occupied {
                     slot.meta.defer_write = batched;
-                    let H2Slot { meta, conn, .. } = &mut *slot;
-                    let _ = pump_slot(meta, conn, slabs, &mut turn, poller, index);
+                    let H2Slot {
+                        meta, conn, bufs, ..
+                    } = &mut *slot;
+                    let _ = pump_slot(meta, conn, bufs, slabs, &mut turn, poller, index);
                     meta.defer_write = false;
                     if let Some(live) = conn.as_mut() {
                         live.compact_decoder();

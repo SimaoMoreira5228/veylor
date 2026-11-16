@@ -198,3 +198,38 @@ fn http10_options_and_error_responses_use_request_version() {
     let length = respond_uri_too_long(&mut output, RequestVersion::Http10).expect("414 encodes");
     assert_closed_http10(&output, length);
 }
+
+#[test]
+fn overload_503_is_bounded_closed_and_body_free_for_head() {
+    use super::{SERVICE_UNAVAILABLE_BODY, respond_service_unavailable};
+    use veylor_http1::RequestVersion;
+
+    fn force(output: &mut [u8], method: &[u8]) -> usize {
+        respond_service_unavailable(output, method, RequestVersion::Http11).expect("503 encodes")
+    }
+
+    let mut output = [0u8; 2048];
+    let length = force(&mut output, b"POST");
+    let response = &output[..length];
+
+    assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\nDate: "));
+    assert!(
+        response
+            .windows(b"Connection: close\r\n".len())
+            .any(|window| window == b"Connection: close\r\n"),
+        "overload closes the connection"
+    );
+    assert!(response.ends_with(SERVICE_UNAVAILABLE_BODY));
+    assert!(length <= 150, "overload answer stays bounded: {length}");
+
+    let mut head_output = [0u8; 2048];
+    let head_length = force(&mut head_output, b"HEAD");
+    let head = &head_output[..head_length];
+
+    assert!(head.ends_with(b"\r\n\r\n"), "HEAD stages head bytes only");
+    assert_eq!(
+        length - head_length,
+        SERVICE_UNAVAILABLE_BODY.len(),
+        "HEAD omits exactly the body the POST answer carries"
+    );
+}

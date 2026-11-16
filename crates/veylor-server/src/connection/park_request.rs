@@ -4,7 +4,9 @@ use veylor_http1::{
 };
 
 use crate::host::{HOST_MAX_METHOD_BYTES, HostShared, ParkError};
-use crate::static_routes::{encode_continue, respond_payload_too_large};
+use crate::static_routes::{
+    encode_continue, respond_payload_too_large, respond_service_unavailable,
+};
 
 use super::streams::BodyPushOutcome;
 use super::trailers::connection_value;
@@ -108,7 +110,7 @@ pub(crate) fn park_request(
         request_headers,
     ) {
         Ok(event_token) => event_token,
-        Err(ParkError::Full) => return ExchangeOutcome::Close(ConnClose::QueueFull),
+        Err(ParkError::Full) => return reject_overloaded(conn, head),
         Err(ParkError::SnapshotTooLarge) => {
             // NOTE: attribute like the parser (request_target_too_long): the route matched
             // on the stripped path but the staged copy carries the whole target, so an
@@ -210,6 +212,53 @@ pub(crate) fn park_request(
         chunked_done: false,
     };
     ExchangeOutcome::Parked
+}
+
+// NOTE: a full host queue is the only overload verdict that arrives with a complete head and
+// known framing, so it answers a bounded 503 + Connection: close instead of a silent close
+// the peer has to guess at; 503 keeps meaning "not acknowledged, maybe applied", exactly as a
+// host-generated 503 on the same route. A head that never completed is never parked (it
+// closes on the request-head deadline with no bytes), and an unencodable response (missing
+// version or output buffer) keeps that same plain close: nothing honest can be framed.
+fn reject_overloaded(conn: &mut ConnState, head: veylor_http1::RequestHead) -> ExchangeOutcome {
+    let mut method = [0u8; HOST_MAX_METHOD_BYTES];
+    let (method_len, request_version) = {
+        let Some(input) = conn.input.as_ref() else {
+            return ExchangeOutcome::Close(ConnClose::QueueFull);
+        };
+        let input = &input[..conn.len];
+        let Some(request_version) = head.protocol_version(input) else {
+            return ExchangeOutcome::Close(ConnClose::QueueFull);
+        };
+        let seen = head.method(input).unwrap_or_default();
+        let take = seen.len().min(HOST_MAX_METHOD_BYTES);
+        method[..take].copy_from_slice(&seen[..take]);
+        (take, request_version)
+    };
+    ConnState::materialize_output(&mut conn.output);
+    let staged = match conn.output.as_mut() {
+        Some(output) => {
+            respond_service_unavailable(&mut output[..], &method[..method_len], request_version)
+                .ok()
+        }
+        None => None,
+    };
+    let Some(length) = staged else {
+        return ExchangeOutcome::Close(ConnClose::QueueFull);
+    };
+    conn.out_len = length;
+    conn.out_sent = 0;
+    conn.write_blocked = false;
+    conn.pending_len = 0;
+    conn.closing = true;
+    conn.close_reason = ConnClose::QueueFull;
+    conn.close_drain_remaining = if head.is_chunked {
+        u64::MAX
+    } else {
+        head.content_length.unwrap_or(0)
+    };
+    conn.phase = ConnPhase::SendingResponse;
+    ExchangeOutcome::Responded
 }
 
 fn reject_managed_body(conn: &mut ConnState, head: veylor_http1::RequestHead) -> ExchangeOutcome {

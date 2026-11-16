@@ -236,14 +236,6 @@ pub(crate) fn spin_until(mut ready: impl FnMut() -> bool) -> bool {
     ready()
 }
 
-pub(crate) fn is_closed(stream: &mut TcpStream) -> bool {
-    match stream.read(&mut [0; 1]) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(error) => error.kind() != std::io::ErrorKind::WouldBlock,
-    }
-}
-
 pub(crate) fn empty_slot() -> EventSlot {
     EventSlot {
         kind: HostEventKind::Shutdown,

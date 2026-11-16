@@ -84,42 +84,42 @@ pub(crate) fn accept_slot(
     poller: &mut Poller,
     counts: &mut CloseCounts,
 ) {
-    let staging = slots.take_staging();
-    let prepared = {
-        let Some(slot) = slots.ensure(index) else {
-            counts.add(ConnClose::TransportError);
-            return;
-        };
-        if !open_slot(
-            &mut slot.meta,
-            accepted.stream,
-            index,
-            now_ns,
-            head_budget_ns,
-            poller,
-            counts,
-        ) {
-            slots.close(index);
-            return;
-        }
-        let opened = slot.open();
-        if opened {
-            if let Some(live) = slot.conn.as_mut() {
-                live.staging = Some(staging);
-            }
-        } else {
-            abort_slot(&mut slot.meta, poller, counts);
-        }
-        opened
+    let H2Slots {
+        slots: entries,
+        slabs,
+        ..
+    } = slots;
+    let Some(entry) = entries.get_mut(index) else {
+        counts.add(ConnClose::TransportError);
+        return;
     };
-    if !prepared {
-        slots.close(index);
+    let slot = entry.get_or_insert_with(super::tables::H2Slot::boxed);
+    if !open_slot(
+        &mut slot.meta,
+        accepted.stream,
+        index,
+        now_ns,
+        head_budget_ns,
+        poller,
+        counts,
+    ) {
+        *entry = None;
         return;
     }
-    // NOTE: adopt fills the pending output and both chunk scratches; the staging slab came
-    // from the same pool one line up so the accept path allocates nothing when the pool is
-    // warm.
-    slots.adopt_at(index, now_ns);
+    // NOTE: prepare installs the pooled engine and decoder slabs, builds the tables on the
+    // first pass, then fills the transport slabs; a warm pool makes the whole accept a set of
+    // pointer moves.
+    if !slot.prepare(slabs, now_ns) {
+        abort_slot(&mut slot.meta, poller, counts);
+        let (engine, decoder) = slot.retire();
+        if let Some(engine) = engine {
+            slabs.engine.give(engine);
+        }
+        if let Some(decoder) = decoder {
+            slabs.decoder.give(decoder);
+        }
+        *entry = None;
+    }
 }
 
 // NOTE: per-turn h2c accept dispatch. h2c shares the H1 accept budget; on an H1-error
@@ -180,13 +180,18 @@ pub(crate) fn move_tls_slot(
     counts: &mut CloseCounts,
     tls_acceptor: &mut Option<TlsAcceptor>,
 ) -> bool {
-    let staging = slots.take_staging();
-    let Some(slot) = slots.ensure(index) else {
+    let H2Slots {
+        slots: entries,
+        slabs,
+        ..
+    } = slots;
+    let Some(entry) = entries.get_mut(index) else {
         if let Some(acceptor) = tls_acceptor.as_mut() {
             acceptor.release();
         }
         return false;
     };
+    let slot = entry.get_or_insert_with(super::tables::H2Slot::boxed);
     if !open_slot(
         &mut slot.meta,
         stream,
@@ -199,24 +204,27 @@ pub(crate) fn move_tls_slot(
         if let Some(acceptor) = tls_acceptor.as_mut() {
             acceptor.release();
         }
-        slots.close(index);
+        *entry = None;
         return false;
     }
     slot.meta.tls = Some(tls);
-    let opened = slot.open();
-    if let Some(live) = slot.conn.as_mut() {
-        live.staging = Some(staging);
-    }
-    let moved = opened
+    let prepared = slot.prepare(slabs, now_ns);
+    let moved = prepared
         && slot
             .conn
             .as_mut()
             .is_some_and(|live| live.push_input(prefix).is_ok());
     if !moved {
         abort_tls_slot(&mut slot.meta, poller, counts, tls_acceptor);
-        slots.close(index);
+        let (engine, decoder) = slot.retire();
+        if let Some(engine) = engine {
+            slabs.engine.give(engine);
+        }
+        if let Some(decoder) = decoder {
+            slabs.decoder.give(decoder);
+        }
+        *entry = None;
         return false;
     }
-    slots.adopt_at(index, now_ns);
     true
 }

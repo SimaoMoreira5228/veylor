@@ -245,6 +245,16 @@ pub(crate) fn read_response_stateful(
     id: u32,
     decoder: &mut HpackTable<'_>,
 ) -> Response {
+    read_response_stateful_block(stream, id, decoder).0
+}
+
+// NOTE: same decode as `read_response_stateful`, but the raw header block comes back too, so a
+// test can pin the leading dynamic table size update a recycled encoder must send.
+pub(crate) fn read_response_stateful_block(
+    stream: &mut TcpStream,
+    id: u32,
+    decoder: &mut HpackTable<'_>,
+) -> (Response, Vec<u8>) {
     let mut block = Vec::new();
     let mut headers_ended_stream = false;
     loop {
@@ -291,7 +301,7 @@ pub(crate) fn read_response_stateful(
         }
     }
     response.body = body;
-    response
+    (response, block)
 }
 
 pub(crate) fn read_eof(stream: &mut TcpStream) {

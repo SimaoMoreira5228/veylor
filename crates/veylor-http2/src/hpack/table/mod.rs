@@ -131,6 +131,37 @@ impl<'a> HpackTable<'a> {
         self.scratch.len()
     }
 
+    // NOTE: the encoder half is ours alone, so its storage can move to a worker pool; the
+    // caller must also call `reset_dynamic_table` before the next block so the peer drops
+    // the entries this storage used to hold.
+    pub fn take_storage(&mut self) -> (&'a mut [HpackEntrySlot], &'a mut [u8]) {
+        self.count = 0;
+        self.size = 0;
+        self.scratch_used = 0;
+        let entries = core::mem::take(&mut self.entries);
+        let scratch = core::mem::take(&mut self.scratch);
+        (entries, scratch)
+    }
+
+    pub fn install_storage(&mut self, entries: &'a mut [HpackEntrySlot], scratch: &'a mut [u8]) {
+        entries.fill(HpackEntrySlot::EMPTY);
+        self.entries = entries;
+        self.scratch = scratch;
+        self.count = 0;
+        self.size = 0;
+        self.scratch_used = 0;
+    }
+
+    // NOTE: the encoder's dynamic table is emptied without the peer knowing, so the next
+    // block opens with a size update to zero (RFC 7541 6.3) and every index that follows
+    // is static or literal until the table refills. A shrink below the table's configured
+    // maximum also arms the matching update back up in `encode_pending_table_size_updates`.
+    pub fn reset_dynamic_table(&mut self) {
+        self.clear_dynamic_entries();
+        self.scratch_used = 0;
+        self.pending_min_size = Some(0);
+    }
+
     pub(super) fn mark_size_updates_sent(&mut self) {
         self.signalled_max = self.max_size;
         self.pending_min_size = None;

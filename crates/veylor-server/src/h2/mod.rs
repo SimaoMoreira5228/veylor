@@ -1,8 +1,10 @@
+#![allow(unsafe_code)]
+
 use std::borrow::Cow;
 
 use veylor_http2::{
-    ErrorCode, H2C_GOAWAY_LEN, H2ServerDriver, H2cServerHandshake, HeaderRange, HpackHeader,
-    HpackTable, ServerError, StreamState, StreamTable,
+    ErrorCode, H2C_GOAWAY_LEN, H2FrameDriver, H2ServerDriver, H2cServerHandshake, HeaderRange,
+    HpackHeader, HpackTable, ServerError, StreamState, StreamTable,
 };
 use veylor_runtime::ConnectionToken;
 
@@ -15,8 +17,9 @@ pub(crate) mod turn;
 // NOTE: seam: routes owns the static table plus match policy, send owns sync wire
 // assembly, serve owns per-event stream serving (host parks, trailers, streaming
 // writes), step owns the staged step draining one queued host command, slots owns
-// the per-worker slot table, flush owns socket flush pacing, and file owns
-// file-mount assembly (range planning, HEADERS emit, DATA pump).
+// the per-worker slot table, tables owns the slot layout and its pooled slabs, flush
+// owns socket flush pacing, and file owns file-mount assembly (range planning,
+// HEADERS emit, DATA pump).
 mod accept;
 mod batch;
 mod file;
@@ -28,11 +31,14 @@ mod send;
 mod serve;
 pub(crate) mod slots;
 mod step;
+mod tables;
 
-pub(crate) use file::H2FileTransfer;
+pub(crate) use file::{FileTable, H2FileTransfer};
 pub(crate) use pump::{fail_goaway, grant_window};
 pub use routes::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
 pub(crate) use step::apply_h2_streams;
+
+use tables::{H2EngineSlab, H2EngineView};
 
 pub const INPUT_STAGING_CAP: usize = 16_384 + 64;
 pub const STREAM_SLOTS: usize = 32;
@@ -163,12 +169,16 @@ pub struct H2Conn<'a> {
     // NOTE: file-mount streaming state beside the driver (projection-adjacent, not a third
     // route table): one entry per servable stream at most, plus a single OUTPUT_CAP chunk
     // scratch reused every turn, so file bytes frame in bounded slices and never stage whole.
+    // The transfer table is allocated on the first file response and pooled once it empties.
     pending_responses: pending::PendingResponses,
     pending_events: [Option<StreamEvent>; MAX_STREAMS_PER_STEP],
     pending_event_len: usize,
-    file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
+    file_transfers: Option<Box<FileTable>>,
     pub(crate) file_scratch: Option<Box<[u8; crate::connection::OUTPUT_CAP]>>,
     pub(crate) tunnel_scratch: Option<Box<[u8; TUNNEL_STEP]>>,
+    // NOTE: the engine tables borrow the slot's slab; a released connection keeps its counters
+    // and settings but leaves the arrays in the worker pool until the next readiness edge.
+    engine_attached: bool,
 }
 
 impl<'a> H2Conn<'a> {
@@ -200,9 +210,10 @@ impl<'a> H2Conn<'a> {
             pending_responses: pending::PendingResponses::new(),
             pending_events: [None; MAX_STREAMS_PER_STEP],
             pending_event_len: 0,
-            file_transfers: Box::new(std::array::from_fn(|_| None)),
+            file_transfers: None,
             file_scratch: None,
             tunnel_scratch: None,
+            engine_attached: true,
         }
     }
 
@@ -246,7 +257,75 @@ impl<'a> H2Conn<'a> {
     }
 
     pub(crate) fn holds_slabs(&self) -> bool {
-        self.staging.is_some() || self.file_scratch.is_some() || self.tunnel_scratch.is_some()
+        self.staging.is_some()
+            || self.file_scratch.is_some()
+            || self.tunnel_scratch.is_some()
+            || self.file_transfers.is_some()
+            || self.engine_attached
+    }
+
+    // NOTE: what an adopt must install, which is everything except the lazily boxed file
+    // table: requiring that one would re-adopt on every edge of a connection that never
+    // serves a file.
+    pub(crate) fn needs_slabs(&self) -> bool {
+        self.staging.is_none()
+            || self.file_scratch.is_none()
+            || self.tunnel_scratch.is_none()
+            || !self.engine_attached
+    }
+
+    pub(crate) const fn tables_attached(&self) -> bool {
+        self.engine_attached
+    }
+
+    // NOTE: the stream slot array, header-block assembler and encoder arrays move back into the
+    // tables for this connection; the encoder opens its next block with a table size update to
+    // zero, so no index from the slab's previous life is ever referenced.
+    pub(crate) fn attach_engine(&mut self, engine: &mut H2EngineSlab) -> bool {
+        let Some(driver) = self.frame_driver_mut() else {
+            return false;
+        };
+        // SAFETY: the slab is owned by the slot's `bufs` and is not moved while this
+        // connection borrows it; the tables are dropped before the slot is retired.
+        let H2EngineView {
+            slots,
+            block,
+            headers,
+            enc_entries,
+            enc_scratch,
+        } = unsafe { engine.view() };
+        driver.streams_mut().install_storage(slots, block);
+        let encoder = driver.hpack_encoder_mut();
+        encoder.install_storage(enc_entries, enc_scratch);
+        encoder.reset_dynamic_table();
+        self.headers = headers;
+        self.engine_attached = true;
+        true
+    }
+
+    // NOTE: refuses while a stream or a partly assembled header block still owns the storage;
+    // the caller keeps the slab then and retries on a later pass.
+    pub(crate) fn detach_engine(&mut self) -> bool {
+        {
+            let Some(driver) = self.frame_driver_mut() else {
+                return false;
+            };
+            let Some((_slots, _block)) = driver.streams_mut().take_storage() else {
+                return false;
+            };
+            let (_enc_entries, _enc_scratch) = driver.hpack_encoder_mut().take_storage();
+        }
+        self.headers = &mut [];
+        self.engine_attached = false;
+        true
+    }
+
+    fn frame_driver_mut(&mut self) -> Option<&mut H2FrameDriver<'a, 'a, 'a, 'a>> {
+        match &mut self.phase {
+            Phase::Handshake(handshake) => Some(handshake.server_mut().driver_mut()),
+            Phase::Serving(server) => Some(server.driver_mut()),
+            Phase::Dead => None,
+        }
     }
 
     // NOTE: staged input rides the staging slab, so only an empty staging window may move it.
@@ -266,7 +345,22 @@ impl<'a> H2Conn<'a> {
     }
 
     pub(crate) fn has_file_transfers(&self) -> bool {
-        self.file_transfers.iter().any(Option::is_some)
+        self.file_transfers
+            .as_ref()
+            .is_some_and(|files| files.iter().any(Option::is_some))
+    }
+
+    pub(crate) fn take_file_table(&mut self) -> Option<Box<FileTable>> {
+        let mut files = self.file_transfers.take()?;
+        for slot in files.iter_mut() {
+            *slot = None;
+        }
+        Some(files)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn file_table_allocated(&self) -> bool {
+        self.file_transfers.is_some()
     }
 
     pub fn set_response_write_clock(&mut self, now_ns: u64, timeout_ns: u64) {

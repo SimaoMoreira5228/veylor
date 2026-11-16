@@ -282,6 +282,78 @@ fn preflights_the_complete_block_before_writing_pending_updates() {
 }
 
 #[test]
+fn a_recycled_encoder_signals_an_empty_table_and_forgets_old_indexes() {
+    let inserting = [HpackFieldToEncode {
+        name: b"content-type",
+        value: b"text/plain",
+        representation: HpackRepresentation::Incremental,
+        huffman_name: false,
+        huffman_value: false,
+    }];
+    let mut entries = [HpackEntrySlot::EMPTY; 4];
+    let mut scratch = [0; 128];
+    let mut encoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+    let mut first = [0; 128];
+    let first_len = encode_header_block(&inserting, &mut encoder, &mut first).expect("first block");
+    assert_eq!(encoder.len(), 1);
+
+    let mut peer_entries = [HpackEntrySlot::EMPTY; 4];
+    let mut peer_scratch = [0; 128];
+    let mut peer = HpackTable::new(&mut peer_entries, &mut peer_scratch, 4_096);
+    let mut fields = [HpackHeader::EMPTY; 4];
+    let decoded = decode_header_block(&first[..first_len], &mut peer, &mut fields);
+    assert_eq!(decoded, Ok((1, first_len)));
+    assert_eq!(peer.len(), 1);
+
+    let (entries, scratch) = encoder.take_storage();
+    encoder.install_storage(entries, scratch);
+    encoder.reset_dynamic_table();
+
+    let stale = [HpackFieldToEncode {
+        name: b"content-type",
+        value: b"text/plain",
+        representation: HpackRepresentation::Indexed,
+        huffman_name: false,
+        huffman_value: false,
+    }];
+    let mut output = [0xa5; 128];
+    assert_eq!(
+        encode_header_block(&stale, &mut encoder, &mut output),
+        Err(HpackError::InvalidIndex)
+    );
+
+    let mut recycled = [0; 128];
+    let recycled_len =
+        encode_header_block(&inserting, &mut encoder, &mut recycled).expect("recycled block");
+    assert_eq!(recycled[0] & 0xe0, 0x20, "opens with a table size update");
+    let (first_size, _) = decode_hpack_integer(&recycled[..], 5).expect("first size update");
+    assert_eq!(first_size, 0, "the update names the empty table");
+    assert_eq!(peer.max_size(), 4_096);
+    let decoded = decode_header_block(&recycled[..recycled_len], &mut peer, &mut fields);
+    assert_eq!(decoded, Ok((1, recycled_len)));
+    assert_eq!(peer.len(), 1, "the peer dropped its old entry");
+
+    let indexed = [HpackFieldToEncode {
+        name: b"content-type",
+        value: b"text/plain",
+        representation: HpackRepresentation::Indexed,
+        huffman_name: false,
+        huffman_value: false,
+    }];
+    let mut refilled = [0; 128];
+    let refilled_len =
+        encode_header_block(&indexed, &mut encoder, &mut refilled).expect("refilled block");
+    assert_eq!(
+        refilled[0] & 0x80,
+        0x80,
+        "indexes the entry it just inserted"
+    );
+    let decoded = decode_header_block(&refilled[..refilled_len], &mut peer, &mut fields);
+    assert_eq!(decoded, Ok((1, refilled_len)));
+    assert_eq!(peer.len(), 1);
+}
+
+#[test]
 fn rejects_unavailable_exact_indexes_before_changing_output_or_table_state() {
     let fields = [
         HpackFieldToEncode {

@@ -39,7 +39,7 @@ pub(crate) struct Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
     pub(crate) used: &'o mut usize,
     pub(crate) outcome: &'o mut StepOutcome,
     pub(crate) pending: &'o mut PendingResponses,
-    pub(crate) files: &'o mut [Option<H2FileTransfer>; STREAM_SLOTS],
+    pub(crate) files: &'o mut Option<Box<[Option<H2FileTransfer>; STREAM_SLOTS]>>,
     pub(crate) scratch: &'o mut [u8],
 }
 

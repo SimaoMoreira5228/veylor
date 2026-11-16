@@ -2,7 +2,9 @@ use crate::frame_io::*;
 use crate::h2_peer::*;
 use crate::h2_response::*;
 use std::time::Duration;
-use veylor_http2::{DATA_FLAG_END_STREAM, FrameType};
+use veylor_http2::{
+    DATA_FLAG_END_STREAM, FrameType, HpackEntrySlot, HpackTable, decode_hpack_integer,
+};
 use veylor_server::RespondOutcome;
 
 // NOTE: longer than SLAB_HOLD_NS plus the two worker sweeps the release gate also needs.
@@ -62,6 +64,46 @@ fn a_body_that_arrives_after_the_hold_window_is_not_lost() {
     assert_eq!(response.body, b"taken");
     let counts = stop_join(server);
     assert_eq!(counts.h2_served, 1);
+}
+
+// NOTE: the pooled encoder storage starts a new life with entries its peer never saw, so the
+// first block after a release must open with a dynamic table size update to zero (RFC 7541
+// 6.3); the peer decoder below is stateful, exactly like a real client.
+#[test]
+fn a_recycled_encoder_opens_its_next_block_with_a_zero_table_size_update() {
+    let root = file_mount_root("recycled-encoder");
+    std::fs::write(root.join("hello.txt"), b"file-content").expect("mount file");
+    let server = file_mount_server(&root);
+    let mut client = h2_connect(&server);
+    handshake(&mut client);
+    let mut entries = [HpackEntrySlot::EMPTY; 8];
+    let mut scratch = [0; 512];
+    let mut decoder = HpackTable::new(&mut entries, &mut scratch, 4_096);
+
+    send_headers(&mut client, 1, b"GET", b"/assets/hello.txt", true);
+    let first = read_response_stateful(&mut client, 1, &mut decoder);
+    assert_eq!(first.status, 200);
+    assert!(!decoder.is_empty(), "the first response refills the table");
+    assert_eq!(first.content_type, b"text/plain");
+
+    std::thread::sleep(HOLD_WINDOW);
+
+    send_headers(&mut client, 3, b"GET", b"/assets/hello.txt", true);
+    let (recycled, block) = read_response_stateful_block(&mut client, 3, &mut decoder);
+    assert_eq!(recycled.status, 200);
+    assert_eq!(recycled.body, b"file-content");
+    assert_eq!(block[0] & 0xe0, 0x20, "block opens with a size update");
+    let (size, _) = decode_hpack_integer(&block[..], 5).expect("size update");
+    assert_eq!(size, 0, "the update names the empty table");
+    assert_eq!(decoder.max_size(), 4_096, "and restores the table size");
+
+    send_headers(&mut client, 5, b"GET", b"/assets/hello.txt", true);
+    let refilled = read_response_stateful(&mut client, 5, &mut decoder);
+    assert_eq!(refilled.status, 200);
+    assert_eq!(refilled.body, b"file-content");
+    assert_eq!(refilled.content_type, b"text/plain");
+    let counts = stop_join(server);
+    assert_eq!(counts.h2_served, 3);
 }
 
 #[test]

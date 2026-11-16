@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use harness::{
-    Database, Service, request, request_with_content_type, request_with_idempotency_key,
-    try_request_with_idempotency_key,
+    Database, Service, durable_keys, request, request_with_content_type,
+    request_with_idempotency_key, try_request_with_idempotency_key, writer_stats,
 };
 use serde_json::json;
 
@@ -440,36 +440,77 @@ fn configured_tls_serves_verified_https_readiness() {
 }
 
 #[test]
-fn concurrent_writes_share_commits_instead_of_paying_one_each() {
+fn concurrent_writes_share_a_commit_and_acknowledged_keys_stay_durable() {
     let database = Database::new();
-    let service = Service::start_with_options(&database.file(), &["--commit-delay-ms", "100"]);
-    let started = std::time::Instant::now();
-    let address = service.address;
+    let mut acknowledged = {
+        let service = Service::start_with_options(&database.file(), &["--commit-delay-ms", "500"]);
+        let address = service.address;
 
-    std::thread::scope(|scope| {
-        for index in 0..64 {
-            scope.spawn(move || {
-                let key = format!("group-{index}");
-                let (status, _) = request_with_idempotency_key(
-                    address,
-                    "POST",
-                    "/accounts/5/transactions",
-                    br#"{"amount":1,"kind":"credit","description":"group"}"#,
-                    false,
-                    &key,
-                );
-                assert_eq!(status, 200);
-            });
-        }
-    });
+        // NOTE: the injected commit window is what lets a burst collect into one batch: the
+        // writer takes the first writes and then holds the transaction open for 500 ms, so
+        // later arrivals queue behind it. The assertion below reads the batch counter, not
+        // the elapsed time, so a slow host cannot fail it; only a run where the 64 writers
+        // truly serialized could, which is what the counter is there to catch.
+        let acknowledged = std::thread::scope(|scope| {
+            let mut writers = Vec::with_capacity(64);
+            for index in 0..64 {
+                writers.push(scope.spawn(move || {
+                    let key = format!("group-{index}");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
+                    loop {
+                        let (status, _) = request_with_idempotency_key(
+                            address,
+                            "POST",
+                            "/accounts/5/transactions",
+                            br#"{"amount":1,"kind":"credit","description":"group"}"#,
+                            false,
+                            &key,
+                        );
+                        match status {
+                            200 => return key,
+                            503 => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "write was never acknowledged"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            status => panic!("unexpected status {status}"),
+                        }
+                    }
+                }));
+            }
+
+            writers
+                .into_iter()
+                .map(|writer| writer.join().expect("writer joined"))
+                .collect::<Vec<_>>()
+        });
+
+        let (_, statement) = request(address, "GET", "/accounts/5/statement", b"", false);
+        assert_eq!(statement["balance"], 64);
+        acknowledged
+    };
+    acknowledged.sort();
+
+    let stats = writer_stats(&database);
     assert!(
-        started.elapsed() < Duration::from_millis(3000),
-        "64 writes took {:?}; commits were not shared",
-        started.elapsed()
+        stats.max_batch > 1,
+        "no commit carried more than one write: {stats:?}"
     );
-    let (_, statement) = request(address, "GET", "/accounts/5/statement", b"", false);
-    assert_eq!(statement["balance"], 64);
+    assert!(
+        stats.commits <= stats.writes,
+        "counters look sane: {stats:?}"
+    );
+    assert!(
+        stats.writes >= acknowledged.len() as u64,
+        "every acknowledged write reached the writer: {stats:?}"
+    );
+
+    let mut durable = durable_keys(&database, 5);
+    durable.sort();
+    assert_eq!(durable, acknowledged, "every acknowledged key is durable");
 }
 
 #[test]

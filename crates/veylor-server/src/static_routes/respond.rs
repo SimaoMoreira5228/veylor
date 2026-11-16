@@ -32,6 +32,7 @@ const URI_TOO_LONG_BODY: &[u8] = b"URI Too Long";
 const REQUEST_HEADER_FIELDS_TOO_LARGE_BODY: &[u8] = b"Request Header Fields Too Large";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"Payload Too Large";
 const EXPECTATION_FAILED_BODY: &[u8] = b"Expectation Failed";
+const SERVICE_UNAVAILABLE_BODY: &[u8] = b"Service Unavailable";
 
 pub struct EncodedStaticResponse {
     pub length: usize,
@@ -479,6 +480,45 @@ pub fn respond_payload_too_large(
             .get_mut(length..end)
             .ok_or(RouteBuildError::Invalid)?
             .copy_from_slice(PAYLOAD_TOO_LARGE_BODY);
+        length = end;
+    }
+    Ok(length)
+}
+
+// NOTE: the overload answer for a request that was read whole enough to frame a response.
+// 503 stays the "not acknowledged" verdict every managed path already uses, so a client
+// treats it exactly like a host-generated 503 instead of guessing at a silent close.
+pub fn respond_service_unavailable(
+    output: &mut [u8],
+    method: &[u8],
+    request_version: RequestVersion,
+) -> Result<usize, RouteBuildError> {
+    let mut now = [0u8; HTTP_DATE_BYTES];
+    let now_len = now_http_date(&mut now);
+    let date = [Field {
+        name: b"Date",
+        value: &now[..now_len],
+    }];
+    let response = ResponseToWrite {
+        request_method: method,
+        request_version,
+        requested_upgrade: b"",
+        status: 503,
+        reason: b"Service Unavailable",
+        fields: &date,
+        framing: ResponseFraming::FixedLength,
+        content_length: SERVICE_UNAVAILABLE_BODY.len() as u64,
+        connection: ConnectionHeader::Close,
+    };
+    let encoded =
+        encode_response_head_trusted(&response, output).map_err(|_| RouteBuildError::Invalid)?;
+    let mut length = encoded.length;
+    if encoded.body_allowed && !SERVICE_UNAVAILABLE_BODY.is_empty() {
+        let end = length + SERVICE_UNAVAILABLE_BODY.len();
+        output
+            .get_mut(length..end)
+            .ok_or(RouteBuildError::Invalid)?
+            .copy_from_slice(SERVICE_UNAVAILABLE_BODY);
         length = end;
     }
     Ok(length)

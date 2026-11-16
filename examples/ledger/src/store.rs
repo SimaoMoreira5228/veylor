@@ -156,6 +156,7 @@ impl Store {
         if !commit_delay.is_zero() && transaction.total_changes() != changes_before {
             std::thread::sleep(commit_delay);
         }
+        record_batch(&transaction, writes.len())?;
         transaction.commit().map_err(database_error)?;
 
         Ok(results)
@@ -218,6 +219,24 @@ impl Store {
     }
 }
 
+// NOTE: the counters live in the same transaction as the writes they describe, so a batch
+// that reports commits also proves those writes are durable: there is no separate accounting
+// channel to drift. The row stays a single row, so a long-lived ledger pays one upsert per
+// commit and the file does not grow with history.
+fn record_batch(transaction: &Connection, writes: usize) -> Result<(), StoreError> {
+    let writes = i64::try_from(writes).map_err(|_| StoreError::Rejected)?;
+    transaction.execute(
+        "UPDATE writer_stats
+         SET commits = commits + 1,
+             writes = writes + ?1,
+             max_batch = max(max_batch, ?1)
+         WHERE id = 0",
+        [writes],
+    )?;
+
+    Ok(())
+}
+
 fn configure_journal_mode(connection: &Connection) -> Result<(), StoreError> {
     let deadline = Instant::now() + Duration::from_secs(5);
 
@@ -255,7 +274,15 @@ fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
                 balance_after INTEGER
             );
             CREATE INDEX IF NOT EXISTS account_history
-                ON transactions (account_id, id DESC);",
+                ON transactions (account_id, id DESC);
+            CREATE TABLE IF NOT EXISTS writer_stats (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                commits INTEGER NOT NULL,
+                writes INTEGER NOT NULL,
+                max_batch INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO writer_stats (id, commits, writes, max_batch)
+                VALUES (0, 0, 0, 0);",
     )?;
 
     migrate_idempotency_columns(connection)?;

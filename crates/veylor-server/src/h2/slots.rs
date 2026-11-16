@@ -1,18 +1,17 @@
 #![allow(unsafe_code)]
 
-use veylor_http2::{H2Role, HpackEntrySlot, HpackHeader, HpackTable, StreamSlot, StreamTable};
 use veylor_runtime::{AcceptedConnection, ConnectionTimeouts, Readiness, TcpStream};
 use veylor_tls::TlsConn;
 
 use crate::connection::tls::TLS_PENDING_MIN_BYTES;
 use crate::connection::{
-    BoundedPool, INPUT_CAP, OUTPUT_CAP, SLAB_HOLD_NS, SLAB_QUIET_TURNS, trim_released_pages,
+    BoundedPool, OUTPUT_CAP, SLAB_HOLD_NS, SLAB_QUIET_TURNS, trim_released_pages,
 };
 
-use super::{
-    ACK_SLOTS, DECODE_BYTES, DECODE_ENTRIES, ENCODE_BYTES, ENCODE_ENTRIES, H2Conn,
-    HEADER_BLOCK_CAP, HEADER_SLOTS, INPUT_STAGING_CAP, MAX_H2_CONNS, STREAM_SLOTS, TUNNEL_STEP,
-};
+use super::file::FileTable;
+pub(crate) use super::tables::H2Slot;
+use super::tables::{H2Buffers, H2DecoderSlab, H2EngineSlab};
+use super::{H2Conn, INPUT_STAGING_CAP, MAX_H2_CONNS, TUNNEL_STEP};
 
 // NOTE: H1 tokens occupy 1..=MAX_CONNECTIONS (`slot + 1`), so the H2 token range starts
 // above the whole H1 table instead of at MAX_CONNECTIONS.
@@ -20,101 +19,115 @@ pub(crate) const H2_STREAM_TOKEN_BASE: usize = crate::static_server::MAX_CONNECT
 pub(crate) const H2_ACCEPT_STAGING: usize = 8;
 pub(crate) const H2_PENDING_CAP: usize = 65_536 + 512;
 
+// NOTE: the ciphertext read quantum: one full TLS record (16 KiB payload plus its AEAD tag
+// and 5-byte header), so a batch read usually carries whole records and a partial one only
+// when the record and the read quantum disagree.
+pub(crate) const TLS_CIPHER_CAP: usize = 16_640;
+
 // NOTE: freed H2 slabs are kept per worker only up to this many of each kind; the rest go back
 // to the allocator, so a wave of idle connections cannot ratchet the process. Eight covers a
-// worker's whole wakeup edge without holding a measurable share of the 64-connection ceiling.
+// worker's whole wakeup edge; the engine and decoder classes make the cap cost about 4.5 MiB
+// per 16 workers of resident floor, which the 256-connection mark pays per connection.
 pub(crate) const H2_SLAB_POOL_CAP: usize = 8;
 
 // NOTE: one released H2 connection frees more than a hundred times the memory of one released
 // H1 connection, so any wave that is not a single trickle pays for the trim walk.
 pub(crate) const H2_TRIM_MIN_RELEASED: usize = 4;
 
-pub(crate) struct H2Buffers {
-    pub(crate) slots: Box<[StreamSlot; STREAM_SLOTS]>,
-    pub(crate) block: Box<[u8; HEADER_BLOCK_CAP]>,
-    pub(crate) dec_entries: Box<[HpackEntrySlot; DECODE_ENTRIES]>,
-    pub(crate) dec_scratch: Box<[u8; DECODE_BYTES]>,
-    pub(crate) enc_entries: Box<[HpackEntrySlot; ENCODE_ENTRIES]>,
-    pub(crate) enc_scratch: Box<[u8; ENCODE_BYTES]>,
-    pub(crate) ack: Box<[u32; ACK_SLOTS]>,
-    pub(crate) headers: Box<[HpackHeader; HEADER_SLOTS]>,
-}
-
-impl H2Buffers {
-    pub(crate) fn new() -> Self {
-        Self {
-            slots: Box::new([StreamSlot::EMPTY; STREAM_SLOTS]),
-            block: Box::new([0; HEADER_BLOCK_CAP]),
-            dec_entries: Box::new([HpackEntrySlot::EMPTY; DECODE_ENTRIES]),
-            dec_scratch: Box::new([0; DECODE_BYTES]),
-            enc_entries: Box::new([HpackEntrySlot::EMPTY; ENCODE_ENTRIES]),
-            enc_scratch: Box::new([0; ENCODE_BYTES]),
-            ack: Box::new([0; ACK_SLOTS]),
-            headers: Box::new([HpackHeader::EMPTY; HEADER_SLOTS]),
-        }
-    }
-}
-
-// NOTE: the worker-local pool for the four slabs an idle H2 connection does not need: input
-// staging, the pending output buffer, and the file and tunnel chunk scratches. The engine
-// tables (stream slots, header block, HPACK entries) stay with the connection because their
-// dynamic state is connection-scoped.
+// NOTE: the worker-local pool for everything an idle H2 connection does not need: the engine
+// tables' arrays, the decoder slab on close, the file-transfer table once a transfer ends, the
+// input staging, pending output, and file/tunnel chunk scratches, and the TLS ciphertext read
+// buffer. The encoder's own counters stay with the connection; its storage travels and is
+// reset on adopt.
 pub(crate) struct H2Slabs {
+    pub(crate) engine: BoundedPool<H2EngineSlab>,
+    pub(crate) decoder: BoundedPool<H2DecoderSlab>,
+    pub(crate) files: BoundedPool<FileTable>,
     staging: BoundedPool<[u8; INPUT_STAGING_CAP]>,
     pending: BoundedPool<[u8; H2_PENDING_CAP]>,
     file: BoundedPool<[u8; OUTPUT_CAP]>,
     tunnel: BoundedPool<[u8; TUNNEL_STEP]>,
+    cipher: BoundedPool<[u8; TLS_CIPHER_CAP]>,
 }
 
 impl H2Slabs {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
+            engine: BoundedPool::new(cap),
+            decoder: BoundedPool::new(cap),
+            files: BoundedPool::new(cap),
             staging: BoundedPool::new(cap),
             pending: BoundedPool::new(cap),
             file: BoundedPool::new(cap),
             tunnel: BoundedPool::new(cap),
+            cipher: BoundedPool::new(cap),
         }
     }
 
     // NOTE: installed together on the readiness edge that follows a release, so a step never
-    // runs with one of the four missing; a pool hit is a pointer move, a miss the only case
-    // that allocates.
+    // runs with one of the slabs missing; a pool hit is a pointer move, a miss the only case
+    // that allocates. The engine slab is re-attached here and its encoder reset before the
+    // next header block can be encoded. The ciphertext slab exists only for TLS, which is why
+    // it is the one class an h2c connection never takes.
     pub(crate) fn adopt(
         &mut self,
         meta: &mut H2Meta,
         conn: &mut Option<H2Conn<'_>>,
+        bufs: &mut H2Buffers,
         now_ns: u64,
     ) -> bool {
         let Some(conn) = conn.as_mut() else {
             return false;
         };
-        let mut installed = false;
+        if bufs.engine.is_none() {
+            bufs.engine = Some(self.engine.take(H2EngineSlab::new));
+        }
+        if !conn.tables_attached() {
+            let Some(engine) = bufs.engine.as_deref_mut() else {
+                return false;
+            };
+            if !conn.attach_engine(engine) {
+                return false;
+            }
+        }
         if meta.pending.is_none() {
             meta.pending = Some(self.pending.take(|| Box::new([0; H2_PENDING_CAP])));
-            installed = true;
         }
         if conn.staging.is_none() {
             conn.staging = Some(self.staging.take(|| Box::new([0; INPUT_STAGING_CAP])));
-            installed = true;
         }
         if conn.file_scratch.is_none() {
             conn.file_scratch = Some(self.file.take(|| Box::new([0; OUTPUT_CAP])));
-            installed = true;
         }
         if conn.tunnel_scratch.is_none() {
             conn.tunnel_scratch = Some(self.tunnel.take(|| Box::new([0; TUNNEL_STEP])));
-            installed = true;
         }
-        if !installed {
-            return false;
+        if meta.tls.is_some() && meta.tls_cipher.is_none() {
+            meta.tls_cipher = Some(self.cipher.take(|| Box::new([0; TLS_CIPHER_CAP])));
         }
         meta.reserve_tls_scratch();
         meta.note_slab_adopt(now_ns);
         true
     }
 
-    pub(crate) fn release(&mut self, meta: &mut H2Meta, conn: &mut Option<H2Conn<'_>>) -> bool {
-        if !self.give_back(meta, conn) {
+    pub(crate) fn release(
+        &mut self,
+        meta: &mut H2Meta,
+        conn: &mut Option<H2Conn<'_>>,
+        bufs: &mut H2Buffers,
+    ) -> bool {
+        let transports = self.give_back(meta, conn);
+        let mut engine = None;
+        if let Some(live) = conn.as_mut()
+            && live.detach_engine()
+        {
+            engine = bufs.engine.take();
+        }
+        let returned = engine.is_some();
+        if let Some(engine) = engine {
+            self.engine.give(engine);
+        }
+        if !transports && !returned {
             return false;
         }
         meta.note_slab_release();
@@ -122,7 +135,8 @@ impl H2Slabs {
     }
 
     // NOTE: a closing connection returns whatever it still holds; staged input keeps its
-    // staging slab private to the drop instead of handing live bytes to the next owner.
+    // staging slab private to the drop instead of handing live bytes to the next owner. The
+    // engine and decoder slabs come back through `H2Slot::retire`, after the tables drop.
     pub(crate) fn reclaim(&mut self, meta: &mut H2Meta, conn: &mut Option<H2Conn<'_>>) {
         self.give_back(meta, conn);
     }
@@ -146,12 +160,23 @@ impl H2Slabs {
                 self.tunnel.give(scratch);
                 released = true;
             }
+            if let Some(files) = live.take_file_table() {
+                self.files.give(files);
+                released = true;
+            }
+        }
+        if let Some(cipher) = meta.tls_cipher.take() {
+            self.cipher.give(cipher);
+            released = true;
         }
         if !released {
             return false;
         }
         meta.pending_len = 0;
         meta.pending_sent = 0;
+        meta.tls_cipher_read = 0;
+        meta.tls_cipher_fed = 0;
+        meta.tls_plain_queued = false;
         meta.drop_tls_scratch();
         true
     }
@@ -164,7 +189,11 @@ pub(crate) struct H2Meta {
     pub(crate) tls: Option<Box<TlsConn>>,
     pub(crate) tls_pending: Vec<u8>,
     pub(crate) tls_pending_sent: usize,
-    pub(crate) tls_plain: Vec<u8>,
+    pub(crate) tls_cipher: Option<Box<[u8; TLS_CIPHER_CAP]>>,
+    pub(crate) tls_cipher_read: usize,
+    pub(crate) tls_cipher_fed: usize,
+    pub(crate) tls_plain_queued: bool,
+    pub(crate) tls_wire_eof: bool,
     pub(crate) occupied: bool,
     pub(crate) readable: bool,
     pub(crate) claimed: bool,
@@ -202,19 +231,30 @@ impl H2Meta {
         self.tls_pending.len() > self.tls_pending_sent
     }
 
+    pub(crate) fn tls_cipher_pending(&self) -> bool {
+        self.tls_cipher_read > self.tls_cipher_fed
+    }
+
     pub(crate) fn wants_pump(&self) -> bool {
         self.readable
             || self.staged
+            || self.tls_cipher_pending()
+            || self.tls_plain_queued
+            || self.tls_wire_eof
             || ((self.pending_unflushed() || self.tls_unflushed()) && !self.write_blocked)
     }
 
     // NOTE: waiting with slabs and nothing to do: no armed read claim, no staged input, no
-    // stream or parked response open on the wire, no file or tunnel transfer to resume.
+    // ciphertext or queued plaintext to decrypt, no stream or parked response open on the
+    // wire, no file or tunnel transfer to resume.
     pub(crate) fn slab_idle(&self, conn: Option<&H2Conn<'_>>) -> bool {
         if !self.occupied || self.readable || self.claimed || self.staged {
             return false;
         }
         if self.timed_out || self.error {
+            return false;
+        }
+        if self.tls_cipher_pending() || self.tls_plain_queued || self.tls_wire_eof {
             return false;
         }
         if self.pending_unflushed() || self.tls_unflushed() {
@@ -262,8 +302,6 @@ impl H2Meta {
         }
         self.tls_pending
             .reserve(TLS_PENDING_MIN_BYTES.saturating_sub(self.tls_pending.capacity()));
-        self.tls_plain
-            .reserve(INPUT_CAP.saturating_sub(self.tls_plain.capacity()));
     }
 
     pub(crate) fn drop_tls_scratch(&mut self) {
@@ -272,89 +310,6 @@ impl H2Meta {
         }
         self.tls_pending = Vec::new();
         self.tls_pending_sent = 0;
-        self.tls_plain = Vec::new();
-    }
-}
-
-struct H2Tables {
-    streams: StreamTable<'static>,
-    decoder: HpackTable<'static>,
-    encoder: HpackTable<'static>,
-}
-
-impl H2Tables {
-    // SAFETY: `bufs` must be a heap allocation that outlives this value and is never moved.
-    unsafe fn new(bufs: &'static mut H2Buffers) -> Self {
-        Self {
-            streams: StreamTable::new(
-                &mut bufs.slots[..],
-                H2Role::Server,
-                &mut bufs.block[..],
-                HEADER_BLOCK_CAP as u32,
-            ),
-            decoder: HpackTable::new(&mut bufs.dec_entries[..], &mut bufs.dec_scratch[..], 4_096),
-            encoder: HpackTable::new(&mut bufs.enc_entries[..], &mut bufs.enc_scratch[..], 4_096),
-        }
-    }
-}
-
-// NOTE: the server slot is a controlled self-reference: `bufs` is a stable Box, the
-// table struct lives at a fixed address inside the slot, and `conn` borrows the tables.
-// The slot itself is always held through Box<H2Slot>, so none of those addresses move,
-// and the field order drops conn before tables before bufs.
-pub(crate) struct H2Slot {
-    pub(crate) conn: Option<H2Conn<'static>>,
-    tables: Option<H2Tables>,
-    pub(crate) bufs: Box<H2Buffers>,
-    pub(crate) meta: H2Meta,
-}
-
-impl H2Slot {
-    fn boxed() -> Box<Self> {
-        Box::new(Self {
-            conn: None,
-            tables: None,
-            bufs: Box::new(H2Buffers::new()),
-            meta: H2Meta::default(),
-        })
-    }
-
-    pub(crate) fn open(&mut self) -> bool {
-        self.conn = None;
-        self.tables = None;
-        let bufs: *mut H2Buffers = &mut *self.bufs;
-        // SAFETY: `bufs` is owned by this boxed slot and never moves; the table struct is
-        // stored at a fixed address in the same slot before the conn borrows it.
-        let tables = unsafe {
-            let bufs = std::mem::transmute::<&mut H2Buffers, &'static mut H2Buffers>(&mut *bufs);
-            H2Tables::new(bufs)
-        };
-        self.tables = Some(tables);
-        let Some(tables) = self.tables.as_mut() else {
-            return false;
-        };
-        let tables = tables as *mut H2Tables;
-        // SAFETY: both referents live in this boxed slot; the conn is dropped before
-        // either field and no other reference reaches them while it is alive.
-        let conn = unsafe {
-            let tables = &mut *tables;
-            let bufs = &mut *bufs;
-            H2Conn::new(
-                &mut tables.streams,
-                &mut tables.decoder,
-                &mut tables.encoder,
-                &mut bufs.ack[..],
-                &mut bufs.headers[..],
-            )
-        };
-        self.conn = Some(unsafe { std::mem::transmute::<H2Conn<'_>, H2Conn<'static>>(conn) });
-        true
-    }
-
-    pub(crate) fn close(&mut self) {
-        self.conn = None;
-        self.tables = None;
-        self.meta = H2Meta::default();
     }
 }
 
@@ -412,13 +367,10 @@ impl H2Slots {
         self.slots.iter().position(|slot| slot.is_none())
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure(&mut self, index: usize) -> Option<&mut H2Slot> {
         let entry = self.slots.get_mut(index)?;
         Some(entry.get_or_insert_with(H2Slot::boxed))
-    }
-
-    pub(crate) fn take_staging(&mut self) -> Box<[u8; INPUT_STAGING_CAP]> {
-        self.slabs.staging.take(|| Box::new([0; INPUT_STAGING_CAP]))
     }
 
     // NOTE: the readiness edge is the only place slabs come back: the recv batch and the step
@@ -434,21 +386,24 @@ impl H2Slots {
             }
             let wants = slot.meta.wants_pump() || slot.meta.staged || slot.meta.timed_out;
             let missing = slot.meta.pending.is_none()
-                || slot.conn.as_ref().is_some_and(|live| !live.holds_slabs());
+                || (slot.meta.tls.is_some() && slot.meta.tls_cipher.is_none())
+                || slot.conn.as_ref().is_some_and(|live| live.needs_slabs());
             if wants && missing {
-                let H2Slot { meta, conn, .. } = slot;
-                slabs.adopt(meta, conn, now_ns);
+                let H2Slot {
+                    meta, conn, bufs, ..
+                } = slot;
+                slabs.adopt(meta, conn, bufs, now_ns);
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn adopt_at(&mut self, index: usize, now_ns: u64) -> bool {
         let H2Slots { slots, slabs, .. } = self;
         let Some(slot) = slots.get_mut(index).and_then(|entry| entry.as_deref_mut()) else {
             return false;
         };
-        let H2Slot { meta, conn, .. } = slot;
-        slabs.adopt(meta, conn, now_ns)
+        slot.prepare(slabs, now_ns)
     }
 
     // NOTE: one pass per turn over at most MAX_H2_CONNS slots. A slot that never went quiet
@@ -463,11 +418,13 @@ impl H2Slots {
             if !slot.meta.occupied || slot.meta.quiet_turns < SLAB_QUIET_TURNS {
                 continue;
             }
-            let H2Slot { meta, conn, .. } = slot;
+            let H2Slot {
+                meta, conn, bufs, ..
+            } = slot;
             if !meta.slab_release_due(conn.as_ref(), now_ns) {
                 continue;
             }
-            if slabs.release(meta, conn) {
+            if slabs.release(meta, conn, bufs) {
                 released += 1;
             }
         }
@@ -499,7 +456,13 @@ impl H2Slots {
         if let Some(slot) = entry.as_deref_mut() {
             let H2Slot { meta, conn, .. } = slot;
             slabs.reclaim(meta, conn);
-            slot.close();
+            let (engine, decoder) = slot.retire();
+            if let Some(engine) = engine {
+                slabs.engine.give(engine);
+            }
+            if let Some(decoder) = decoder {
+                slabs.decoder.give(decoder);
+            }
         }
         *entry = None;
     }
@@ -573,19 +536,22 @@ pub(crate) fn pending_spare(meta: &mut H2Meta) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use veylor_tls::TlsAcceptor;
+
+    const CERT_DER: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/server_cert.der");
+    const KEY_DER: &[u8] = include_bytes!("../../../veylor-tls/tests/testdata/server_key.der");
 
     fn opened(conns: usize) -> H2Slots {
         let mut slots = H2Slots::new();
         for index in 0..conns {
             let slot = slots.ensure(index).expect("slot");
-            assert!(slot.open());
             slot.meta.occupied = true;
             assert!(slots.adopt_at(index, 0));
         }
         slots
     }
 
-    fn pointer(slots: &mut H2Slots, index: usize) -> (usize, usize) {
+    fn pointers(slots: &mut H2Slots, index: usize) -> (usize, usize, usize) {
         let slot = slots.slot_mut(index).expect("slot");
         let pending = slot.meta.pending.as_ref().expect("pending").as_ptr() as usize;
         let staging = slot
@@ -594,21 +560,38 @@ mod tests {
             .and_then(|conn| conn.staging.as_ref())
             .expect("staging")
             .as_ptr() as usize;
-        (pending, staging)
+        let slots = slot.bufs.engine.as_ref().expect("engine").slots_pointer();
+        (pending, staging, slots)
     }
 
     #[test]
     fn a_quiet_connection_gives_its_slabs_back_and_the_next_edge_takes_them() {
         let mut slots = opened(1);
-        let (pending, staging) = pointer(&mut slots, 0);
+        let first = pointers(&mut slots, 0);
         slots.slot_mut(0).expect("slot").meta.quiet_turns = SLAB_QUIET_TURNS;
         assert_eq!(slots.reclaim_idle(SLAB_HOLD_NS), 1);
         let slot = slots.slot_mut(0).expect("slot");
         assert!(slot.meta.pending.is_none());
+        assert!(slot.bufs.engine.is_none());
         assert!(slot.conn.as_ref().is_some_and(|conn| !conn.holds_slabs()));
 
         assert!(slots.adopt_at(0, SLAB_HOLD_NS));
-        assert_eq!(pointer(&mut slots, 0), (pending, staging));
+        assert_eq!(pointers(&mut slots, 0), first);
+    }
+
+    #[test]
+    fn a_connection_that_never_served_a_file_holds_no_transfer_table() {
+        let mut slots = opened(1);
+        assert!(slots.slot_mut(0).expect("slot").bufs.engine.is_some());
+        assert!(
+            !slots
+                .slot_mut(0)
+                .expect("slot")
+                .conn
+                .as_ref()
+                .expect("conn")
+                .file_table_allocated()
+        );
     }
 
     #[test]
@@ -651,7 +634,6 @@ mod tests {
         slots.slabs = H2Slabs::new(cap);
         for index in 0..cap * 4 {
             let slot = slots.ensure(index).expect("slot");
-            assert!(slot.open());
             slot.meta.occupied = true;
             assert!(slots.adopt_at(index, 0));
             slots.slot_mut(index).expect("slot").meta.quiet_turns = SLAB_QUIET_TURNS;
@@ -661,5 +643,75 @@ mod tests {
         assert_eq!(slots.slabs.staging.len(), cap);
         assert_eq!(slots.slabs.file.len(), cap);
         assert_eq!(slots.slabs.tunnel.len(), cap);
+        assert_eq!(slots.slabs.cipher.len(), 0);
+        assert_eq!(slots.slabs.engine.len(), cap);
+        assert_eq!(slots.slabs.files.len(), 0);
+    }
+
+    #[test]
+    fn a_tls_connection_takes_and_returns_the_ciphertext_slab() {
+        let mut acceptor = TlsAcceptor::new(CERT_DER, KEY_DER, 1).expect("acceptor builds");
+        let mut slots = opened(1);
+        let slot = slots.slot_mut(0).expect("slot");
+        slot.meta.tls = Some(Box::new(acceptor.admit().expect("slot available")));
+        assert!(slots.adopt_at(0, 0));
+
+        let taken = slots
+            .slot_mut(0)
+            .expect("slot")
+            .meta
+            .tls_cipher
+            .as_ref()
+            .expect("cipher slab")
+            .as_ptr() as usize;
+
+        slots.slot_mut(0).expect("slot").meta.quiet_turns = SLAB_QUIET_TURNS;
+        assert_eq!(slots.reclaim_idle(SLAB_HOLD_NS), 1);
+        assert!(slots.slot_mut(0).expect("slot").meta.tls_cipher.is_none());
+        assert_eq!(slots.slabs.cipher.len(), 1);
+
+        assert!(slots.adopt_at(0, SLAB_HOLD_NS));
+        let retaken = slots
+            .slot_mut(0)
+            .expect("slot")
+            .meta
+            .tls_cipher
+            .as_ref()
+            .expect("cipher slab")
+            .as_ptr() as usize;
+        assert_eq!(retaken, taken);
+    }
+
+    #[test]
+    fn closing_a_slot_returns_its_decoder_slab_and_the_next_accept_takes_it() {
+        let mut slots = opened(1);
+        let decoder = slots
+            .slot_mut(0)
+            .expect("slot")
+            .bufs
+            .decoder
+            .as_ref()
+            .expect("decoder")
+            .scratch_pointer();
+        slots.close(0);
+        assert_eq!(slots.slots.len(), MAX_H2_CONNS);
+        assert!(slots.slot_mut(0).is_none());
+        assert_eq!(slots.slabs.decoder.len(), 1);
+        assert_eq!(slots.slabs.engine.len(), 1);
+
+        let slot = slots.ensure(0).expect("slot");
+        slot.meta.occupied = true;
+        assert!(slots.adopt_at(0, 0));
+        assert_eq!(
+            slots
+                .slot_mut(0)
+                .expect("slot")
+                .bufs
+                .decoder
+                .as_ref()
+                .expect("decoder")
+                .scratch_pointer(),
+            decoder
+        );
     }
 }
