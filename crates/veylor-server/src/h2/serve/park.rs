@@ -12,6 +12,7 @@ use crate::h2::{H2HostCtx, STREAM_SLOTS, StepOutcome};
 pub(super) fn park_stream(
     ctx: H2HostCtx<'_>,
     routes: &FrozenRoutesView<'_>,
+    route_index: usize,
     stream: u32,
     request: ValidatedServerRequest<'_>,
     end: bool,
@@ -31,13 +32,11 @@ pub(super) fn park_stream(
         }
     };
     let path = request.path.unwrap_or(b"/");
-    let route_id = routes.find(request.method, path).map(|index| index as u64);
-    let route_token = routes
-        .find(request.method, path)
-        .map(|index| routes.token(index))
-        .unwrap_or(0);
-    let route_id = route_id.unwrap_or(u64::MAX);
-    let trailers = routes.managed_trailers(request.method, path);
+    // NOTE: the caller already selected this route, so the identity, token and trailer set
+    // come from that index instead of three more pattern scans.
+    let route_id = route_index as u64;
+    let route_token = routes.token(route_index);
+    let trailers = routes.trailers(route_index);
     let sub = (stream >> 1) as usize % STREAM_SLOTS;
     let base = ConnectionToken {
         stream_id: stream,

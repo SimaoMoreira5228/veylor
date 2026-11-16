@@ -10,6 +10,9 @@ mod h2_response;
 #[path = "h2_tests/batch_io.rs"]
 mod batch_io;
 
+#[path = "h2_tests/clean_close.rs"]
+mod clean_close;
+
 #[path = "h2_tests/closed_data.rs"]
 mod closed_data;
 

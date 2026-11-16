@@ -82,6 +82,15 @@ enum RouteSelection {
     Native(usize),
 }
 
+// NOTE: one selection per request, carrying the precedence H1 applies: a managed static
+// parks, a native dispatches, any other static serves its stored body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteTarget {
+    Managed(usize),
+    Native(usize),
+    Static(usize),
+}
+
 fn route_matches(pattern: &[u8], target: &[u8]) -> bool {
     matches_route(pattern, target)
 }
@@ -189,12 +198,66 @@ impl<'a> FrozenRoutesView<'a> {
         self.routes.get(index).map(|route| route.token).unwrap_or(0)
     }
 
-    pub(crate) fn find(&self, method: &[u8], path: &[u8]) -> Option<usize> {
-        let RouteSelection::Static(index) = self.select(method, path)? else {
-            return None;
-        };
+    pub(crate) fn target(&self, method: &[u8], path: &[u8], parks: bool) -> Option<RouteTarget> {
+        match self.select(method, path)? {
+            RouteSelection::Native(index) => Some(RouteTarget::Native(index)),
+            RouteSelection::Static(index) if self.routes[index].managed && parks => {
+                Some(RouteTarget::Managed(index))
+            }
+            RouteSelection::Static(index) => Some(self.static_target(method, index)),
+        }
+    }
 
-        Some(index)
+    // NOTE: H1 native-before-static parity: a HEAD request that matched a static pattern still
+    // dispatches a HEAD or GET native registered on that same pattern, and only then falls
+    // back to the stored body.
+    fn static_target(&self, method: &[u8], index: usize) -> RouteTarget {
+        if method == b"HEAD"
+            && let Some(native) = self.head_native(index)
+        {
+            return RouteTarget::Native(native);
+        }
+        if self.routes[index].managed {
+            RouteTarget::Managed(index)
+        } else {
+            RouteTarget::Static(index)
+        }
+    }
+
+    // NOTE: exact pattern equality, HEAD before GET, like the old lookup_native two-pass scan.
+    fn head_native(&self, route: usize) -> Option<usize> {
+        let pattern = self.routes.get(route)?.path;
+        let find = |method: &[u8]| {
+            self.natives
+                .iter()
+                .position(|native| native.method == method && native.path == pattern)
+        };
+        find(b"HEAD").or_else(|| find(b"GET"))
+    }
+
+    pub(crate) fn stored(&self, index: usize) -> Option<StaticContent<'a>> {
+        self.routes
+            .get(index)
+            .map(|route| (route.status, route.body, route.gzip_body))
+    }
+
+    pub(crate) fn body_limit(&self, index: usize) -> u64 {
+        self.routes
+            .get(index)
+            .map_or(0, |route| route.max_body_bytes)
+    }
+
+    pub(crate) fn native_route(
+        &self,
+        index: usize,
+    ) -> Option<(NativeHandler, usize, bool, &'a [u8])> {
+        self.natives
+            .get(index)
+            .map(|route| (route.handler, route.user_data, route.gzip, route.path))
+    }
+
+    pub(crate) fn trailers(&self, index: usize) -> &'a [Vec<u8>] {
+        self.routes.get(index).map_or(&[], |route| route.trailers)
     }
 
     fn select(&self, method: &[u8], path: &[u8]) -> Option<RouteSelection> {
@@ -231,15 +294,6 @@ impl<'a> FrozenRoutesView<'a> {
         selected.map(|(_, route)| route)
     }
 
-    pub(crate) fn managed_body_limit(&self, method: &[u8], path: &[u8]) -> Option<u64> {
-        let RouteSelection::Static(index) = self.select(method, path)? else {
-            return None;
-        };
-        let route = &self.routes[index];
-
-        route.managed.then_some(route.max_body_bytes)
-    }
-
     pub(crate) fn accepts_gzip<'b, 't, 'd, 'e>(
         fields: &[HpackHeader],
         server: &H2ServerDriver<'b, 't, 'd, 'e>,
@@ -254,44 +308,6 @@ impl<'a> FrozenRoutesView<'a> {
         }
 
         false
-    }
-
-    pub(crate) fn lookup(&self, method: &[u8], path: &[u8]) -> Option<StaticContent<'_>> {
-        self.find(method, path).map(|index| {
-            (
-                self.routes[index].status,
-                self.routes[index].body,
-                self.routes[index].gzip_body,
-            )
-        })
-    }
-
-    // NOTE: native-first dispatch like H1 (respond_to_head checks natives before statics):
-    // same HEAD-to-GET fallback as find, so a HEAD static never shadows a GET native.
-    pub(crate) fn lookup_native(
-        &self,
-        method: &[u8],
-        path: &[u8],
-    ) -> Option<(NativeHandler, usize, bool, &[u8])> {
-        let selected = match self.select(method, path)? {
-            RouteSelection::Static(index) => self.routes[index].path,
-            RouteSelection::Native(index) => self.natives[index].path,
-        };
-        let native = self
-            .natives
-            .iter()
-            .find(|route| route.method == method && route.path == selected)
-            .or_else(|| {
-                (method == b"HEAD")
-                    .then(|| {
-                        self.natives
-                            .iter()
-                            .find(|route| route.method == b"GET" && route.path == selected)
-                    })
-                    .flatten()
-            })?;
-
-        Some((native.handler, native.user_data, native.gzip, selected))
     }
 
     // NOTE: miss-only path scan, so hits return with no extra work: one bounded pass
@@ -397,27 +413,8 @@ impl<'a> FrozenRoutesView<'a> {
         join_allow_value(&methods[..count], out)
     }
 
-    pub(crate) fn is_managed(&self, method: &[u8], path: &[u8]) -> bool {
-        self.find(method, path)
-            .is_some_and(|index| self.routes[index].managed)
-    }
-
-    // NOTE: read-only allowlist for the park path: same match shape as find (exact then
-    // HEAD-to-GET), empty when the route is gone so trailer staging fails closed without
-    // disturbing the body path. Mirrors StaticRoutes::managed_trailers field for field.
-    pub(crate) fn managed_trailers(&self, method: &[u8], path: &[u8]) -> &[Vec<u8>] {
-        let found = self
-            .find(method, path)
-            .map(|index| &self.routes[index])
-            .filter(|route| route.managed);
-        match found {
-            Some(route) => route.trailers,
-            None => &[],
-        }
-    }
-
     // NOTE: longest-prefix file match over the mirrored mount entries: exact routes never
-    // land here (find skips file entries), so H1 precedence (statics and natives win, files
+    // land here (selection skips file entries), so H1 precedence (statics and natives win, files
     // serve table misses) carries over byte for byte.
     pub(crate) fn lookup_file_mount(&self, path: &[u8]) -> Option<(&'a [u8], &'a Path)> {
         self.routes
@@ -466,7 +463,7 @@ mod tests {
 
     use crate::static_routes::{NativeRequestView, NativeResponseOut};
 
-    use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView};
+    use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView, RouteTarget};
     use veylor_http1::{ALLOW_BYTES, ALLOW_METHODS, CONTENT_RANGE_BYTES, MULTIPART_CTYPE_BYTES};
 
     #[allow(unsafe_code)]
@@ -572,5 +569,178 @@ mod tests {
         assert_eq!(ALLOW_BYTES, 320);
         assert_eq!(CONTENT_RANGE_BYTES, 80);
         assert_eq!(MULTIPART_CTYPE_BYTES, 128);
+    }
+
+    fn target_rig() -> (Vec<FrozenRoute<'static>>, Vec<FrozenNativeRoute<'static>>) {
+        let routes = vec![
+            FrozenRoute {
+                method: b"GET",
+                path: b"/static",
+                token: 11,
+                status: 201,
+                body: b"stored",
+                gzip_body: None,
+                managed: false,
+                max_body_bytes: 0,
+                file_root: None,
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"GET",
+                path: b"/managed/:id",
+                token: 12,
+                status: 200,
+                body: b"",
+                gzip_body: None,
+                managed: true,
+                max_body_bytes: 4096,
+                file_root: None,
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"GET",
+                path: b"/files/",
+                token: 13,
+                status: 200,
+                body: b"",
+                gzip_body: None,
+                managed: false,
+                max_body_bytes: 0,
+                file_root: Some(std::path::Path::new("/tmp")),
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"POST",
+                path: b"/static",
+                token: 14,
+                status: 200,
+                body: b"posted",
+                gzip_body: None,
+                managed: false,
+                max_body_bytes: 0,
+                file_root: None,
+                trailers: &[],
+            },
+            FrozenRoute {
+                method: b"HEAD",
+                path: b"/x",
+                token: 15,
+                status: 200,
+                body: b"static-head",
+                gzip_body: None,
+                managed: false,
+                max_body_bytes: 0,
+                file_root: None,
+                trailers: &[],
+            },
+        ];
+        let natives = vec![
+            FrozenNativeRoute {
+                method: b"GET",
+                path: b"/native",
+                handler: probe,
+                user_data: 7,
+                gzip: true,
+            },
+            FrozenNativeRoute {
+                method: b"POST",
+                path: b"/native",
+                handler: probe,
+                user_data: 8,
+                gzip: false,
+            },
+            FrozenNativeRoute {
+                method: b"GET",
+                path: b"/x",
+                handler: probe,
+                user_data: 9,
+                gzip: false,
+            },
+        ];
+        (routes, natives)
+    }
+
+    fn target_view<'a>(
+        routes: &'a [FrozenRoute<'a>],
+        natives: &'a [FrozenNativeRoute<'a>],
+    ) -> FrozenRoutesView<'a> {
+        FrozenRoutesView::new(routes)
+            .expect("frozen routes")
+            .with_natives(natives)
+            .expect("natives")
+    }
+
+    #[test]
+    fn one_selection_names_the_kind_the_dispatch_order_uses() {
+        let (routes, natives) = target_rig();
+        let view = target_view(&routes, &natives);
+        let Some(RouteTarget::Static(index)) = view.target(b"GET", b"/static", true) else {
+            panic!("static winner");
+        };
+        assert_eq!(view.token(index), 11);
+        assert_eq!(view.stored(index), Some((201, b"stored".as_slice(), None)));
+
+        let Some(RouteTarget::Managed(index)) = view.target(b"GET", b"/managed/7?x=1", true) else {
+            panic!("managed winner");
+        };
+        assert_eq!(view.token(index), 12);
+        assert_eq!(view.body_limit(index), 4096);
+
+        let Some(RouteTarget::Native(index)) = view.target(b"GET", b"/native", true) else {
+            panic!("native winner");
+        };
+        assert_eq!(
+            view.native_route(index)
+                .map(|route| (route.1, route.2, route.3)),
+            Some((7, true, &b"/native"[..]))
+        );
+
+        let Some(RouteTarget::Native(index)) = view.target(b"POST", b"/native", true) else {
+            panic!("post native winner");
+        };
+        assert_eq!(view.native_route(index).map(|route| route.1), Some(8));
+    }
+
+    #[test]
+    fn a_head_request_targets_the_get_route_and_a_mount_never_targets() {
+        let (routes, natives) = target_rig();
+        let view = target_view(&routes, &natives);
+        let Some(RouteTarget::Static(index)) = view.target(b"HEAD", b"/static", true) else {
+            panic!("HEAD falls back to GET");
+        };
+        assert_eq!(view.token(index), 11);
+        assert_eq!(view.target(b"GET", b"/files/a.css", true), None);
+        assert_eq!(view.target(b"PUT", b"/static", true), None);
+        assert_eq!(view.target(b"GET", b"/missing", true), None);
+    }
+
+    #[test]
+    fn a_head_request_dispatches_the_get_native_on_a_static_pattern() {
+        let (routes, natives) = target_rig();
+        let view = target_view(&routes, &natives);
+        for parks in [true, false] {
+            let Some(RouteTarget::Native(index)) = view.target(b"HEAD", b"/x", parks) else {
+                panic!("the GET native wins the HEAD-to-static pattern");
+            };
+            assert_eq!(view.native_route(index).map(|route| route.1), Some(9));
+        }
+    }
+
+    #[test]
+    fn a_managed_winner_parks_only_when_the_turn_has_a_host() {
+        let (routes, natives) = target_rig();
+        let view = target_view(&routes, &natives);
+        assert_eq!(
+            view.target(b"GET", b"/managed/7", true),
+            Some(RouteTarget::Managed(1))
+        );
+        assert_eq!(
+            view.target(b"GET", b"/managed/7", false),
+            Some(RouteTarget::Managed(1))
+        );
+        assert_eq!(
+            view.target(b"HEAD", b"/managed/7", false),
+            Some(RouteTarget::Managed(1))
+        );
     }
 }

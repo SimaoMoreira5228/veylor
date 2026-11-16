@@ -96,6 +96,23 @@ fn flood_tripped(meta: &mut H2Meta, conn: Option<&H2Conn<'_>>, now_ns: u64) -> b
         || settings.saturating_sub(meta.flood_settings_base) > FLOOD_MAX_SETTINGS
 }
 
+// NOTE: a peer GOAWAY bars new streams, so a connection with none active and no staged
+// input has nothing left to read; waiting for the FIN behind the peer's last segment only
+// holds the slot until the idle deadline. A queued response keeps the slot for one more
+// turn, so the deferred pass flushes it and the close never truncates a response.
+fn goaway_idle(meta: &H2Meta, conn: Option<&H2Conn<'_>>) -> bool {
+    let Some(live) = conn else {
+        return false;
+    };
+    live.peer_goaway()
+        && live.active_streams() == 0
+        && !live.has_pending_responses()
+        && !live.has_file_transfers()
+        && live.staged_len() == 0
+        && !meta.pending_unflushed()
+        && !meta.tls_unflushed()
+}
+
 // NOTE: polite close (timeouts, drain-idle): stage GOAWAY, flush once, then close.
 fn goaway_close(
     meta: &mut H2Meta,
@@ -428,6 +445,21 @@ pub(crate) fn pump_slot(
             break;
         }
     }
+    // NOTE: half-close lands here with the response still deferred, so the close must be
+    // known before the flush, or the deferred pass would target a retired slot.
+    if eof && close_reason.is_none() {
+        close_reason = Some(ConnClose::PeerClosed);
+    }
+    if close_reason.is_none() && goaway_idle(meta, conn.as_ref()) {
+        return goaway_close(
+            meta,
+            conn,
+            stream_poller,
+            ConnClose::PeerClosed,
+            ErrorCode::NoError,
+            turn,
+        );
+    }
     // NOTE: closed means flush-then-close: staged bytes go best-effort before the FIN.
     // Flush failure reports transport truth; a blocked remainder drops with the slot.
     if meta.pending_unflushed() || meta.tls_unflushed() {
@@ -437,9 +469,6 @@ pub(crate) fn pump_slot(
         if let H2Flush::Closed(fatal) = flush_h2(meta, stream_poller, &mut turn.budget) {
             close_reason = Some(fatal);
         }
-    }
-    if eof && close_reason.is_none() {
-        close_reason = Some(ConnClose::PeerClosed);
     }
     if progressed {
         meta.note_progress(turn.now_ns);

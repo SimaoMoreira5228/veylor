@@ -14,7 +14,7 @@ use crate::static_routes::{
 use super::file::FileDecision;
 use super::pending::PendingResponses;
 use super::routes::{
-    FrozenRoutesView, MAX_REQUEST_TARGET_BYTES, NOT_FOUND_BODY, URI_TOO_LONG_BODY,
+    FrozenRoutesView, MAX_REQUEST_TARGET_BYTES, NOT_FOUND_BODY, RouteTarget, URI_TOO_LONG_BODY,
 };
 use super::send::{send_full, send_method_not_allowed, send_options};
 use super::{
@@ -182,6 +182,11 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     _ => return self.deny(stream, ErrorCode::RefusedStream, false),
                 };
                 let is_head = request.method == b"HEAD";
+                // NOTE: one route selection per request; the winner's kind is the dispatch
+                // order H1 uses (managed parks, native handles, static serves).
+                let target = self
+                    .routes
+                    .target(request.method, path, self.host.is_some());
                 if request.method == b"CONNECT" {
                     if request.protocol != Some(&b"websocket"[..]) {
                         return self.deny(stream, ErrorCode::RefusedStream, false);
@@ -192,12 +197,13 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     let Some(ctx) = self.host else {
                         return self.deny(stream, ErrorCode::RefusedStream, false);
                     };
-                    if !self.routes.is_managed(request.method, path) {
+                    let Some(RouteTarget::Managed(index)) = target else {
                         return self.deny(stream, ErrorCode::RefusedStream, false);
-                    }
+                    };
                     if park_stream(
                         ctx,
                         self.routes,
+                        index,
                         stream,
                         request,
                         end,
@@ -263,18 +269,14 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     }
                     return;
                 }
-                if self.routes.is_managed(request.method, path)
+                if let Some(RouteTarget::Managed(index)) = target
                     && let Some(ctx) = self.host
                 {
                     let declared = request.content_length;
                     if end && declared.unwrap_or(0) > 0 {
                         return self.deny(stream, ErrorCode::ProtocolError, false);
                     }
-                    let Some(body_limit) = self.routes.managed_body_limit(request.method, path)
-                    else {
-                        return self.deny(stream, ErrorCode::RefusedStream, false);
-                    };
-                    let body_limit = body_limit.min(H2_BODY_CAP);
+                    let body_limit = self.routes.body_limit(index).min(H2_BODY_CAP);
 
                     if declared.is_some_and(|length| length > body_limit) {
                         self.serve_managed_body_too_large(stream, is_head);
@@ -284,6 +286,7 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     if park_stream(
                         ctx,
                         self.routes,
+                        index,
                         stream,
                         request,
                         end,
@@ -297,8 +300,9 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                     }
                     return self.deny(stream, ErrorCode::RefusedStream, false);
                 }
-                if let Some((handler, user_data, gzip, pattern)) =
-                    self.routes.lookup_native(request.method, path)
+                if let Some(RouteTarget::Native(index)) = target
+                    && let Some((handler, user_data, gzip, pattern)) =
+                        self.routes.native_route(index)
                 {
                     let declared = request.content_length.unwrap_or(0);
                     let mut native_headers = [NativeHeader::EMPTY; MAX_NATIVE_HEADERS];
@@ -366,7 +370,12 @@ impl<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> Serve<'s, 'o, 'b, 't, 'd, 'e, 'h, 'u> {
                 // above, so this covers static, managed, and native kinds together. File
                 // entries never match the scan, so file 405 probes only after plan_file below
                 // reports Miss. Unknown paths fall through to the 404 tail untouched.
-                let found = self.routes.lookup(request.method, path);
+                let found = match target {
+                    Some(RouteTarget::Static(index) | RouteTarget::Managed(index)) => {
+                        self.routes.stored(index)
+                    }
+                    _ => None,
+                };
                 if found.is_none() {
                     let routes = self.routes;
                     if routes.has_path_match(path) {

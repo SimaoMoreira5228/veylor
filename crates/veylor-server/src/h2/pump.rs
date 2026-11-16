@@ -9,6 +9,15 @@ use super::{
 };
 
 impl<'a> H2Conn<'a> {
+    // NOTE: the only signal already on the wire that says the peer will not open another
+    // stream; reading it costs no syscall, unlike probing for the FIN it sends behind it.
+    pub(super) fn peer_goaway(&self) -> bool {
+        match &self.phase {
+            Phase::Serving(server) => server.driver().streams().goaway_received(),
+            _ => false,
+        }
+    }
+
     pub(super) fn step_inner(
         &mut self,
         output: &mut [u8],

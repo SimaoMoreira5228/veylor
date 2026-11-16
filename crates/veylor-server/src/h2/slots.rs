@@ -25,13 +25,19 @@ pub(crate) const H2_PENDING_CAP: usize = 65_536 + 512;
 pub(crate) const TLS_CIPHER_CAP: usize = 16_640;
 
 // NOTE: freed H2 slabs are kept per worker only up to this many of each kind; the rest go back
-// to the allocator, so a wave of idle connections cannot ratchet the process. Eight covers a
-// worker's whole wakeup edge; the engine and decoder classes make the cap cost about 4.5 MiB
-// per 16 workers of resident floor, which the 256-connection mark pays per connection.
+// to the allocator, so a wave of idle connections cannot ratchet the process. Eight stays the
+// ceiling and it is reached at half the worker's connection limit: one set per four live
+// connections, at least two. At the 256-connection mark a worker carries sixteen slots and
+// keeps four sets instead of eight, while the 512 mark and above keep today's cap and pay no
+// extra allocation churn on the ramp.
 pub(crate) const H2_SLAB_POOL_CAP: usize = 8;
+pub(crate) const H2_SLAB_POOL_MIN: usize = 2;
+pub(crate) const H2_CONNS_PER_SLAB_SET: usize = 4;
 
 // NOTE: one released H2 connection frees more than a hundred times the memory of one released
-// H1 connection, so any wave that is not a single trickle pays for the trim walk.
+// H1 connection, so any wave that is not a single trickle pays for the trim walk. A pool shrink
+// counts its dropped slabs in the same wave, for the same reason: they are the pass where the
+// pages actually leave the process.
 pub(crate) const H2_TRIM_MIN_RELEASED: usize = 4;
 
 // NOTE: the worker-local pool for everything an idle H2 connection does not need: the engine
@@ -62,6 +68,25 @@ impl H2Slabs {
             tunnel: BoundedPool::new(cap),
             cipher: BoundedPool::new(cap),
         }
+    }
+
+    // NOTE: the pool follows the worker's live connection count between passes: one set per
+    // four connections, at least two and at most the ceiling, so the cap stops moving at half
+    // the worker's connection limit. The floor holds even at zero connections, because that is
+    // the moment the next accept storm needs it: dropping the pool there turns every slab of
+    // the next wave into an allocation. Raising the cap needs no allocation here; the next
+    // release fills it. The return counts the slabs a shrink handed back, which the caller
+    // folds into the wave that decides the heap trim.
+    pub(crate) fn scale_to(&mut self, live: usize) -> usize {
+        let cap = (live / H2_CONNS_PER_SLAB_SET).clamp(H2_SLAB_POOL_MIN, H2_SLAB_POOL_CAP);
+        self.engine.trim_to(cap)
+            + self.decoder.trim_to(cap)
+            + self.files.trim_to(cap)
+            + self.staging.trim_to(cap)
+            + self.pending.trim_to(cap)
+            + self.file.trim_to(cap)
+            + self.tunnel.trim_to(cap)
+            + self.cipher.trim_to(cap)
     }
 
     // NOTE: installed together on the readiness edge that follows a release, so a step never
@@ -408,8 +433,12 @@ impl H2Slots {
 
     // NOTE: one pass per turn over at most MAX_H2_CONNS slots. A slot that never went quiet
     // pays one counter compare; the trim only runs on a wave whose worker has nothing left.
+    // The live count is read before the release wave so this pass already gives the excess
+    // away instead of filling a cap the worker no longer justifies.
     pub(crate) fn reclaim_idle(&mut self, now_ns: u64) -> usize {
+        let live = self.occupied();
         let H2Slots { slots, slabs, .. } = self;
+        let dropped = slabs.scale_to(live);
         let mut released = 0usize;
         for entry in slots.iter_mut() {
             let Some(slot) = entry.as_deref_mut() else {
@@ -432,8 +461,8 @@ impl H2Slots {
             .iter()
             .flatten()
             .any(|slot| slot.meta.occupied && slot.meta.wants_pump());
-        if released > 0 && !pending {
-            trim_released_pages(released, H2_TRIM_MIN_RELEASED);
+        if (released > 0 || dropped > 0) && !pending {
+            trim_released_pages(released + dropped, H2_TRIM_MIN_RELEASED);
         }
         released
     }
@@ -628,24 +657,67 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_stops_at_its_cap_and_drops_the_excess() {
-        let cap = 3;
-        let mut slots = H2Slots::new();
-        slots.slabs = H2Slabs::new(cap);
-        for index in 0..cap * 4 {
-            let slot = slots.ensure(index).expect("slot");
-            slot.meta.occupied = true;
-            assert!(slots.adopt_at(index, 0));
+    fn the_pool_cap_tracks_the_live_connection_count() {
+        let mut slabs = H2Slabs::new(H2_SLAB_POOL_CAP);
+        slabs.scale_to(0);
+        assert_eq!(slabs.pending.cap(), H2_SLAB_POOL_MIN);
+        assert_eq!(slabs.engine.cap(), H2_SLAB_POOL_MIN);
+        slabs.scale_to(1);
+        assert_eq!(slabs.pending.cap(), H2_SLAB_POOL_MIN);
+        slabs.scale_to(H2_CONNS_PER_SLAB_SET * 4);
+        assert_eq!(slabs.pending.cap(), 4);
+        assert_eq!(slabs.decoder.cap(), 4);
+        assert_eq!(slabs.cipher.cap(), 4);
+        slabs.scale_to(H2_CONNS_PER_SLAB_SET * 2);
+        assert_eq!(slabs.pending.cap(), H2_SLAB_POOL_MIN);
+        slabs.scale_to(MAX_H2_CONNS);
+        assert_eq!(slabs.pending.cap(), H2_SLAB_POOL_CAP);
+        slabs.scale_to(MAX_H2_CONNS * 2);
+        assert_eq!(slabs.pending.cap(), H2_SLAB_POOL_CAP);
+    }
+
+    #[test]
+    fn a_worker_below_the_ceiling_keeps_a_scaled_pool_and_reuses_it() {
+        let live = H2_CONNS_PER_SLAB_SET * 3;
+        let scaled = live / H2_CONNS_PER_SLAB_SET;
+        let mut slots = opened(live);
+        let released: Vec<(usize, usize, usize)> =
+            (0..live).map(|index| pointers(&mut slots, index)).collect();
+        for index in 0..live {
             slots.slot_mut(index).expect("slot").meta.quiet_turns = SLAB_QUIET_TURNS;
         }
-        assert_eq!(slots.reclaim_idle(SLAB_HOLD_NS), cap * 4);
-        assert_eq!(slots.slabs.pending.len(), cap);
-        assert_eq!(slots.slabs.staging.len(), cap);
-        assert_eq!(slots.slabs.file.len(), cap);
-        assert_eq!(slots.slabs.tunnel.len(), cap);
+        assert_eq!(slots.reclaim_idle(SLAB_HOLD_NS), live);
+        assert_eq!(slots.slabs.pending.len(), scaled);
+        assert_eq!(slots.slabs.staging.len(), scaled);
+        assert_eq!(slots.slabs.file.len(), scaled);
+        assert_eq!(slots.slabs.tunnel.len(), scaled);
+        assert_eq!(slots.slabs.engine.len(), scaled);
         assert_eq!(slots.slabs.cipher.len(), 0);
-        assert_eq!(slots.slabs.engine.len(), cap);
-        assert_eq!(slots.slabs.files.len(), 0);
+
+        assert!(slots.adopt_at(live - 1, SLAB_HOLD_NS));
+        assert!(released.contains(&pointers(&mut slots, live - 1)));
+    }
+
+    #[test]
+    fn an_empty_worker_keeps_the_warm_floor_and_drops_the_rest() {
+        let live = H2_CONNS_PER_SLAB_SET + 4;
+        let mut slots = opened(live);
+        for index in 0..live {
+            slots.slot_mut(index).expect("slot").meta.quiet_turns = SLAB_QUIET_TURNS;
+        }
+        assert_eq!(slots.reclaim_idle(SLAB_HOLD_NS), live);
+        for index in 0..live {
+            slots.close(index);
+        }
+        slots.reclaim_idle(SLAB_HOLD_NS);
+        assert_eq!(slots.slabs.pending.len(), H2_SLAB_POOL_MIN);
+        assert_eq!(slots.slabs.engine.len(), H2_SLAB_POOL_MIN);
+        assert_eq!(slots.slabs.decoder.len(), H2_SLAB_POOL_MIN);
+        assert_eq!(slots.slabs.pending.cap(), H2_SLAB_POOL_MIN);
+
+        let slot = slots.ensure(0).expect("slot");
+        slot.meta.occupied = true;
+        assert!(slots.adopt_at(0, 0));
     }
 
     #[test]

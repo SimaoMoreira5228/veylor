@@ -47,10 +47,30 @@ impl<T> BoundedPool<T> {
         self.free.push(slab);
     }
 
-    // NOTE: test-only probe: the H1 pool tests assert a class stopped at its cap.
+    // NOTE: a scaled owner lowers the cap between passes; the excess leaves the pool here,
+    // so the free list can never stay above a cap it has already shrunk past. Dropping the
+    // box is what returns the slab to the allocator; the count is the wave the caller uses
+    // to decide whether handing the pages back to the system is worth the walk.
+    pub(crate) fn trim_to(&mut self, cap: usize) -> usize {
+        self.cap = cap;
+        if self.free.len() <= cap {
+            return 0;
+        }
+        let dropped = self.free.len() - cap;
+        self.free.truncate(cap);
+        dropped
+    }
+
+    // NOTE: test-only probes: the pool tests assert a class stopped at a cap and that the
+    // owner can raise it again.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.free.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
     }
 }
 
@@ -276,6 +296,29 @@ mod tests {
         for conn in conns.iter() {
             assert!(conn.input.is_none());
         }
+    }
+
+    #[test]
+    fn a_bounded_pool_trims_to_a_lower_cap_and_refills_to_a_higher_one() {
+        let mut pool = BoundedPool::<[u8; 8]>::new(4);
+        for _ in 0..6 {
+            pool.give(Box::new([0; 8]));
+        }
+        assert_eq!(pool.len(), 4);
+
+        assert_eq!(pool.trim_to(2), 2);
+        assert_eq!(pool.len(), 2);
+        pool.give(Box::new([0; 8]));
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.trim_to(2), 0);
+
+        pool.trim_to(4);
+        pool.give(Box::new([0; 8]));
+        assert_eq!(pool.len(), 3);
+
+        assert_eq!(pool.trim_to(0), 3);
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.cap(), 0);
     }
 
     #[test]
