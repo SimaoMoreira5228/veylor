@@ -83,6 +83,10 @@ impl<'a> H2Conn<'a> {
         }
 
         let output_len = output.len();
+        let scratch: &mut [u8] = match self.file_scratch.as_deref_mut() {
+            Some(scratch) => &mut scratch[..],
+            None => &mut [],
+        };
         let mut serve = serve::Serve {
             server,
             headers: &*self.headers,
@@ -95,7 +99,7 @@ impl<'a> H2Conn<'a> {
             outcome: &mut outcome,
             pending: &mut self.pending_responses,
             files: &mut self.file_transfers,
-            scratch: &mut self.file_scratch[..],
+            scratch,
         };
         let mut served_events = 0;
         for event in events.iter().take(event_len).flatten() {
@@ -175,8 +179,12 @@ impl<'a> H2Conn<'a> {
             .max_frame_size;
         let mut actions: [Option<H2FrameAction<'_>>; MAX_STREAMS_PER_STEP] =
             [None; MAX_STREAMS_PER_STEP];
+        let input: &[u8] = match self.staging.as_deref() {
+            Some(staging) => &staging[..self.staged],
+            None => &[],
+        };
         let result = handshake.feed(
-            &self.staging[..self.staged],
+            input,
             &mut output[*used..],
             &mut actions,
             &mut *self.headers,
@@ -202,7 +210,9 @@ impl<'a> H2Conn<'a> {
             self.fail(ErrorCode::InternalError, output, used, outcome);
             return false;
         }
-        consume(&mut *self.staging, &mut self.staged, result.consumed);
+        if let Some(staging) = self.staging.as_deref_mut() {
+            consume(staging, &mut self.staged, result.consumed);
+        }
         if full || (result.consumed > 0 && self.staged > 0) {
             outcome.pending = true;
         }
@@ -238,14 +248,18 @@ impl<'a> H2Conn<'a> {
         let max = server.driver().streams().remote_settings().max_frame_size;
         let mut actions: [Option<H2FrameAction<'_>>; MAX_STREAMS_PER_STEP] =
             [None; MAX_STREAMS_PER_STEP];
-        let result = server.driver_mut().feed(
-            &self.staging[..self.staged],
-            &mut actions,
-            &mut *self.headers,
-        );
+        let input: &[u8] = match self.staging.as_deref() {
+            Some(staging) => &staging[..self.staged],
+            None => &[],
+        };
+        let result = server
+            .driver_mut()
+            .feed(input, &mut actions, &mut *self.headers);
         if result.status == FeedStatus::ConnectionFailed {
             let code = result.error.unwrap_or(ErrorCode::InternalError);
-            consume(&mut *self.staging, &mut self.staged, result.consumed);
+            if let Some(staging) = self.staging.as_deref_mut() {
+                consume(staging, &mut self.staged, result.consumed);
+            }
             self.fail(code, output, used, outcome);
             return false;
         }
@@ -262,7 +276,9 @@ impl<'a> H2Conn<'a> {
             self.fail(ErrorCode::InternalError, output, used, outcome);
             return false;
         }
-        consume(&mut *self.staging, &mut self.staged, result.consumed);
+        if let Some(staging) = self.staging.as_deref_mut() {
+            consume(staging, &mut self.staged, result.consumed);
+        }
         if full || (result.consumed > 0 && self.staged > 0) {
             outcome.pending = true;
         }

@@ -504,3 +504,78 @@ fn client_reads_response_trailers() {
     drop(client);
     running.join().expect("join h3 server");
 }
+
+#[test]
+fn writes_large_body_and_extra_headers() {
+    let (cert, key) = identity();
+    let server = Server::bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Config {
+            tls: Tls::new(vec![cert.clone()], key),
+            limits: Limits::default(),
+            runtime_threads: 2,
+        },
+    );
+    let running = server
+        .start(|_: http::Request<()>, _: bytes::Bytes| {
+            http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("cache-control", "no-store")
+                .header("x-large", "yes")
+                .header("x-padding-one", "aaaaaaaaaaaaaaaa")
+                .header("x-padding-two", "bbbbbbbbbbbbbbbb")
+                .body(veylor_h3::Body::Bytes(veylor_h3::Bytes::from(vec![
+                    0x61_u8;
+                    20 * 1024
+                ])))
+                .expect("response")
+        })
+        .expect("start h3 server");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("client runtime");
+    runtime.block_on(async {
+        let (endpoint, config) = client_endpoint(cert);
+        let connection = endpoint
+            .connect_with(config, running.address(), "localhost")
+            .expect("connect")
+            .await
+            .expect("handshake");
+        let (mut driver, mut client) = h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .expect("h3 client");
+        let driver = tokio::spawn(async move { driver.wait_idle().await });
+
+        for _ in 0..2 {
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://localhost/large")
+                .body(())
+                .expect("request");
+            let mut stream = client.send_request(request).await.expect("send");
+            stream.finish().await.expect("finish");
+            let response = stream.recv_response().await.expect("response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-large")
+                    .and_then(|value| value.to_str().ok()),
+                Some("yes")
+            );
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.recv_data().await.expect("data") {
+                body.extend_from_slice(chunk.chunk());
+            }
+            assert_eq!(body.len(), 20 * 1024);
+            assert!(body.iter().all(|byte| *byte == b'a'));
+        }
+
+        endpoint.close(quinn::VarInt::from_u32(0), b"done");
+        let _ = driver.await;
+    });
+
+    running.join().expect("join h3 server");
+}

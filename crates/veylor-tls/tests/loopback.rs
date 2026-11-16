@@ -2,8 +2,8 @@ use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
 use veylor_tls::{
-    MAX_TLS_CONN_BYTES, TlsAcceptor, TlsConn, TlsError, alpn, drain_plaintext, feed_ciphertext,
-    negotiated_version,
+    MAX_TLS_CONN_BYTES, TlsAcceptor, TlsConn, TlsError, WireIo, alpn, decrypt_from,
+    drain_plaintext, feed_ciphertext, negotiated_version,
 };
 
 const CERT_DER: &[u8] = include_bytes!("testdata/server_cert.der");
@@ -295,6 +295,56 @@ fn round_trip_ten_kibibytes_byte_identical() {
     assert!(
         server.bytes_decrypted() > 0 && server.bytes_decrypted() < MAX_WIRE_BYTES,
         "decrypted counter is nonzero and bounded"
+    );
+}
+
+#[test]
+fn decrypt_from_delivers_one_record_across_short_slices() {
+    let mut acceptor = TlsAcceptor::new(CERT_DER, KEY_DER, 8).expect("acceptor builds");
+
+    let mut server = acceptor.admit().expect("slot available");
+
+    let config = client_config();
+    let mut client = client_conn(&config);
+
+    let mut c2s = Vec::new();
+    let mut s2c = Vec::new();
+
+    handshake(&mut server, &mut client, &mut c2s, &mut s2c);
+
+    let request = pattern(1000, 0x11);
+
+    client
+        .writer()
+        .write_all(&request)
+        .expect("client queues request");
+
+    client.write_tls(&mut c2s).expect("client emits request");
+
+    let mut cursor: &[u8] = &c2s;
+    let mut slice = [0u8; 100];
+    let mut wire = 0usize;
+    let mut got = Vec::new();
+
+    while got.len() < request.len() {
+        match decrypt_from(&mut server, &mut cursor, &mut slice).expect("decrypt succeeds") {
+            WireIo::Progress { wire: read, plain } => {
+                wire += read;
+                got.extend_from_slice(&slice[..plain]);
+            }
+            WireIo::WouldBlock => panic!("a queued record must not block"),
+            WireIo::Eof => panic!("peer did not close"),
+        }
+    }
+
+    assert_eq!(got, request, "short slices reassemble the record in order");
+
+    assert_eq!(wire, c2s.len(), "every ciphertext byte is consumed once");
+
+    assert_eq!(
+        server.bytes_decrypted(),
+        request.len() as u64,
+        "decrypted counter matches the delivered bytes"
     );
 }
 

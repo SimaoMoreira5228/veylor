@@ -463,6 +463,8 @@ pub(crate) fn reuse_keep_alive(conn: &mut ConnState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::SlabPool;
+    use crate::connection::slabs::{SLAB_HOLD_NS, SLAB_POOL_CAP};
     use veylor_router::RouteSlot;
     use veylor_runtime::{ConnectionToken, TcpStream};
 
@@ -576,5 +578,102 @@ mod tests {
             assert_eq!(conn.headers.as_ref().map(|slab| slab.as_ptr()), headers_ptr);
             assert_eq!(conn.output.as_ref().map(|slab| slab.as_ptr()), output_ptr);
         }
+    }
+
+    fn serve_one(
+        conn: &mut ConnState,
+        routes: &StaticRoutes,
+        table: &RouteTable<'_, '_>,
+        host: &HostShared,
+    ) -> usize {
+        let request = b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+        let input = ConnState::materialize_input(&mut conn.input);
+        input[..request.len()].copy_from_slice(request);
+        conn.len = request.len();
+        conn.read_ready = true;
+        match parse_exchange(conn, routes, table, 0, host, false) {
+            ExchangeOutcome::Responded => {}
+            ExchangeOutcome::NeedMore => panic!("full head must parse"),
+            ExchangeOutcome::Parked => panic!("no managed routes registered"),
+            ExchangeOutcome::Close(_) => panic!("unknown path must encode, not close"),
+        }
+        let encoded = conn.out_len;
+        conn.out_sent = conn.out_len;
+        reuse_keep_alive(conn);
+        encoded
+    }
+
+    #[test]
+    fn idle_release_hands_the_same_slabs_to_the_next_exchange() {
+        let mut conn = test_conn();
+        let routes = StaticRoutes::new();
+        let mut slots = [RouteSlot::EMPTY; 8];
+        let table = routes.build_table(&mut slots).expect("empty table");
+        let host = HostShared::new(1);
+        let mut pool = SlabPool::new(SLAB_POOL_CAP);
+
+        pool.adopt(&mut conn, 0);
+        assert!(serve_one(&mut conn, &routes, &table, &host) > 0);
+        let input_ptr = conn.input.as_ref().map(|slab| slab.as_ptr());
+        let headers_ptr = conn.headers.as_ref().map(|slab| slab.as_ptr());
+        let output_ptr = conn.output.as_ref().map(|slab| slab.as_ptr());
+        assert!(conn.is_idle());
+        assert!(!conn.slab_release_due(SLAB_HOLD_NS));
+
+        conn.note_activity(0, SLAB_HOLD_NS);
+        assert!(!conn.slab_release_due(SLAB_HOLD_NS));
+        conn.note_activity(0, SLAB_HOLD_NS);
+        assert!(conn.slab_release_due(SLAB_HOLD_NS));
+
+        assert!(pool.release(&mut conn));
+        assert!(conn.input.is_none());
+        assert!(conn.output.is_none());
+        assert!(conn.headers.is_none());
+
+        assert!(pool.adopt(&mut conn, SLAB_HOLD_NS * 2));
+        assert_eq!(conn.input.as_ref().map(|slab| slab.as_ptr()), input_ptr);
+        assert_eq!(conn.headers.as_ref().map(|slab| slab.as_ptr()), headers_ptr);
+        assert_eq!(conn.output.as_ref().map(|slab| slab.as_ptr()), output_ptr);
+
+        assert!(serve_one(&mut conn, &routes, &table, &host) > 0);
+        assert!(conn.is_idle());
+    }
+
+    #[test]
+    fn a_connection_that_keeps_moving_is_never_due() {
+        let mut conn = test_conn();
+        let mut pool = SlabPool::new(SLAB_POOL_CAP);
+        pool.adopt(&mut conn, 0);
+        for turn in 0..64u64 {
+            let now_ns = turn * SLAB_HOLD_NS;
+            conn.note_activity(1, now_ns);
+            assert!(!conn.slab_release_due(now_ns));
+            assert!(!conn.slab_release_ready(now_ns));
+        }
+        assert!(conn.holds_slabs());
+    }
+
+    #[test]
+    fn a_pending_response_is_never_released() {
+        let mut conn = test_conn();
+        let routes = StaticRoutes::new();
+        let mut slots = [RouteSlot::EMPTY; 8];
+        let table = routes.build_table(&mut slots).expect("empty table");
+        let host = HostShared::new(1);
+        let mut pool = SlabPool::new(SLAB_POOL_CAP);
+        pool.adopt(&mut conn, 0);
+        let request = b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+        let input = ConnState::materialize_input(&mut conn.input);
+        input[..request.len()].copy_from_slice(request);
+        conn.len = request.len();
+        conn.read_ready = true;
+        match parse_exchange(&mut conn, &routes, &table, 0, &host, false) {
+            ExchangeOutcome::Responded => {}
+            _ => panic!("head must respond"),
+        }
+        assert!(conn.has_pending_output());
+        assert!(!conn.slab_release_ready(SLAB_HOLD_NS * 4));
+        conn.note_activity(0, SLAB_HOLD_NS * 4);
+        assert!(!conn.slab_release_due(SLAB_HOLD_NS * 4));
     }
 }

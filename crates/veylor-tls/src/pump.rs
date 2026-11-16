@@ -1,17 +1,57 @@
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read, Write as _};
 
 use crate::{TlsConn, TlsError};
 
-// NOTE: plaintext drain quantum per pump turn: bounded so one connection cannot
-// monopolize the worker on a large TLS record run; the remainder waits for the next turn.
-const DRAIN_CHUNK: usize = 4096;
+// NOTE: one transport read outcome for the plaintext side. `Progress` may carry wire bytes
+// without plaintext (a partial record); `WouldBlock` means the transport had nothing.
+pub enum WireIo {
+    Progress { wire: usize, plain: usize },
+    WouldBlock,
+    Eof,
+}
+
+pub fn decrypt_from<R: Read>(
+    conn: &mut TlsConn,
+    reader: &mut R,
+    plain_out: &mut [u8],
+) -> Result<WireIo, TlsError> {
+    let mut filled = 0;
+
+    exchange(conn, reader, |chunk| {
+        let take = chunk.len().min(plain_out.len() - filled);
+
+        plain_out[filled..filled + take].copy_from_slice(&chunk[..take]);
+
+        filled += take;
+
+        take
+    })
+}
+
+pub fn decrypt_from_vec<R: Read>(
+    conn: &mut TlsConn,
+    reader: &mut R,
+    plain_out: &mut Vec<u8>,
+) -> Result<WireIo, TlsError> {
+    exchange(conn, reader, |chunk| {
+        plain_out.extend_from_slice(chunk);
+
+        chunk.len()
+    })
+}
 
 pub fn feed_ciphertext(
     conn: &mut TlsConn,
     input: &[u8],
     plain_out: &mut Vec<u8>,
 ) -> Result<usize, TlsError> {
-    drain_reader(conn, plain_out)?;
+    let mut take = |chunk: &[u8]| {
+        plain_out.extend_from_slice(chunk);
+
+        chunk.len()
+    };
+
+    pump_plain(conn, &mut take)?;
 
     let mut cursor: &[u8] = input;
 
@@ -24,7 +64,7 @@ pub fn feed_ciphertext(
 
         conn.inner.process_new_packets()?;
 
-        drain_reader(conn, plain_out)?;
+        pump_plain(conn, &mut take)?;
     }
 
     Ok(input.len() - cursor.len())
@@ -82,26 +122,88 @@ pub fn flush_ciphertext(conn: &mut TlsConn, out: &mut Vec<u8>) -> Result<(), Tls
     Ok(())
 }
 
-fn drain_reader(conn: &mut TlsConn, plain_out: &mut Vec<u8>) -> Result<(), TlsError> {
-    let mut chunk = [0u8; DRAIN_CHUNK];
+// NOTE: pull pending plaintext first so a caller that passed a small slice keeps the rest
+// queued in the provider rather than reading past what it can deliver this turn.
+fn exchange<R: Read>(
+    conn: &mut TlsConn,
+    reader: &mut R,
+    mut put: impl FnMut(&[u8]) -> usize,
+) -> Result<WireIo, TlsError> {
+    let pending = pump_plain(conn, &mut put)?;
+
+    if pending > 0 {
+        return Ok(WireIo::Progress {
+            wire: 0,
+            plain: pending,
+        });
+    }
+
+    let wire = match read_wire(conn, reader) {
+        Ok(0) => return Ok(WireIo::Eof),
+        Ok(wire) => wire,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            return Ok(WireIo::WouldBlock);
+        }
+        Err(error) => return Err(TlsError::Io(error)),
+    };
+
+    conn.inner.process_new_packets()?;
+
+    let plain = pump_plain(conn, &mut put)?;
+
+    Ok(WireIo::Progress { wire, plain })
+}
+
+fn read_wire<R: Read>(conn: &mut TlsConn, reader: &mut R) -> std::io::Result<usize> {
+    let mut attempts = 0;
 
     loop {
-        match conn.inner.reader().read(&mut chunk) {
-            Ok(0) => {
-                conn.peer_closed = true;
-
-                return Ok(());
+        match conn.inner.read_tls(reader) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted && attempts < 2 => {
+                attempts += 1;
             }
-
-            Ok(n) => {
-                plain_out.extend_from_slice(&chunk[..n]);
-
-                conn.bytes_decrypted += n as u64;
-            }
-
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-
-            Err(e) => return Err(TlsError::Io(e)),
+            Err(error) => return Err(error),
         }
     }
+}
+
+// NOTE: the provider hands out decrypted bytes as a borrowed chunk; copying that chunk
+// straight to the destination keeps one plaintext copy per record instead of three.
+fn pump_plain(conn: &mut TlsConn, put: &mut impl FnMut(&[u8]) -> usize) -> Result<usize, TlsError> {
+    let mut taken = 0;
+
+    loop {
+        let used = {
+            let mut reader = conn.inner.reader();
+
+            let chunk = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(TlsError::Io(error)),
+            };
+
+            if chunk.is_empty() {
+                conn.peer_closed = true;
+
+                break;
+            }
+
+            put(chunk)
+        };
+
+        if used == 0 {
+            break;
+        }
+
+        conn.inner.reader().consume(used);
+
+        conn.bytes_decrypted += used as u64;
+        taken += used;
+    }
+
+    Ok(taken)
 }

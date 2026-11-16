@@ -60,6 +60,31 @@ pub(crate) async fn read_frame(
     Ok(Some((kind, payload)))
 }
 
+// PERF: the request path takes one HEADERS, one or more DATA frames and an optional
+// trailer HEADERS per request. Allocating the payload for each one is the largest
+// single source of allocator traffic on a saturating connection, so the caller owns
+// the buffer and this variant refills it.
+pub(crate) async fn read_frame_into(
+    recv: &mut RecvStream,
+    limit: usize,
+    payload: &mut Vec<u8>,
+) -> Result<Option<u64>, ()> {
+    let Some(kind) = read_varint(recv).await? else {
+        return Ok(None);
+    };
+    let Some(length) = read_varint(recv).await? else {
+        return Ok(None);
+    };
+    let length = usize::try_from(length).map_err(|_| ())?;
+    if length > limit {
+        return Err(());
+    }
+    payload.clear();
+    payload.resize(length, 0);
+    recv.read_exact(payload).await.map_err(|_| ())?;
+    Ok(Some(kind))
+}
+
 pub(crate) async fn discard(recv: &mut RecvStream, length: usize) -> Result<(), ()> {
     let mut scratch = [0u8; 1024];
     let mut remaining = length;

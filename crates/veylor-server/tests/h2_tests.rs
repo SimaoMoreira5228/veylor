@@ -25,6 +25,9 @@ mod gzip_responses;
 #[path = "h2_tests/host_events.rs"]
 mod host_events;
 
+#[path = "h2_tests/idle_slabs.rs"]
+mod idle_slabs;
+
 #[path = "h2_tests/managed_parking.rs"]
 mod managed_parking;
 

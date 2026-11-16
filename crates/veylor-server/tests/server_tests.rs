@@ -1,6 +1,9 @@
 #[path = "server_tests/h1_peer.rs"]
 mod h1_peer;
 
+#[path = "server_tests/idle_slabs.rs"]
+mod idle_slabs;
+
 #[path = "server_tests/file_conditional.rs"]
 mod file_conditional;
 

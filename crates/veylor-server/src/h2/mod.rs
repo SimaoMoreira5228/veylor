@@ -17,6 +17,7 @@ pub(crate) mod turn;
 // writes), step owns the staged step draining one queued host command, slots owns
 // the per-worker slot table, flush owns socket flush pacing, and file owns
 // file-mount assembly (range planning, HEADERS emit, DATA pump).
+mod accept;
 mod batch;
 mod file;
 mod flush;
@@ -150,7 +151,10 @@ impl<'a> Phase<'a> {
 }
 
 pub struct H2Conn<'a> {
-    staging: &'a mut [u8],
+    // NOTE: transport slabs are optional so an idle connection can give them back to its
+    // worker pool. Present always covers `staged`/the step window: an absent slab is an empty
+    // window and every miss path heals to idle or fails closed, never panics.
+    pub(crate) staging: Option<Box<[u8; INPUT_STAGING_CAP]>>,
     staged: usize,
     headers: &'a mut [HpackHeader],
     pub(crate) phase: Phase<'a>,
@@ -163,8 +167,8 @@ pub struct H2Conn<'a> {
     pending_events: [Option<StreamEvent>; MAX_STREAMS_PER_STEP],
     pending_event_len: usize,
     file_transfers: Box<[Option<H2FileTransfer>; STREAM_SLOTS]>,
-    file_scratch: Box<[u8; crate::connection::OUTPUT_CAP]>,
-    tunnel_scratch: Box<[u8; TUNNEL_STEP]>,
+    pub(crate) file_scratch: Option<Box<[u8; crate::connection::OUTPUT_CAP]>>,
+    pub(crate) tunnel_scratch: Option<Box<[u8; TUNNEL_STEP]>>,
 }
 
 impl<'a> H2Conn<'a> {
@@ -172,7 +176,6 @@ impl<'a> H2Conn<'a> {
         streams: &'a mut StreamTable<'a>,
         decoder: &'a mut HpackTable<'a>,
         encoder: &'a mut HpackTable<'a>,
-        staging: &'a mut [u8],
         ack_limits: &'a mut [u32],
         headers: &'a mut [HpackHeader],
     ) -> Self {
@@ -188,7 +191,7 @@ impl<'a> H2Conn<'a> {
         };
         let terminal = matches!(phase, Phase::Dead);
         Self {
-            staging,
+            staging: None,
             staged: 0,
             headers,
             phase,
@@ -198,8 +201,8 @@ impl<'a> H2Conn<'a> {
             pending_events: [None; MAX_STREAMS_PER_STEP],
             pending_event_len: 0,
             file_transfers: Box::new(std::array::from_fn(|_| None)),
-            file_scratch: Box::new([0; crate::connection::OUTPUT_CAP]),
-            tunnel_scratch: Box::new([0; TUNNEL_STEP]),
+            file_scratch: None,
+            tunnel_scratch: None,
         }
     }
 
@@ -217,11 +220,15 @@ impl<'a> H2Conn<'a> {
         if self.terminal {
             return Err(PushError::Closed);
         }
-        if bytes.len() > self.staging.len() - self.staged {
+        let Some(staging) = self.staging.as_deref_mut() else {
+            self.terminal = true;
+            return Err(PushError::Overflow);
+        };
+        if bytes.len() > staging.len() - self.staged {
             self.terminal = true;
             return Err(PushError::Overflow);
         }
-        self.staging[self.staged..self.staged + bytes.len()].copy_from_slice(bytes);
+        staging[self.staged..self.staged + bytes.len()].copy_from_slice(bytes);
         self.staged += bytes.len();
         Ok(())
     }
@@ -236,6 +243,30 @@ impl<'a> H2Conn<'a> {
 
     pub const fn staged_len(&self) -> usize {
         self.staged
+    }
+
+    pub(crate) fn holds_slabs(&self) -> bool {
+        self.staging.is_some() || self.file_scratch.is_some() || self.tunnel_scratch.is_some()
+    }
+
+    // NOTE: staged input rides the staging slab, so only an empty staging window may move it.
+    pub(crate) fn take_staging(&mut self) -> Option<Box<[u8; INPUT_STAGING_CAP]>> {
+        if self.staged > 0 {
+            return None;
+        }
+        self.staging.take()
+    }
+
+    pub(crate) fn active_streams(&self) -> usize {
+        match &self.phase {
+            Phase::Handshake(handshake) => handshake.server().driver().streams().active_count(),
+            Phase::Serving(server) => server.driver().streams().active_count(),
+            Phase::Dead => 0,
+        }
+    }
+
+    pub(crate) fn has_file_transfers(&self) -> bool {
+        self.file_transfers.iter().any(Option::is_some)
     }
 
     pub fn set_response_write_clock(&mut self, now_ns: u64, timeout_ns: u64) {
@@ -255,14 +286,25 @@ impl<'a> H2Conn<'a> {
     }
 
     pub fn spare_mut(&mut self) -> &mut [u8] {
-        &mut self.staging[self.staged..]
+        match self.staging.as_deref_mut() {
+            Some(staging) => &mut staging[self.staged..],
+            None => &mut [],
+        }
+    }
+
+    pub fn install_staging(&mut self, staging: Box<[u8; INPUT_STAGING_CAP]>) {
+        self.staging = Some(staging);
     }
 
     pub fn commit_staged(&mut self, count: usize) {
         if self.terminal {
             return;
         }
-        self.staged = (self.staged + count).min(self.staging.len());
+        let capacity = match self.staging.as_deref() {
+            Some(staging) => staging.len(),
+            None => 0,
+        };
+        self.staged = (self.staged + count).min(capacity);
     }
 
     pub fn drain(&mut self, output: &mut [u8]) -> StepOutcome {

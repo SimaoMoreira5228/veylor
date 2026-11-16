@@ -7,6 +7,7 @@ use veylor_tls::TlsConn;
 #[cfg(target_os = "linux")]
 use super::file::FdCache;
 use super::file::FileTransfer;
+use super::slabs::{SLAB_HOLD_NS, SLAB_QUIET_TURNS};
 use super::{HEADER_SLOTS, INPUT_CAP, OUTPUT_CAP};
 use crate::host::HOST_MAX_METHOD_BYTES;
 
@@ -95,6 +96,8 @@ pub struct ConnState {
     pub(crate) tls_pending: Vec<u8>,
     pub(crate) tls_pending_sent: usize,
     pub(crate) tls_plain: Vec<u8>,
+    pub(crate) last_active_ns: u64,
+    pub(crate) quiet_turns: u8,
 }
 
 impl ConnState {
@@ -140,6 +143,8 @@ impl ConnState {
             tls_pending: Vec::new(),
             tls_pending_sent: 0,
             tls_plain: Vec::new(),
+            last_active_ns: 0,
+            quiet_turns: 0,
         }
     }
 
@@ -151,6 +156,13 @@ impl ConnState {
 
     pub(crate) fn attach_tls(&mut self, tls: TlsConn) {
         self.tls = Some(Box::new(tls));
+        self.reserve_tls_scratch();
+    }
+
+    pub(crate) fn reserve_tls_scratch(&mut self) {
+        if self.tls.is_none() {
+            return;
+        }
 
         if self.tls_pending.capacity() < TLS_PENDING_MIN_BYTES {
             self.tls_pending
@@ -161,6 +173,16 @@ impl ConnState {
             self.tls_plain
                 .reserve(INPUT_CAP - self.tls_plain.capacity());
         }
+    }
+
+    pub(crate) fn drop_tls_scratch(&mut self) {
+        if self.tls.is_none() {
+            return;
+        }
+
+        self.tls_pending = Vec::new();
+        self.tls_pending_sent = 0;
+        self.tls_plain = Vec::new();
     }
 
     pub(crate) fn has_tls(&self) -> bool {
@@ -205,6 +227,52 @@ impl ConnState {
 
     pub fn is_parked(&self) -> bool {
         matches!(self.phase, ConnPhase::Parked { .. })
+    }
+
+    pub(crate) fn holds_slabs(&self) -> bool {
+        self.input.is_some() || self.output.is_some() || self.headers.is_some()
+    }
+
+    // NOTE: waiting with slabs and nothing to do: no buffered head, no staged response, no
+    // armed read claim to use the input slab. Only such a connection can give slabs back.
+    pub(crate) fn slab_idle(&self) -> bool {
+        self.is_idle() && !self.read_ready
+    }
+
+    // NOTE: gate for the reclaim pass in the turn loop: a worker that has nothing to do stops
+    // sweeping, so turns stop accruing and silence is the only clock left.
+    pub(crate) fn slab_release_ready(&self, now_ns: u64) -> bool {
+        self.slab_idle() && now_ns.saturating_sub(self.last_active_ns) >= SLAB_HOLD_NS
+    }
+
+    // NOTE: gate for the sweep, which runs while other connections keep the worker busy: a
+    // pipelined request is parsed in the same turn it is read, so two idle sweeps really are
+    // silence rather than a gap between exchanges.
+    pub(crate) fn slab_release_due(&self, now_ns: u64) -> bool {
+        self.quiet_turns >= SLAB_QUIET_TURNS && self.slab_release_ready(now_ns)
+    }
+
+    pub(crate) fn slab_release_at(&self) -> u64 {
+        self.last_active_ns.saturating_add(SLAB_HOLD_NS)
+    }
+
+    pub(crate) fn note_activity(&mut self, moved: u64, now_ns: u64) {
+        if moved > 0 || !self.is_idle() {
+            self.last_active_ns = now_ns;
+            self.quiet_turns = 0;
+            return;
+        }
+
+        self.quiet_turns = self.quiet_turns.saturating_add(1);
+    }
+
+    pub(crate) fn note_slab_adopt(&mut self, now_ns: u64) {
+        self.last_active_ns = now_ns;
+        self.quiet_turns = 0;
+    }
+
+    pub(crate) fn note_slab_release(&mut self) {
+        self.quiet_turns = 0;
     }
 
     pub fn begin_drain(&mut self) {

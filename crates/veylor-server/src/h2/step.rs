@@ -192,8 +192,8 @@ pub(crate) fn apply_h2_streams(
             tunnel_scratch,
             ..
         } = &mut *live;
-        if let Phase::Serving(server) = phase {
-            progressed = tunnel_step(meta, server, host, turn.worker_id, base, tunnel_scratch);
+        if let (Phase::Serving(server), Some(scratch)) = (phase, tunnel_scratch.as_deref_mut()) {
+            progressed = tunnel_step(meta, server, host, turn.worker_id, base, scratch);
         }
     }
     let peek = host.with_inner(|inner| {

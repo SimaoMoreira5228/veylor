@@ -1,10 +1,10 @@
 use std::io::{self, Read, Write};
 
 use crate::{
-    TlsConn, TlsError, drain_plaintext, feed_ciphertext, flush_ciphertext, queue_close_notify,
+    TlsConn, TlsError, WireIo, decrypt_from_vec, drain_plaintext, flush_ciphertext,
+    queue_close_notify,
 };
 
-const WIRE_CHUNK: usize = 16 * 1024;
 const WRITE_CHUNK: usize = 16 * 1024;
 
 // NOTE: blocking adapter for tests, tools and small clients; the servers use the pump functions
@@ -81,27 +81,21 @@ impl<S: Read + Write> TlsStream<S> {
     }
 
     fn pull(&mut self) -> io::Result<()> {
-        let mut chunk = [0u8; WIRE_CHUNK];
-        let read = self.io.read(&mut chunk)?;
-
-        if read == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-
         if self.plain_pos == self.plain.len() {
             self.plain.clear();
             self.plain_pos = 0;
         }
 
-        let fed = feed_ciphertext(&mut self.conn, &chunk[..read], &mut self.plain);
+        match decrypt_from_vec(&mut self.conn, &mut self.io, &mut self.plain) {
+            Ok(WireIo::Progress { .. }) => Ok(()),
+            Ok(WireIo::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
+            Ok(WireIo::Eof) => Err(io::ErrorKind::UnexpectedEof.into()),
+            Err(error) => {
+                let _ = self.flush_wire();
 
-        if let Err(error) = fed {
-            let _ = self.flush_wire();
-
-            return Err(into_io(error));
+                Err(into_io(error))
+            }
         }
-
-        Ok(())
     }
 }
 

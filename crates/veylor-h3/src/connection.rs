@@ -14,13 +14,42 @@ use veylor_http3::{
     SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, frame, qpack,
 };
 
-use crate::frame_io::{close, read_byte, read_continuation, read_frame, read_varint};
+use crate::frame_io::{
+    close, read_byte, read_continuation, read_frame, read_frame_into, read_varint,
+};
 use crate::{
     Body, ConnectProtocol, Handler, Limits, ManagedOutcome, RequestStream, RequestTrailers,
 };
 
 const MAX_TRAILER_FIELDS: usize = 8;
 const MAX_TRAILER_BYTES: usize = 1024;
+const HEADER_RESERVE: usize = 16;
+const RESPONSE_COPY_BYTES: usize = 8 * 1024;
+const FRAME_REUSE_BYTES: usize = 64 * 1024;
+
+// PERF: one connection handles its bidirectional streams one at a time, so one set
+// of decode and response buffers can be reused for every request instead of being
+// allocated and freed per stream. The 1 KiB QPACK scratch and the frame payload are
+// the two allocations the profile attributed to the request path most often.
+struct Scratch {
+    frame: Vec<u8>,
+    header_scratch: Vec<u8>,
+    fields: Vec<qpack::FieldView>,
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    head: Vec<u8>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            frame: Vec::with_capacity(256),
+            header_scratch: Vec::with_capacity(1024),
+            fields: Vec::with_capacity(16),
+            trailers: Vec::new(),
+            head: Vec::with_capacity(256),
+        }
+    }
+}
 
 pub(crate) async fn serve(connection: Connection, handler: Arc<dyn Handler>, limits: Limits) {
     if setup_control(&connection, limits).await.is_err() {
@@ -32,11 +61,12 @@ pub(crate) async fn serve(connection: Connection, handler: Arc<dyn Handler>, lim
         accept_uni(uni, limits).await;
     });
 
+    let mut scratch = Scratch::new();
     loop {
         let Ok((send, recv)) = connection.accept_bi().await else {
             return;
         };
-        let _ = handle_request(send, recv, Arc::clone(&handler), connection.clone(), limits).await;
+        let _ = handle_request(send, recv, &*handler, &connection, limits, &mut scratch).await;
     }
 }
 
@@ -286,42 +316,44 @@ async fn read_qpack(connection: Connection, mut recv: RecvStream, kind: u64) {
 async fn handle_request(
     mut send: SendStream,
     mut recv: RecvStream,
-    handler: Arc<dyn Handler>,
-    connection: Connection,
+    handler: &dyn Handler,
+    connection: &Connection,
     limits: Limits,
+    scratch: &mut Scratch,
 ) -> Result<(), ()> {
     let limit = (limits.max_field_section as usize).saturating_mul(2);
-    let Some((kind, payload)) = read_frame(&mut recv, limit).await.map_err(|_| ())? else {
+    let Some(kind) = read_frame_into(&mut recv, limit, &mut scratch.frame)
+        .await
+        .map_err(|_| ())?
+    else {
         close(
-            &connection,
+            connection,
             H3_REQUEST_INCOMPLETE,
             "request finished before headers",
         );
         return Ok(());
     };
     if kind != frame::HEADERS {
-        close(&connection, H3_FRAME_UNEXPECTED, "expected headers");
+        close(connection, H3_FRAME_UNEXPECTED, "expected headers");
         return Ok(());
     }
-    let mut header_scratch = Vec::with_capacity(1024);
-    let mut fields = Vec::with_capacity(16);
     if qpack::decode_into(
-        &payload,
+        &scratch.frame,
         limits.max_field_section as usize,
-        &mut header_scratch,
-        &mut fields,
+        &mut scratch.header_scratch,
+        &mut scratch.fields,
     )
     .is_err()
     {
         close(
-            &connection,
+            connection,
             QPACK_DECOMPRESSION_FAILED,
             "header block decode failed",
         );
         return Ok(());
     }
-    let Some(mut request) = request_from_fields(&fields, &header_scratch) else {
-        close(&connection, H3_MESSAGE_ERROR, "malformed request");
+    let Some(mut request) = request_from_fields(&scratch.fields, &scratch.header_scratch) else {
+        close(connection, H3_MESSAGE_ERROR, "malformed request");
         return Ok(());
     };
 
@@ -333,12 +365,15 @@ async fn handle_request(
                 .await
         };
         match outcome {
-            ManagedOutcome::Handled(response) => write_response(&mut send, response, false).await,
+            ManagedOutcome::Handled(response) => {
+                write_response(&mut send, response, false, &mut scratch.head).await
+            }
             ManagedOutcome::Pass(_, _) => {
                 write_response(
                     &mut send,
                     crate::text_response(StatusCode::NOT_IMPLEMENTED, "connect unsupported"),
                     false,
+                    &mut scratch.head,
                 )
                 .await;
             }
@@ -347,26 +382,31 @@ async fn handle_request(
         return Ok(());
     }
     let mut body = Vec::new();
-    let mut trailers = Vec::new();
     loop {
-        match read_frame(&mut recv, limits.max_request_body.saturating_add(1)).await {
-            Ok(Some((kind, payload))) => match kind {
+        match read_frame_into(
+            &mut recv,
+            limits.max_request_body.saturating_add(1),
+            &mut scratch.frame,
+        )
+        .await
+        {
+            Ok(Some(kind)) => match kind {
                 frame::DATA => {
-                    if body.len().saturating_add(payload.len()) > limits.max_request_body {
-                        close(&connection, H3_EXCESSIVE_LOAD, "request body too large");
+                    if body.len().saturating_add(scratch.frame.len()) > limits.max_request_body {
+                        close(connection, H3_EXCESSIVE_LOAD, "request body too large");
                         return Ok(());
                     }
-                    body.extend_from_slice(&payload);
+                    body.extend_from_slice(&scratch.frame);
                 }
                 frame::HEADERS => {
-                    if payload.len() > limits.max_field_section as usize
+                    if scratch.frame.len() > limits.max_field_section as usize
                         || !append_trailers(
-                            &mut trailers,
-                            &payload,
+                            &mut scratch.trailers,
+                            &scratch.frame,
                             limits.max_field_section as usize,
                         )
                     {
-                        close(&connection, H3_MESSAGE_ERROR, "invalid request trailers");
+                        close(connection, H3_MESSAGE_ERROR, "invalid request trailers");
                         return Ok(());
                     }
                 }
@@ -375,20 +415,24 @@ async fn handle_request(
                 | frame::MAX_PUSH_ID
                 | frame::CANCEL_PUSH
                 | frame::PUSH_PROMISE => {
-                    close(&connection, H3_FRAME_UNEXPECTED, "unexpected request frame");
+                    close(connection, H3_FRAME_UNEXPECTED, "unexpected request frame");
                     return Ok(());
                 }
                 _ => {}
             },
             Ok(None) => break,
             Err(()) => {
-                close(&connection, H3_FRAME_ERROR, "invalid request frame");
+                close(connection, H3_FRAME_ERROR, "invalid request frame");
                 return Ok(());
             }
         }
     }
 
-    if !trailers.is_empty() {
+    if scratch.frame.capacity() > FRAME_REUSE_BYTES {
+        scratch.frame.shrink_to(256);
+    }
+    if !scratch.trailers.is_empty() {
+        let trailers = std::mem::take(&mut scratch.trailers);
         request.extensions_mut().insert(RequestTrailers(trailers));
     }
     let is_head = request.method() == Method::HEAD;
@@ -415,13 +459,18 @@ async fn handle_request(
     } else {
         response
     };
-    write_response(&mut send, response, is_head).await;
+    write_response(&mut send, response, is_head, &mut scratch.head).await;
     Ok(())
 }
 
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
-async fn write_response(send: &mut SendStream, response: Response<Body>, is_head: bool) {
+async fn write_response(
+    send: &mut SendStream,
+    response: Response<Body>,
+    is_head: bool,
+    head: &mut Vec<u8>,
+) {
     let (parts, body) = response.into_parts();
     let status = parts.status;
     let mut status_buf = [0u8; 3];
@@ -462,30 +511,45 @@ async fn write_response(send: &mut SendStream, response: Response<Body>, is_head
         fields.push((name.as_str().as_bytes(), value.as_bytes()));
     }
 
-    let block_length = qpack::encoded_len(&fields);
     let sends_body = !is_head && !sheds_length && status != StatusCode::RESET_CONTENT;
-    let mut head = Vec::with_capacity(12 + block_length);
-    let mut header = [0u8; 12];
+    // PERF: encode the block first and write its frame header into the reserved
+    // bytes in front of it. `encoded_len` used to walk every field a second time
+    // only to learn a length that the encoder already determines.
+    head.clear();
+    head.resize(HEADER_RESERVE, 0);
+    qpack::encode_into(&fields, head);
+    let block_length = head.len() - HEADER_RESERVE;
+    let mut header = [0u8; 16];
     let written = frame::encode_frame_header(frame::HEADERS, block_length as u64, &mut header);
-    head.extend_from_slice(&header[..written]);
-    qpack::encode_into(&fields, &mut head);
+    if written > HEADER_RESERVE {
+        return;
+    }
+    let start = HEADER_RESERVE - written;
+    head[start..HEADER_RESERVE].copy_from_slice(&header[..written]);
 
     match body {
         Body::Bytes(body) if sends_body && !body.is_empty() => {
             let written = frame::encode_frame_header(frame::DATA, body.len() as u64, &mut header);
             head.extend_from_slice(&header[..written]);
-            let mut chunks = [Bytes::from(head), body];
-            if send.write_all_chunks(&mut chunks).await.is_err() {
-                return;
+            if body.len() <= RESPONSE_COPY_BYTES {
+                head.extend_from_slice(&body);
+                if send.write_all(&head[start..]).await.is_err() {
+                    return;
+                }
+            } else {
+                let mut chunks = [Bytes::copy_from_slice(&head[start..]), body];
+                if send.write_all_chunks(&mut chunks).await.is_err() {
+                    return;
+                }
             }
         }
         Body::Bytes(_) => {
-            if send.write_all(&head).await.is_err() {
+            if send.write_all(&head[start..]).await.is_err() {
                 return;
             }
         }
         Body::Stream(mut body) => {
-            if send.write_all(&head).await.is_err() {
+            if send.write_all(&head[start..]).await.is_err() {
                 return;
             }
             let mut scratch = vec![0u8; STREAM_CHUNK_BYTES];

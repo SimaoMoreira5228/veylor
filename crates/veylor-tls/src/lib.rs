@@ -10,7 +10,10 @@ mod types;
 
 pub use client::{TlsConnector, TlsConnectorBuilder};
 pub use pem::{load_cert_chain, load_private_key};
-pub use pump::{drain_plaintext, feed_ciphertext, flush_ciphertext, queue_close_notify};
+pub use pump::{
+    WireIo, decrypt_from, decrypt_from_vec, drain_plaintext, feed_ciphertext, flush_ciphertext,
+    queue_close_notify,
+};
 pub use stream::TlsStream;
 pub use types::{Certificate, PrivateKey, ProtocolVersion};
 

@@ -5,6 +5,7 @@ mod park_request;
 pub(crate) mod parked;
 mod parked_pull;
 mod pump;
+mod slabs;
 mod state;
 pub(crate) mod streams;
 pub(crate) mod tls;
@@ -18,6 +19,10 @@ pub(crate) use parked::push_staged_body;
 pub(crate) use parked_pull::pull_staged_body;
 pub(crate) use pump::reuse_keep_alive;
 pub use pump::{PumpOutcome, PumpProgress, pump_connection};
+pub(crate) use slabs::{
+    BoundedPool, SLAB_HOLD_NS, SLAB_POOL_CAP, SLAB_QUIET_TURNS, SlabPool, arm_slab_due,
+    reclaim_idle_slabs, trim_released_pages, trim_settled_heap,
+};
 pub(crate) use state::ConnPhase;
 pub use state::{ConnClose, ConnState};
 pub use trailers::{TrailerOutcome, TrailerReport};

@@ -153,7 +153,6 @@ fn slot_reuse_across_ten_sequential_conns() {
 
 #[test]
 fn step_driver_rejects_bad_magic_direct() {
-    let mut staging = [0u8; INPUT_STAGING_CAP];
     let mut slots = [StreamSlot::EMPTY; STREAM_SLOTS];
     let mut header_block = [0u8; HEADER_BLOCK_CAP];
     let mut streams = StreamTable::new(
@@ -174,10 +173,10 @@ fn step_driver_rejects_bad_magic_direct() {
         &mut streams,
         &mut decoder,
         &mut encoder,
-        &mut staging,
         &mut ack_limits,
         &mut headers,
     );
+    conn.install_staging(Box::new([0; INPUT_STAGING_CAP]));
     conn.push_input(b"NOT-H2C-MAGIC-NOT-H2C-MAGIC!!!")
         .expect("stage garbage");
     let view = FrozenRoutesView::new(&ROUTES).expect("frozen routes");

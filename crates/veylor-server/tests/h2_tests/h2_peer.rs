@@ -139,7 +139,6 @@ pub(crate) fn socketpair() -> (TcpStream, TcpStream) {
 pub(crate) fn with_rig(
     body: impl FnOnce(&mut H2Conn<'_>, &HostShared, &mut TcpStream, &mut TcpStream),
 ) {
-    let mut staging = [0u8; INPUT_STAGING_CAP];
     let mut slots = [StreamSlot::EMPTY; STREAM_SLOTS];
     let mut header_block = [0u8; HEADER_BLOCK_CAP];
     let mut streams = StreamTable::new(
@@ -160,10 +159,10 @@ pub(crate) fn with_rig(
         &mut streams,
         &mut decoder,
         &mut encoder,
-        &mut staging,
         &mut ack_limits,
         &mut headers,
     );
+    conn.install_staging(Box::new([0; INPUT_STAGING_CAP]));
     let shared = HostShared::new(1);
     let (mut client, mut server) = socketpair();
     body(&mut conn, &shared, &mut client, &mut server)

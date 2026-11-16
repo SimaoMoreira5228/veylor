@@ -1,11 +1,11 @@
-use veylor_runtime::{
-    ConnectionTimeouts, ConnectionToken, PollInterest, Poller, TcpListener, TcpStream,
-};
+use veylor_runtime::{ConnectionTimeouts, ConnectionToken, Poller};
 use veylor_tls::TlsAcceptor;
 
+pub(crate) use super::accept::{drive_accepts, move_tls_slot, register_listener};
 use super::flush::{H2Flush, H2Read, flush_h2, read_once};
+
 use super::slots::{
-    H2_PENDING_CAP, H2_STREAM_TOKEN_BASE, H2Meta, H2Slots, idle_for_drain, pending_spare,
+    H2_STREAM_TOKEN_BASE, H2Meta, H2Slabs, H2Slot, H2Slots, idle_for_drain, pending_spare,
 };
 use super::{FrozenNativeRoute, FrozenRoute, FrozenRoutesView, H2Conn, STREAM_SLOTS};
 use crate::connection::ConnClose;
@@ -45,48 +45,6 @@ pub(crate) struct H2Turn<'a> {
     pub(crate) tls_acceptor: Option<&'a mut TlsAcceptor>,
 }
 
-pub(crate) fn open_slot(
-    meta: &mut H2Meta,
-    stream: TcpStream,
-    index: usize,
-    now_ns: u64,
-    head_budget_ns: u64,
-    stream_poller: &mut Poller,
-    counts: &mut CloseCounts,
-) -> bool {
-    // NOTE: transient only: registers the stream and arms scalars (driver built at call site).
-    let token = H2_STREAM_TOKEN_BASE + index;
-    let mut owned = stream;
-    if stream_poller
-        .register(&mut owned, token, PollInterest::Readable)
-        .is_err()
-    {
-        counts.add(ConnClose::TransportError);
-        return false;
-    }
-    *meta = H2Meta {
-        stream: Some(owned),
-        occupied: true,
-        readable: true,
-        token,
-        deadline_ns: now_ns.saturating_add(head_budget_ns),
-        last_progress_ns: now_ns,
-        pending: Some(Box::new([0; H2_PENDING_CAP])),
-        ..Default::default()
-    };
-    true
-}
-
-pub(crate) fn abort_slot(meta: &mut H2Meta, stream_poller: &mut Poller, counts: &mut CloseCounts) {
-    if let Some(mut stream) = meta.stream.take() {
-        let _ = stream_poller.deregister(&mut stream);
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    }
-    meta.occupied = false;
-    meta.readable = false;
-    counts.add(ConnClose::TransportError);
-}
-
 // NOTE: driver-chain construction expands inline once per slot over buffer FIELDS;
 // Option temporaries and helper params are rejected; transient helpers stay plain fns.
 
@@ -99,20 +57,6 @@ fn unpark_conn(host: &HostShared, worker: u32, meta: &H2Meta) {
             (MAX_CONNECTIONS + index * STREAM_SLOTS + sub) as u32,
         );
     }
-}
-
-pub(crate) fn abort_tls_slot(
-    meta: &mut H2Meta,
-    stream_poller: &mut Poller,
-    counts: &mut CloseCounts,
-    tls_acceptor: &mut Option<TlsAcceptor>,
-) {
-    if meta.tls.take().is_some()
-        && let Some(acceptor) = tls_acceptor.as_mut()
-    {
-        acceptor.release();
-    }
-    abort_slot(meta, stream_poller, counts);
 }
 
 fn shut_slot(meta: &mut H2Meta, poller: &mut Poller, reason: ConnClose, turn: &mut H2Turn<'_>) {
@@ -173,9 +117,21 @@ fn goaway_close(
     Some(fatal)
 }
 
+// NOTE: a slot-scoped index into the turn's staged work: a host response that arrives for a
+// connection whose slabs are in the pool must take them before `apply_h2_staged` writes.
+impl H2Turn<'_> {
+    fn staged_for(&self, index: usize) -> bool {
+        let base = MAX_CONNECTIONS + index * STREAM_SLOTS;
+        self.staged
+            .iter()
+            .any(|work| work.slot >= base && work.slot < base + STREAM_SLOTS)
+    }
+}
+
 pub(crate) fn pump_slot(
     meta: &mut H2Meta,
     conn: &mut Option<H2Conn<'_>>,
+    slabs: &mut H2Slabs,
     turn: &mut H2Turn<'_>,
     stream_poller: &mut Poller,
     index: usize,
@@ -192,6 +148,14 @@ pub(crate) fn pump_slot(
     if turn.forcing {
         shut_slot(meta, stream_poller, ConnClose::Shutdown, turn);
         return Some(ConnClose::Shutdown);
+    }
+    // NOTE: a connection that just woke up after giving its slabs back takes them here, before
+    // the staged application, the flush or the read can write through them.
+    let staged_here = turn.staged_for(index);
+    let wants = staged_here || meta.wants_pump() || meta.timed_out || turn.draining;
+    let missing = meta.pending.is_none() || conn.as_ref().is_some_and(|live| !live.holds_slabs());
+    if wants && missing {
+        slabs.adopt(meta, conn, turn.now_ns);
     }
     if meta.timed_out {
         return goaway_close(
@@ -253,6 +217,9 @@ pub(crate) fn pump_slot(
                 };
                 match tls_read_decrypted(stream, tls, spare, turn.budget, &mut meta.tls_plain) {
                     Ok((wire, plain, blocked)) => {
+                        // NOTE: TLS never joins the batch pass, so this is the claim's only
+                        // consumer; leaving it set would keep the slabs from ever releasing.
+                        meta.claimed = false;
                         live.commit_staged(plain);
                         turn.budget = turn.budget.saturating_sub(wire);
                         if blocked {
@@ -274,11 +241,15 @@ pub(crate) fn pump_slot(
             if room > 0 {
                 match read_once(stream, &mut live.spare_mut()[..room]) {
                     H2Read::Progress(read) => {
+                        meta.claimed = false;
                         live.commit_staged(read);
                         turn.budget -= read as u64;
                         progressed = true;
                     }
-                    H2Read::Blocked => meta.readable = false,
+                    H2Read::Blocked => {
+                        meta.claimed = false;
+                        meta.readable = false;
+                    }
                     H2Read::Eof => eof = true,
                     H2Read::Closed(reason) => close_reason = Some(reason),
                 }
@@ -358,8 +329,10 @@ pub(crate) fn pump_slot(
         close_reason = Some(ConnClose::PeerClosed);
     }
     if progressed {
-        meta.last_progress_ns = turn.now_ns;
+        meta.note_progress(turn.now_ns);
         meta.deadline_ns = turn.now_ns.saturating_add(turn.timeouts.keep_alive_idle_ns);
+    } else {
+        meta.note_quiet();
     }
     if !meta.serving {
         meta.serving = conn.as_ref().is_some_and(|live| live.handshake_complete());
@@ -422,20 +395,6 @@ pub(crate) fn restart_h2_drain(
     *h2_force_ns = now_ns.saturating_add(shutdown_grace_ns);
 }
 
-pub(crate) fn register_listener(
-    worker_poller: &mut Poller,
-    h2c_listener: &mut Option<TcpListener>,
-) -> Result<(), &'static str> {
-    // NOTE: h2c readiness rides the worker poller under its own token, so h2c accepts
-    // share the turn's event budget; Worker::turn ignores the token.
-    if let Some(bound) = h2c_listener.as_mut() {
-        worker_poller
-            .register(bound, H2C_LISTENER_TOKEN, PollInterest::Readable)
-            .map_err(|_| "h2c listener register failed")?;
-    }
-    Ok(())
-}
-
 pub(crate) fn project_routes<'a>(
     h2_routes: &'a [H2StaticRoute],
 ) -> (Vec<FrozenRoute<'a>>, Vec<FrozenNativeRoute<'a>>) {
@@ -480,128 +439,6 @@ pub(crate) fn project_routes<'a>(
     (flat, natives)
 }
 // NOTE: single accept-arm definition, invoked once per slot index below.
-pub(crate) fn accept_slot(
-    slots: &mut H2Slots,
-    index: usize,
-    accepted: veylor_runtime::AcceptedConnection,
-    now_ns: u64,
-    head_budget_ns: u64,
-    poller: &mut Poller,
-    counts: &mut CloseCounts,
-) {
-    let Some(slot) = slots.ensure(index) else {
-        counts.add(ConnClose::TransportError);
-        return;
-    };
-    if !open_slot(
-        &mut slot.meta,
-        accepted.stream,
-        index,
-        now_ns,
-        head_budget_ns,
-        poller,
-        counts,
-    ) {
-        slots.close(index);
-        return;
-    }
-    if !slot.open() {
-        abort_slot(&mut slot.meta, poller, counts);
-        slots.close(index);
-    }
-}
-
-// NOTE: per-turn h2c accept dispatch. h2c shares the H1 accept budget; on an H1-error
-// turn the budget is unknown, so h2c skips (fail closed).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn drive_accepts(
-    slots: &mut H2Slots,
-    listener: Option<&mut veylor_runtime::TcpListener>,
-    enabled: bool,
-    draining: bool,
-    budget: usize,
-    now_ns: u64,
-    head_budget_ns: u64,
-    poller: &mut Poller,
-    counts: &mut CloseCounts,
-    staging: &mut [Option<veylor_runtime::AcceptedConnection>],
-) {
-    if !(enabled && !draining && budget > 0) {
-        return;
-    }
-    let Some(bound) = listener else {
-        return;
-    };
-    // NOTE: one nonblocking accept per turn; WouldBlock short-circuits empty.
-    if veylor_runtime::accept_ready(bound, staging, budget).is_err() {
-        return;
-    }
-    for entry in staging.iter_mut() {
-        let Some(accepted) = entry.take() else {
-            continue;
-        };
-        let Some(index) = slots.free_slot() else {
-            counts.add(ConnClose::TransportError);
-            continue;
-        };
-        accept_slot(
-            slots,
-            index,
-            accepted,
-            now_ns,
-            head_budget_ns,
-            poller,
-            counts,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn move_tls_slot(
-    slots: &mut H2Slots,
-    index: usize,
-    stream: veylor_runtime::TcpStream,
-    tls: Box<veylor_tls::TlsConn>,
-    prefix: &[u8],
-    now_ns: u64,
-    head_budget_ns: u64,
-    poller: &mut Poller,
-    counts: &mut CloseCounts,
-    tls_acceptor: &mut Option<TlsAcceptor>,
-) -> bool {
-    let Some(slot) = slots.ensure(index) else {
-        if let Some(acceptor) = tls_acceptor.as_mut() {
-            acceptor.release();
-        }
-        return false;
-    };
-    if !open_slot(
-        &mut slot.meta,
-        stream,
-        index,
-        now_ns,
-        head_budget_ns,
-        poller,
-        counts,
-    ) {
-        if let Some(acceptor) = tls_acceptor.as_mut() {
-            acceptor.release();
-        }
-        slots.close(index);
-        return false;
-    }
-    slot.meta.tls = Some(tls);
-    let moved = slot.open()
-        && slot
-            .conn
-            .as_mut()
-            .is_some_and(|live| live.push_input(prefix).is_ok());
-    if !moved {
-        abort_tls_slot(&mut slot.meta, poller, counts, tls_acceptor);
-        slots.close(index);
-    }
-    moved
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_pumps(
@@ -624,6 +461,9 @@ pub(crate) fn drive_pumps(
         return;
     };
     slots.sweep_deadlines(now_ns, timeouts);
+    // NOTE: slabs come back before the recv batch and the pump, because both write through
+    // them; the pass is bounded by the connection ceiling and costs nothing when warm.
+    slots.adopt_ready(now_ns);
     let batched = slots.batch_available();
     slots.recv_ready(poller, budget);
     let mut turn = H2Turn {
@@ -640,24 +480,32 @@ pub(crate) fn drive_pumps(
         counts,
         tls_acceptor,
     };
-    for index in 0..slots.capacity() {
-        turn.budget = budget;
-        let mut retire = false;
-        if let Some(slot) = slots.slot_mut(index) {
-            if slot.meta.occupied {
-                slot.meta.defer_write = batched;
-                let _ = pump_slot(&mut slot.meta, &mut slot.conn, &mut turn, poller, index);
-                slot.meta.defer_write = false;
-                if let Some(conn) = slot.conn.as_mut() {
-                    conn.compact_decoder();
+    {
+        let entries = &mut slots.slots;
+        let slabs = &mut slots.slabs;
+        for index in 0..entries.len() {
+            turn.budget = budget;
+            let mut retire = false;
+            if let Some(slot) = entries
+                .get_mut(index)
+                .and_then(|entry| entry.as_deref_mut())
+            {
+                if slot.meta.occupied {
+                    slot.meta.defer_write = batched;
+                    let H2Slot { meta, conn, .. } = &mut *slot;
+                    let _ = pump_slot(meta, conn, slabs, &mut turn, poller, index);
+                    meta.defer_write = false;
+                    if let Some(live) = conn.as_mut() {
+                        live.compact_decoder();
+                    }
+                    retire = !meta.occupied;
+                } else {
+                    retire = true;
                 }
-                retire = !slot.meta.occupied;
-            } else {
-                retire = true;
             }
-        }
-        if retire {
-            slots.close(index);
+            if retire && let Some(entry) = entries.get_mut(index) {
+                *entry = None;
+            }
         }
     }
     if batched && slots.send_deferred(poller, budget) {
@@ -675,5 +523,8 @@ pub(crate) fn drive_pumps(
             }
             slots.close(index);
         }
+    }
+    if !draining {
+        slots.reclaim_idle(now_ns);
     }
 }

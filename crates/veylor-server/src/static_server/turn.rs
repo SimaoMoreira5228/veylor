@@ -15,7 +15,10 @@ use veylor_runtime::{
 #[cfg(target_os = "linux")]
 use super::{batch_recv, batch_send};
 use crate::connection::tls::tls_alpn_is_h2;
-use crate::connection::{ConnClose, ConnState, PumpOutcome, pump_connection};
+use crate::connection::{
+    ConnClose, ConnState, PumpOutcome, SLAB_POOL_CAP, SlabPool, arm_slab_due, pump_connection,
+    reclaim_idle_slabs, trim_settled_heap,
+};
 use crate::h2::slots as h2_slots;
 use crate::h2::turn as h2_turn;
 use crate::multi_worker::{ThreadCtx, ThreadResult};
@@ -158,6 +161,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
         .collect();
     let mut admitted: Vec<Option<AdmittedConnection>> = (0..staging_cap).map(|_| None).collect();
     let mut ready: Vec<Readiness> = Vec::new();
+    let mut slabs = SlabPool::new(SLAB_POOL_CAP);
+    // NOTE: non-zero while an idle connection holds slabs; the value is the earliest moment the
+    // reclaim pass can free one, so a worker with nothing idle pays one compare per poll
+    // wakeup instead of a sweep over every slot.
+    let mut slab_due_ns = 0u64;
+    // NOTE: set when the sweep gives slabs back between reclaim passes; the turn that finds the
+    // worker idle hands those pages to the system before it sleeps.
+    let mut slabs_released = false;
     let mut h2 = h2_slots::H2Slots::new();
     let mut h2_staging = h2_slots::accept_staging();
     let base = Instant::now();
@@ -182,6 +193,14 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             send_slots.clear();
         }
         let now_ns = base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        // NOTE: reclaim runs before the skip check below, because the connections that hold
+        // the most unused memory are exactly the ones that make this turn skippable.
+        if slab_due_ns != 0 && now_ns >= slab_due_ns {
+            let horizon = worker.slot_horizon().min(conns.len());
+            let (due, released) = reclaim_idle_slabs(&mut conns, &mut slabs, horizon, now_ns);
+            slab_due_ns = due;
+            slabs_released |= released;
+        }
         if force.load(Ordering::Acquire) {
             worker.force_shutdown();
         } else if stop.load(Ordering::Acquire) && worker.shutdown_phase() == ShutdownPhase::Running
@@ -223,6 +242,10 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             let horizon = worker.slot_horizon().min(max_conns);
             work_pending(&conns[..horizon], h2_want)
         };
+        if slabs_released && !pending {
+            trim_settled_heap();
+            slabs_released = false;
+        }
         let stream_wait_ms = if pending { 0 } else { config.poll_wait_ms };
         let worker_wait_ms = if live_streams == 0 { stream_wait_ms } else { 0 };
         let mut stream_touched = false;
@@ -254,6 +277,12 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 };
                 if event.readable || event.read_closed_hint {
                     conn.mark_readable();
+                    // NOTE: a waking connection takes its slabs here, before batch_recv writes
+                    // into the input slab; a pool miss is the only case that allocates.
+                    if conn.input.is_none() {
+                        slabs.adopt(conn, now_ns);
+                        arm_slab_due(&mut slab_due_ns, now_ns);
+                    }
                     #[cfg(target_os = "linux")]
                     read_slots.push(slot);
                 }
@@ -480,6 +509,13 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
             if draining {
                 conn.begin_drain();
             }
+            // NOTE: a connection woken by connect or by a re-armed claim has no readiness
+            // event to hand it slabs, so the sweep fills them before the pump reads.
+            if conn.read_ready && conn.input.is_none() {
+                slabs.adopt(conn, now_ns);
+                arm_slab_due(&mut slab_due_ns, now_ns);
+            }
+            let mut moved = 0u64;
             let hook_close = match pump_connection(
                 conn,
                 &routes,
@@ -490,6 +526,7 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 draining,
             ) {
                 PumpOutcome::Keep(progress) => {
+                    moved = progress.bytes_read.saturating_add(progress.bytes_written);
                     if !tls_alpn_is_h2(conn) {
                         let token = conn.token();
                         apply_pump_hooks(&mut worker, token, progress, now_ns)
@@ -552,6 +589,16 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                 continue;
             }
             if let Some(conn) = conns[slot].as_mut() {
+                conn.note_activity(moved, now_ns);
+                if conn.holds_slabs() {
+                    if conn.slab_release_due(now_ns) {
+                        if slabs.release(conn) {
+                            slabs_released = true;
+                        }
+                    } else if conn.slab_idle() {
+                        arm_slab_due(&mut slab_due_ns, now_ns);
+                    }
+                }
                 #[cfg(target_os = "linux")]
                 if conn.write_deferred && conn.has_pending_output() {
                     send_slots.push(slot);
@@ -586,6 +633,19 @@ pub(crate) fn worker_main(ctx: ThreadCtx) -> ThreadResult {
                     &mut tls_acceptor,
                     now_ns,
                 );
+                // NOTE: the deferred write is the one response completion outside the sweep, so
+                // the connections it just made idle need their hold window armed here.
+                if slab_due_ns == 0 {
+                    for &slot in &send_slots {
+                        let idle = conns[slot]
+                            .as_ref()
+                            .is_some_and(|conn| conn.holds_slabs() && conn.slab_idle());
+                        if idle {
+                            arm_slab_due(&mut slab_due_ns, now_ns);
+                            break;
+                        }
+                    }
+                }
             }
         }
         let h2_pump_enabled = h2_enabled && h2.occupied() > 0;

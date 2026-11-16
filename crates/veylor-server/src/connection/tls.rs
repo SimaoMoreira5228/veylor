@@ -1,5 +1,5 @@
 use veylor_runtime::TcpStream;
-use veylor_tls::{TlsConn, alpn, drain_plaintext, feed_ciphertext};
+use veylor_tls::{TlsConn, TlsError, WireIo, alpn, decrypt_from, drain_plaintext};
 
 use super::{ConnClose, ConnPhase, ConnState, INPUT_CAP, OUTPUT_CAP, PumpProgress};
 
@@ -7,6 +7,10 @@ use super::{ConnClose, ConnPhase, ConnState, INPUT_CAP, OUTPUT_CAP, PumpProgress
 // pending buffer pre-reserves 16 KiB while the plaintext side matches INPUT_CAP. Floors,
 // not caps — growth beyond them is normal and unbounded by these values.
 pub const TLS_PENDING_MIN_BYTES: usize = 16384;
+
+// NOTE: plaintext delivered to one turn's read spare, matching the old ciphertext read
+// quantum; a larger record leaves its remainder queued in the provider for the next turn.
+const TLS_PLAIN_CHUNK: usize = 4096;
 
 pub(crate) fn tls_flush_pending(conn: &mut ConnState, budget: u64) -> Result<u64, ConnClose> {
     let unflushed = conn.tls_pending.len().saturating_sub(conn.tls_pending_sent);
@@ -176,95 +180,39 @@ pub(crate) fn tls_read_available(
         return Ok((0, 0));
     }
 
-    ConnState::materialize_input(&mut conn.input);
+    let room = (INPUT_CAP - conn.len)
+        .min(TLS_PLAIN_CHUNK)
+        .min(budget as usize);
 
-    let spare = INPUT_CAP - conn.len;
-    let want = (spare.min(4096) as u64).min(budget) as usize;
-
-    if want == 0 {
+    if room == 0 {
         return Ok((0, 0));
     }
 
-    let mut raw = [0u8; 4096];
-    let mut wire = 0usize;
-    let mut attempts = 0;
-
-    let got = loop {
-        if want <= wire {
-            break wire;
-        }
-
-        let limit = (want - wire).min(4096 - wire);
-
-        let outcome = tls_read_once(&mut conn.stream, &mut raw[wire..wire + limit]);
-
-        match outcome {
-            TlsReadOutcome::Progress(n) => {
-                wire += n;
-
-                break wire;
-            }
-            TlsReadOutcome::Blocked => {
-                if wire > 0 {
-                    break wire;
-                }
-
-                conn.read_ready = false;
-
-                return Ok((0, 0));
-            }
-            TlsReadOutcome::Interrupted => {
-                attempts += 1;
-
-                if attempts >= 2 {
-                    break wire;
-                }
-            }
-            TlsReadOutcome::Eof => {
-                return Err(ConnClose::PeerClosed);
-            }
-            TlsReadOutcome::Closed(reason) => {
-                return Err(reason);
-            }
-        }
-    };
-
-    if got == 0 {
-        return Ok((0, 0));
-    }
+    let input = ConnState::materialize_input(&mut conn.input);
 
     let Some(tls) = conn.tls.as_mut() else {
         return Err(ConnClose::TransportError);
     };
 
-    conn.tls_plain.clear();
+    let start = conn.len;
+    let spare = &mut input[start..start + room];
 
-    let consumed = feed_ciphertext(tls, &raw[..got], &mut conn.tls_plain)
-        .map_err(|_| ConnClose::TransportError)?;
+    match decrypt_from(tls, &mut conn.stream, spare) {
+        Ok(WireIo::Progress { wire, plain }) => {
+            conn.len += plain;
+            conn.read_ready = true;
 
-    if consumed != got {
-        return Err(ConnClose::TransportError);
-    }
-
-    let decrypted = conn.tls_plain.len();
-    let end = conn.len + decrypted;
-
-    if end > INPUT_CAP {
-        return Err(ConnClose::TransportError);
-    }
-
-    if decrypted > 0 {
-        if let Some(input) = conn.input.as_mut() {
-            input[conn.len..end].copy_from_slice(&conn.tls_plain[..]);
+            Ok((wire as u64, plain as u64))
         }
+        Ok(WireIo::WouldBlock) => {
+            conn.read_ready = false;
 
-        conn.tls_plain.clear();
-        conn.len = end;
+            Ok((0, 0))
+        }
+        Ok(WireIo::Eof) => Err(ConnClose::PeerClosed),
+        Err(TlsError::Io(error)) => Err(close_for(&error)),
+        Err(_) => Err(ConnClose::TransportError),
     }
-
-    conn.read_ready = true;
-
-    Ok((got as u64, decrypted as u64))
 }
 
 pub(crate) fn tls_alpn_is_h2(conn: &ConnState) -> bool {
@@ -286,70 +234,29 @@ pub(crate) fn tls_read_decrypted(
     tls: &mut TlsConn,
     spare: &mut [u8],
     budget: u64,
-    scratch: &mut Vec<u8>,
+    _scratch: &mut Vec<u8>,
 ) -> Result<(u64, usize, bool), ConnClose> {
+    // NOTE: h2/turn.rs still passes its tls_plain slot for this call; plaintext lands
+    // straight in the caller's spare, so that slot stays empty until its owner drops it.
     if budget == 0 || spare.is_empty() {
         return Ok((0, 0, false));
     }
-    let limit = spare.len().min(4096).min(budget as usize);
-    if limit == 0 {
-        return Ok((0, 0, false));
+
+    let room = spare.len().min(budget as usize);
+
+    match decrypt_from(tls, stream, &mut spare[..room]) {
+        Ok(WireIo::Progress { wire, plain }) => Ok((wire as u64, plain, false)),
+        Ok(WireIo::WouldBlock) => Ok((0, 0, true)),
+        Ok(WireIo::Eof) => Err(ConnClose::PeerClosed),
+        Err(TlsError::Io(error)) => Err(close_for(&error)),
+        Err(_) => Err(ConnClose::TransportError),
     }
-    let mut raw = [0u8; 4096];
-    let mut wire = 0usize;
-    let mut attempts = 0;
-    let blocked = loop {
-        match tls_read_once(stream, &mut raw[wire..limit]) {
-            TlsReadOutcome::Progress(n) => {
-                wire += n;
-                break false;
-            }
-            TlsReadOutcome::Blocked => {
-                if wire > 0 {
-                    break false;
-                }
-                break true;
-            }
-            TlsReadOutcome::Interrupted => {
-                attempts += 1;
-                if attempts >= 2 {
-                    break false;
-                }
-            }
-            TlsReadOutcome::Eof => return Err(ConnClose::PeerClosed),
-            TlsReadOutcome::Closed(reason) => return Err(reason),
-        }
-    };
-    if wire == 0 {
-        return Ok((0, 0, blocked));
-    }
-    scratch.clear();
-    let consumed =
-        feed_ciphertext(tls, &raw[..wire], scratch).map_err(|_| ConnClose::TransportError)?;
-    if consumed != wire {
-        return Err(ConnClose::TransportError);
-    }
-    if scratch.len() > spare.len() {
-        return Err(ConnClose::TransportError);
-    }
-    spare[..scratch.len()].copy_from_slice(scratch);
-    let plain = scratch.len();
-    scratch.clear();
-    Ok((wire as u64, plain, blocked))
 }
 
 pub(crate) enum TlsWriteOutcome {
     Accepted(usize),
     Blocked,
     Interrupted,
-    Closed(ConnClose),
-}
-
-pub(crate) enum TlsReadOutcome {
-    Progress(usize),
-    Blocked,
-    Interrupted,
-    Eof,
     Closed(ConnClose),
 }
 
@@ -386,33 +293,13 @@ pub(crate) fn tls_write_once(stream: &mut TcpStream, chunk: &[u8]) -> TlsWriteOu
     }
 }
 
-pub(crate) fn tls_read_once(stream: &mut TcpStream, scratch: &mut [u8]) -> TlsReadOutcome {
-    use std::io::Read as _;
-
-    if scratch.is_empty() {
-        return TlsReadOutcome::Progress(0);
-    }
-
-    match stream.read(scratch) {
-        Ok(0) => TlsReadOutcome::Eof,
-        Ok(n) => TlsReadOutcome::Progress(n),
-        Err(error) => {
-            let kind = error.kind();
-
-            if kind == std::io::ErrorKind::WouldBlock {
-                return TlsReadOutcome::Blocked;
-            }
-
-            if kind == std::io::ErrorKind::Interrupted {
-                return TlsReadOutcome::Interrupted;
-            }
-
-            if kind == std::io::ErrorKind::ConnectionReset {
-                return TlsReadOutcome::Closed(ConnClose::Reset);
-            }
-
-            TlsReadOutcome::Closed(ConnClose::TransportError)
+fn close_for(error: &std::io::Error) -> ConnClose {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+            ConnClose::Reset
         }
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof => ConnClose::PeerClosed,
+        _ => ConnClose::TransportError,
     }
 }
 
